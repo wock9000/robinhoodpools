@@ -70,6 +70,67 @@ def indexer(store: MarketStore, rpc=None, **kwargs) -> MarketIndexer:
     )
 
 
+def test_live_writer_and_history_recovery_cannot_deadlock(tmp_path):
+    from eth_abi import encode
+    from eth_utils import keccak
+
+    store = MarketStore(tmp_path / "market.sqlite")
+    scanner = indexer(store)
+    token0, token1, hook = "0x" + "11" * 20, "0x" + "22" * 20, "0x" + "00" * 20
+    pool_id = "0x" + keccak(encode(
+        ["address", "address", "uint24", "int24", "address"],
+        [token0, token1, 3000, 8, hook],
+    )).hex()
+    store.upsert_pools([{
+        "id": pool_id, "protocol": "v4", "address": POOL_MANAGER,
+        "token0": token0, "token1": token1, "fee_ppm": 3000,
+        "tick_spacing": None, "hook": hook, "factory": POOL_MANAGER,
+        "source": "census", "metadata_json": {"dynamic_fee": False},
+    }])
+    history_waiting = threading.Event()
+    writer_lock = store.lock
+    failures = []
+    recovered = []
+
+    class ObservedWriterLock:
+        def __enter__(self):
+            if threading.current_thread().name == "history-recovery":
+                history_waiting.set()
+            if not writer_lock.acquire(timeout=2):
+                raise TimeoutError("history recovery was blocked by live ingestion")
+            return self
+
+        def __exit__(self, *_args):
+            writer_lock.release()
+
+    def recover_history():
+        try:
+            recovered.append(scanner._pool(pool_id))
+        except Exception as exc:
+            failures.append(exc)
+        finally:
+            store.close_reader()
+
+    store.lock = ObservedWriterLock()
+    history = threading.Thread(target=recover_history, name="history-recovery")
+    try:
+        with store.transaction():
+            history.start()
+            assert history_waiting.wait(2)
+            live = scanner._pool(pool_id)
+            assert live["tick_spacing"] == 8
+        history.join(3)
+        assert not history.is_alive()
+        assert failures == []
+        assert recovered[0]["id"] == pool_id
+        assert recovered[0]["tick_spacing"] == 8
+        assert store.pool(pool_id)["tick_spacing"] == 8
+    finally:
+        history.join(3)
+        scanner.close()
+        store.close()
+
+
 def test_pool_lookup_work_is_per_unique_candidate_not_per_log(monkeypatch):
     store = MarketStore(":memory:")
     scanner = indexer(store)

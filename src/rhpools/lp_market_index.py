@@ -361,7 +361,6 @@ class MarketIndexer:
         self._pool_misses: set[str] = set()
         self._identity_checked: set[str] = set()
         self._identity_resolve_lock = threading.Lock()
-        self._legacy_v4_identity_lock = threading.Lock()
         self._cache_lock = threading.Lock()
         self._live_chunk = LIVE_INITIAL_CHUNK
         self._history_chunk = HISTORY_INITIAL_CHUNK
@@ -2279,7 +2278,10 @@ class MarketIndexer:
     ) -> dict[str, Any] | None:
         if _lower(stored.get("protocol")) != "v4":
             return None
-        with self._legacy_v4_identity_lock:
+        # Live ingestion may already own the writer lock. Reuse that reentrant
+        # lock rather than taking a second mutex in the opposite order to a
+        # history lane that must persist its recovered identity.
+        with self.store.lock:
             current = self.store.pool(candidate) or dict(stored)
             decoded = self._stored_pool(current)
             normalized = self._normalize_pool(decoded)
