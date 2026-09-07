@@ -124,6 +124,51 @@ def test_dense_live_interval_grows_and_reports_scan_work(monkeypatch):
         scanner.close()
         store.close()
 
+def test_live_chunk_sizing_excludes_writer_lock_wait(tmp_path, monkeypatch):
+    store = MarketStore(tmp_path / "market.sqlite")
+    scanner = indexer(store, StaticRpc(355))
+    anchor = header(99)
+    store.ingest(
+        [anchor], [], lane="live",
+        cursor={
+            "block_number": 99,
+            "block_hash": anchor["hash"],
+            "timestamp": int(anchor["timestamp"], 16),
+        },
+    )
+    boundaries = {100: header(100), 355: header(355)}
+    monkeypatch.setattr(
+        scanner, "_fetch_interval",
+        lambda _lane, start, end: ([], {start: boundaries[start], end: boundaries[end]}),
+    )
+    monkeypatch.setattr(
+        "rhpools.lp_market_index.MAX_INTERVAL_STORE_SECONDS", 0.1,
+    )
+    held = threading.Event()
+    release = threading.Event()
+
+    def hold_writer():
+        with store.transaction():
+            held.set()
+            release.wait(2)
+
+    writer = threading.Thread(target=hold_writer)
+    writer.start()
+    try:
+        assert held.wait(1)
+        timer = threading.Timer(0.3, release.set)
+        timer.start()
+        assert scanner._scan_live_once() is True
+        timer.join(1)
+        scan = scanner.runtime_status()["live_scan"]
+        assert scan["store_lock_wait_seconds"] >= 0.15
+        assert scan["next_chunk"] == 512
+    finally:
+        release.set()
+        writer.join(2)
+        scanner.close()
+        store.close()
+
 
 def test_live_parent_mismatch_never_advances_cursor(monkeypatch):
     store = MarketStore(":memory:")

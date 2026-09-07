@@ -69,6 +69,13 @@ The response contains:
 `coverage.catalog.complete_for_known_catalog` applies only to supported known
 factories and the indexed V4 PoolManager catalog.
 
+Verified pool identities are cached separately from current liquidity snapshots
+and invalidated when pool or token metadata changes. Recovering an omitted V4
+tick spacing reuses candidates from previously verified PoolKeys, but each
+candidate must still reproduce the requested pool hash. Large-token responses
+remain complete rather than silently capped; state reads use bounded RPC
+batches and retain the exact-block confirmation described above.
+
 ### Pool identity and dynamic fees
 
 - V2 and V3 have a 20-byte `pool_id` equal to `pool_address`.

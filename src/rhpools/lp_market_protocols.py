@@ -5,13 +5,15 @@ lower-case.  No helper in this module performs I/O; the indexer owns RPC.
 """
 from __future__ import annotations
 
-from collections import defaultdict
-from functools import lru_cache
+from collections import OrderedDict, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
+from functools import lru_cache
+from threading import Lock
 from types import MappingProxyType
 from typing import Any
 import re
 
+from eth_hash.auto import keccak as _raw_keccak
 from eth_utils import keccak
 
 from .lp_chain import (
@@ -546,7 +548,34 @@ def _v4_pool_id(token0: str, token1: str, fee: int, spacing: int, hook: str) -> 
         spacing if spacing >= 0 else (1 << 256) + spacing,
         int(hook, 16),
     ]
-    return "0x" + keccak(b"".join(word.to_bytes(32, "big") for word in words)).hex()
+    return "0x" + _raw_keccak(
+        b"".join(word.to_bytes(32, "big") for word in words)
+    ).hex()
+
+
+_V4_TICK_SPACING_HINT_LIMIT = 32768
+_v4_tick_spacing_hints: OrderedDict[tuple[int, str], tuple[int, ...]] = OrderedDict()
+_v4_tick_spacing_hints_lock = Lock()
+
+
+def _remember_v4_tick_spacing(fee: int, hooks: str, spacing: int) -> None:
+    key = (fee, hooks)
+    with _v4_tick_spacing_hints_lock:
+        current = _v4_tick_spacing_hints.get(key, ())
+        if spacing not in current:
+            _v4_tick_spacing_hints[key] = (*current, spacing)
+        _v4_tick_spacing_hints.move_to_end(key)
+        while len(_v4_tick_spacing_hints) > _V4_TICK_SPACING_HINT_LIMIT:
+            _v4_tick_spacing_hints.popitem(last=False)
+
+
+def _known_v4_tick_spacings(fee: int, hooks: str) -> tuple[int, ...]:
+    key = (fee, hooks)
+    with _v4_tick_spacing_hints_lock:
+        hints = _v4_tick_spacing_hints.get(key, ())
+        if hints:
+            _v4_tick_spacing_hints.move_to_end(key)
+        return hints
 
 
 @lru_cache(maxsize=32768)
@@ -570,10 +599,18 @@ def _resolve_v4_tick_spacing_cached(
         )
     )
     expected = bytes.fromhex(pool_id[2:])
+    # Hints only reorder the exhaustive search and are learned after a full
+    # PoolKey hash match; each reuse is independently verified here.
+    for candidate in _known_v4_tick_spacings(fee, hooks):
+        encoded[126] = candidate >> 8
+        encoded[127] = candidate & 255
+        if _raw_keccak(bytes(encoded)) == expected:
+            return candidate
     for candidate in range(1, 32768):
         encoded[126] = candidate >> 8
         encoded[127] = candidate & 255
-        if keccak(bytes(encoded)) == expected:
+        if _raw_keccak(bytes(encoded)) == expected:
+            _remember_v4_tick_spacing(fee, hooks, candidate)
             return candidate
     return None
 
@@ -601,6 +638,7 @@ def resolve_v4_tick_spacing(
         or isinstance(fee, bool)
         or not isinstance(fee, int)
         or not 0 <= fee < 1 << 24
+        or (fee > 1_000_000 and fee != 0x800000)
         or (
             tick_spacing is not None
             and (
@@ -612,17 +650,16 @@ def resolve_v4_tick_spacing(
     ):
         return None
     if tick_spacing is not None:
-        return (
-            tick_spacing
-            if _v4_pool_id(
-                normalized0,
-                normalized1,
-                fee,
-                tick_spacing,
-                normalized_hooks,
-            ) == normalized_id
-            else None
-        )
+        if _v4_pool_id(
+            normalized0,
+            normalized1,
+            fee,
+            tick_spacing,
+            normalized_hooks,
+        ) != normalized_id:
+            return None
+        _remember_v4_tick_spacing(fee, normalized_hooks, tick_spacing)
+        return tick_spacing
     return _resolve_v4_tick_spacing_cached(
         normalized_id,
         normalized0,

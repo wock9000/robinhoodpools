@@ -44,6 +44,12 @@ The equivalent environment settings are `RHP_HTTP_HOST`, `RHP_HTTP_PORT`, `RHP_R
 
 A successful request to `/` establishes only that the HTTP process can serve the installed UI. Index progress and source coverage are separate; inspect `/api/lp/status` and its observed head, indexed head, lag, history coverage, and provider status before treating results as current. During startup, catch-up, provider failure, or a chain reorganization, the server can remain available while indexed data is incomplete or stale.
 
+Recent live lag, older historical backfill, and pending accounting enrichment
+are separate backlogs. Closing the live gap does not make historical position
+accounting complete. Recent-gap-first scheduling prioritizes live ingestion,
+then resumes older history; status continues to expose both coverage intervals
+and pending enrichment, balance, and reprojection counts.
+
 ```sh
 curl -fsS http://127.0.0.1:8196/ >/dev/null
 curl -fsS http://127.0.0.1:8196/api/lp/status

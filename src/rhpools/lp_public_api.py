@@ -178,6 +178,9 @@ class PublicMarketAPI:
         self.cache_ttl = float(cache_ttl)
         self.max_cache_entries = int(max_cache_entries)
         self._cache: OrderedDict[tuple[Any, ...], tuple[float, dict[str, Any]]] = OrderedDict()
+        self._known_cache: OrderedDict[
+            str, tuple[tuple[int, int], tuple[dict[str, Any], ...], dict[str, Any]]
+        ] = OrderedDict()
         self._pending: dict[tuple[Any, ...], Future[dict[str, Any]]] = {}
         self._cache_lock = threading.Lock()
         self._closed = False
@@ -187,6 +190,7 @@ class PublicMarketAPI:
         with self._cache_lock:
             self._closed = True
             self._cache.clear()
+            self._known_cache.clear()
 
     @staticmethod
     def _token_param(params: Mapping[str, Any]) -> str:
@@ -386,8 +390,12 @@ class PublicMarketAPI:
             if pool["token0"] >= pool["token1"]:
                 return None, "noncanonical_v4_currency_order"
             configured = _integer(pool.get("configured_fee"))
-            if configured is None or not 0 <= configured < 1 << 24:
+            if configured is None:
                 return None, "missing_v4_configured_fee"
+            if not 0 <= configured < 1 << 24 or (
+                configured > 1_000_000 and configured != 0x800000
+            ):
+                return None, "invalid_v4_configured_fee"
             dynamic = bool(configured & 0x800000)
             declared_dynamic = pool.get("dynamic_fee")
             if declared_dynamic is not None and bool(declared_dynamic) != dynamic:
@@ -436,6 +444,16 @@ class PublicMarketAPI:
 
 
     def _known_pools(self, token: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        revision = (
+            _integer(getattr(self.store, "pool_metadata_token", None)) or 0,
+            _integer(getattr(self.market, "pool_publication_revision", None)) or 0,
+        )
+        with self._cache_lock:
+            cached = self._known_cache.get(token)
+            if cached is not None and cached[0] == revision:
+                self._known_cache.move_to_end(token)
+                _revision, pools, issues = cached
+                return list(pools), dict(issues)
         stored, catalog_ids = self._stored_matches(token)
         lock = getattr(self.market, "_lock", None)
         if lock is not None:
@@ -496,9 +514,16 @@ class PublicMarketAPI:
                     issues.append(issue)
 
         pools: list[dict[str, Any]] = []
-        for candidate in candidates.values():
-            if candidate is None:
-                continue
+        ordered_candidates = sorted(
+            (candidate for candidate in candidates.values() if candidate is not None),
+            key=lambda candidate: (
+                candidate["protocol"] == "v4"
+                and _integer(candidate.get("tick_spacing")) is None
+            ),
+        )
+        # Complete keys cheaply verify and seed spacing hints before legacy
+        # rows with omitted spacing are recovered.
+        for candidate in ordered_candidates:
             self._token_metadata(candidate, universe)
             finalized, issue = self._finalize_pool(candidate)
             if finalized is None:
@@ -506,10 +531,17 @@ class PublicMarketAPI:
                 continue
             pools.append(finalized)
         pools.sort(key=lambda row: (row["protocol"], row["id"]))
-        return pools, {
+        result_issues = {
             "omitted_records": len(issues),
             "omission_reasons": sorted(set(issues)),
         }
+        with self._cache_lock:
+            if not self._closed:
+                self._known_cache[token] = (revision, tuple(pools), result_issues)
+                self._known_cache.move_to_end(token)
+                while len(self._known_cache) > self.max_cache_entries:
+                    self._known_cache.popitem(last=False)
+        return pools, result_issues
 
     def _header(self) -> dict[str, Any]:
         try:

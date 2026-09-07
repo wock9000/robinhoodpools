@@ -448,10 +448,12 @@ def test_backfill_insertion_order_does_not_reorder_live_tape(tmp_path):
     try:
         app.store.upsert_pools(pools())
         now = int(time.time()) - 60
-        recent = [header(99, now), header(100, now + 1)]
+        # Equal timestamps exercise the timestamp-index floor tie: the
+        # backfilled lower block receives the highest insertion id.
+        recent = [header(99, now), header(100, now)]
         app.store.ingest(recent, [swap(recent[0], V3, "v3"), swap(recent[1], V4, "v4")])
-        old = header(98, now - 30)
-        app.store.ingest([old], [swap(old, V3, "v3")], lane="backfill")
+        old = header(98, now)
+        app.store.ingest([old], [swap(old, V3, "v3")])
         tape = app.tape({"window": "1h", "kind": "all", "limit": 2})
         assert [row["block_number"] for row in tape["rows"]] == [100, 99]
         next_page = app.tape({"window": "1h", "kind": "all", "before": tape["cursor"]})
@@ -459,6 +461,51 @@ def test_backfill_insertion_order_does_not_reorder_live_tape(tmp_path):
     finally:
         app.close()
 
+@pytest.mark.parametrize(
+    ("recent_kind", "expected_rows"),
+    (("swap", 0), ("add", 1)),
+)
+def test_underfilled_lp_tape_stays_within_window(
+        tmp_path, recent_kind, expected_rows):
+    path = tmp_path / f"market-{recent_kind}.sqlite"
+    seed = MarketStore(path)
+    now = int(time.time())
+    old = header(1, now - 7_200)
+    recent = header(1_000, now - 10)
+    recent_event = {**swap(recent, V3, "v3"), "kind": recent_kind}
+    try:
+        seed.upsert_pools(pools())
+        seed.ingest(
+            [old, recent],
+            [
+                *(swap(old, V3, "v3", index=index) for index in range(2_000)),
+                recent_event,
+            ],
+        )
+    finally:
+        seed.close()
+
+    app = service(path)
+    connection = app.store.read()
+    connection.set_progress_handler(lambda: 1, 2_000)
+    try:
+        result = app.tape(
+            {"window": "1h"},
+            _status={
+                "history_from": now - 7_200,
+                "history_to": now,
+                "revision": 1,
+                "epoch": 0,
+            },
+        )
+        assert len(result["rows"]) == expected_rows
+        assert [row["block_number"] for row in result["rows"]] == (
+            [1_000] if expected_rows else []
+        )
+        assert (result["cursor"] is not None) is bool(expected_rows)
+    finally:
+        connection.set_progress_handler(None, 0)
+        app.close()
 
 def test_backfilled_price_repairs_existing_flows_after_restart(tmp_path):
     path = tmp_path / "market.sqlite"

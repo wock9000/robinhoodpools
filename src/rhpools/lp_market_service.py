@@ -2372,9 +2372,25 @@ class LPMarketService:
         selective = bool(
             query or any(params.get(key) for key in ("protocol", "pool", "owner"))
         )
-        event_source = (
-            "events e" if selective else "events e INDEXED BY events_block_idx"
-        )
+        event_source = "events e"
+        if not selective:
+            event_source = "events e INDEXED BY events_block_idx"
+            if start:
+                # Bound the canonical-order scan at the first event in the
+                # requested time window.  Without this scalar range, an empty
+                # or underfilled LP tape walks events_block_idx to genesis
+                # while holding a WAL reader.  Canonical timestamps are
+                # monotonic by block; ordering the covering index by timestamp
+                # then block chooses the conservative lowest block when
+                # several blocks share a timestamp.  The timestamp predicate
+                # remains authoritative and the block index preserves cursor
+                # ordering.
+                conditions.append(
+                    "e.block_number>=(SELECT block_number FROM events "
+                    "INDEXED BY lp_events_time WHERE timestamp>=? "
+                    "ORDER BY timestamp,block_number LIMIT 1)"
+                )
+                args.append(start)
 
         def load():
             rows = self.store.read().execute(

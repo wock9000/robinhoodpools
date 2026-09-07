@@ -3623,6 +3623,8 @@ class MarketIndexer:
             interval_end = headers[end]
             store_started = time.monotonic()
             with self.store.transaction() as connection:
+                store_acquired = time.monotonic()
+                store_wait_s = store_acquired - store_started
                 deferred_identities = self._queue_deferred_pool_identities(
                     connection, logs, events,
                 )
@@ -3637,7 +3639,7 @@ class MarketIndexer:
                         "timestamp": _timestamp(interval_end),
                     },
                 )
-            store_s = time.monotonic() - store_started
+            store_s = time.monotonic() - store_acquired
         except CanonicalConflict as exc:
             self._recover_reorg(cursor, str(exc))
             return True
@@ -3671,6 +3673,7 @@ class MarketIndexer:
             "fetch": fetch_s,
             "decode": decode_s,
             "store": store_s,
+            "writer_wait": store_wait_s,
             "postprocess": postprocess_s,
         }
         scan = {
@@ -3688,6 +3691,7 @@ class MarketIndexer:
             "fetch_seconds": round(fetch_s, 6),
             "decode_seconds": round(decode_s, 6),
             "store_seconds": round(store_s, 6),
+            "store_lock_wait_seconds": round(store_wait_s, 6),
             "postprocess_seconds": round(postprocess_s, 6),
             "blocks_per_second": round(blocks / max(elapsed, 1e-9), 3),
             "events_per_second": round(

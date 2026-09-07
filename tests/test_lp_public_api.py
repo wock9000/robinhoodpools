@@ -363,6 +363,73 @@ def test_large_token_snapshot_batches_multicalls_without_hiding_pool_failures():
         store.close()
 
 
+def test_native_catalog_recovers_shared_legacy_v4_configurations_completely():
+    fee = 933_267
+    hook = NATIVE
+    spacings = (19_988, 9_303)
+    pools = []
+    expected: dict[str, int] = {}
+    next_currency = 1
+    for spacing in spacings:
+        for complete in (True, *([False] * 32)):
+            currency1 = f"0x{0x8000000000000000000000000000000000000000 + next_currency:040x}"
+            next_currency += 1
+            pool_id = _v4_id(NATIVE, currency1, fee, spacing, hook)
+            pools.append(_pool(
+                pool_id,
+                "v4",
+                NATIVE,
+                currency1,
+                fee=fee,
+                spacing=spacing if complete else None,
+                hooks=hook,
+                configured_fee=fee,
+            ))
+            expected[pool_id] = spacing
+
+    invalid_fee = 1_000_001
+    invalid_currency = "0xffffffffffffffffffffffffffffffffffffffff"
+    pools.append(_pool(
+        _v4_id(NATIVE, invalid_currency, invalid_fee, 32_767, hook),
+        "v4",
+        NATIVE,
+        invalid_currency,
+        fee=invalid_fee,
+        spacing=None,
+        hooks=hook,
+        configured_fee=invalid_fee,
+    ))
+    store = MarketStore(":memory:")
+    _insert(store, pools)
+    responses = {
+        (STATE_VIEW, SV_LIQUIDITY_SELECTOR + pool_id[2:]): abi_encode(
+            ["uint128"], [index + 1],
+        )
+        for index, pool_id in enumerate(expected)
+    }
+    api = PublicMarketAPI(Service(store, SnapshotRpc(responses)), cache_ttl=0)
+    try:
+        result = api.pools({"token": NATIVE})
+        assert result["pool_count"] == len(expected)
+        assert {
+            row["pool_id"]: int(row["pool_key"]["tick_spacing"])
+            for row in result["pools"]
+        } == expected
+        assert all(
+            row["pool_key"]["currency0"] == NATIVE
+            and row["pool_key"]["fee_raw"] == str(fee)
+            and row["pool_key"]["hooks"] == hook
+            for row in result["pools"]
+        )
+        assert result["coverage"]["catalog"]["omitted_records"] == 1
+        assert result["coverage"]["catalog"]["omission_reasons"] == [
+            "invalid_v4_configured_fee",
+        ]
+    finally:
+        api.close()
+        store.close()
+
+
 def test_changed_pinned_hash_is_never_published_or_cached():
     v3 = "0x" + "b1" * 20
     store = MarketStore(":memory:")
