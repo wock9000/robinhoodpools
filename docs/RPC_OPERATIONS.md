@@ -40,6 +40,12 @@ Separate durable cursor progress from the live observed feed. A moving live tape
 
 Production sampling found wallet aggregation repeatedly restarting whenever ingestion advanced its revision. This could keep LP Wallets at `SYNCING` indefinitely while consuming CPU needed by the indexer. Wallet totals, gas and coverage now come from one completed WAL read snapshot; appends trigger a later refresh instead of recursive recomputation. Canonical-branch changes still invalidate service publications. The regression exercises an indexer append during an actual wallet read.
 
+Late historical events rebuild only the affected position's changed accounting rows rather than deleting and rewriting its entire projection. This preserves synchronous, atomic financial updates while reducing write amplification. Existing durable metadata counters are reused on restart; full-table counts initialize missing counters only.
+
+WAL checkpoints run outside the ingestion writer lock. The writer retains at most 256 MiB of reusable journal allocation after a safe reset; this is not a hard cap on active transactions or snapshots. A reader may still pin older WAL frames until its snapshot finishes. A real SQLite smoke kept an old reader at one row while 530 large rows committed, then safely reclaimed the journal after that reader ended; all 532 final rows survived reopen.
+
+An oversized WAL can make recovery slow before HTTP is available. Preserve the database, `-wal`, and `-shm` together; never delete the journal to force startup. For planned exclusive checkpoint maintenance, stop the watchdog and all database owners first, let SQLite complete `PRAGMA wal_checkpoint(TRUNCATE)`, verify success, then start exactly one application owner and resume monitoring.
+
 ## Availability monitoring and recovery
 
 The independent Cloudflare Worker at <https://status.rhpools.lol/> probes the public root and status API every two minutes. It reports the observed and indexed heads separately from HTTP availability. Its secondary-domain check can fail independently of the application; a registrar hold is not repaired by restarting the indexer.

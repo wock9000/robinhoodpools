@@ -649,7 +649,7 @@ select:focus { border-color: var(--text); color: var(--text); }
 
 @media (max-width: 520px), (max-height: 520px) and (max-width: 900px) {
   :root {
-    --pane-tape-size: calc(100% - var(--pane-separator-size) - 81px);
+    --pane-tape-size: 62dvh;
     --pane-owners-size: calc(100% - var(--pane-separator-size));
     --pane-pools-size: 100%;
     --dim: #a0a0a0;

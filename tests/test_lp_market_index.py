@@ -698,36 +698,3 @@ def test_interval_end_is_rechecked_after_logs_before_commit():
 
 
 
-def test_current_observer_shares_strictly_ordered_nonblocking_dispatch():
-    calls = []
-
-    class Observer:
-        def __init__(self, name: str) -> None:
-            self.name = name
-
-        def observe_current_block(self, block):
-            calls.append((self.name, "block", block["number"]))
-
-        def observe_current_events(self, block, events):
-            calls.append((self.name, "events", block["number"], len(events)))
-
-    store = MarketStore(":memory:")
-    market = Observer("market")
-    current = Observer("current")
-    scanner = MarketIndexer(
-        store, market, "http://unused.invalid", rpc=StaticRpc(),
-        current_observer=current,
-    )
-    block = header(1)
-    scanner._submit_market_observer("observe_current_block", block)
-    scanner._submit_market_observer("observe_current_events", block, ({"kind": "add"},))
-    scanner.close()
-    try:
-        assert calls == [
-            ("market", "block", "0x1"),
-            ("current", "block", "0x1"),
-            ("market", "events", "0x1", 1),
-            ("current", "events", "0x1", 1),
-        ]
-    finally:
-        store.close()

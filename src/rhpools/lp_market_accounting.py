@@ -219,6 +219,7 @@ CREATE TABLE IF NOT EXISTS lp_accounting_meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
 """
 
 _EVENT_COLUMNS = (
@@ -567,7 +568,6 @@ class AccountBook:
             return int(json.loads(row[0]))
         except (TypeError, ValueError, json.JSONDecodeError):
             return 0
-
     def install(self) -> "AccountBook":
         """Create the projection, catch up existing events and register callbacks."""
         if self._installed:

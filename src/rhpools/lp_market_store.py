@@ -195,6 +195,7 @@ class MarketStore:
             # The projection lane checkpoints off the ingestion critical path.
             # Retain an automatic fallback for standalone stores.
             connection.execute("PRAGMA wal_autocheckpoint=65536")
+            connection.execute("PRAGMA journal_size_limit=268435456")
         else:
             connection.execute("PRAGMA query_only=ON")
         return connection
@@ -455,29 +456,37 @@ class MarketStore:
                     "SELECT token0 FROM pools WHERE symbol0 IS NULL OR decimals0 IS NULL "
                     "UNION SELECT token1 FROM pools WHERE symbol1 IS NULL OR decimals1 IS NULL",
                 )
-                defaults = {
-                    "revision": 0,
-                    "epoch": 0,
-                    "indexed_events": connection.execute("SELECT COUNT(*) FROM events").fetchone()[0],
-                    "indexed_pools": connection.execute("SELECT COUNT(*) FROM pools").fetchone()[0],
-                    "indexed_transactions": connection.execute("SELECT COUNT(*) FROM transactions").fetchone()[0],
-                    "pending_enrichment": connection.execute("SELECT COUNT(*) FROM pending_enrichment").fetchone()[0],
-                    "pending_balances": connection.execute("SELECT COUNT(*) FROM pending_balances").fetchone()[0],
-                    "pending_metadata": connection.execute(
-                        "SELECT COUNT(*) FROM pending_token_metadata"
-                    ).fetchone()[0],
-                    "pending_pool_unpublish": connection.execute(
-                        "SELECT COUNT(*) FROM pending_pool_unpublish"
-                    ).fetchone()[0],
-                    "pending_reprojection": connection.execute(
-                        "SELECT COUNT(*) FROM pending_reprojection"
-                    ).fetchone()[0],
+                count_tables = {
+                    "indexed_events": "events",
+                    "indexed_pools": "pools",
+                    "indexed_transactions": "transactions",
+                    "pending_enrichment": "pending_enrichment",
+                    "pending_balances": "pending_balances",
+                    "pending_metadata": "pending_token_metadata",
+                    "pending_pool_unpublish": "pending_pool_unpublish",
+                    "pending_reprojection": "pending_reprojection",
                 }
-                for key, value in defaults.items():
-                    connection.execute(
-                        "INSERT OR IGNORE INTO metadata(key,value) VALUES(?,?)",
-                        (key, _json(value)),
-                    )
+                default_keys = ("revision", "epoch", *count_tables)
+                marks = ",".join("?" for _ in default_keys)
+                existing = {
+                    str(row[0]) for row in connection.execute(
+                        f"SELECT key FROM metadata WHERE key IN ({marks})",
+                        default_keys,
+                    ).fetchall()
+                }
+                defaults = {
+                    key: 0 for key in ("revision", "epoch")
+                    if key not in existing
+                }
+                for key, table in count_tables.items():
+                    if key not in existing:
+                        defaults[key] = connection.execute(
+                            f"SELECT COUNT(*) FROM {table}",
+                        ).fetchone()[0]
+                connection.executemany(
+                    "INSERT INTO metadata(key,value) VALUES(?,?)",
+                    ((key, _json(value)) for key, value in defaults.items()),
+                )
                 catalog_counts = {
                     row["protocol"]: int(row["pools"])
                     for row in connection.execute(
@@ -592,6 +601,7 @@ class MarketStore:
             projection = (apply, rollback, bool(persists_events))
             if projection not in self._projections:
                 self._projections.append(projection)
+
 
     def _metadata(self, connection: sqlite3.Connection, key: str, default: Any = None) -> Any:
         row = connection.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()

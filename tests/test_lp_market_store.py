@@ -68,6 +68,46 @@ def test_catalog_replay_and_restart_keep_search_counts_exact(tmp_path):
         store.close()
 
 
+def test_reopen_preserves_durable_counts_and_initializes_only_missing_counts(tmp_path):
+    path = tmp_path / "market.sqlite"
+    pool = {
+        "id": "0x" + "33" * 32,
+        "protocol": "v4",
+        "address": "0x" + "44" * 20,
+        "token0": "0x" + "11" * 20,
+        "token1": "0x" + "22" * 20,
+        "symbol0": None,
+        "symbol1": None,
+        "decimals0": None,
+        "decimals1": None,
+        "fee_ppm": 500,
+        "tick_spacing": 5,
+        "hook": None,
+        "factory": "0x" + "44" * 20,
+        "created_block": 10,
+        "source": "test",
+        "metadata_json": {},
+    }
+    store = MarketStore(path)
+    try:
+        store.upsert_pools([pool])
+        with store.transaction() as connection:
+            connection.execute(
+                "UPDATE metadata SET value='777' WHERE key='indexed_events'",
+            )
+            connection.execute(
+                "DELETE FROM metadata WHERE key='indexed_pools'",
+            )
+        store.close()
+
+        store = MarketStore(path)
+        status = store.status()
+        assert status["indexed_events"] == 777
+        assert status["indexed_pools"] == 1
+    finally:
+        store.close()
+
+
 def test_repeated_search_entities_do_not_duplicate_search_results():
     store = MarketStore(":memory:")
     block = header(10)
