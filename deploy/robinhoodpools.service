@@ -1,0 +1,25 @@
+[Unit]
+Description=RobinhoodPools public LP explorer
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=3600
+StartLimitBurst=6
+
+[Service]
+Type=simple
+WorkingDirectory=%h/robinhoodpools
+Environment=PYTHONUNBUFFERED=1
+Environment=LP_RPC_DISABLE_LOCAL_FALLBACK=1
+Environment=LP_RPC_DISABLE_ALCHEMY=1
+ExecStart=%h/robinhoodpools/.venv/bin/rhpools --host 127.0.0.1 --port 8196 --public-origin https://rhpools.lol --public-origin https://www.rhpools.lol --public-origin https://robinhoodpools.lol --public-origin https://www.robinhoodpools.lol
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=120s
+LimitNOFILE=8192
+NoNewPrivileges=true
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,1170 @@
+{
+  "openapi": "3.1.0",
+  "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
+  "info": {
+    "title": "Robinhood Pools Public Read API",
+    "version": "1.0.0",
+    "license": {"name": "GNU Affero General Public License v3.0 only", "identifier": "AGPL-3.0-only"},
+    "contact": {"name": "Source code and contributions", "url": "https://github.com/wock9000/robinhoodpools"},
+    "description": "Anonymous, read-only Robinhood Chain LP market, owner-research, and attributed public-flow data. All responses permit cross-origin public reads with Access-Control-Allow-Origin: *. No endpoint accepts credentials, an RPC URL, transaction input, or a write operation. Current pool state is pinned to and confirmed against one canonical block; event-history coverage is reported separately and may be incomplete."
+  },
+  "servers": [
+    {
+      "url": "https://rhpools.lol",
+      "description": "Public service"
+    },
+    {
+      "url": "http://127.0.0.1:8196",
+      "description": "Default local installation"
+    }
+  ],
+  "security": [],
+  "tags": [
+    {
+      "name": "Market",
+      "description": "Current canonical state for every matching pool in the verified known catalog. These endpoints are not a claim of full-chain discovery."
+    },
+    {
+      "name": "Research",
+      "description": "Coverage-qualified views over indexed LP ownership and position history."
+    },
+    {
+      "name": "Flow",
+      "description": "Bounded projections from explicitly attributed anonymous public publishers."
+    }
+  ],
+  "paths": {
+    "/api/v1/pools": {
+      "get": {
+        "tags": ["Market"],
+        "operationId": "getPoolsByToken",
+        "summary": "List every verified known pool containing a token",
+        "description": "Returns all matches in the verified known catalog without output pagination. The response is published only after all state calls are pinned to one block number and that block's canonical hash is confirmed. `coverage.catalog` qualifies discovery completeness, `coverage.history` independently qualifies indexed event history, and `coverage.state` reports current state-read availability. Supplying `limit` or `offset` is an error rather than a result cap.",
+        "parameters": [
+          {"$ref": "#/components/parameters/Token"}
+        ],
+        "responses": {
+          "200": {
+            "description": "Every verified known match, including explicit nulls and reasons for pool state that could not be read.",
+            "headers": {
+              "Access-Control-Allow-Origin": {"$ref": "#/components/headers/PublicCors"}
+            },
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/PoolsResponse"}
+              }
+            }
+          },
+          "400": {"$ref": "#/components/responses/BadRequest"},
+          "503": {"$ref": "#/components/responses/Unavailable"}
+        }
+      }
+    },
+    "/api/v1/assets": {
+      "get": {
+        "tags": ["Market"],
+        "operationId": "getAssetGroupsByToken",
+        "summary": "Group matching pools into unit-safe asset aggregates",
+        "description": "Uses the same canonical pool snapshot as `/api/v1/pools` and groups matches by protocol, exact fee configuration, tick spacing, and hooks. Only same-token V2 reserves have a cross-pool subtotal. Concentrated-liquidity raw L, unlike reserves, is pool-specific and is never added across pools. Supplying `limit` or `offset` is an error.",
+        "parameters": [
+          {"$ref": "#/components/parameters/Token"}
+        ],
+        "responses": {
+          "200": {
+            "description": "Configuration groups and only those subtotals whose units are comparable.",
+            "headers": {
+              "Access-Control-Allow-Origin": {"$ref": "#/components/headers/PublicCors"}
+            },
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/AssetsResponse"}
+              }
+            }
+          },
+          "400": {"$ref": "#/components/responses/BadRequest"},
+          "503": {"$ref": "#/components/responses/Unavailable"}
+        }
+      }
+    },
+    "/api/v1/research/owner": {
+      "get": {
+        "tags": ["Research"],
+        "operationId": "getOwnerResearch",
+        "summary": "Inspect coverage-qualified LP activity for an owner",
+        "description": "Returns allocation, configuration, and lifecycle observations derived from the canonical LP accounting model. The endpoint is bounded to 200 source positions and 100 recent lifecycle entries and reports possible truncation. Current observations and indexed historical coverage are separate: `window_complete: false` means the indexed history does not prove full coverage of the requested window. Custody matches are not attributed as beneficial ownership. Known USDG values use a USDG quote basis (1 USDG = 1 quote dollar), not a fiat oracle, and unknown or unpriced values remain null.",
+        "parameters": [
+          {"$ref": "#/components/parameters/Owner"},
+          {"$ref": "#/components/parameters/Window"},
+          {"$ref": "#/components/parameters/Protocol"},
+          {"$ref": "#/components/parameters/ResearchPool"},
+          {"$ref": "#/components/parameters/ResearchPoolId"}
+        ],
+        "responses": {
+          "200": {
+            "description": "A bounded owner-research envelope. An owner with no observations is still a successful response with `coverage.found: false`.",
+            "headers": {
+              "Access-Control-Allow-Origin": {"$ref": "#/components/headers/PublicCors"}
+            },
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/OwnerResearchResponse"}
+              }
+            }
+          },
+          "400": {"$ref": "#/components/responses/BadRequest"},
+          "503": {"$ref": "#/components/responses/Unavailable"}
+        }
+      }
+    },
+    "/api/v1/fomo/flow": {
+      "get": {
+        "tags": ["Flow"],
+        "operationId": "getPublicFomoFlow",
+        "summary": "Read one bounded attributed public-flow page",
+        "description": "Projects only the selected anonymous public publisher's supported contract. Unknown query parameters are rejected. Apollo supports `solana`, `base`, and `robinhood`, an opaque cursor, and `verified=true`. RH Trenches supports Robinhood Chain only, observed-wallet identity only, and a current tape snapshot without a cursor. Flow actions are publisher observations, not intent, recommendations, pool routes, or LP activity.",
+        "parameters": [
+          {"$ref": "#/components/parameters/FlowSource"},
+          {"$ref": "#/components/parameters/FlowChain"},
+          {"$ref": "#/components/parameters/FlowLimit"},
+          {"$ref": "#/components/parameters/FlowCursor"},
+          {"$ref": "#/components/parameters/FlowVerified"}
+        ],
+        "responses": {
+          "200": {
+            "description": "A normalized bounded page with publisher attribution, evidence times, and explicit coverage limitations.",
+            "headers": {
+              "Access-Control-Allow-Origin": {"$ref": "#/components/headers/PublicCors"}
+            },
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/FomoFlowResponse"}
+              }
+            }
+          },
+          "400": {"$ref": "#/components/responses/BadRequest"},
+          "503": {"$ref": "#/components/responses/Unavailable"}
+        }
+      }
+    }
+  },
+  "components": {
+    "headers": {
+      "PublicCors": {
+        "description": "Public read-only CORS; no authentication or credentials are required.",
+        "schema": {"type": "string", "const": "*"}
+      }
+    },
+    "parameters": {
+      "Token": {
+        "name": "token",
+        "in": "query",
+        "required": true,
+        "description": "A 0x-prefixed 20-byte currency address. Input hex is case-insensitive and output is normalized to lowercase. The native currency is represented by the zero address.",
+        "schema": {"$ref": "#/components/schemas/AddressInput"}
+      },
+      "Owner": {
+        "name": "owner",
+        "in": "query",
+        "required": true,
+        "description": "A 0x-prefixed 20-byte owner or custody address. Input is case-insensitive and the response normalizes it to lowercase.",
+        "schema": {"$ref": "#/components/schemas/AddressInput"}
+      },
+      "Window": {
+        "name": "window",
+        "in": "query",
+        "required": false,
+        "description": "Historical observation window. `all` is never reported as complete because no finite start proves all history.",
+        "schema": {"type": "string", "enum": ["1h", "24h", "7d", "30d", "all"], "default": "30d"}
+      },
+      "Protocol": {
+        "name": "protocol",
+        "in": "query",
+        "required": false,
+        "description": "Restrict returned owner positions to one protocol.",
+        "schema": {"$ref": "#/components/schemas/Protocol"}
+      },
+      "ResearchPool": {
+        "name": "pool",
+        "in": "query",
+        "required": false,
+        "description": "Restrict returned owner positions to this pool id. Use the 20-byte pool address for V2/V3 and the exact 32-byte pool id for V4.",
+        "schema": {"type": "string", "maxLength": 128}
+      },
+      "ResearchPoolId": {
+        "name": "pool_id",
+        "in": "query",
+        "required": false,
+        "description": "Accepted alias of `pool`; if both are supplied, `pool` takes precedence.",
+        "schema": {"type": "string", "maxLength": 128}
+      },
+      "FlowSource": {
+        "name": "source",
+        "in": "query",
+        "required": false,
+        "description": "Select the public publisher contract.",
+        "schema": {"type": "string", "enum": ["apollo", "rhtrenches"], "default": "apollo"}
+      },
+      "FlowChain": {
+        "name": "chain",
+        "in": "query",
+        "required": false,
+        "description": "Apollo may be filtered to one supported chain. Omit it for Apollo's supported set. RH Trenches permits only `robinhood` and normalizes an omitted value to `robinhood`; all-chain scope is unavailable.",
+        "schema": {"type": "string", "enum": ["solana", "base", "robinhood"]}
+      },
+      "FlowLimit": {
+        "name": "limit",
+        "in": "query",
+        "required": false,
+        "description": "Maximum upstream page or tape rows considered. Publisher-qualified omissions and Apollo chain filtering can make `items` shorter than this value.",
+        "schema": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50}
+      },
+      "FlowCursor": {
+        "name": "cursor",
+        "in": "query",
+        "required": false,
+        "description": "Opaque Apollo base64url cursor. RH Trenches rejects this parameter.",
+        "schema": {"type": "string", "minLength": 1, "maxLength": 4096, "pattern": "^[A-Za-z0-9_-]+$"}
+      },
+      "FlowVerified": {
+        "name": "verified",
+        "in": "query",
+        "required": false,
+        "description": "Apollo-only identity filter. RH Trenches rejects `true` because it publishes observed-wallet identity only.",
+        "schema": {"type": "boolean", "default": false}
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "The query is missing a required value, contains a malformed or unsupported value, requests unsupported pagination, violates a source-specific flow constraint, or includes an unsupported flow parameter.",
+        "headers": {
+          "Access-Control-Allow-Origin": {"$ref": "#/components/headers/PublicCors"}
+        },
+        "content": {
+          "application/json": {
+            "schema": {"$ref": "#/components/schemas/ErrorResponse"}
+          }
+        }
+      },
+      "Unavailable": {
+        "description": "The bounded server capacity, required current canonical chain state, indexed service, or selected public publisher is unavailable or returned an unusable contract. A pre-publication reorganization is also 503; retry the complete request. Individual pool contract-call failures do not cause this response and are represented by nullable state in a 200 response.",
+        "headers": {
+          "Access-Control-Allow-Origin": {"$ref": "#/components/headers/PublicCors"},
+          "Retry-After": {
+            "description": "May be supplied for capacity exhaustion.",
+            "schema": {"type": "integer", "minimum": 0}
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {"$ref": "#/components/schemas/ErrorResponse"}
+          }
+        }
+      }
+    },
+    "schemas": {
+      "AddressInput": {
+        "type": "string",
+        "pattern": "^0x[0-9a-fA-F]{40}$"
+      },
+      "Address": {
+        "type": "string",
+        "pattern": "^0x[0-9a-f]{40}$"
+      },
+      "Hash32": {
+        "type": "string",
+        "pattern": "^0x[0-9a-f]{64}$"
+      },
+      "UnsignedIntegerString": {
+        "type": "string",
+        "pattern": "^(0|[1-9][0-9]*)$",
+        "description": "An exact non-negative integer encoded as a decimal JSON string to avoid precision loss."
+      },
+      "SignedIntegerString": {
+        "type": "string",
+        "pattern": "^-?(0|[1-9][0-9]*)$",
+        "description": "An exact integer encoded as a decimal JSON string to avoid precision loss."
+      },
+      "DecimalString": {
+        "type": "string",
+        "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+        "description": "A non-negative decimal value preserved as a JSON string."
+      },
+      "Protocol": {
+        "type": "string",
+        "enum": ["v2", "v3", "v4"]
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "required": ["error"],
+        "properties": {
+          "error": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "Snapshot": {
+        "type": "object",
+        "description": "Current state read at an exact Robinhood Chain block, followed by canonical-hash confirmation. This is independent of indexed event-history completeness.",
+        "required": ["block_number", "block_hash", "timestamp", "canonical", "read_basis", "transports"],
+        "properties": {
+          "block_number": {"$ref": "#/components/schemas/UnsignedIntegerString"},
+          "block_hash": {"$ref": "#/components/schemas/Hash32"},
+          "timestamp": {"$ref": "#/components/schemas/UnsignedIntegerString"},
+          "canonical": {"type": "boolean", "const": true},
+          "read_basis": {"type": "string"},
+          "transports": {
+            "type": "array",
+            "items": {"type": "string", "enum": ["multicall3", "json_rpc_batch", "unavailable"]},
+            "uniqueItems": true
+          }
+        },
+        "additionalProperties": false
+      },
+      "Currency": {
+        "type": "object",
+        "required": ["address", "symbol", "decimals"],
+        "properties": {
+          "address": {"$ref": "#/components/schemas/Address"},
+          "symbol": {"type": ["string", "null"]},
+          "decimals": {"type": ["integer", "null"], "minimum": 0}
+        },
+        "additionalProperties": false
+      },
+      "Fee": {
+        "type": "object",
+        "description": "`configured_raw` is the exact identity/configuration field. For dynamic V4, bit 0x800000 is a flag rather than ppm, so `configured_ppm` is null and `current_ppm` is read separately at the snapshot block.",
+        "required": ["mode", "configured_raw", "configured_ppm", "current_ppm", "current_status"],
+        "properties": {
+          "mode": {"type": "string", "enum": ["static", "dynamic", "unknown"]},
+          "configured_raw": {"anyOf": [{"$ref": "#/components/schemas/UnsignedIntegerString"}, {"type": "null"}]},
+          "configured_ppm": {"anyOf": [{"$ref": "#/components/schemas/UnsignedIntegerString"}, {"type": "null"}]},
+          "current_ppm": {"anyOf": [{"$ref": "#/components/schemas/UnsignedIntegerString"}, {"type": "null"}]},
+          "current_status": {"type": "string", "enum": ["configured_static", "block_pinned", "unavailable"]}
+        },
+        "additionalProperties": false
+      },
+      "PoolKey": {
+        "type": "object",
+        "description": "The exact V4 PoolKey identity tuple, verified against the 32-byte pool id. `fee_raw` preserves the uint24 configuration including the dynamic-fee flag.",
+        "required": ["currency0", "currency1", "fee_raw", "dynamic_fee", "tick_spacing", "hooks"],
+        "properties": {
+          "currency0": {"$ref": "#/components/schemas/Address"},
+          "currency1": {"$ref": "#/components/schemas/Address"},
+          "fee_raw": {"$ref": "#/components/schemas/UnsignedIntegerString"},
+          "dynamic_fee": {"type": "boolean"},
+          "tick_spacing": {"$ref": "#/components/schemas/SignedIntegerString"},
+          "hooks": {"$ref": "#/components/schemas/Address"}
+        },
+        "additionalProperties": false
+      },
+      "Liquidity": {
+        "type": "object",
+        "description": "For `v2_reserves`, reserve strings are exact currency raw units and must be scaled by the corresponding currency decimals. For `concentrated_active_liquidity`, active L is protocol raw active liquidity, comparable only within that pool; it is not a token amount, TVL, or additive across pools. A successful zero is `\"0\"`; unavailable state remains null.",
+        "required": ["type", "status", "reserve0_raw", "reserve1_raw", "active_liquidity_raw", "unit", "unavailable_reason"],
+        "properties": {
+          "type": {"type": "string", "enum": ["v2_reserves", "concentrated_active_liquidity"]},
+          "status": {"type": "string", "enum": ["available", "unavailable"]},
+          "reserve0_raw": {"anyOf": [{"$ref": "#/components/schemas/UnsignedIntegerString"}, {"type": "null"}]},
+          "reserve1_raw": {"anyOf": [{"$ref": "#/components/schemas/UnsignedIntegerString"}, {"type": "null"}]},
+          "active_liquidity_raw": {"anyOf": [{"$ref": "#/components/schemas/UnsignedIntegerString"}, {"type": "null"}]},
+          "unit": {"type": "string", "enum": ["currency raw units", "protocol raw active L; comparable only within this pool"]},
+          "unavailable_reason": {"type": ["string", "null"]}
+        },
+        "additionalProperties": false
+      },
+      "Availability": {
+        "type": "object",
+        "required": ["state", "reasons"],
+        "properties": {
+          "state": {"type": "string", "enum": ["available", "partial", "unavailable"]},
+          "reasons": {"type": "array", "items": {"type": "string"}}
+        },
+        "additionalProperties": false
+      },
+      "CatalogProvenance": {
+        "type": "object",
+        "required": ["source", "created_block", "observed_block", "observed_hash", "verification"],
+        "properties": {
+          "source": {"type": ["string", "null"]},
+          "created_block": {"anyOf": [{"$ref": "#/components/schemas/UnsignedIntegerString"}, {"type": "null"}]},
+          "observed_block": {"anyOf": [{"$ref": "#/components/schemas/UnsignedIntegerString"}, {"type": "null"}]},
+          "observed_hash": {"anyOf": [{"$ref": "#/components/schemas/Hash32"}, {"type": "null"}]},
+          "verification": {"type": "string", "enum": ["verified_workbench_catalog", "verified_canonical_store"]}
+        },
+        "additionalProperties": false
+      },
+      "Pool": {
+        "type": "object",
+        "description": "V2/V3 use a 20-byte `pool_id` equal to `pool_address`. V4 uses a 32-byte pool id, has `pool_address: null`, and identifies its singleton contract separately as `manager_address`; the manager is not the pool.",
+        "required": ["pool_id", "protocol", "pool_address", "manager_address", "currency0", "currency1", "matched_currency", "fee", "tick_spacing", "hooks", "pool_key", "catalog", "liquidity", "availability"],
+        "properties": {
+          "pool_id": {
+            "oneOf": [
+              {"$ref": "#/components/schemas/Address"},
+              {"$ref": "#/components/schemas/Hash32"}
+            ]
+          },
+          "protocol": {"$ref": "#/components/schemas/Protocol"},
+          "pool_address": {"anyOf": [{"$ref": "#/components/schemas/Address"}, {"type": "null"}]},
+          "manager_address": {"anyOf": [{"$ref": "#/components/schemas/Address"}, {"type": "null"}]},
+          "currency0": {"$ref": "#/components/schemas/Currency"},
+          "currency1": {"$ref": "#/components/schemas/Currency"},
+          "matched_currency": {"type": "string", "enum": ["currency0", "currency1"]},
+          "fee": {"$ref": "#/components/schemas/Fee"},
+          "tick_spacing": {"anyOf": [{"$ref": "#/components/schemas/SignedIntegerString"}, {"type": "null"}]},
+          "hooks": {"anyOf": [{"$ref": "#/components/schemas/Address"}, {"type": "null"}]},
+          "pool_key": {"anyOf": [{"$ref": "#/components/schemas/PoolKey"}, {"type": "null"}]},
+          "catalog": {"$ref": "#/components/schemas/CatalogProvenance"},
+          "liquidity": {"$ref": "#/components/schemas/Liquidity"},
+          "availability": {"$ref": "#/components/schemas/Availability"}
+        },
+        "additionalProperties": false
+      },
+      "FactoryTail": {
+        "type": "object",
+        "required": ["state", "through_block", "through_hash", "head_lag_blocks"],
+        "properties": {
+          "state": {"type": "string"},
+          "through_block": {"anyOf": [{"$ref": "#/components/schemas/UnsignedIntegerString"}, {"type": "null"}]},
+          "through_hash": {"anyOf": [{"$ref": "#/components/schemas/Hash32"}, {"type": "null"}]},
+          "head_lag_blocks": {"anyOf": [{"$ref": "#/components/schemas/UnsignedIntegerString"}, {"type": "null"}]}
+        },
+        "additionalProperties": false
+      },
+      "CatalogCoverage": {
+        "type": "object",
+        "required": ["scope", "returned_matching_pools", "known_catalog_pools", "known_catalog_state", "complete_for_known_catalog", "full_chain_complete", "historical_continuity", "historical_gap_count", "factory_tail", "omitted_records", "omission_reasons", "limitation"],
+        "properties": {
+          "scope": {"type": "string"},
+          "returned_matching_pools": {"type": "integer", "minimum": 0},
+          "known_catalog_pools": {"type": ["integer", "null"], "minimum": 0},
+          "known_catalog_state": {"type": "string"},
+          "complete_for_known_catalog": {"type": "boolean"},
+          "full_chain_complete": {"type": "boolean", "const": false},
+          "historical_continuity": {"type": "string"},
+          "historical_gap_count": {"type": ["integer", "null"], "minimum": 0},
+          "factory_tail": {"$ref": "#/components/schemas/FactoryTail"},
+          "omitted_records": {"type": "integer", "minimum": 0},
+          "omission_reasons": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+          "limitation": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "HistoryInterval": {
+        "type": "object",
+        "required": ["from_block", "to_block", "from_timestamp", "to_timestamp"],
+        "properties": {
+          "from_block": {"anyOf": [{"$ref": "#/components/schemas/UnsignedIntegerString"}, {"type": "null"}]},
+          "to_block": {"anyOf": [{"$ref": "#/components/schemas/UnsignedIntegerString"}, {"type": "null"}]},
+          "from_timestamp": {"anyOf": [{"$ref": "#/components/schemas/UnsignedIntegerString"}, {"type": "null"}]},
+          "to_timestamp": {"anyOf": [{"$ref": "#/components/schemas/UnsignedIntegerString"}, {"type": "null"}]}
+        },
+        "additionalProperties": false
+      },
+      "HistoryCoverage": {
+        "type": "object",
+        "description": "Canonical indexed event-history coverage. It does not qualify the current block-pinned state snapshot.",
+        "required": ["state", "indexed_head", "indexed_head_hash", "lag_blocks", "backfill_complete", "live_interval", "history_interval", "role"],
+        "properties": {
+          "state": {"type": "string"},
+          "indexed_head": {"anyOf": [{"$ref": "#/components/schemas/UnsignedIntegerString"}, {"type": "null"}]},
+          "indexed_head_hash": {"anyOf": [{"$ref": "#/components/schemas/Hash32"}, {"type": "null"}]},
+          "lag_blocks": {"anyOf": [{"$ref": "#/components/schemas/UnsignedIntegerString"}, {"type": "null"}]},
+          "backfill_complete": {"type": ["boolean", "null"]},
+          "live_interval": {"anyOf": [{"$ref": "#/components/schemas/HistoryInterval"}, {"type": "null"}]},
+          "history_interval": {"anyOf": [{"$ref": "#/components/schemas/HistoryInterval"}, {"type": "null"}]},
+          "role": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "StateCoverage": {
+        "type": "object",
+        "required": ["requested_pools", "available_pools", "unavailable_pools"],
+        "properties": {
+          "requested_pools": {"type": "integer", "minimum": 0},
+          "available_pools": {"type": "integer", "minimum": 0},
+          "unavailable_pools": {"type": "integer", "minimum": 0}
+        },
+        "additionalProperties": false
+      },
+      "PoolCoverage": {
+        "type": "object",
+        "required": ["catalog", "history", "state"],
+        "properties": {
+          "catalog": {"$ref": "#/components/schemas/CatalogCoverage"},
+          "history": {"$ref": "#/components/schemas/HistoryCoverage"},
+          "state": {"$ref": "#/components/schemas/StateCoverage"}
+        },
+        "additionalProperties": false
+      },
+      "PoolsResponse": {
+        "type": "object",
+        "required": ["chain_id", "token", "snapshot", "pool_count", "pools", "coverage"],
+        "properties": {
+          "chain_id": {"type": "integer", "const": 4663},
+          "token": {"$ref": "#/components/schemas/Address"},
+          "snapshot": {"$ref": "#/components/schemas/Snapshot"},
+          "pool_count": {"type": "integer", "minimum": 0},
+          "pools": {"type": "array", "items": {"$ref": "#/components/schemas/Pool"}},
+          "coverage": {"$ref": "#/components/schemas/PoolCoverage"}
+        },
+        "additionalProperties": false
+      },
+      "AssetIdentity": {
+        "type": "object",
+        "required": ["address", "symbol", "decimals", "metadata_status"],
+        "properties": {
+          "address": {"$ref": "#/components/schemas/Address"},
+          "symbol": {"type": ["string", "null"]},
+          "decimals": {"type": ["integer", "null"], "minimum": 0},
+          "metadata_status": {"type": "string", "enum": ["known", "conflicting", "partial"]}
+        },
+        "additionalProperties": false
+      },
+      "AssetConfiguration": {
+        "type": "object",
+        "required": ["protocol", "fee", "tick_spacing", "hooks"],
+        "properties": {
+          "protocol": {"$ref": "#/components/schemas/Protocol"},
+          "fee": {
+            "type": "object",
+            "required": ["mode", "configured_raw", "configured_ppm"],
+            "properties": {
+              "mode": {"type": "string", "enum": ["static", "dynamic", "unknown"]},
+              "configured_raw": {"anyOf": [{"$ref": "#/components/schemas/UnsignedIntegerString"}, {"type": "null"}]},
+              "configured_ppm": {"anyOf": [{"$ref": "#/components/schemas/UnsignedIntegerString"}, {"type": "null"}]}
+            },
+            "additionalProperties": false
+          },
+          "tick_spacing": {"anyOf": [{"$ref": "#/components/schemas/SignedIntegerString"}, {"type": "null"}]},
+          "hooks": {"anyOf": [{"$ref": "#/components/schemas/Address"}, {"type": "null"}]}
+        },
+        "additionalProperties": false
+      },
+      "GroupStateCoverage": {
+        "type": "object",
+        "required": ["state", "measured_pools", "missing_pools"],
+        "properties": {
+          "state": {"type": "string", "enum": ["complete", "partial", "unavailable"]},
+          "measured_pools": {"type": "integer", "minimum": 0},
+          "missing_pools": {"type": "integer", "minimum": 0}
+        },
+        "additionalProperties": false
+      },
+      "AssetSubtotal": {
+        "type": "object",
+        "description": "Currently emitted only for a V2 queried-token reserve subtotal. All terms use the queried token's raw unit.",
+        "required": ["metric", "currency", "value_raw", "value_decimal", "decimals", "unit", "pools_measured", "pools_missing", "coverage", "basis"],
+        "properties": {
+          "metric": {"type": "string", "const": "matched_currency_reserve"},
+          "currency": {"$ref": "#/components/schemas/Address"},
+          "value_raw": {"$ref": "#/components/schemas/UnsignedIntegerString"},
+          "value_decimal": {"type": ["string", "null"], "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$"},
+          "decimals": {"type": ["integer", "null"], "minimum": 0},
+          "unit": {"type": "string", "const": "queried token units"},
+          "pools_measured": {"type": "integer", "minimum": 0},
+          "pools_missing": {"type": "integer", "minimum": 0},
+          "coverage": {"type": "string", "enum": ["complete", "partial"]},
+          "basis": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "AssetGroup": {
+        "type": "object",
+        "required": ["configuration", "pool_count", "pool_ids", "state_coverage", "subtotals", "limitations"],
+        "properties": {
+          "configuration": {"$ref": "#/components/schemas/AssetConfiguration"},
+          "pool_count": {"type": "integer", "minimum": 0},
+          "pool_ids": {
+            "type": "array",
+            "items": {"oneOf": [{"$ref": "#/components/schemas/Address"}, {"$ref": "#/components/schemas/Hash32"}]}
+          },
+          "state_coverage": {"$ref": "#/components/schemas/GroupStateCoverage"},
+          "subtotals": {"type": "array", "items": {"$ref": "#/components/schemas/AssetSubtotal"}},
+          "limitations": {"type": "array", "items": {"type": "string"}}
+        },
+        "additionalProperties": false
+      },
+      "AggregationCoverage": {
+        "type": "object",
+        "required": ["configuration_groups", "groups_with_comparable_subtotals", "missing_state_pools"],
+        "properties": {
+          "configuration_groups": {"type": "integer", "minimum": 0},
+          "groups_with_comparable_subtotals": {"type": "integer", "minimum": 0},
+          "missing_state_pools": {"type": "integer", "minimum": 0}
+        },
+        "additionalProperties": false
+      },
+      "AssetCoverage": {
+        "type": "object",
+        "required": ["catalog", "history", "state", "aggregation"],
+        "properties": {
+          "catalog": {"$ref": "#/components/schemas/CatalogCoverage"},
+          "history": {"$ref": "#/components/schemas/HistoryCoverage"},
+          "state": {"$ref": "#/components/schemas/StateCoverage"},
+          "aggregation": {"$ref": "#/components/schemas/AggregationCoverage"}
+        },
+        "additionalProperties": false
+      },
+      "AssetsResponse": {
+        "type": "object",
+        "required": ["chain_id", "asset", "snapshot", "pool_count", "configuration_count", "groups", "coverage", "limitations"],
+        "properties": {
+          "chain_id": {"type": "integer", "const": 4663},
+          "asset": {"$ref": "#/components/schemas/AssetIdentity"},
+          "snapshot": {"$ref": "#/components/schemas/Snapshot"},
+          "pool_count": {"type": "integer", "minimum": 0},
+          "configuration_count": {"type": "integer", "minimum": 0},
+          "groups": {"type": "array", "items": {"$ref": "#/components/schemas/AssetGroup"}},
+          "coverage": {"$ref": "#/components/schemas/AssetCoverage"},
+          "limitations": {"type": "array", "items": {"type": "string"}}
+        },
+        "additionalProperties": false
+      },
+      "FlexibleCoverage": {
+        "type": "object",
+        "description": "Coverage qualifiers copied from the canonical accounting row. Keys are additive because protocols and qualification reasons differ.",
+        "additionalProperties": true
+      },
+      "ResearchTokenAmount": {
+        "type": "object",
+        "required": ["address", "symbol", "decimals", "principal_raw", "pending_claim_raw"],
+        "properties": {
+          "address": {"anyOf": [{"$ref": "#/components/schemas/Address"}, {"type": "null"}]},
+          "symbol": {"type": ["string", "null"]},
+          "decimals": {"type": ["integer", "null"], "minimum": 0},
+          "principal_raw": {"anyOf": [{"$ref": "#/components/schemas/SignedIntegerString"}, {"type": "null"}]},
+          "pending_claim_raw": {"anyOf": [{"$ref": "#/components/schemas/SignedIntegerString"}, {"type": "null"}]}
+        },
+        "additionalProperties": false
+      },
+      "ResearchAllocationPosition": {
+        "type": "object",
+        "required": ["position_key", "token_id", "pool_id", "pair", "protocol", "status", "liquidity_raw", "token_amounts", "known_principal_usdg", "known_active_principal_usdg", "known_pending_claim_usdg", "valuation_state", "valuation_block", "valuation_timestamp", "valuation_basis", "coverage"],
+        "properties": {
+          "position_key": {"type": ["string", "null"]},
+          "token_id": {"anyOf": [{"$ref": "#/components/schemas/SignedIntegerString"}, {"type": "null"}]},
+          "pool_id": {"type": ["string", "null"]},
+          "pair": {"type": "string"},
+          "protocol": {"type": ["string", "null"]},
+          "status": {"type": ["string", "null"]},
+          "liquidity_raw": {"anyOf": [{"$ref": "#/components/schemas/SignedIntegerString"}, {"type": "null"}]},
+          "token_amounts": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"$ref": "#/components/schemas/ResearchTokenAmount"}},
+          "known_principal_usdg": {"type": ["number", "null"]},
+          "known_active_principal_usdg": {"type": ["number", "null"]},
+          "known_pending_claim_usdg": {"type": ["number", "null"]},
+          "valuation_state": {"type": "string", "enum": ["complete", "partial", "unknown"]},
+          "valuation_block": {"type": ["integer", "null"], "minimum": 0},
+          "valuation_timestamp": {"type": ["integer", "null"], "minimum": 0},
+          "valuation_basis": {"type": "string"},
+          "coverage": {"$ref": "#/components/schemas/FlexibleCoverage"}
+        },
+        "additionalProperties": false
+      },
+      "ResearchPoolTokenAmount": {
+        "type": "object",
+        "required": ["address", "symbol", "decimals", "known_principal_raw", "known_pending_claim_raw", "positions_with_known_principal", "positions_with_known_pending_claim", "principal_complete", "pending_claim_complete"],
+        "properties": {
+          "address": {"anyOf": [{"$ref": "#/components/schemas/Address"}, {"type": "null"}]},
+          "symbol": {"type": ["string", "null"]},
+          "decimals": {"type": ["integer", "null"], "minimum": 0},
+          "known_principal_raw": {"anyOf": [{"$ref": "#/components/schemas/SignedIntegerString"}, {"type": "null"}]},
+          "known_pending_claim_raw": {"anyOf": [{"$ref": "#/components/schemas/SignedIntegerString"}, {"type": "null"}]},
+          "positions_with_known_principal": {"type": "integer", "minimum": 0},
+          "positions_with_known_pending_claim": {"type": "integer", "minimum": 0},
+          "principal_complete": {"type": "boolean"},
+          "pending_claim_complete": {"type": "boolean"}
+        },
+        "additionalProperties": false
+      },
+      "ResearchAllocationPool": {
+        "type": "object",
+        "required": ["pool_id", "pair", "protocol", "position_count", "valued_positions", "partially_valued_positions", "unvalued_positions", "known_principal_usdg", "share_of_known_principal_pct", "token_amounts", "inspector"],
+        "properties": {
+          "pool_id": {"type": ["string", "null"]},
+          "pair": {"type": "string"},
+          "protocol": {"type": ["string", "null"]},
+          "position_count": {"type": "integer", "minimum": 0},
+          "valued_positions": {"type": "integer", "minimum": 0},
+          "partially_valued_positions": {"type": "integer", "minimum": 0},
+          "unvalued_positions": {"type": "integer", "minimum": 0},
+          "known_principal_usdg": {"type": ["number", "null"]},
+          "share_of_known_principal_pct": {"type": ["number", "null"]},
+          "token_amounts": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"$ref": "#/components/schemas/ResearchPoolTokenAmount"}},
+          "inspector": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "ResearchAllocation": {
+        "type": "object",
+        "description": "Known-only values cover returned current beneficial-owner positions. Null is unavailable, not zero. USDG is a quote basis rather than a fiat oracle.",
+        "required": ["basis", "returned_position_scope", "current_beneficial_positions", "custody_positions_observed", "known_principal_usdg", "known_pending_claim_usdg", "valued_positions", "partially_valued_positions", "unvalued_positions", "pools", "positions"],
+        "properties": {
+          "basis": {"type": "string"},
+          "returned_position_scope": {"type": "boolean", "const": true},
+          "current_beneficial_positions": {"type": "integer", "minimum": 0},
+          "custody_positions_observed": {"type": "integer", "minimum": 0},
+          "known_principal_usdg": {"type": ["number", "null"]},
+          "known_pending_claim_usdg": {"type": ["number", "null"]},
+          "valued_positions": {"type": "integer", "minimum": 0},
+          "partially_valued_positions": {"type": "integer", "minimum": 0},
+          "unvalued_positions": {"type": "integer", "minimum": 0},
+          "pools": {"type": "array", "items": {"$ref": "#/components/schemas/ResearchAllocationPool"}},
+          "positions": {"type": "array", "items": {"$ref": "#/components/schemas/ResearchAllocationPosition"}}
+        },
+        "additionalProperties": false
+      },
+      "ResearchFee": {
+        "type": "object",
+        "description": "For dynamic V4, `raw_configuration` retains the flag-bearing field, `configured_ppm` is null, and `current_ppm` is a separate observation when available.",
+        "required": ["mode", "raw_configuration", "configured_ppm", "current_ppm", "hook"],
+        "properties": {
+          "mode": {"type": "string", "enum": ["static", "dynamic", "unknown"]},
+          "raw_configuration": {"anyOf": [{"$ref": "#/components/schemas/SignedIntegerString"}, {"type": "null"}]},
+          "configured_ppm": {"anyOf": [{"$ref": "#/components/schemas/SignedIntegerString"}, {"type": "null"}]},
+          "current_ppm": {"anyOf": [{"$ref": "#/components/schemas/SignedIntegerString"}, {"type": "null"}]},
+          "hook": {"type": ["string", "null"]}
+        },
+        "additionalProperties": false
+      },
+      "ResearchRange": {
+        "type": "object",
+        "required": ["tick_lower", "tick_upper", "width_ticks", "current_tick", "in_range", "observation_block", "observation_timestamp"],
+        "properties": {
+          "tick_lower": {"type": ["integer", "null"]},
+          "tick_upper": {"type": ["integer", "null"]},
+          "width_ticks": {"type": ["integer", "null"], "minimum": 0},
+          "current_tick": {"type": ["integer", "null"]},
+          "in_range": {"type": ["boolean", "null"]},
+          "observation_block": {"type": ["integer", "null"], "minimum": 0},
+          "observation_timestamp": {"type": ["integer", "null"], "minimum": 0}
+        },
+        "additionalProperties": false
+      },
+      "ResearchLifecycleSummary": {
+        "type": "object",
+        "required": ["episodes_observed", "completed_episodes", "first_opened_at", "last_closed_at", "last_event_at"],
+        "properties": {
+          "episodes_observed": {"type": "integer", "minimum": 0},
+          "completed_episodes": {"type": "integer", "minimum": 0},
+          "first_opened_at": {"type": ["integer", "null"], "minimum": 0},
+          "last_closed_at": {"type": ["integer", "null"], "minimum": 0},
+          "last_event_at": {"type": ["integer", "null"], "minimum": 0}
+        },
+        "additionalProperties": false
+      },
+      "ResearchConfigurationPosition": {
+        "type": "object",
+        "required": ["position_key", "token_id", "pool_id", "pair", "protocol", "identity_match", "identity_basis", "current", "status", "range", "fee", "lifecycle", "coverage", "inspector"],
+        "properties": {
+          "position_key": {"type": ["string", "null"]},
+          "token_id": {"anyOf": [{"$ref": "#/components/schemas/SignedIntegerString"}, {"type": "null"}]},
+          "pool_id": {"type": ["string", "null"]},
+          "pair": {"type": "string"},
+          "protocol": {"type": "string"},
+          "identity_match": {"type": "string"},
+          "identity_basis": {"type": ["string", "null"]},
+          "current": {"type": "boolean"},
+          "status": {"type": ["string", "null"]},
+          "range": {"$ref": "#/components/schemas/ResearchRange"},
+          "fee": {"$ref": "#/components/schemas/ResearchFee"},
+          "lifecycle": {"$ref": "#/components/schemas/ResearchLifecycleSummary"},
+          "coverage": {"$ref": "#/components/schemas/FlexibleCoverage"},
+          "inspector": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "ProtocolMix": {
+        "type": "object",
+        "required": ["protocol", "returned_positions", "current_beneficial_positions"],
+        "properties": {
+          "protocol": {"type": "string"},
+          "returned_positions": {"type": "integer", "minimum": 0},
+          "current_beneficial_positions": {"type": "integer", "minimum": 0}
+        },
+        "additionalProperties": false
+      },
+      "FeeModeMix": {
+        "type": "object",
+        "required": ["mode", "returned_positions", "pool_count"],
+        "properties": {
+          "mode": {"type": "string", "enum": ["static", "dynamic", "unknown"]},
+          "returned_positions": {"type": "integer", "minimum": 0},
+          "pool_count": {"type": "integer", "minimum": 0}
+        },
+        "additionalProperties": false
+      },
+      "RangeWidthSummary": {
+        "type": "object",
+        "required": ["observations", "minimum", "median", "maximum"],
+        "properties": {
+          "observations": {"type": "integer", "minimum": 0},
+          "minimum": {"type": ["integer", "null"], "minimum": 0},
+          "median": {"type": ["number", "null"], "minimum": 0},
+          "maximum": {"type": ["integer", "null"], "minimum": 0}
+        },
+        "additionalProperties": false
+      },
+      "ResearchConfigurations": {
+        "type": "object",
+        "required": ["basis", "returned_position_scope", "positions", "protocol_mix", "fee_mode_mix", "range_width_ticks"],
+        "properties": {
+          "basis": {"type": "string"},
+          "returned_position_scope": {"type": "boolean", "const": true},
+          "positions": {"type": "array", "items": {"$ref": "#/components/schemas/ResearchConfigurationPosition"}},
+          "protocol_mix": {"type": "array", "items": {"$ref": "#/components/schemas/ProtocolMix"}},
+          "fee_mode_mix": {"type": "array", "items": {"$ref": "#/components/schemas/FeeModeMix"}},
+          "range_width_ticks": {"$ref": "#/components/schemas/RangeWidthSummary"}
+        },
+        "additionalProperties": false
+      },
+      "LatestActivity": {
+        "type": "object",
+        "required": ["block_number", "timestamp", "pool_id", "pair", "kind", "tx_hash", "event_count", "qualification", "identity_match"],
+        "properties": {
+          "block_number": {"type": ["integer", "null"], "minimum": 0},
+          "timestamp": {"type": ["integer", "null"], "minimum": 0},
+          "pool_id": {"type": ["string", "null"]},
+          "pair": {"type": ["string", "null"]},
+          "kind": {"type": "string"},
+          "tx_hash": {"type": ["string", "null"]},
+          "event_count": {"type": ["integer", "null"], "minimum": 0},
+          "qualification": {"type": "string", "enum": ["provisional_canonical", "durable_position_summary"]},
+          "identity_match": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "LifecycleEntry": {
+        "type": "object",
+        "required": ["kind", "timestamp", "position_key", "pool_id", "pair", "identity_match"],
+        "properties": {
+          "kind": {"type": "string", "enum": ["opened", "closed"]},
+          "timestamp": {"type": "integer", "minimum": 0},
+          "position_key": {"type": ["string", "null"]},
+          "pool_id": {"type": ["string", "null"]},
+          "pair": {"type": "string"},
+          "identity_match": {"type": "string"},
+          "duration_s": {"type": ["integer", "null"], "minimum": 0},
+          "status": {"type": ["string", "null"]}
+        },
+        "additionalProperties": false
+      },
+      "ResearchActivity": {
+        "type": "object",
+        "required": ["latest", "qualification", "positions_returned", "episodes_observed", "recent_lifecycle", "recent_lifecycle_limit"],
+        "properties": {
+          "latest": {"anyOf": [{"$ref": "#/components/schemas/LatestActivity"}, {"type": "null"}]},
+          "qualification": {"type": "string", "enum": ["provisional_canonical", "durable_position_summary", "none"]},
+          "positions_returned": {"type": "integer", "minimum": 0},
+          "episodes_observed": {"type": "integer", "minimum": 0},
+          "recent_lifecycle": {"type": "array", "maxItems": 100, "items": {"$ref": "#/components/schemas/LifecycleEntry"}},
+          "recent_lifecycle_limit": {"type": "integer", "const": 100}
+        },
+        "additionalProperties": false
+      },
+      "ResearchIdentityCoverage": {
+        "type": "object",
+        "required": ["basis", "beneficial_owner_observed", "custody_observed", "current_activity_match"],
+        "properties": {
+          "basis": {"type": "string"},
+          "beneficial_owner_observed": {"type": "boolean"},
+          "custody_observed": {"type": "boolean"},
+          "current_activity_match": {"type": ["string", "null"]}
+        },
+        "additionalProperties": false
+      },
+      "ResearchValuationCoverage": {
+        "type": "object",
+        "required": ["basis", "scope", "positions_with_known_subtotal", "fully_valued_positions", "partially_valued_positions", "unvalued_positions", "complete_for_returned_current_positions"],
+        "properties": {
+          "basis": {"type": "string", "const": "USDG quote (1 USDG = 1 quote dollar); not a fiat oracle"},
+          "scope": {"type": "string"},
+          "positions_with_known_subtotal": {"type": "integer", "minimum": 0},
+          "fully_valued_positions": {"type": "integer", "minimum": 0},
+          "partially_valued_positions": {"type": "integer", "minimum": 0},
+          "unvalued_positions": {"type": "integer", "minimum": 0},
+          "complete_for_returned_current_positions": {"type": "boolean"}
+        },
+        "additionalProperties": false
+      },
+      "CurrentActivityCoverage": {
+        "type": "object",
+        "required": ["qualification", "head", "observed_from"],
+        "properties": {
+          "qualification": {"type": "string", "enum": ["provisional_canonical", "unavailable"]},
+          "head": {"type": ["integer", "null"], "minimum": 0},
+          "observed_from": {"type": ["integer", "null"], "minimum": 0},
+          "revision": {"type": "integer", "minimum": 0},
+          "epoch": {"type": "integer", "minimum": 0}
+        },
+        "additionalProperties": false
+      },
+      "ResearchCoverage": {
+        "type": "object",
+        "required": ["found", "state", "indexed_head", "history_from", "history_from_block", "history_to", "history_target", "window_complete", "identity", "returned_positions", "source_positions_received", "positions_omitted_by_research_limit", "source_position_limit", "possible_position_truncation", "valuation", "current_activity"],
+        "properties": {
+          "found": {"type": "boolean"},
+          "state": {"type": ["string", "null"]},
+          "indexed_head": {"type": ["integer", "null"], "minimum": 0},
+          "history_from": {"type": ["integer", "null"], "minimum": 0},
+          "history_from_block": {"type": ["integer", "null"], "minimum": 0},
+          "history_to": {"type": ["integer", "null"], "minimum": 0},
+          "history_target": {"type": ["integer", "null"], "minimum": 0},
+          "window_complete": {"type": "boolean"},
+          "identity": {"$ref": "#/components/schemas/ResearchIdentityCoverage"},
+          "returned_positions": {"type": "integer", "minimum": 0, "maximum": 200},
+          "source_positions_received": {"type": "integer", "minimum": 0},
+          "positions_omitted_by_research_limit": {"type": "integer", "minimum": 0},
+          "source_position_limit": {"type": "integer", "const": 200},
+          "possible_position_truncation": {"type": "boolean"},
+          "valuation": {"$ref": "#/components/schemas/ResearchValuationCoverage"},
+          "current_activity": {"$ref": "#/components/schemas/CurrentActivityCoverage"}
+        },
+        "additionalProperties": false
+      },
+      "OwnerResearchResponse": {
+        "type": "object",
+        "required": ["owner", "window", "coverage", "allocation", "configurations", "activity", "limitations"],
+        "properties": {
+          "owner": {"$ref": "#/components/schemas/Address"},
+          "window": {"type": "string", "enum": ["1h", "24h", "7d", "30d", "all"]},
+          "coverage": {"$ref": "#/components/schemas/ResearchCoverage"},
+          "allocation": {"$ref": "#/components/schemas/ResearchAllocation"},
+          "configurations": {"$ref": "#/components/schemas/ResearchConfigurations"},
+          "activity": {"$ref": "#/components/schemas/ResearchActivity"},
+          "limitations": {"type": "array", "items": {"type": "string"}}
+        },
+        "additionalProperties": false
+      },
+      "FlowIdentity": {
+        "type": "object",
+        "required": ["kind", "trader_id", "handle", "wallet"],
+        "properties": {
+          "kind": {"type": "string", "enum": ["verified-fomo", "observed-wallet"]},
+          "trader_id": {"type": ["string", "null"]},
+          "handle": {"type": "string"},
+          "wallet": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "FlowChainSource": {
+        "type": "object",
+        "required": ["kind", "transaction_hash", "instruction_or_log_index", "block_hash", "block_number_or_slot", "confirmation_status"],
+        "properties": {
+          "kind": {"type": "string", "const": "chain-observed"},
+          "transaction_hash": {"type": "string"},
+          "instruction_or_log_index": {"type": ["integer", "null"], "minimum": 0},
+          "block_hash": {"type": ["string", "null"]},
+          "block_number_or_slot": {"$ref": "#/components/schemas/UnsignedIntegerString"},
+          "confirmation_status": {"type": ["string", "null"], "enum": ["processed", "confirmed", "finalized", null]}
+        },
+        "additionalProperties": false
+      },
+      "FlowOfficialSource": {
+        "type": "object",
+        "required": ["kind", "event_id", "sequence"],
+        "properties": {
+          "kind": {"type": "string", "const": "fomo-official"},
+          "event_id": {"type": "string"},
+          "sequence": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "FlowAsset": {
+        "type": "object",
+        "required": ["chain", "address", "symbol", "name"],
+        "properties": {
+          "chain": {"type": "string", "enum": ["solana", "base", "robinhood"]},
+          "address": {"type": "string"},
+          "symbol": {"type": ["string", "null"]},
+          "name": {"type": ["string", "null"]}
+        },
+        "additionalProperties": false
+      },
+      "FlowEconomics": {
+        "type": "object",
+        "description": "Publisher-reported decimal strings. These are not independently priced or inferred. RH Trenches rows with a non-cash-leg estimated-value label are omitted.",
+        "required": ["leader_position_before_usd", "leader_position_after_usd", "trade_size_usd", "leader_fill_price_usd", "trade_quantity", "quote_token", "value_basis"],
+        "properties": {
+          "leader_position_before_usd": {"anyOf": [{"$ref": "#/components/schemas/DecimalString"}, {"type": "null"}]},
+          "leader_position_after_usd": {"anyOf": [{"$ref": "#/components/schemas/DecimalString"}, {"type": "null"}]},
+          "trade_size_usd": {"anyOf": [{"$ref": "#/components/schemas/DecimalString"}, {"type": "null"}]},
+          "leader_fill_price_usd": {"anyOf": [{"$ref": "#/components/schemas/DecimalString"}, {"type": "null"}]},
+          "trade_quantity": {"anyOf": [{"$ref": "#/components/schemas/DecimalString"}, {"type": "null"}]},
+          "quote_token": {"anyOf": [{"$ref": "#/components/schemas/Address"}, {"type": "null"}]},
+          "value_basis": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "FlowEvidence": {
+        "type": "object",
+        "required": ["occurred_at", "occurred_at_unix", "observed_at"],
+        "properties": {
+          "occurred_at": {"type": "string", "format": "date-time"},
+          "occurred_at_unix": {"anyOf": [{"$ref": "#/components/schemas/UnsignedIntegerString"}, {"type": "null"}]},
+          "observed_at": {"type": ["string", "null"], "format": "date-time"}
+        },
+        "additionalProperties": false
+      },
+      "FlowItem": {
+        "type": "object",
+        "required": ["publisher", "canonical_action_id", "source_event_id", "trader_strategy_id", "identity", "source", "asset", "action", "action_basis", "economics", "evidence"],
+        "properties": {
+          "publisher": {"type": "string", "enum": ["apollo", "rhtrenches"]},
+          "canonical_action_id": {"type": ["string", "null"]},
+          "source_event_id": {"type": ["string", "null"]},
+          "trader_strategy_id": {"type": ["string", "null"]},
+          "identity": {"$ref": "#/components/schemas/FlowIdentity"},
+          "source": {"oneOf": [{"$ref": "#/components/schemas/FlowChainSource"}, {"$ref": "#/components/schemas/FlowOfficialSource"}]},
+          "asset": {"$ref": "#/components/schemas/FlowAsset"},
+          "action": {"type": "string", "enum": ["open", "increase", "decrease", "close", "buy", "sell"]},
+          "action_basis": {"type": "string", "enum": ["apollo-normalized-leader-action", "rhtrenches-published-side"]},
+          "economics": {"$ref": "#/components/schemas/FlowEconomics"},
+          "evidence": {"$ref": "#/components/schemas/FlowEvidence"}
+        },
+        "additionalProperties": false
+      },
+      "FlowQuery": {
+        "type": "object",
+        "required": ["source", "chain", "chain_scope", "verified_only", "limit"],
+        "properties": {
+          "source": {"type": "string", "enum": ["apollo", "rhtrenches"]},
+          "chain": {"type": ["string", "null"], "enum": ["solana", "base", "robinhood", null]},
+          "chain_scope": {"type": "string", "enum": ["solana", "base", "robinhood", "supported-set"]},
+          "verified_only": {"type": "boolean"},
+          "limit": {"type": "integer", "minimum": 1, "maximum": 100}
+        },
+        "additionalProperties": false
+      },
+      "FlowEnabledSource": {
+        "type": "object",
+        "required": ["id", "publisher", "origin", "chains", "identity", "scope"],
+        "properties": {
+          "id": {"type": "string", "enum": ["apollo", "rhtrenches"]},
+          "publisher": {"type": "string"},
+          "origin": {"type": "string", "format": "uri"},
+          "chains": {"type": "array", "items": {"type": "string", "enum": ["solana", "base", "robinhood"]}},
+          "identity": {"type": "string"},
+          "scope": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "FlowDisabledSource": {
+        "type": "object",
+        "required": ["id", "origin", "reason"],
+        "properties": {
+          "id": {"type": "string"},
+          "origin": {"type": "string", "format": "uri"},
+          "reason": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "FlowSourceCatalog": {
+        "type": "object",
+        "required": ["selected", "enabled", "not_enabled"],
+        "properties": {
+          "selected": {"type": "string", "enum": ["apollo", "rhtrenches"]},
+          "enabled": {"type": "array", "items": {"$ref": "#/components/schemas/FlowEnabledSource"}},
+          "not_enabled": {"type": "array", "items": {"$ref": "#/components/schemas/FlowDisabledSource"}}
+        },
+        "additionalProperties": false
+      },
+      "FlowProvenance": {
+        "type": "object",
+        "required": ["publisher", "source_id", "upstream_origin", "canonical_origin", "upstream_endpoint", "upstream_contract", "access", "retrieved_at", "upstream_read_at", "upstream_evidence_through", "evidence_time_basis"],
+        "properties": {
+          "publisher": {"type": "string"},
+          "source_id": {"type": "string", "enum": ["apollo", "rhtrenches"]},
+          "upstream_origin": {"type": "string", "format": "uri"},
+          "canonical_origin": {"type": "string", "format": "uri"},
+          "upstream_endpoint": {"type": "string"},
+          "status_endpoint": {"type": "string"},
+          "upstream_contract": {"type": "string"},
+          "access": {"type": "string", "const": "anonymous-public-read"},
+          "retrieved_at": {"type": "string", "format": "date-time"},
+          "upstream_read_at": {"type": "string", "format": "date-time"},
+          "upstream_evidence_through": {"type": ["string", "null"], "format": "date-time"},
+          "evidence_time_basis": {"type": "string"},
+          "attribution": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "FlowLatency": {
+        "type": "object",
+        "required": ["sample_count", "median", "p90", "since", "since_unix"],
+        "properties": {
+          "sample_count": {"type": "integer", "minimum": 0},
+          "median": {"anyOf": [{"$ref": "#/components/schemas/DecimalString"}, {"type": "null"}]},
+          "p90": {"anyOf": [{"$ref": "#/components/schemas/DecimalString"}, {"type": "null"}]},
+          "since": {"type": ["string", "null"], "format": "date-time"},
+          "since_unix": {"anyOf": [{"$ref": "#/components/schemas/UnsignedIntegerString"}, {"type": "null"}]}
+        },
+        "additionalProperties": false
+      },
+      "FlowPublisherStatus": {
+        "type": "object",
+        "required": ["ok", "chain", "chain_id", "tracked_wallets", "source_transport", "last_block", "last_event_at", "last_event_at_unix", "server_at", "server_at_unix", "lag_seconds_reported", "indexer_age_seconds_reported", "latency_seconds_reported"],
+        "properties": {
+          "ok": {"type": "boolean", "const": true},
+          "chain": {"type": "string", "const": "robinhood"},
+          "chain_id": {"type": "integer", "const": 4663},
+          "tracked_wallets": {"type": "integer", "minimum": 0},
+          "source_transport": {"type": "string"},
+          "last_block": {"$ref": "#/components/schemas/UnsignedIntegerString"},
+          "last_event_at": {"type": ["string", "null"], "format": "date-time"},
+          "last_event_at_unix": {"anyOf": [{"$ref": "#/components/schemas/UnsignedIntegerString"}, {"type": "null"}]},
+          "server_at": {"type": "string", "format": "date-time"},
+          "server_at_unix": {"$ref": "#/components/schemas/UnsignedIntegerString"},
+          "lag_seconds_reported": {"anyOf": [{"$ref": "#/components/schemas/DecimalString"}, {"type": "null"}]},
+          "indexer_age_seconds_reported": {"anyOf": [{"$ref": "#/components/schemas/DecimalString"}, {"type": "null"}]},
+          "latency_seconds_reported": {"$ref": "#/components/schemas/FlowLatency"}
+        },
+        "additionalProperties": false
+      },
+      "PoolAttribution": {
+        "type": "object",
+        "required": ["state", "reason"],
+        "properties": {
+          "state": {"type": "string", "const": "not-provided"},
+          "reason": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "FlowCoverage": {
+        "type": "object",
+        "required": ["supported_chains", "full_chain_complete", "requested_chain", "upstream_page_items", "returned_items", "items_filtered_by_chain", "identity_scope", "cursor_scope", "publisher_status", "rows_omitted", "pool_attribution"],
+        "properties": {
+          "supported_chains": {"type": "array", "items": {"type": "string", "enum": ["solana", "base", "robinhood"]}},
+          "full_chain_complete": {"type": "boolean", "const": false},
+          "requested_chain": {"type": ["string", "null"], "enum": ["solana", "base", "robinhood", null]},
+          "upstream_page_items": {"type": "integer", "minimum": 0},
+          "upstream_fetch_items": {"type": "integer", "minimum": 0},
+          "returned_items": {"type": "integer", "minimum": 0},
+          "items_filtered_by_chain": {"type": "integer", "minimum": 0},
+          "identity_scope": {"type": "string"},
+          "cursor_scope": {"type": "string"},
+          "publisher_status": {"anyOf": [{"$ref": "#/components/schemas/FlowPublisherStatus"}, {"type": "null"}]},
+          "rows_omitted": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
+          "pool_attribution": {"$ref": "#/components/schemas/PoolAttribution"}
+        },
+        "additionalProperties": false
+      },
+      "FomoFlowResponse": {
+        "type": "object",
+        "required": ["schema_version", "query", "sources", "items", "next_cursor", "read_at", "evidence_through", "provenance", "coverage", "limitations"],
+        "properties": {
+          "schema_version": {"type": "string", "const": "fomo-flow.v1"},
+          "query": {"$ref": "#/components/schemas/FlowQuery"},
+          "sources": {"$ref": "#/components/schemas/FlowSourceCatalog"},
+          "items": {"type": "array", "maxItems": 100, "items": {"$ref": "#/components/schemas/FlowItem"}},
+          "next_cursor": {"type": ["string", "null"], "maxLength": 4096, "pattern": "^[A-Za-z0-9_-]+$"},
+          "read_at": {"type": "string", "format": "date-time"},
+          "evidence_through": {"type": ["string", "null"], "format": "date-time"},
+          "provenance": {"$ref": "#/components/schemas/FlowProvenance"},
+          "coverage": {"$ref": "#/components/schemas/FlowCoverage"},
+          "limitations": {"type": "array", "items": {"type": "string"}}
+        },
+        "additionalProperties": false
+      }
+    }
+  }
+}

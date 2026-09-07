@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#000000">
+  <title>Owner Research / Robinhood Pools</title>
+  <link rel="stylesheet" href="/static/lp_research.css">
+</head>
+<body>
+  <header class="terminal-header">
+    <div class="status-strip">
+      <strong>ROBINHOOD POOLS</strong>
+      <span class="chain">4663</span>
+      <span>OWNER RESEARCH</span>
+      <span id="request-state" class="request-state" role="status">READY</span>
+      <time id="clock" datetime="">--:--:-- UTC</time>
+    </div>
+    <nav class="section-nav" aria-label="LP research navigation">
+      <a href="/pools">POOLS</a>
+      <a href="/guide">GUIDE</a>
+      <a href="#allocation">ALLOCATION</a>
+      <a href="#configuration">POSITIONS</a>
+      <a href="#activity">ACTIVITY</a>
+      <a id="api-link" href="/api/v1/research/owner">API</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="query-panel" aria-labelledby="page-title">
+      <div class="intro">
+        <p class="eyebrow">OWNER QUERY · READ ONLY</p>
+        <h1 id="page-title">OWNER RESEARCH</h1>
+        <p>Query indexed allocation, position configuration, fee mode, and lifecycle timing. Results are observed facts, not trading intent.</p>
+      </div>
+      <form id="owner-form" role="search">
+        <label for="owner-input">OWNER OR CUSTODY ADDRESS</label>
+        <div class="query-row">
+          <span aria-hidden="true">&gt;</span>
+          <input id="owner-input" name="owner" type="text" inputmode="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="0x…" aria-describedby="form-message" required>
+          <label class="sr-only" for="window-select">History window</label>
+          <select id="window-select" name="window">
+            <option value="1h">1H</option>
+            <option value="24h">24H</option>
+            <option value="7d">7D</option>
+            <option value="30d" selected>30D</option>
+            <option value="all">ALL INDEXED</option>
+          </select>
+          <button type="submit">INSPECT</button>
+        </div>
+        <p id="form-message" class="form-message" aria-live="polite">ENTER A 20-BYTE HEX ADDRESS</p>
+      </form>
+    </section>
+
+    <section id="notice" class="notice" role="status" aria-live="polite" hidden></section>
+    <section id="error-panel" class="error-panel" role="alert" hidden>
+      <strong>REQUEST FAILED</strong>
+      <p id="error-message"></p>
+      <button id="retry-button" type="button">RETRY</button>
+    </section>
+
+    <div id="results" hidden>
+      <section class="identity-panel" aria-labelledby="identity-title">
+        <div>
+          <p class="eyebrow" id="identity-title">OBSERVED IDENTITY</p>
+          <div id="owner-address" class="owner-address">—</div>
+        </div>
+        <div id="identity-badges" class="badges"></div>
+      </section>
+
+      <section aria-labelledby="coverage-title">
+        <header class="section-head">
+          <h2 id="coverage-title">COVERAGE</h2>
+          <span>WHAT THE INDEX CAN SUPPORT</span>
+        </header>
+        <dl id="coverage-grid" class="metric-grid"></dl>
+        <p id="coverage-note" class="section-copy"></p>
+      </section>
+
+      <section id="allocation" aria-labelledby="allocation-title">
+        <header class="section-head">
+          <h2 id="allocation-title">CURRENT ALLOCATION</h2>
+          <span>BENEFICIAL OWNER · RETURNED POSITIONS</span>
+        </header>
+        <dl id="allocation-grid" class="metric-grid"></dl>
+        <p id="allocation-note" class="section-copy"></p>
+        <div class="table-wrap" tabindex="0" aria-label="Current beneficial-owner pool allocation">
+          <table>
+            <thead><tr><th>pool</th><th>protocol</th><th class="numeric">positions</th><th class="numeric">known principal</th><th class="numeric">known-only share</th><th>coverage</th><th>inspect</th></tr></thead>
+            <tbody id="allocation-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="configuration" aria-labelledby="configuration-title">
+        <header class="section-head">
+          <h2 id="configuration-title">CONFIGURATION</h2>
+          <span>RANGES · FEE MODES · LIFECYCLE</span>
+        </header>
+        <div id="mix-grid" class="mix-grid"></div>
+        <div class="table-wrap" tabindex="0" aria-label="Returned position configurations">
+          <table class="wide-table">
+            <thead><tr><th>pair</th><th>identity</th><th>state</th><th>range</th><th class="numeric">width</th><th>fee</th><th class="numeric">episodes</th><th>first opened</th><th>last event</th><th>inspect</th></tr></thead>
+            <tbody id="configuration-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="activity" aria-labelledby="activity-title">
+        <header class="section-head">
+          <h2 id="activity-title">ACTIVITY</h2>
+          <span>OBSERVED POSITION LIFECYCLE · NOT INTENT</span>
+        </header>
+        <div id="latest-activity" class="latest-activity"></div>
+        <div class="table-wrap" tabindex="0" aria-label="Recent observed position lifecycle">
+          <table>
+            <thead><tr><th>when</th><th>event</th><th>pair</th><th>identity</th><th class="numeric">duration</th><th>position</th></tr></thead>
+            <tbody id="activity-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <details aria-labelledby="limitations-title" class="limitations-panel">
+        <summary class="section-head">
+          <strong id="limitations-title">LIMITATIONS</strong>
+          <span>READ BEFORE COMPARING WALLETS</span>
+        </summary>
+        <ul id="limitations-list"></ul>
+        <p class="manual-note">No execution, copy-trading or private strategy inference is provided. Learn the mechanics in the <a href="/guide">LP guide</a>, inspect a pool manually, or consume the qualified <a id="api-link-bottom" href="/api/v1/research/owner">JSON response</a>.</p>
+      </details>
+    </div>
+  </main>
+
+  <footer><span id="footer-state">NO OWNER LOADED</span><a class="source-link" href="https://github.com/wock9000/robinhoodpools#license" target="_blank" rel="noopener noreferrer" title="Copyright 2026 RobinhoodPools contributors · AGPL-3.0-only · no warranty · corresponding source">SOURCE</a><span>READ ONLY</span></footer>
+  <script src="/static/lp_research.js" defer></script>
+</body>
+</html>

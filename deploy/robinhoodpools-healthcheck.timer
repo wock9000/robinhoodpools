@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the RHPools availability guard every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=60s
+AccuracySec=5s
+Persistent=true
+Unit=robinhoodpools-healthcheck.service
+
+[Install]
+WantedBy=timers.target

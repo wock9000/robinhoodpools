@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#000000">
+  <link rel="canonical" href="https://rhpools.lol/">
+  <script src="/static/lp_panes_boot.js"></script>
+  <title>Robinhood Pools / Chain 4663</title>
+  <link rel="stylesheet" href="/static/lp_terminal.css">
+</head>
+<body>
+  <header class="terminal-header">
+    <div class="status-strip">
+      <strong class="product-name">ROBINHOOD POOLS</strong>
+      <span class="chain-id">4663</span>
+      <span id="strip-context" class="status-context">LP WALLETS</span>
+      <span class="block-readout">
+        <span class="strip-label">BLOCK</span>
+        <a id="live-block-link" rel="noopener noreferrer" target="_blank">#—</a>
+        <span id="live-block-age">—</span>
+        <span id="live-block-gap" class="block-gap" hidden>GAP</span>
+      </span>
+      <span id="stream-state" class="strip-state" role="status">CONNECTING</span>
+      <span id="strip-freshness" title="Age of the last index status response. Live head, durable index head, and the actual catch-up gap are shown below.">STATUS —</span>
+      <time id="terminal-clock" datetime="">--:--:-- UTC</time>
+      <nav id="key-strip" class="key-strip" aria-label="Window, tape, and pane controls">
+        <label class="mobile-only sr-only" for="mobile-window">Accounting window</label>
+        <select id="mobile-window" class="mobile-only" aria-label="Accounting window">
+          <option value="1h">1h</option>
+          <option value="24h" selected>24h</option>
+          <option value="7d">7d</option>
+          <option value="30d">30d</option>
+          <option value="all">All history</option>
+        </select>
+        <button type="button" class="key-control" data-window="1h"><kbd>1</kbd>1h</button>
+        <button type="button" class="key-control is-active" data-window="24h"><kbd>2</kbd>24h</button>
+        <button type="button" class="key-control" data-window="7d"><kbd>3</kbd>7d</button>
+        <button type="button" class="key-control" data-window="30d"><kbd>4</kbd>30d</button>
+        <button type="button" class="key-control" data-window="all"><kbd>5</kbd>all</button>
+        <button type="button" id="follow-control" class="key-control is-active"><kbd>f</kbd>follow:<span id="follow-state">on</span></button>
+        <button type="button" id="filter-control" class="key-control desk-only"><kbd>/</kbd>filter</button>
+        <button type="button" id="pane-reset" class="key-control" title="Reset all saved pane heights"><kbd>↺</kbd>reset panes</button>
+      </nav>
+    </div>
+    <nav class="section-nav" aria-label="LP terminal sections">
+      <a href="#search">SEARCH</a>
+      <a href="#tape-section">FEED</a>
+      <a href="#owners-section">WALLETS</a>
+      <a href="#pools-section">POOLS</a>
+      <a href="/guide">GUIDE</a>
+      <a href="/research">RESEARCH</a>
+      <a href="/flow">FLOW</a>
+      <a href="https://status.rhpools.lol/" target="_blank" rel="noopener noreferrer">STATUS</a>
+      <details class="mobile-more mobile-only">
+        <summary><span id="mobile-more-window">24h</span>&nbsp; MORE</summary>
+        <nav aria-label="Research and help">
+          <div id="mobile-controls-slot"></div>
+          <a href="/guide">Beginner guide</a>
+          <a href="/research">LP research</a>
+          <a href="/flow">Fomo flow</a>
+          <a href="https://status.rhpools.lol/" target="_blank" rel="noopener noreferrer">Service status</a>
+        </nav>
+      </details>
+    </nav>
+  </header>
+
+  <main id="terminal-main">
+    <section class="readout" aria-label="LP market status">
+      <div id="status-readout" class="readout-line" aria-live="polite">index connecting</div>
+      <div id="overview-readout" class="readout-line dim">24h · metrics —</div>
+      <div id="endpoint-health" class="sr-only" role="status" aria-live="polite"></div>
+    </section>
+
+    <section id="search" class="universal-search" aria-labelledby="lp-search-title">
+      <h1 id="lp-search-title" class="sr-only">Search pools, tokens, LPs, and transactions</h1>
+      <form id="lp-search-form" class="lp-search-form" role="search">
+        <label class="search-prompt" for="lp-search-input">SEARCH&gt;</label>
+        <input id="lp-search-input" type="search" enterkeyhint="search" autocomplete="off" spellcheck="false" placeholder="Search pools, tokens, wallets" aria-describedby="lp-search-status" aria-controls="lp-search-results">
+        <button type="submit">GO</button>
+        <a class="pool-catalog-link" href="/pools">ALL POOLS</a>
+      </form>
+      <div id="lp-search-status" class="lp-search-status" role="status" aria-live="polite"></div>
+      <div id="lp-search-results" class="lp-search-results" role="list" aria-label="Universal search results"></div>
+    </section>
+
+    <section id="owner-modal" class="owner-detail-view" role="dialog" aria-modal="true" aria-labelledby="owner-dialog-title" hidden>
+      <div id="owner-dialog" class="owner-detail-shell" tabindex="-1">
+        <header class="owner-detail-head">
+          <div>
+            <h2 id="owner-dialog-title">LP DETAIL</h2>
+            <div id="owner-dialog-address" class="modal-address">—</div>
+            <div id="owner-dialog-identity" class="owner-identity">OWNER — · CUSTODY —</div>
+          </div>
+          <div class="owner-detail-controls">
+            <span id="owner-live-state" class="owner-live-state is-stale" role="status">SYNCING</span>
+            <button id="owner-follow" class="owner-follow is-active" type="button" aria-pressed="true">FOLLOW ON</button>
+            <button id="owner-close" class="owner-close" type="button" aria-label="Close LP detail">CLOSE</button>
+          </div>
+        </header>
+        <div id="owner-dialog-error" class="inline-error" role="alert" hidden></div>
+        <section aria-labelledby="owner-summary-title">
+          <h3 id="owner-summary-title" class="modal-section-title">STATS</h3>
+          <dl id="owner-summary" class="summary-grid"></dl>
+        </section>
+        <section aria-labelledby="owner-curve-title">
+          <h3 id="owner-curve-title" class="modal-section-title">REALIZED P/L · <span class="legend-gross">GROSS</span> · <span class="legend-net">NET</span></h3>
+          <canvas id="owner-curve" class="pnl-chart" role="img" aria-label="Realized LP profit and loss" aria-describedby="owner-curve-note"></canvas>
+          <p id="owner-curve-note" class="curve-note">—</p>
+        </section>
+        <section aria-labelledby="owner-positions-title">
+          <h3 id="owner-positions-title" class="modal-section-title">OPEN POSITIONS · DEPTH</h3>
+          <div class="table-wrap modal-table-wrap" tabindex="0" aria-label="Owner open positions, horizontally scrollable">
+            <table class="terminal-table"><thead><tr><th>pair</th><th>proto</th><th>position / range</th><th class="numeric">liquidity</th><th class="numeric">principal</th><th class="numeric">uncollected fees</th><th class="numeric">equity</th><th>valuation</th><th>status</th><th>depth</th></tr></thead><tbody id="owner-positions-body"></tbody></table>
+          </div>
+        </section>
+        <section aria-labelledby="owner-closed-title">
+          <h3 id="owner-closed-title" class="modal-section-title">CASHFLOWS / CLOSED RUNS</h3>
+          <div class="table-wrap modal-table-wrap" tabindex="0" aria-label="Owner cashflows and closed runs, horizontally scrollable">
+            <table class="terminal-table"><thead><tr><th>closed</th><th>pair</th><th>proto</th><th class="numeric">paid in</th><th class="numeric">got out</th><th class="numeric">fees</th><th class="numeric">gross P/L</th><th class="numeric">gas</th><th class="numeric">net P/L</th><th class="numeric">return</th><th class="numeric">held</th><th>depth</th></tr></thead><tbody id="owner-closed-body"></tbody></table>
+          </div>
+        </section>
+      </div>
+    </section>
+
+    <section id="tape-section" aria-labelledby="tape-title">
+      <header class="section-head">
+        <div><h1 id="tape-title">FEED</h1></div>
+        <button id="mobile-filter-toggle" class="mobile-only" type="button" aria-expanded="false" aria-controls="tape-tools">Filter</button>
+        <div id="tape-tools" class="tools">
+          <label class="filter-field" for="market-filter"><span aria-hidden="true">/</span><span class="sr-only">Filter pair, pool, owner, custody, token, or transaction</span><input id="market-filter" type="search" autocomplete="off" spellcheck="false" placeholder="filter pair / pool / LP"></label>
+          <label for="protocol-filter" class="sr-only">Protocol</label>
+          <select id="protocol-filter">
+            <option value="">protocol: all</option>
+            <option value="v2">protocol: v2</option>
+            <option value="v3">protocol: v3</option>
+            <option value="v4">protocol: v4</option>
+          </select>
+          <label for="tape-kind" class="sr-only">Tape event kind</label>
+          <select id="tape-kind">
+            <option value="lp">events: LP only</option>
+            <option value="all">events: all</option>
+          </select>
+        </div>
+          <button id="tape-arrivals" class="tape-arrivals is-empty" type="button" aria-hidden="true" disabled>+0 NEW</button>
+      </header>
+      <div class="table-wrap tape-wrap" id="tape-scroll" tabindex="0" aria-label="Live activity">
+        <table class="terminal-table" id="tape-table" role="table">
+          <thead><tr><th>age</th><th>action</th><th>pool</th><th>LP</th><th class="numeric">flow</th><th class="numeric desktop-column">USDG</th><th class="numeric desktop-column" title="Verified fee value in USD, or explicitly labelled pool fee rate when earned fees cannot be attributed.">fees / rate</th><th class="desktop-column">tx</th></tr></thead>
+          <tbody id="tape-body" aria-live="off"></tbody>
+        </table>
+      </div>
+    </section>
+    <div class="pane-separator" id="separator-tape-owners" role="separator" aria-orientation="horizontal" aria-label="Resize block flow and LP wallets" aria-controls="tape-section owners-section" aria-valuemin="0" aria-valuemax="100" aria-valuenow="50" tabindex="0">
+      <span aria-hidden="true"></span>
+    </div>
+
+
+    <section id="owners-section" aria-labelledby="owners-title">
+      <header class="section-head">
+        <div class="owners-heading">
+          <h1 id="owners-title">LP WALLETS</h1>
+          <span class="wallet-description">Who is providing liquidity, and where? Select a wallet for positions and accounting.</span>
+          <div class="owner-qualification" role="status" aria-live="polite">
+            <span id="owners-accounting-readout">Loading wallet activity…</span>
+          </div>
+        </div>
+        <div class="tools">
+          <label for="owner-scope" class="sr-only">Wallet identity scope</label>
+          <select id="owner-scope">
+            <option value="wallets">LP wallets</option>
+            <option value="custody">Custody contracts</option>
+          </select>
+          <label for="owner-sort" class="sr-only">Sort wallets</label>
+          <select id="owner-sort">
+            <option value="activity">sort: recently updated</option>
+            <option value="net_pnl_usd">sort: net P/L</option>
+            <option value="fees_usd">sort: fees</option>
+          </select>
+        </div>
+      </header>
+      <div class="table-wrap bounded-wrap" tabindex="0" aria-label="LP wallets: latest action, pool, age, indexed open positions, and qualified historical fees and net P/L">
+        <table class="terminal-table" id="owners-table" role="table">
+          <thead><tr><th>LP wallet</th><th>latest action</th><th>pool</th><th>age</th><th class="numeric ledger-first" title="Open positions in the indexed snapshot, not a claim about current holdings.">indexed open</th><th class="numeric" title="Attributed historical fees in USDG quote units; unknown values remain unavailable.">fees · USDG</th><th class="numeric" title="Historical net outcome after attributable gas, in USDG quote units. Not a performance ranking when history is partial.">net P/L · USDG</th><th>data coverage</th></tr></thead>
+          <tbody id="owners-body"></tbody>
+        </table>
+      </div>
+    </section>
+    <div class="pane-separator" id="separator-owners-pools" role="separator" aria-orientation="horizontal" aria-label="Resize LP wallets and pool market views" aria-controls="owners-section pools-section" aria-valuemin="0" aria-valuemax="100" aria-valuenow="50" tabindex="0">
+      <span aria-hidden="true"></span>
+    </div>
+
+    <section id="pools-section" aria-labelledby="pool-section-title">
+      <header class="section-head tab-head">
+        <h1 id="pool-section-title" class="sr-only">Pool market views</h1>
+        <div id="pool-tabs" class="tabs" role="tablist" aria-label="Pool market views">
+          <button type="button" id="tab-pools" role="tab" aria-selected="true" aria-controls="pool-panel" tabindex="0" data-tab="pools">POOLS</button>
+          <button type="button" id="tab-flow" role="tab" aria-selected="false" aria-controls="pool-panel" tabindex="-1" data-tab="flow">CAPITAL FLOW</button>
+          <button type="button" id="tab-fresh" role="tab" aria-selected="false" aria-controls="pool-panel" tabindex="-1" data-tab="fresh">FRESH POOLS</button>
+        </div>
+      </header>
+      <div class="mobile-only mobile-pool-controls" role="group" aria-label="Pool sorting">
+        <select id="mobile-pool-sort" aria-label="Sort pools">
+          <option value="fees">Pools: fees</option>
+          <option value="volume">Pools: volume</option>
+          <option value="tvl">Pools: TVL</option>
+          <option value="flow">Pools: net flow</option>
+          <option value="created">Pools: newest</option>
+          <option value="fee">Pools: fee rate</option>
+          <option value="active_tvl">Pools: active TVL</option>
+          <option value="observed_active_tvl">Pools: observed active</option>
+          <option value="swaps">Pools: swaps</option>
+          <option value="adds">Pools: adds</option>
+          <option value="removes">Pools: removes</option>
+          <option value="lps">Pools: LP count</option>
+          <option value="price">Pools: price</option>
+          <option value="change">Pools: price change</option>
+        </select>
+        <button id="mobile-pool-order" type="button" aria-label="Reverse pool sort order">↓</button>
+      </div>
+      <div id="pool-panel" role="tabpanel" aria-labelledby="tab-pools">
+        <div class="table-wrap pool-wrap" tabindex="0" aria-label="Pools table, horizontally scrollable">
+          <table class="terminal-table" id="pools-table" role="table">
+            <thead><tr><th>pair</th><th>proto</th><th class="numeric"><button type="button" data-pool-sort="fee">fee</button></th><th class="numeric"><button type="button" data-pool-sort="tvl">TVL</button></th><th class="numeric desktop-column"><button type="button" data-pool-sort="active_tvl">active TVL</button></th><th class="numeric desktop-column"><button type="button" data-pool-sort="observed_active_tvl">observed active</button></th><th class="numeric"><button type="button" data-pool-sort="volume">volume</button></th><th class="numeric"><button type="button" data-pool-sort="fees">fees</button></th><th class="numeric"><button type="button" data-pool-sort="flow">net flow</button></th><th class="numeric desktop-column"><button type="button" data-pool-sort="swaps">swaps</button></th><th class="numeric desktop-column"><button type="button" data-pool-sort="adds">adds</button></th><th class="numeric desktop-column"><button type="button" data-pool-sort="removes">removes</button></th><th class="numeric"><button type="button" data-pool-sort="lps">LPs</button></th><th class="numeric desktop-column"><button type="button" data-pool-sort="price">price t1/t0</button></th><th class="numeric desktop-column"><button type="button" data-pool-sort="change">change</button></th></tr></thead>
+            <tbody id="pools-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <section id="pool-inspector" class="pool-inspector" aria-labelledby="pool-inspector-title" hidden>
+    <div id="pool-inspector-shell" class="pool-inspector-shell" role="dialog" aria-modal="true" tabindex="-1">
+      <header class="pool-inspector-head">
+        <h2 id="pool-inspector-title">POOL INSPECTOR</h2>
+        <span id="pool-inspector-context">—</span>
+        <a id="pool-inspector-new-tab" href="/pool" target="_blank" rel="noopener noreferrer">NEW TAB</a>
+        <button id="pool-inspector-close" type="button" aria-label="Close pool inspector">CLOSE</button>
+      </header>
+      <iframe id="pool-inspector-frame" class="pool-inspector-frame" title="Live pool inspector" src="about:blank"></iframe>
+    </div>
+  </section>
+
+  <footer class="terminal-footer"><span id="footer-state">index —</span><span>READ ONLY · <a class="source-link" href="https://github.com/wock9000/robinhoodpools#license" target="_blank" rel="noopener noreferrer" title="Copyright 2026 RobinhoodPools contributors · AGPL-3.0-only · no warranty · corresponding source">SOURCE</a></span></footer>
+  <div id="copy-status" class="sr-only" role="status" aria-live="polite"></div>
+  <script src="/static/lp_terminal.js" defer></script>
+</body>
+</html>

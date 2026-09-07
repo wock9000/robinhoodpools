@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rhpools"
+version = "0.1.0"
+description = "Public Robinhood Chain liquidity-pool observatory"
+readme = "README.md"
+license = "AGPL-3.0-only"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.txt"]
+requires-python = ">=3.11"
+dependencies = [
+  "eth-abi>=5,<6",
+  "eth-hash[pycryptodome]>=0.7,<1",
+  "eth-utils>=5,<6",
+  "requests>=2.31,<3",
+  "websockets>=12,<16",
+]
+
+[project.urls]
+Homepage = "https://rhpools.lol"
+Source = "https://github.com/wock9000/robinhoodpools"
+Issues = "https://github.com/wock9000/robinhoodpools/issues"
+
+[project.optional-dependencies]
+test = ["pytest>=8,<9"]
+
+[project.scripts]
+rhpools = "rhpools.lp_server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rhpools"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/rhpools", "tests", "docs", "deploy", "pyproject.toml", "uv.lock", "README.md", "CONTRIBUTING.md", "SECURITY.md", "LICENSE", "THIRD_PARTY_NOTICES.txt"]

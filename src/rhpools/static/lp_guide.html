@@ -1,0 +1,382 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#000000">
+  <meta name="description" content="A source-linked operator manual for screening Robinhood Chain liquidity pools, measuring LP outcomes, and rejecting weak opportunities.">
+  <title>LP Operator Manual / Robinhood Pools</title>
+  <link rel="stylesheet" href="/static/lp_guide.css">
+</head>
+<body>
+  <a class="skip-link" href="#guide-content">SKIP TO MANUAL</a>
+
+  <header class="terminal-bar">
+    <div class="terminal-id">
+      <a class="product-link" href="/">ROBINHOOD POOLS</a>
+      <span class="terminal-context">CHAIN 4663 · LP OPERATOR MANUAL</span>
+    </div>
+    <div class="mode-badge" aria-label="This guide is read-only"><span aria-hidden="true"></span>READ ONLY</div>
+    <nav class="global-nav" aria-label="Primary navigation">
+      <a href="/">TERMINAL</a>
+      <a href="/pools">POOLS</a>
+      <a href="/research">RESEARCH</a>
+      <a href="/api/v1/openapi.json">API</a>
+    </nav>
+  </header>
+
+  <main id="guide-content">
+    <header class="guide-hero">
+      <div class="hero-kicker">LP FIELD MANUAL / SOURCES CHECKED 2026-09-07</div>
+      <h1>Liquidity provider guide</h1>
+      <p class="hero-summary">Uniswap mechanics, pool screening, costs, benchmarks, and Robinhood Chain data sources.</p>
+    </header>
+
+    <aside class="risk-banner" aria-labelledby="risk-banner-title">
+      <strong id="risk-banner-title">OPERATING RULE</strong>
+      <p>No pool is recommended here. Fees are revenue, not profit. Reject any candidate whose assets, complete pool identity, data window, range behavior, hook logic, or net benchmark cannot be verified.</p>
+    </aside>
+
+    <div class="guide-layout">
+      <aside class="contents-panel" aria-labelledby="contents-title">
+        <h2 id="contents-title">RUNBOOK</h2>
+        <nav aria-label="Guide sections">
+          <ol>
+            <li><a href="#identify">Fix identity</a></li>
+            <li><a href="#compare">Know the mechanics</a></li>
+            <li><a href="#depth">Screen like-for-like</a></li>
+            <li><a href="#economics">Reconstruct net outcome</a></li>
+            <li><a href="#ownership">Test and falsify</a></li>
+            <li><a href="#coverage">Respect evidence bounds</a></li>
+            <li><a href="#analysis">Use the tool directory</a></li>
+            <li><a href="#api">Query the API</a></li>
+          </ol>
+        </nav>
+        <div class="contents-status">
+          <span>MODE</span>
+          <strong>OBSERVE / TEST</strong>
+          <small>NO WALLET REQUIRED</small>
+        </div>
+      </aside>
+
+      <article class="guide-article">
+        <section id="identify" class="guide-section" aria-labelledby="identify-title">
+          <header class="section-head">
+            <span class="step-number">01</span>
+            <div>
+              <p>IDENTITY BEFORE METRICS</p>
+              <h2 id="identify-title">Verify the chain, tokens, and pool identity</h2>
+            </div>
+          </header>
+          <div class="section-body">
+            <p>Robinhood Chain mainnet is chain ID <code>4663</code>; its testnet is <code>46630</code>. Treat data from either network as a different dataset, even when names and symbols match. The official connection page publishes both IDs and separate explorers/RPC hosts. <a href="https://docs.robinhood.com/chain/connecting">[Robinhood: connecting]</a></p>
+            <ol class="check-sequence">
+              <li><strong>Assets:</strong> record chain ID, full token0 and token1 contract addresses, decimals, and price orientation. A bridged ERC-20 can have a different L2 address from its Ethereum address. <a href="https://docs.robinhood.com/chain/bridging">[Robinhood: bridging]</a></li>
+              <li><strong>Token controls:</strong> on the <a href="https://robinhoodchain.blockscout.com/">mainnet Blockscout</a>, inspect verified source, proxy implementation, owner/roles, pausing, freezing or blacklisting, mint/burn controls, and recent admin transactions. “Verified source” means published code is available for inspection; it is not a safety verdict. <a href="https://docs.blockscout.com/devs/verification">[Blockscout: verification]</a></li>
+              <li><strong>v3 pool:</strong> record the pool contract address, both token addresses, fee tier, tick spacing, current tick, and observation block. A pair symbol is not enough. <a href="https://uniswap.org/whitepaper-v3.pdf">[v3 whitepaper §§3.1, 6.1]</a></li>
+              <li><strong>v4 pool:</strong> record the entire <code>PoolKey</code>: <code>(currency0, currency1, fee, tickSpacing, hooks)</code>. Core computes <code>PoolId = keccak256(abi.encode(PoolKey))</code>. <a href="https://github.com/Uniswap/v4-core/blob/main/src/types/PoolKey.sol">[v4 PoolKey source]</a> <a href="https://github.com/Uniswap/v4-core/blob/main/src/types/PoolId.sol">[v4 PoolId source]</a></li>
+              <li><strong>Observation:</strong> attach block number, timestamp, source URL/API route, requested window, and coverage state to every copied number.</li>
+            </ol>
+            <div class="callout caution">
+              <strong>USDG IS A TOKEN, NOT THE UNIT “FIAT USD”</strong>
+              <p>This terminal uses USDG as a quote basis where stated. Paxos describes USDG as a dollar-pegged stablecoin and says it is redeemable from Paxos one-for-one, with reserve composition and attestations published separately. That issuer claim does not turn a USDG-denominated mark into a fiat oracle or remove market, contract, access, redemption, bridge, or issuer risk. Verify the exact chain contract and current terms. <a href="https://docs.paxos.com/stablecoin/usdg">[Paxos USDG overview]</a> <a href="https://www.paxos.com/usdg-transparency">[USDG attestations]</a></p>
+            </div>
+          </div>
+        </section>
+
+        <section id="compare" class="guide-section" aria-labelledby="compare-title">
+          <header class="section-head">
+            <span class="step-number">02</span>
+            <div>
+              <p>MECHANICS / V3 + V4</p>
+              <h2 id="compare-title">V3 and V4 liquidity mechanics</h2>
+            </div>
+          </header>
+          <div class="section-body">
+            <div class="comparison-grid">
+              <article>
+                <h3>ACTIVE RANGE</h3>
+                <p>In v3 and v4, a position earns swap fees only while spot is inside its range. Beyond an edge it is inactive and becomes one-sided; it resumes if price re-enters. <a href="https://developers.uniswap.org/docs/get-started/concepts/liquidity-providers/concentrated-liquidity">[Uniswap: concentrated liquidity]</a></p>
+              </article>
+              <article>
+                <h3>TICKS</h3>
+                <p>Ticks are discrete price boundaries; one tick is a 0.01% price step. Lower/upper ticks bound a position, while tick spacing limits which ticks can initialize. Crossing an initialized boundary changes active liquidity. <a href="https://developers.uniswap.org/docs/get-started/concepts/liquidity-providers/concentrated-liquidity">[Uniswap: ticks]</a></p>
+              </article>
+              <article>
+                <h3>FEES</h3>
+                <p>Swap fees accrue pro rata to liquidity active at the swap. In v3/v4 they sit as position claims rather than compounding automatically and must be collected. A collectible fee is revenue; inventory loss and costs can still make the position unprofitable. <a href="https://developers.uniswap.org/docs/get-started/concepts/fees">[Uniswap: fees]</a> <a href="https://uniswap.org/whitepaper-v3.pdf">[v3 whitepaper §3.2.1]</a></p>
+              </article>
+              <article>
+                <h3>V4 FEE MODE</h3>
+                <p>A v4 pool’s dynamic-fee capability is fixed at creation, but its LP fee can later update through <code>PoolManager.updateDynamicLPFee</code> or per swap through <code>beforeSwap</code>. Record fee mode, current rate, rate history, and setter logic—not one displayed rate. <a href="https://developers.uniswap.org/docs/protocols/v4/concepts/dynamic-fees">[Uniswap: dynamic fees]</a></p>
+              </article>
+            </div>
+            <p>A v4 hook is an external contract fixed in the PoolKey. It may run before/after initialization, swaps, liquidity changes, or donations. Return-delta permissions can change operation balances; custom accounting can add hook fees or replace native concentrated-liquidity pricing with custom logic. <a href="https://developers.uniswap.org/docs/protocols/v4/concepts/hooks">[Uniswap: hooks]</a> <a href="https://developers.uniswap.org/docs/protocols/v4/guides/custom-accounting">[Uniswap: custom accounting]</a></p>
+            <ul class="risk-list">
+              <li><strong>Read permissions:</strong> decode the hook address flags and compare them with implemented callbacks.</li>
+              <li><strong>Read authority:</strong> identify owner, proxy, upgrade path, timelock, pauser, fee recipient, oracle and parameter setters.</li>
+              <li><strong>Read dependencies:</strong> list external calls, bridges, lending systems, oracles, unusual token behavior, and failure modes.</li>
+              <li><strong>Read deltas:</strong> determine whether the hook can take a fee, alter input/output, hold assets, rehypothecate, or bypass native swap math.</li>
+            </ul>
+            <div class="callout critical">
+              <strong>HOOK REVIEW IS PART OF POOL REVIEW</strong>
+              <p>The Uniswap Foundation security framework flags accounting, external calls, math, dependencies, upgradeability, autonomous updates, and price-impacting behavior as separate hook risks; its worksheet is self-assessment, not certification. An audit is evidence, not a guarantee. <a href="https://developers.uniswap.org/docs/protocols/v4/security">[v4 hook security framework]</a></p>
+            </div>
+          </div>
+        </section>
+
+        <section id="depth" class="guide-section" aria-labelledby="depth-title">
+          <header class="section-head">
+            <span class="step-number">03</span>
+            <div>
+              <p>SCREEN / SAME POOL / SAME WINDOW</p>
+              <h2 id="depth-title">Compare pool fees, activity, and depth</h2>
+            </div>
+          </header>
+          <div class="section-body">
+            <p>Choose the exact PoolId/address and a window <em>before</em> looking at rankings. Uniswap’s Explore instructions say pools can be sorted by TVL, pool/rewards APR, one-day or 30-day volume, and one-day volume/TVL, then filtered by network or name/address/symbol. Use those fields for discovery; in this terminal select the same explicit <code>1h</code>, <code>24h</code>, <code>7d</code>, <code>30d</code>, or <code>all</code> window for fees and volume. Never divide metrics from different windows, pools, end times, or valuation bases. <a href="https://support.uniswap.org/hc/en-us/articles/9818094509453-How-to-use-the-Uniswap-Explore-page">[Uniswap: Explore fields]</a> <a href="https://app.uniswap.org/explore/pools/robinhood/">[Robinhood pools]</a></p>
+            <div class="equation" aria-label="Pool screening ratios require the same pool and window">
+              <span>SAME-POOL DIAGNOSTICS</span>
+              <code>TURNOVER_W = VOLUME_W / TIME-WEIGHTED ACTIVE CAPITAL_W
+GROSS FEE DENSITY_W = FEES_W / TIME-WEIGHTED ACTIVE CAPITAL_W
+ACTIVE SHARE_t = ACTIVE VALUE_t / TOTAL VALUE_t</code>
+            </div>
+            <p>These are screens, not returns. A current active-capital snapshot is not the time-weighted denominator for a historical window. If only snapshots exist, label the ratio a rough proxy and do not annualize it. For dynamic-fee or hooked pools, <code>fees / volume</code> is an observed effective-rate diagnostic only when both fields share definitions and coverage.</p>
+            <div class="terminal-table-wrap" tabindex="0" aria-label="Pool screening workflow, horizontally scrollable">
+              <table>
+                <thead>
+                  <tr><th>SCREEN</th><th>RECORD</th><th>REJECT / INVESTIGATE WHEN</th></tr>
+                </thead>
+                <tbody>
+                  <tr><td>WINDOW</td><td>Start/end time, indexed-through block, volume, fees, swaps</td><td>Windows or coverage differ; missing is presented as zero</td></tr>
+                  <tr><td>CAPITAL</td><td>Total value, active value, valuation basis, as-of block</td><td>Only headline TVL exists or active denominator is a single late snapshot</td></tr>
+                  <tr><td>RANGE</td><td>Spot orientation, current tick, lower/upper ticks, distance to each edge, time active</td><td>Orientation is ambiguous or expected holding period exceeds untested edge distance</td></tr>
+                  <tr><td>DEPTH</td><td>Executable output/price impact for the same notional in both directions</td><td>Chart looks deep but the required size crosses gaps or many initialized ticks</td></tr>
+                  <tr><td>FLOW</td><td>Contract-verified swaps, notional, direction, source identity, post-trade markout</td><td>Headline volume cannot be joined to receipts/logs or is dominated by unverified source labels</td></tr>
+                  <tr><td>CONTROL</td><td>Hook, fee mode/history, token admins, proxies, oracles, fee recipients</td><td>Code or authority is unknown, mutable without acceptable controls, or cannot be simulated</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p>Depth is local to the path a trade crosses. Read the liquidity around spot and request quotes at the intended size in both directions; a total-value number does not reveal gaps, edge proximity, or slippage.</p>
+            <div class="callout critical">
+              <strong>NEVER SUM RAW <em>L</em> ACROSS POOLS</strong>
+              <p>Concentrated-liquidity <em>L</em> is virtual liquidity for a particular price interval. Its meaning depends on token ordering/decimals, price, range, and pool configuration. Compare value or executable depth on an explicit basis; do not add raw <em>L</em> across pools or treat it as dollars. <a href="https://uniswap.org/whitepaper-v3.pdf">[v3 whitepaper §§6.1–6.2]</a></p>
+            </div>
+          </div>
+        </section>
+
+        <section id="economics" class="guide-section" aria-labelledby="economics-title">
+          <header class="section-head">
+            <span class="step-number">04</span>
+            <div>
+              <p>ACCOUNTING / POSITION CASHFLOWS</p>
+              <h2 id="economics-title">Calculate net returns and benchmarks</h2>
+            </div>
+          </header>
+          <div class="section-body">
+            <div class="equation" aria-label="Net LP profit and loss includes position value, cashflows, and all operating costs">
+              <span>NET LP P/L AT T</span>
+              <code>MARKED OPEN POSITION_T + LP CASH WITHDRAWN/COLLECTED
+− LP CASH DEPOSITED − GAS − PREP/REBALANCE/EXIT SLIPPAGE − OTHER COSTS</code>
+            </div>
+            <p>Use actual token cashflows and one end-time price basis. If a removal contains principal and fees, count the transfer once. If collectible fees are already inside the marked position or a collected transfer, do not add them again. Include approvals, failed transactions, collections, bridge costs, inventory-preparation swaps, manager/hook fees, financing, and exit price impact where they apply.</p>
+            <div class="equation" aria-label="LP excess versus holding uses the same starting assets and timestamps">
+              <span>EXCESS VS HOLD</span>
+              <code>LP TERMINAL WEALTH_T − VALUE_T(UNTRADED STARTING TOKEN QUANTITIES)</code>
+            </div>
+            <p>For multiple deposits and withdrawals, use a cashflow-matched hold benchmark rather than one arbitrary start snapshot. State whether the comparison is versus holding, a continuously rebalanced inventory, or another deployment such as lending; these are different questions.</p>
+            <p>The loss-versus-rebalancing paper models LP return as a beta-like market exposure plus an alpha-like microstructure component: accrued fees minus losses to arbitrageurs. Its empirical result is for one Uniswap v2 ETH–USDC pool, while the paper’s framework discusses application to concentrated liquidity. It assumes a stylized continuous market and explicitly abstracts from gas and block discreteness, so its numerical finding is not a Robinhood Chain, v3, or v4 backtest. <a href="https://arxiv.org/abs/2208.06046">[Milionis et al.: LVR]</a></p>
+            <ul class="risk-list">
+              <li><strong>First benchmark:</strong> net result versus holding the same starting quantities over the same timestamps.</li>
+              <li><strong>Research benchmark:</strong> fees minus loss versus a strategy that repeatedly matches the AMM’s risky-asset inventory at an external reference price.</li>
+              <li><strong>Reality adjustment:</strong> subtract gas, execution, financing, hook/manager fees, taxes if applicable, and any cost omitted by the model.</li>
+              <li><strong>Unresolved data:</strong> if external reference prices, inventory through time, or complete cashflows are missing, LVR and net alpha are unknown—not zero.</li>
+            </ul>
+          </div>
+        </section>
+
+        <section id="ownership" class="guide-section" aria-labelledby="ownership-title">
+          <header class="section-head">
+            <span class="step-number">05</span>
+            <div>
+              <p>PUBLIC FLOW / TESTABLE ALPHA</p>
+              <h2 id="ownership-title">Research hypotheses and failure checks</h2>
+            </div>
+          </header>
+          <div class="section-body">
+            <p>The two public flow origins used here are <a href="https://apollo-copy.xylem-group.org">Apollo</a> and <a href="https://rhtrenches.com">rhtrenches</a>. Apollo exposes current-holdings/equity-history slots for traders it labels verified; the public view may be empty or require sign-in. rhtrenches exposes a bounded tape with time, side, token, size, trader label, contract and transaction links, and calls itself unofficial. These are selected observations—not complete market flow, verified beneficial ownership, intent, or proof that a trade traversed a particular pool.</p>
+            <p>For every candidate flow: copy the full token address and transaction hash; open the receipt/logs on <a href="https://robinhoodchain.blockscout.com/">Blockscout</a>; identify the actual pool/router and chain; resolve the exact PoolKey/address; then join it to same-window pool swaps and fees. A username, profile, calldata target, or token match alone is insufficient route evidence.</p>
+            <dl class="definition-grid">
+              <div>
+                <dt>MECHANIC</dt>
+                <dd>Established by deployed code or protocol documentation: range activation, fee accounting, PoolKey fields, hook callbacks.</dd>
+              </div>
+              <div>
+                <dt>OBSERVATION</dt>
+                <dd>A value tied to a source, exact identity, block/as-of, window and coverage. It can be partial without being false.</dd>
+              </div>
+              <div>
+                <dt>HYPOTHESIS</dt>
+                <dd>A predeclared relationship tested on future or held-out data, with a threshold and result that would reject it.</dd>
+              </div>
+            </dl>
+            <div class="terminal-table-wrap" tabindex="0" aria-label="LP hypotheses and falsifiers, horizontally scrollable">
+              <table>
+                <thead>
+                  <tr><th>HYPOTHESIS</th><th>TEST</th><th>FALSIFIED WHEN</th></tr>
+                </thead>
+                <tbody>
+                  <tr><td>Observed trader flow becomes fee-paying flow in this exact pool</td><td>Resolve receipts/logs to PoolId; measure same-window swaps, volume and fees; repeat on a held-out window</td><td>Transactions route elsewhere, cannot be resolved, or subsequent attributed flow/fees miss the predeclared minimum</td></tr>
+                  <tr><td>A narrower range improves capital use</td><td>Run a fixed range rule against a wider rule on the same price path; include inactive time, inventory, every rebalance and gas</td><td>Net result after costs fails to beat the wider rule or matched hold benchmark</td></tr>
+                  <tr><td>A dynamic-fee hook reduces adverse selection</td><td>Compare fee revenue minus post-trade markouts and hook fees with a matched static pool/rule at the same sizes and periods</td><td>Net markout-adjusted result is no better, or fee/authority behavior cannot be independently reconstructed</td></tr>
+                  <tr><td>Current flow is durable rather than one-source promotion</td><td>Measure share by verified origin/address and repeat across non-overlapping windows</td><td>Volume/fees collapse when the dominant source stops, or most source identity remains unverified</td></tr>
+                  <tr><td>Gross fees clear the opportunity-cost hurdle</td><td>Reconstruct position cashflows, compare with matched hold and declared alternative, then subtract all costs</td><td>Net excess is non-positive under the predeclared base case, or becomes unknown because required cashflows/prices are absent</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="callout neutral">
+              <strong>CANDIDATE KILL SWITCH</strong>
+              <p>Reject the candidate—not the data warning—when complete identity cannot be proven, required-size depth fails, the net result misses its declared benchmark, held-out flow fails, or token/hook authority exceeds the risk you specified before screening. Do not move the hurdle after seeing the result.</p>
+            </div>
+          </div>
+        </section>
+
+        <section id="coverage" class="guide-section" aria-labelledby="coverage-title">
+          <header class="section-head">
+            <span class="step-number">06</span>
+            <div>
+              <p>OBSERVATION BOUNDARIES</p>
+              <h2 id="coverage-title">Freshness, history, and coverage</h2>
+            </div>
+          </header>
+          <div class="section-body">
+            <div class="coverage-grid">
+              <article>
+                <span class="coverage-tag current">CURRENT</span>
+                <h3>BLOCK-PINNED STATE</h3>
+                <p>Spot, active liquidity, configuration or position state at a named block. It may be newer than durable history and cannot supply a historical denominator by itself.</p>
+              </article>
+              <article>
+                <span class="coverage-tag durable">DURABLE</span>
+                <h3>INDEXED THROUGH</h3>
+                <p>Events committed through the durable cursor. A requested window is complete only when the index reaches both its start and end.</p>
+              </article>
+              <article>
+                <span class="coverage-tag partial">PARTIAL</span>
+                <h3>KNOWN CATALOG / BOUNDED FEED</h3>
+                <p>This service’s verified pools and selected public-flow sources. Absence is not proof of no pool, no owner, or no activity elsewhere.</p>
+              </article>
+            </div>
+            <ul class="risk-list">
+              <li>Record source block/timestamp, indexed head, history start, requested window, omitted-row limits, valuation coverage, and any provisional suffix.</li>
+              <li>Keep unknown values <code>null</code>/unknown. Do not convert missing fees, prices, positions, gas, or history to zero.</li>
+              <li>A current position may predate the index. Without its opening quantities and intervening cashflows, net P/L and hold comparison are incomplete.</li>
+              <li>Custody addresses can aggregate many beneficial owners. Address activity proves an address acted; it does not prove who bore the economics or why.</li>
+              <li>Chain-wide dashboards, wallet APIs, Uniswap screens, and this terminal can use different prices, clocks, pool discovery, and fee definitions. Reconcile before comparing.</li>
+            </ul>
+            <div class="callout caution">
+              <strong>MAINNET / TESTNET CHECK</strong>
+              <p>Confirm <code>4663</code>, mainnet explorer hostname, contract address, and transaction receipt together. A testnet deployment or schema is not evidence of mainnet liquidity, volume, ownership, or profitability. <a href="https://docs.robinhood.com/chain/connecting">[official network table]</a></p>
+            </div>
+          </div>
+        </section>
+
+        <section id="analysis" class="guide-section" aria-labelledby="analysis-title">
+          <header class="section-head">
+            <span class="step-number">07</span>
+            <div>
+              <p>VERIFIED ROBINHOOD ECOSYSTEM TOOLS</p>
+              <h2 id="analysis-title">Robinhood ecosystem tools</h2>
+            </div>
+          </header>
+          <div class="section-body">
+            <p>Robinhood’s ecosystem page is a discovery list and explicitly says inclusion is not an endorsement or warranty. The shortlist below was checked against the linked product or documentation; none supplies a complete LP return by itself. <a href="https://docs.robinhood.com/chain/#ecosystem">[Robinhood ecosystem list]</a></p>
+            <div class="terminal-table-wrap" tabindex="0" aria-label="Robinhood Chain LP tool directory, horizontally scrollable">
+              <table>
+                <thead>
+                  <tr><th>TOOL</th><th>EXACT USE</th><th>LIMIT / DO NOT INFER</th></tr>
+                </thead>
+                <tbody>
+                  <tr><td><a href="https://app.uniswap.org/explore/pools/robinhood/">UNISWAP EXPLORE</a> / <a href="https://support.uniswap.org/hc/en-us/articles/40420536034061-The-Liquidity-Position-Details-Screen">POSITION SCREEN</a></td><td>Filter Robinhood pools; compare TVL/APR and one-day/30-day volume. For a held position, inspect token amounts, uncollected fees, min/max range and market price</td><td>APR/live aggregates are not reconstructed net return; USD displays can be unavailable. Neither screen replaces complete PoolKey/hook review or time-weighted active capital</td></tr>
+                  <tr><td><a href="https://robinhoodchain.blockscout.com/">BLOCKSCOUT</a> / <a href="https://docs.blockscout.com/devs/apis/rest">REST API</a></td><td>Resolve full contracts, verified source/proxies, transactions, receipts/logs, tokens and addresses; query instance <code>/api/v2/…</code></td><td>Verification and labels are not audits or beneficial-owner proof; pagination and indexing state matter</td></tr>
+                  <tr><td><a href="https://www.coingecko.com/en/chains/robinhood">COINGECKO ROBINHOOD</a></td><td>Cross-check token address pages, displayed prices/24H volume/market fields, and chain-level DEX discovery</td><td>Third-party aggregates and shortened pair labels do not establish exact pool route, local depth, fee attribution, or a USD oracle</td></tr>
+                  <tr><td><a href="https://arbdata.com/ecosystems/robinhood">ENTROPY / ARBDATA</a></td><td>View chain-level asset/stablecoin/tokenized-value KPIs and scoped time-series; the page says KPI cards use the latest available date</td><td>Macro context only—not a pool, range, fee, position, or execution-depth dataset</td></tr>
+                  <tr><td><a href="https://docs.allium.so/app/overview">ALLIUM APP</a> / <a href="https://www.allium.so/blog/supporting-robinhood-chain-at-launch/">COVERAGE NOTE</a></td><td>SQL/visualize indexed data; Allium’s mainnet launch note claims raw data, transfers, balances, DEX trades, prices, historical data and realtime APIs</td><td>Account/access required; Explorer API docs say enterprise-only. The public chain schema page checked is still labeled <a href="https://docs.allium.so/historical-data/supported-blockchains/evm/robinhood_testnet">Robinhood Testnet</a>, so confirm a mainnet schema and plan before use</td></tr>
+                  <tr><td><a href="https://developers.zerion.io/supported-blockchains">ZERION API</a></td><td>For chain key <code>robinhood</code>, cross-check wallet token positions and transaction history through authenticated API endpoints</td><td>Zerion’s support table marks Robinhood tokens/transactions/NFTs available but DeFi coverage unavailable; do not use it as LP-position completeness or P/L proof</td></tr>
+                  <tr><td><a href="https://data.morpho.org/chain/robinhood-chain">MORPHO DATA</a> / <a href="https://docs.morpho.org/developers/api/get-started/">API</a></td><td>Observe Robinhood lending APY, TVL, utilization, fees and history as a separately measured capital-deployment hurdle</td><td>Variable lending is not risk-free or a hold benchmark; it adds market, oracle, borrower, curator and contract risks. USDG values remain token-denominated</td></tr>
+                  <tr><td><a href="https://docs.rialto.xyz/developers/swap-api-overview">RIALTO SWAP API</a> / <a href="https://docs.arcus.xyz/concepts/spot-rfq">ARCUS SPOT RFQ</a></td><td>Compare a same-time, same-size external spot quote: Rialto returns route/output/fee breakdown; Arcus describes indicative liquidity and a signed minimum-output intent</td><td>API key or signing may be required; RFQ/PropAMM quotes are not resting Uniswap depth, an independent oracle, or evidence that candidate LPs earned the flow</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <ol class="execution-gates">
+              <li><span>01</span><div><strong>DISCOVER</strong><p>Use Uniswap/CoinGecko/arbdata to find a candidate, never to finalize identity.</p></div></li>
+              <li><span>02</span><div><strong>VERIFY</strong><p>Use Blockscout and protocol source to resolve tokens, PoolKey/address, hook, receipts and admins.</p></div></li>
+              <li><span>03</span><div><strong>MEASURE</strong><p>Use one clock/window and explicit active-capital, flow, markout, cashflow and coverage definitions.</p></div></li>
+              <li><span>04</span><div><strong>CHALLENGE</strong><p>Compare executable external quotes and declared benchmarks; reject on the prewritten falsifier.</p></div></li>
+            </ol>
+            <div class="callout neutral">
+              <strong>NOT LP ANALYTICS</strong>
+              <p><a href="https://robinhoodchain.lighter.xyz/">Lighter</a> is listed as a perpetuals DEX, Arcus documents separate <a href="https://docs.arcus.xyz/concepts/spot-rfq">spot RFQ</a> and <a href="https://docs.arcus.xyz/concepts/exchange-architecture">perpetuals</a> systems, <a href="https://docs.paxos.com/stablecoin/usdg">Paxos</a> documents USDG issuance, and <a href="https://data.morpho.org/chain/robinhood-chain">Morpho</a> is lending. They can supply context only when the instrument and timestamp match; none proves Uniswap pool economics.</p>
+            </div>
+          </div>
+        </section>
+
+        <section id="api" class="guide-section" aria-labelledby="api-title">
+          <header class="section-head">
+            <span class="step-number">08</span>
+            <div>
+              <p>LOCAL VERIFIED CATALOG / MACHINE READABLE</p>
+              <h2 id="api-title">Token-to-pool API</h2>
+            </div>
+          </header>
+          <div class="section-body">
+            <p>The public endpoint accepts one full token contract and returns verified known catalog matches where it appears on either currency side. It is a discovery query, not proof of all pools deployed on chain.</p>
+            <div class="api-example">
+              <span>REQUEST</span>
+              <code>GET /api/v1/pools?token={TOKEN_CONTRACT_ADDRESS}</code>
+            </div>
+            <form class="api-form" action="/api/v1/pools" method="get">
+              <label for="token-address">TOKEN CONTRACT ADDRESS</label>
+              <div>
+                <input id="token-address" name="token" type="text" inputmode="text" autocomplete="off" spellcheck="false" pattern="0x[a-fA-F0-9]{40}" aria-describedby="token-address-hint" required>
+                <button type="submit">QUERY POOLS</button>
+              </div>
+              <small id="token-address-hint">Enter the complete 42-character 0x address. The response opens as JSON.</small>
+            </form>
+            <ol class="check-sequence">
+              <li>Confirm the response chain, token addresses, protocol, complete pool identity, hook/fee mode, and pool link.</li>
+              <li>Record current-state block separately from durable indexed head and requested window.</li>
+              <li>Preserve unknown fields and precision-safe integer strings; do not coerce them to zero or floating-point approximations.</li>
+              <li>For schemas and field semantics, use the <a href="/api/v1/openapi.json">OpenAPI document</a>; for owner/custody evidence use the <a href="/research">research view</a> with its returned limitations.</li>
+            </ol>
+            <div class="callout neutral">
+              <strong>PRIMARY SOURCES</strong>
+              <p><a href="https://developers.uniswap.org/docs/get-started/concepts/liquidity-providers/concentrated-liquidity">Concentrated liquidity/ticks</a> · <a href="https://developers.uniswap.org/docs/get-started/concepts/fees">fee accounting</a> · <a href="https://github.com/Uniswap/v4-core/blob/main/src/types/PoolKey.sol">v4 PoolKey</a> · <a href="https://developers.uniswap.org/docs/protocols/v4/concepts/dynamic-fees">dynamic fees</a> · <a href="https://developers.uniswap.org/docs/protocols/v4/concepts/hooks">hooks</a> · <a href="https://developers.uniswap.org/docs/protocols/v4/guides/custom-accounting">custom accounting</a> · <a href="https://arxiv.org/abs/2208.06046">LVR paper</a> · <a href="https://docs.robinhood.com/chain/">Robinhood Chain/ecosystem</a>.</p>
+            </div>
+          </div>
+        </section>
+
+        <section class="final-check" aria-labelledby="final-check-title">
+          <div>
+            <p>GO / NO-GO RECORD</p>
+            <h2 id="final-check-title">Pre-deposit checklist</h2>
+          </div>
+          <ul>
+            <li>I recorded mainnet chain ID, both token contracts, exact PoolKey/address, hook, fee mode, and as-of block.</li>
+            <li>I compared fees, volume, active/total capital, range and executable depth on compatible windows and bases.</li>
+            <li>I reconstructed net cashflows after gas/slippage and compared them with matched hold and declared alternatives.</li>
+            <li>I resolved claimed flow to receipts/logs, quantified source concentration, and tested a held-out window.</li>
+            <li>I wrote the falsifier first and kept unknown coverage, token powers, and hook authority visible.</li>
+          </ul>
+        </section>
+      </article>
+    </div>
+  </main>
+
+  <footer class="site-footer">
+    <p>Independent community tooling. Not affiliated with Robinhood, Uniswap, or any data, RPC, wallet, or infrastructure provider.</p>
+    <nav aria-label="Footer navigation"><a href="/">TERMINAL</a><a href="/pools">POOLS</a><a href="/research">RESEARCH</a><a href="/api/v1/openapi.json">OPENAPI</a><a class="source-link" href="https://github.com/wock9000/robinhoodpools#license" target="_blank" rel="noopener noreferrer" title="Copyright 2026 RobinhoodPools contributors · AGPL-3.0-only · no warranty · corresponding source">SOURCE / AGPL-3.0</a></nav>
+  </footer>
+</body>
+</html>

@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#000000">
+  <meta name="description" content="Read-only, evidence-qualified public activity from selectable Apollo and RH Trenches sources.">
+  <title>Public Flow / Robinhood Pools</title>
+  <link rel="stylesheet" href="/static/lp_flow.css">
+</head>
+<body>
+  <a class="skip-link" href="#flow-content">SKIP TO FLOW</a>
+
+  <header class="terminal-header">
+    <div class="identity-line">
+      <a class="product" href="/">ROBINHOOD POOLS</a>
+      <span class="slash">/</span>
+      <strong>PUBLIC FLOW</strong>
+      <span class="read-only"><i aria-hidden="true"></i>READ ONLY</span>
+      <time id="clock" datetime="">--:--:-- UTC</time>
+    </div>
+    <nav aria-label="Primary navigation">
+      <a href="/">TERMINAL</a>
+      <a href="/pools">POOLS</a>
+      <a href="/research">LP RESEARCH</a>
+      <a href="/guide">GUIDE</a>
+      <a href="/api/v1/fomo/flow">JSON</a>
+    </nav>
+  </header>
+
+  <main id="flow-content">
+    <section class="hero" aria-labelledby="page-title">
+      <div class="hero-title">
+        <p id="source-eyebrow" class="eyebrow">PUBLISHED SOURCE EVENTS</p>
+        <h1 id="page-title">PUBLIC FLOW</h1>
+      </div>
+      <details class="source-details">
+        <summary>SOURCE COVERAGE + DATA BOUNDARY</summary>
+        <div class="source-details-body">
+          <p id="source-summary" class="summary">A bounded view of published public flow. Sources, identities, clocks, and coverage remain separate.</p>
+          <dl class="source-card">
+            <div><dt>SOURCE</dt><dd id="source-name">APOLLO FLOWPAGE</dd></div>
+            <div><dt>ACCESS</dt><dd id="source-access">ANONYMOUS PUBLIC READ</dd></div>
+            <div><dt>CHAIN SET</dt><dd id="source-chains">SOLANA · BASE · ROBINHOOD</dd></div>
+            <div><dt>POOL JOIN</dt><dd class="warn">NOT PROVIDED</dd></div>
+          </dl>
+        </div>
+      </details>
+    </section>
+
+    <section class="controls" aria-labelledby="filters-title">
+      <div class="section-label">
+        <span>01</span>
+        <h2 id="filters-title">FLOW FILTERS</h2>
+      </div>
+      <form id="flow-form">
+        <label>SOURCE
+          <select id="source-select" name="source">
+            <option value="apollo">APOLLO FLOWPAGE</option>
+            <option value="rhtrenches">RH TRENCHES TAPE</option>
+          </select>
+        </label>
+        <label>CHAIN
+          <select id="chain-select" name="chain">
+            <option value="">3 CHAINS</option>
+            <option value="solana">SOLANA</option>
+            <option value="base">BASE</option>
+            <option value="robinhood">ROBINHOOD</option>
+          </select>
+        </label>
+        <label>IDENTITY EVIDENCE
+          <select id="verified-select" name="verified">
+            <option value="false">ALL OBSERVATIONS</option>
+            <option value="true">VERIFIED FOMO ONLY</option>
+          </select>
+        </label>
+        <label>UPSTREAM PAGE
+          <select id="limit-select" name="limit">
+            <option value="25">25 EVENTS</option>
+            <option value="50" selected>50 EVENTS</option>
+            <option value="100">100 EVENTS</option>
+          </select>
+        </label>
+        <button type="submit">REFRESH</button>
+      </form>
+      <div class="request-line" aria-live="polite">
+        <span id="request-state" class="request-state">READY</span>
+        <span id="request-detail">Awaiting the public flow page.</span>
+      </div>
+    </section>
+
+    <section id="error-panel" class="error-panel" role="alert" hidden>
+      <div><strong>UPSTREAM FLOW UNAVAILABLE</strong><p id="error-message"></p></div>
+      <button id="retry-button" type="button">RETRY</button>
+    </section>
+
+    <section id="coverage-warning" class="coverage-warning" role="status" aria-live="polite" hidden></section>
+
+    <div id="results" hidden>
+      <details class="evidence-strip source-details">
+        <summary class="section-label">
+          <span>02</span>
+          <strong id="evidence-title" class="boundary-heading">SOURCE EVIDENCE</strong>
+        </summary>
+        <dl id="evidence-grid" class="metric-grid"></dl>
+        <p id="evidence-note" class="section-note"></p>
+      </details>
+
+      <section class="flow-section" aria-labelledby="events-title">
+        <header class="section-head">
+          <div class="section-label">
+            <span>03</span>
+            <h2 id="events-title">EVENTS</h2>
+          </div>
+          <div class="pager" aria-label="Flow page navigation">
+            <button id="newer-button" type="button" disabled>← NEWER</button>
+            <span id="page-number">PAGE 1</span>
+            <button id="older-button" type="button" disabled>OLDER →</button>
+          </div>
+        </header>
+        <div class="legend" aria-label="Evidence legend">
+          <span id="verified-legend"><i class="dot verified"></i>VERIFIED FOMO</span>
+          <span><i class="dot observed"></i>OBSERVED WALLET</span>
+          <span id="action-legend">OPEN / INCREASE / DECREASE / CLOSE ARE SOURCE ACTIONS — NOT RECOMMENDATIONS</span>
+        </div>
+        <div class="table-wrap" tabindex="0" aria-label="Published public source flow events">
+          <table>
+            <thead>
+              <tr>
+                <th>OCCURRED</th>
+                <th>CHAIN</th>
+                <th>ACTION</th>
+                <th>ASSET</th>
+                <th>IDENTITY</th>
+                <th class="numeric">OBSERVED SIZE</th>
+                <th class="numeric">FILL PRICE</th>
+                <th class="numeric">POSITION BEFORE → AFTER</th>
+                <th>EVIDENCE</th>
+              </tr>
+            </thead>
+            <tbody id="flow-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <details class="boundary-section">
+        <summary class="section-label">
+          <span>04</span>
+          <strong id="boundary-title">DATA BOUNDARIES</strong>
+        </summary>
+        <div class="boundary-grid">
+          <article>
+            <strong>IDENTITY</strong>
+            <p><code>observed-wallet</code> means the selected publisher associated a handle and address with the row. Only Apollo can publish <code>verified-fomo</code> in this adapter; source boundaries never upgrade identity.</p>
+          </article>
+          <article>
+            <strong>TIME</strong>
+            <p>Apollo supplies occurred and durable-observed clocks. RH Trenches supplies Unix event time but no per-row observation time. Server read and consumer retrieval remain transport clocks.</p>
+          </article>
+          <article>
+            <strong>POOL ATTRIBUTION</strong>
+            <p>Neither selected projection supplies an approved exact same-transaction pool route. This page creates no pool link and makes no LP-behavior claim.</p>
+          </article>
+          <article>
+            <strong>COVERAGE</strong>
+            <p>Apollo covers its supported Solana/Base/Robinhood set. RH Trenches is Robinhood-only and tracked-wallet-only. Neither is all-chain or all-wallet coverage.</p>
+          </article>
+        </div>
+        <aside class="source-comparison">
+          <strong>EXCLUDED SOURCE</strong>
+          <p><a href="https://wochovy.org/#traders" target="_blank" rel="noopener noreferrer">Wochovy</a> anonymously proxies keyed <a href="https://fomoapi.io/" target="_blank" rel="noopener noreferrer">FomoAPI</a> data and adds reputation, signals, consensus, narratives, and theses. It is not used to bypass the upstream's paid access or licensing. Direct FomoAPI use requires a bearer key and an explicit product redistribution/license agreement; see the <a href="https://api.fomoapi.io/v1" target="_blank" rel="noopener noreferrer">provider API description</a>.</p>
+        </aside>
+        <ul id="limitations-list" class="limitations"></ul>
+      </details>
+    </div>
+  </main>
+
+  <footer>
+    <span id="footer-state">NO PAGE LOADED</span>
+    <a class="source-link" href="https://github.com/wock9000/robinhoodpools#license" target="_blank" rel="noopener noreferrer" title="Copyright 2026 RobinhoodPools contributors · AGPL-3.0-only · no warranty · corresponding source">SOURCE</a>
+    <span>PUBLIC FACTS · NO COPY · NO EXECUTION</span>
+  </footer>
+  <script src="/static/lp_flow.js" defer></script>
+</body>
+</html>

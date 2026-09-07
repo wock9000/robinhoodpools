@@ -1,0 +1,18 @@
+:root {
+  --rhp-black: #000;
+  --rhp-text: #d8d8d8;
+  --rhp-white: #e8e8e8;
+  --rhp-cyan: #5fd7ff;
+  --rhp-green: #5ff05f;
+  --rhp-red: #ff5c5c;
+  --rhp-yellow: #e5e500;
+  --rhp-dim: #7a7a7a;
+  --rhp-dimmer: #494949;
+  --rhp-line: #242424;
+  --rhp-panel: #070707;
+  --rhp-panel-raised: #0b0b0b;
+  --rhp-mono: "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  color-scheme: dark;
+}
+
+.source-link { flex: none; color: var(--rhp-cyan); white-space: nowrap; }

@@ -1,0 +1,16 @@
+[Unit]
+Description=Probe and conservatively recover RHPools availability
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/robinhoodpools
+Environment=PATH=/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONPATH=%h/robinhoodpools/src
+ExecStart=%h/robinhoodpools/.venv/bin/python -m rhpools.lp_healthcheck --origin-url http://127.0.0.1:8196 --public-url https://rhpools.lol --state-path %h/.local/state/rhpools/lp-healthcheck.json --timeout 3 --app-unit robinhoodpools.service --tunnel-unit robinhoodpools-tunnel.service
+TimeoutStartSec=25s
+NoNewPrivileges=true
+UMask=0077
+StandardOutput=journal
+StandardError=journal

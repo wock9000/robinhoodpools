@@ -1,0 +1,29 @@
+{
+  "config": {
+    "ingress": [
+      {
+        "hostname": "robinhoodpools.lol",
+        "path": "^(/|/lp|/pools|/pool|/guide|/research|/flow|/static/(lp_theme|lp_terminal|lp_panes_boot|lp_guide|lp_research|lp_flow|workbench)\\.(css|js)|/api/v1/(pools|assets|research/owner|fomo/flow|openapi.json)|/api/lp/(status|overview|pools|tape|owners|closed|owner|search|stream|allocation)|/api/workbench/(pools|pool|stream|capabilities))$",
+        "service": "http://127.0.0.1:8196"
+      },
+      {
+        "hostname": "www.robinhoodpools.lol",
+        "path": "^(/|/lp|/pools|/pool|/guide|/research|/flow|/static/(lp_theme|lp_terminal|lp_panes_boot|lp_guide|lp_research|lp_flow|workbench)\\.(css|js)|/api/v1/(pools|assets|research/owner|fomo/flow|openapi.json)|/api/lp/(status|overview|pools|tape|owners|closed|owner|search|stream|allocation)|/api/workbench/(pools|pool|stream|capabilities))$",
+        "service": "http://127.0.0.1:8196"
+      },
+      {
+        "hostname": "rhpools.lol",
+        "path": "^(/|/lp|/pools|/pool|/guide|/research|/flow|/static/(lp_theme|lp_terminal|lp_panes_boot|lp_guide|lp_research|lp_flow|workbench)\\.(css|js)|/api/v1/(pools|assets|research/owner|fomo/flow|openapi.json)|/api/lp/(status|overview|pools|tape|owners|closed|owner|search|stream|allocation)|/api/workbench/(pools|pool|stream|capabilities))$",
+        "service": "http://127.0.0.1:8196"
+      },
+      {
+        "hostname": "www.rhpools.lol",
+        "path": "^(/|/lp|/pools|/pool|/guide|/research|/flow|/static/(lp_theme|lp_terminal|lp_panes_boot|lp_guide|lp_research|lp_flow|workbench)\\.(css|js)|/api/v1/(pools|assets|research/owner|fomo/flow|openapi.json)|/api/lp/(status|overview|pools|tape|owners|closed|owner|search|stream|allocation)|/api/workbench/(pools|pool|stream|capabilities))$",
+        "service": "http://127.0.0.1:8196"
+      },
+      {
+        "service": "http_status:404"
+      }
+    ]
+  }
+}

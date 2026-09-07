@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#000000">
+  <title>Pool / Robinhood Pools</title>
+  <link rel="stylesheet" href="/static/workbench.css">
+</head>
+<body>
+  <header class="terminal-bar">
+    <div class="terminal-id"><a id="owner-back-link" href="/lp" aria-label="Back to selected LP detail">← LP DETAIL</a><a href="/pools" aria-label="Browse LP pools">POOL TAPE</a><span>CHAIN 4663</span><a class="source-link" href="https://github.com/wock9000/robinhoodpools#license" target="_blank" rel="noopener noreferrer" title="Copyright 2026 RobinhoodPools contributors · AGPL-3.0-only · no warranty · corresponding source">SOURCE</a></div>
+    <button id="pool-switcher" class="pool-switcher" type="button" aria-expanded="false" aria-controls="catalog-panel">
+      <span>POOL</span><b id="switcher-pair">SELECT POOL</b><i aria-hidden="true">⌄</i>
+    </button>
+    <div class="terminal-health">
+      <span id="catalog-health" role="status">CONNECTING</span>
+      <span id="catalog-asof" class="mono">—</span>
+      <span id="global-clock" class="mono">—</span>
+    </div>
+    <button id="mobile-action-open" class="action-open" type="button">LP ACTIONS</button>
+    <button id="embedded-close" class="embedded-only quiet-button" type="button" aria-label="Close pool workbench">CLOSE</button>
+  </header>
+
+  <aside id="catalog-panel" class="catalog-panel" aria-label="Pool switcher" aria-hidden="true" inert>
+    <header class="popover-head">
+      <strong>SELECT POOL</strong>
+      <span id="pool-count" class="mono">—</span>
+      <button id="catalog-close" class="icon-button" type="button" aria-label="Close pool switcher">×</button>
+    </header>
+    <label class="search-field" for="pool-search">
+      <span class="sr-only">Search by pair, protocol, or address</span>
+      <span aria-hidden="true">/</span>
+      <input id="pool-search" type="search" autocomplete="off" spellcheck="false" placeholder="pair, protocol, address">
+      <kbd>/</kbd>
+    </label>
+    <div class="catalog-controls">
+      <div id="kind-filter" class="segmented" aria-label="Protocol version filter">
+        <button class="is-active" type="button" data-kind="">ALL</button>
+        <button type="button" data-kind="v2">V2</button>
+        <button type="button" data-kind="v3">V3</button>
+        <button type="button" data-kind="v4">V4</button>
+      </div>
+      <label class="select-label" for="pool-sort"><span>ORDER</span>
+        <select id="pool-sort"><option value="activity">ACTIVITY</option><option value="liquidity">LIQUIDITY</option><option value="fees">FEES</option></select>
+      </label>
+    </div>
+    <div id="catalog-summary" class="protocol-summary" aria-label="Pool counts by version"></div>
+    <details id="catalog-coverage" class="coverage-details is-hidden"><summary>INDEX STATUS</summary><div id="catalog-error" class="inline-notice" role="alert"></div></details>
+    <div id="pool-list" class="pool-list" aria-live="polite" aria-busy="true"></div>
+    <nav class="pagination" aria-label="Pool pages">
+      <button id="page-prev" class="quiet-button" type="button" disabled>← PREV</button>
+      <span id="page-label" class="mono">—</span>
+      <button id="page-next" class="quiet-button" type="button" disabled>NEXT →</button>
+    </nav>
+  </aside>
+  <div id="catalog-scrim" class="popover-scrim is-hidden" aria-hidden="true"></div>
+
+  <main class="application-shell">
+    <section id="pool-workbench" class="pool-workbench" aria-label="Selected pool LP workbench">
+      <div id="pool-empty" class="pool-empty">
+        <strong>LOADING POOL</strong><span>Reading current chain state.</span>
+      </div>
+
+      <div id="pool-content" class="pool-content is-hidden">
+        <header class="pool-header">
+          <div class="pool-title-block">
+            <div class="pool-heading-line">
+              <h1 id="selected-pair">POOL —</h1>
+              <span id="selected-kind" class="kind-stamp">—</span>
+              <span id="selected-protocol">—</span>
+              <span id="pool-live-badge" class="live-badge is-stale"><i aria-hidden="true"></i><b>WAITING</b></span>
+              <span id="pool-block" class="pool-block mono">BLOCK —</span>
+            </div>
+            <div class="pool-meta">
+              <button id="selected-address" class="copy-address mono" type="button" title="Copy pool identifier">—</button>
+              <span>OWNER</span><button id="owner-toggle" class="owner-button mono" type="button" title="Change watched beneficial owner or custody address">NOT SET</button><a id="owner-detail-link" class="owner-detail-link" href="/lp">LP DETAIL →</a><button id="embedded-open-owner" class="embedded-only owner-detail-link" type="button">LP DETAIL →</button>
+            </div>
+          </div>
+          <div class="spot-quote">
+            <span id="spot-label">QUOTE PER BASE</span>
+            <strong id="spot-price">—</strong>
+            <small id="spot-tick" class="mono">TICK —</small>
+          </div>
+        </header>
+
+        <form id="owner-form" class="owner-form is-hidden">
+          <label for="owner-input">READ-ONLY OWNER</label>
+          <input id="owner-input" class="mono" type="text" spellcheck="false" autocomplete="off" value="" placeholder="0x…">
+          <button type="submit">WATCH</button>
+          <span>Read-only; no signature.</span>
+        </form>
+
+        <details id="pool-coverage" class="coverage-details pool-coverage is-hidden">
+          <summary>STATUS DETAILS</summary><div id="pool-error" class="inline-notice" role="alert"></div>
+        </details>
+
+        <section class="primary-grid">
+          <article class="chart-card" aria-labelledby="liquidity-title">
+            <header class="panel-head chart-header">
+              <div><h2 id="liquidity-title">LIQUIDITY DEPTH</h2><span id="axis-orientation">PRICE · QUOTE PER BASE</span></div>
+              <div class="chart-tools">
+                <span id="chart-mode" class="chart-mode is-live" data-mode="live">LIVE</span>
+                <button id="invert-price" class="quiet-button" type="button" aria-pressed="false">INVERSE</button>
+                <button id="return-live" class="live-return is-hidden" type="button">LIVE</button>
+                <button id="fit-chart" class="icon-button" type="button" aria-label="Fit all liquidity" title="Fit all liquidity">FIT</button>
+              </div>
+            </header>
+            <div id="chart-frame" class="chart-frame">
+              <canvas id="liquidity-chart" class="liquidity-chart" tabindex="0" role="img" aria-label="Pool liquidity by initialized tick. Swipe horizontally to pan, pinch or use plus and minus to zoom, and swipe vertically to scroll the page."></canvas>
+              <div id="chart-loading" class="chart-message">WAITING FOR LIVE LIQUIDITY</div>
+              <div id="chart-readout" class="chart-readout is-hidden" aria-hidden="true">
+                <span id="readout-price">—</span><b id="readout-liquidity">—</b><small id="readout-detail">—</small>
+              </div>
+            </div>
+            <footer class="chart-footer">
+              <div class="chart-legend"><span><i class="market-swatch"></i>POOL</span><span><i class="ours-swatch"></i>OWNED</span><span><i class="participant-swatch"></i>SELECTED</span><span><i class="preview-swatch"></i>PLAN</span><span><i class="spot-swatch"></i>SPOT</span></div>
+              <span title="Drag or swipe horizontally to pan; wheel or pinch to zoom; arrows pan; Home returns live.">PAN · PINCH · HOME LIVE</span>
+            </footer>
+          </article>
+        </section>
+
+        <section class="secondary-stack" aria-label="Optional pool detail">
+          <details class="secondary-panel metrics-panel">
+            <summary><b>OWNER METRICS</b><span>LIQUIDITY / SHARE / PRINCIPAL</span></summary>
+            <section class="metric-row" aria-label="LP state">
+              <article><span>POOL L</span><strong id="metric-liquidity" class="mono">—</strong><small id="metric-block">BLOCK —</small></article>
+              <article><span>OWNED L</span><strong id="metric-tvl" class="mono">—</strong><small id="metric-tvl-note">RAW</small></article>
+              <article><span>ACTIVE SHARE</span><strong id="metric-volume">—</strong><small id="metric-swaps">AT SPOT</small></article>
+              <article><span>PRINCIPAL</span><strong id="metric-fees">—</strong><small id="metric-fee-tier">CURRENT</small></article>
+              <article><span>POSITIONS</span><strong id="metric-ranges">—</strong><small id="metric-ranges-note">IN / TOTAL</small></article>
+            </section>
+          </details>
+
+          <details id="pool-tools" class="allocation-panel">
+            <summary><b>RANGE / ALLOCATION TOOLS</b><span>ANALYSIS · REPLAY · READ-ONLY</span></summary>
+            <div class="tools-grid">
+              <section class="allocator-editor" aria-labelledby="allocator-title">
+                <header class="panel-head allocator-head">
+                  <div><h2 id="allocator-title">RANGE ALLOCATION</h2><span>ANALYTICAL · NO SIGNATURE</span></div>
+                  <b id="alloc-position-count" class="mono">1 POSITION</b>
+                </header>
+                <div class="allocator-body">
+                  <div id="alloc-presets" class="preset-row" role="group" aria-label="Range presets">
+                    <button type="button" data-preset="narrow">NARROW ±2%</button>
+                    <button type="button" data-preset="wide">WIDE ±10%</button>
+                    <button type="button" data-preset="full">FULL</button>
+                  </div>
+                  <div class="allocator-settings">
+                    <label for="alloc-capital"><span>CAPITAL · QUOTE</span><input id="alloc-capital" type="text" inputmode="decimal" autocomplete="off" value="10000"></label>
+                    <label for="alloc-shape"><span>DISTRIBUTION</span><select id="alloc-shape"><option value="uniform">SINGLE / UNIFORM</option><option value="curve">CURVE · CENTER HEAVY</option><option value="bid_ask">BID / ASK · EDGE HEAVY</option></select></label>
+                    <label for="alloc-bands"><span>REAL POSITIONS</span><input id="alloc-bands" type="number" min="2" max="12" step="1" value="5" disabled></label>
+                    <label for="alloc-history-window"><span>REPLAY WINDOW</span><select id="alloc-history-window"><option value="1h">1H</option><option value="24h" selected>24H</option><option value="7d">7D</option><option value="30d">30D</option><option value="all">ALL INDEXED</option></select></label>
+                  </div>
+                  <div class="allocator-boundaries" role="group" aria-label="Synchronized range boundaries">
+                    <div class="boundary-head"><span>BOUND</span><span>PRICE</span><span>TICK</span><span>% SPOT</span></div>
+                    <div class="boundary-row" data-boundary="lower"><b>LOWER</b><input id="alloc-price-lower" aria-label="Lower boundary price" type="text" inputmode="decimal"><input id="alloc-tick-lower" aria-label="Lower boundary tick" type="number" step="1"><input id="alloc-pct-lower" aria-label="Lower boundary percent from spot" type="number" step="0.01"></div>
+                    <div class="boundary-row" data-boundary="upper"><b>UPPER</b><input id="alloc-price-upper" aria-label="Upper boundary price" type="text" inputmode="decimal"><input id="alloc-tick-upper" aria-label="Upper boundary tick" type="number" step="1"><input id="alloc-pct-upper" aria-label="Upper boundary percent from spot" type="number" step="0.01"></div>
+                  </div>
+                  <div class="allocator-costs">
+                    <label for="alloc-entry-gas"><span>ENTRY GAS / POSITION · QUOTE</span><input id="alloc-entry-gas" type="text" inputmode="decimal" placeholder="UNAVAILABLE"></label>
+                    <label for="alloc-exit-gas"><span>EXIT GAS / POSITION · QUOTE</span><input id="alloc-exit-gas" type="text" inputmode="decimal" placeholder="UNAVAILABLE"></label>
+                  </div>
+                  <div id="alloc-split" class="preview-split" aria-live="polite"><div><span>TOKEN 0</span><strong>—</strong><small>—</small></div><div><span>TOKEN 1</span><strong>—</strong><small>—</small></div></div>
+                  <div id="alloc-status" class="allocator-status" role="status">OPENED · WAITING FOR POOL PRICE</div>
+                  <details class="allocator-detail"><summary>BAND OUTPUT</summary><div id="alloc-bands-list" class="alloc-bands-list"></div></details>
+                  <details class="allocator-detail"><summary>SWAP REPLAY</summary><section id="alloc-history" class="alloc-history" aria-live="polite"><header><b>REAL SWAP REPLAY</b><span>WAITING</span></header><p>NO INDEXED SWAPS</p></section></details>
+                  <details class="allocator-detail qualification"><summary>EXECUTION NOTES</summary><p class="allocator-safety">Each band is independent. Loading only fills the action form; review and signature remain explicit.</p></details>
+                </div>
+              </section>
+              <section class="tools-readout">
+                <section class="tracking-strip" aria-labelledby="tracking-title">
+                  <header class="panel-head"><h2 id="tracking-title">PRICE TRACK · BLOCK SAMPLES</h2><span id="tracking-status" class="warming">WARMING</span></header>
+                  <div class="tracking-frame"><canvas id="price-chart" class="price-chart" role="img" aria-label="Real sampled price history for the selected pool"></canvas><div id="price-chart-message">WAITING FOR REAL SAMPLES</div></div>
+                </section>
+                <header class="panel-head allocation-head"><h2 id="allocation-title">ALLOCATION NOW</h2><span id="allocation-state">—</span></header>
+                <div class="allocation-split">
+                  <div><strong id="allocation-amount0">—</strong><span id="allocation-token0">TOKEN0</span></div>
+                  <div><strong id="allocation-amount1">—</strong><span id="allocation-token1">TOKEN1</span></div>
+                </div>
+                <div id="range-edges" class="range-edges"><span>RANGE EDGES</span><p>Waiting for positions.</p></div>
+                <div class="minute-stats">
+                  <header><span>FLOW · 1M</span><b id="minute-status" class="warming">WARMING</b></header>
+                  <dl>
+                    <div><dt>SWAPS</dt><dd id="lp-swaps-1m">—</dd></div>
+                    <div><dt>VOLUME</dt><dd id="lp-volume-1m">—</dd></div>
+                    <div><dt>POOL FEES</dt><dd id="lp-pool-fees-1m">—</dd></div>
+                    <div><dt>OUR FEES EST</dt><dd id="lp-our-fees-1m">—</dd></div>
+                  </dl>
+                </div>
+              </section>
+            </div>
+          </details>
+
+          <details class="secondary-panel positions-card">
+            <summary><b>ACTIVE POSITIONS</b><span id="positions-summary">—</span></summary>
+            <header class="panel-head participant-head">
+              <label for="participant-sort">SORT
+                <select id="participant-sort"><option value="size">LIQUIDITY</option><option value="pnl">GROSS PNL</option></select>
+              </label>
+            </header>
+            <div class="table-wrap">
+              <table class="positions-table"><thead><tr><th>LP / CUSTODY</th><th>RANGE / EDGES</th><th>PRINCIPAL</th><th>LIQUIDITY / SHARE</th><th title="Fees earned since the verified baseline. Claimable also includes any removed principal.">FEES / CLAIMABLE</th><th title="Marked equity plus withdrawals minus deposits and initial equity, before gas.">GROSS PNL</th><th></th></tr></thead><tbody id="positions-list"><tr><td colspan="7">WAITING FOR POSITIONS</td></tr></tbody></table>
+            </div>
+            <details id="historical-positions-details" class="history-positions is-hidden"><summary><span id="historical-positions-count">0</span> DUST / EMPTY</summary><div class="table-wrap"><table class="positions-table"><tbody id="historical-positions-list"></tbody></table></div></details>
+          </details>
+
+          <details class="secondary-panel swaps-card">
+            <summary><b>RECENT ACTIVITY</b><span id="swap-count" class="mono">—</span></summary>
+            <header class="panel-head participant-head"><label for="flow-filter">SHOW <select id="flow-filter"><option value="lp">LP ONLY</option><option value="all">ALL EVENTS</option></select></label></header>
+            <div id="swaps-list" class="swaps-list"><p class="empty-copy">WAITING FOR EVENTS</p></div>
+          </details>
+        </section>
+      </div>
+    </section>
+  </main>
+
+  <aside id="action-drawer" class="action-drawer" aria-label="Liquidity actions" aria-hidden="true" inert>
+    <header class="drawer-header"><div><span>EXPLICIT WALLET EXECUTION</span><h2>LP ACTIONS</h2></div><button id="mobile-action-close" class="icon-button" type="button" aria-label="Close liquidity actions">×</button></header>
+    <section class="wallet-panel"><div><span id="wallet-state">Read-only mode</span><b id="wallet-account" class="mono">No owner selected</b></div><button id="connect-wallet" class="primary-button" type="button">Connect wallet</button></section>
+    <div id="wallet-notice" class="inline-notice is-hidden" role="status"></div>
+    <div id="action-tabs" class="action-tabs" role="tablist" aria-label="Liquidity action"><button id="tab-add" class="is-active" type="button" role="tab" aria-selected="true" data-action="add">ADD</button><button id="tab-remove" type="button" role="tab" aria-selected="false" data-action="remove">REMOVE</button><button id="tab-collect" type="button" role="tab" aria-selected="false" data-action="collect">COLLECT</button></div>
+    <div id="capability-notice" class="capability-notice">Select a pool to see supported actions.</div>
+    <form id="action-form" novalidate><fieldset id="action-fields" disabled>
+      <div class="field-pair range-fields"><label for="tick-lower"><span>LOWER TICK</span><input id="tick-lower" name="tick_lower" class="mono" type="number" step="1" inputmode="numeric"></label><label for="tick-upper"><span>UPPER TICK</span><input id="tick-upper" name="tick_upper" class="mono" type="number" step="1" inputmode="numeric"></label></div>
+      <div class="range-rail" aria-label="Position range controls"><input id="range-lower" type="range" min="-100" max="100" step="1" value="-20" aria-label="Lower tick range"><input id="range-upper" type="range" min="-100" max="100" step="1" value="20" aria-label="Upper tick range"></div>
+      <div id="range-prices" class="range-prices mono"><span>—</span><span>—</span></div>
+      <div id="amount-fields" class="field-pair"><label for="amount0"><span id="amount0-label">TOKEN 0 AMOUNT</span><input id="amount0" name="amount0" type="text" inputmode="decimal" autocomplete="off" placeholder="0.00"></label><label for="amount1"><span id="amount1-label">TOKEN 1 AMOUNT</span><input id="amount1" name="amount1" type="text" inputmode="decimal" autocomplete="off" placeholder="0.00"></label></div>
+      <label id="liquidity-control" class="slider-field is-hidden" for="liquidity-bps"><span><b>POSITION LIQUIDITY</b><output id="liquidity-output">100%</output></span><input id="liquidity-bps" name="liquidity_bps" type="range" min="1" max="10000" step="1" value="10000"></label>
+      <label class="slider-field" for="slippage-bps"><span><b>SLIPPAGE LIMIT</b><output id="slippage-output">0.50%</output></span><input id="slippage-bps" name="slippage_bps" type="range" min="1" max="500" step="1" value="50"></label>
+      <button id="simulate-action" class="simulate-button" type="submit">SIMULATE ADD</button>
+    </fieldset></form>
+    <section id="simulation-panel" class="simulation-panel is-hidden" aria-live="polite"><header><div><span>PREFLIGHT RESULT</span><h3>TRANSACTION SEQUENCE</h3></div><span id="simulation-expiry" class="mono">—</span></header><div id="simulation-warnings" class="warning-list"></div><dl id="simulation-summary" class="simulation-summary"></dl><ol id="transaction-steps" class="transaction-steps"></ol><p class="safety-copy">Each step requires a separate review and wallet confirmation. Nothing is sent automatically.</p></section>
+  </aside>
+  <div id="drawer-scrim" class="drawer-scrim is-hidden" aria-hidden="true"></div>
+
+  <dialog id="transaction-dialog" class="transaction-dialog"><form method="dialog"><header><div><span>EXPLICIT REVIEW</span><h2 id="review-title">REVIEW TRANSACTION</h2></div><button class="icon-button" value="cancel" aria-label="Close review">×</button></header><p id="review-description" class="review-description"></p><dl class="review-grid"><div><dt>FROM</dt><dd id="review-from" class="mono">—</dd></div><div><dt>TO</dt><dd id="review-to" class="mono">—</dd></div><div><dt>VALUE</dt><dd id="review-value" class="mono">—</dd></div><div><dt>ESTIMATED GAS</dt><dd id="review-gas" class="mono">—</dd></div></dl><details><summary>CALLDATA</summary><pre id="review-data"></pre></details><div id="review-error" class="inline-notice is-hidden" role="alert"></div><footer><button class="quiet-button" value="cancel">CANCEL</button><button id="confirm-transaction" class="primary-button" type="button">CONFIRM IN WALLET</button></footer></form></dialog>
+  <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
+  <script src="/static/workbench.js" defer></script>
+</body>
+</html>
