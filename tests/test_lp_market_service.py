@@ -442,11 +442,15 @@ def test_backfill_insertion_order_does_not_reorder_live_tape(tmp_path):
         app.close()
 
 @pytest.mark.parametrize(
-    ("recent_kind", "expected_rows"),
-    (("swap", 0), ("add", 1)),
+    ("recent_kind", "params", "expected_rows"),
+    (
+        ("swap", {}, 0),
+        ("add", {}, 1),
+        ("swap", {"kind": "all", "q": V3}, 1),
+    ),
 )
-def test_underfilled_lp_tape_stays_within_window(
-        tmp_path, recent_kind, expected_rows):
+def test_underfilled_tape_stays_within_window(
+        tmp_path, recent_kind, params, expected_rows):
     path = tmp_path / f"market-{recent_kind}.sqlite"
     seed = MarketStore(path)
     now = int(time.time())
@@ -470,7 +474,7 @@ def test_underfilled_lp_tape_stays_within_window(
     connection.set_progress_handler(lambda: 1, 2_000)
     try:
         result = app.tape(
-            {"window": "1h"},
+            {"window": "1h", **params},
             _status={
                 "history_from": now - 7_200,
                 "history_to": now,
