@@ -490,40 +490,6 @@ class _WssRpc:
                 raise self._error(f"WSS {method} response omitted result")
             return response["result"]
 
-    def _batch_request(
-        self, state: dict[str, Any], calls: Sequence[tuple[str, Sequence[Any]]],
-    ) -> list[Any]:
-        payload = []
-        ids = []
-        for method, params in calls:
-            state["request_id"] += 1
-            ids.append(state["request_id"])
-            payload.append({
-                "jsonrpc": "2.0", "id": state["request_id"],
-                "method": method, "params": list(params),
-            })
-        websocket = state["websocket"]
-        websocket.send(json.dumps(payload, separators=(",", ":")))
-        deadline = time.monotonic() + 4.0
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise self._error("WSS batch response timeout")
-            response = json.loads(websocket.recv(timeout=remaining))
-            if not isinstance(response, list):
-                continue
-            by_id = {item.get("id"): item for item in response if isinstance(item, Mapping)}
-            output = []
-            for request_id, (method, _params) in zip(ids, calls):
-                item = by_id.get(request_id)
-                if item is None:
-                    raise self._error(f"WSS batch omitted {method}")
-                if item.get("error") is not None:
-                    raise self._error(f"WSS {method}: {str(item['error'])[:300]}")
-                if "result" not in item:
-                    raise self._error(f"WSS {method} response omitted result")
-                output.append(item["result"])
-            return output
 
     def _connect(self, excluded: set[str] | None = None) -> dict[str, Any]:
         from websockets.sync.client import connect
@@ -588,13 +554,6 @@ class _WssRpc:
     def call(self, method: str, params: Sequence[Any] | None = None) -> Any:
         return self._run(lambda state: self._request(state, method, list(params or ())))
 
-    def batch(self, calls: Iterable[tuple[str, Sequence[Any]]]) -> list[Any]:
-        specifications = [(method, list(params)) for method, params in calls]
-        if not specifications:
-            return []
-        if len(specifications) > MAX_BATCH_CALLS:
-            raise ValueError(f"RPC batch exceeds {MAX_BATCH_CALLS} calls")
-        return self._run(lambda state: self._batch_request(state, specifications))
 
     def close(self) -> None:
         with self._lock:
@@ -608,7 +567,7 @@ class _WssRpc:
 
 
 class _WssPreferredRpc:
-    """Use persistent WSS first, retaining the checked HTTP router as fallback."""
+    """Use WSS for single calls and the capability router for bulk RPC."""
 
     def __init__(self, wss: _WssRpc, fallback: Any) -> None:
         self._wss = wss
@@ -621,11 +580,10 @@ class _WssPreferredRpc:
             return self._fallback.call(method, params)
 
     def batch(self, calls: Iterable[tuple[str, Sequence[Any]]]) -> list[Any]:
-        specifications = [(method, list(params)) for method, params in calls]
-        try:
-            return self._wss.batch(specifications)
-        except Exception:
-            return self._fallback.batch(specifications)
+        # Bulk snapshots must use capability-specific providers and their
+        # shared concurrency/rate budgets, not the public head-subscription
+        # socket that is optimized for individual latency-sensitive calls.
+        return self._fallback.batch(calls)
 
     def status(self) -> dict[str, Any]:
         return self._fallback.status()

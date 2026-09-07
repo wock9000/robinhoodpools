@@ -156,27 +156,19 @@ def test_local_log_provider_never_answers_above_its_own_head(monkeypatch):
         factory.close()
 
 
-def test_shared_wss_rejects_wrong_chain_and_incomplete_batch(monkeypatch):
+def test_shared_wss_rejects_wrong_chain(monkeypatch):
     class Websocket:
-        def __init__(self, *, chain=4663, omit_batch_id=False):
+        def __init__(self, *, chain=4663):
             self.chain = chain
-            self.omit_batch_id = omit_batch_id
             self.responses = []
             self.closed = False
 
         def send(self, raw):
             payload = json.loads(raw)
-            if isinstance(payload, list):
-                selected = payload[:-1] if self.omit_batch_id else payload
-                self.responses.append(json.dumps([
-                    {"jsonrpc": "2.0", "id": item["id"], "result": "0x1"}
-                    for item in selected
-                ]))
-            else:
-                assert payload["method"] == "eth_chainId"
-                self.responses.append(json.dumps({
-                    "jsonrpc": "2.0", "id": payload["id"], "result": hex(self.chain),
-                }))
+            assert payload["method"] == "eth_chainId"
+            self.responses.append(json.dumps({
+                "jsonrpc": "2.0", "id": payload["id"], "result": hex(self.chain),
+            }))
 
         def recv(self, timeout):
             assert timeout > 0
@@ -195,18 +187,6 @@ def test_shared_wss_rejects_wrong_chain_and_incomplete_batch(monkeypatch):
     assert wrong_chain.closed is True
     client.close()
 
-    incomplete = Websocket(omit_batch_id=True)
-    monkeypatch.setattr(
-        "websockets.sync.client.connect", lambda *_args, **_kwargs: incomplete,
-    )
-    client = _WssRpc(("wss://current.example.invalid",), RuntimeError, size=1)
-    with pytest.raises(RuntimeError, match="WSS batch omitted eth_getCode"):
-        client.batch([
-            ("eth_getBalance", [TOKEN, "0x64"]),
-            ("eth_getCode", [TOKEN, "0x64"]),
-        ])
-    assert incomplete.closed is True
-    client.close()
 
 
 def test_activity_wss_partitions_provider_muted_topic_filter(tmp_path, monkeypatch):
