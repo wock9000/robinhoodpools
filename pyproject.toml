@@ -24,7 +24,7 @@ Source = "https://github.com/wock9000/robinhoodpools"
 Issues = "https://github.com/wock9000/robinhoodpools/issues"
 
 [project.optional-dependencies]
-test = ["pytest>=8,<9"]
+test = ["pytest>=8,<10"]
 
 [project.scripts]
 rhpools = "rhpools.lp_server:main"
