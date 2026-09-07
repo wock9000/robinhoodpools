@@ -1059,7 +1059,7 @@ class LPMarketService:
         from .lp_market_index import MarketIndexer
         from .lp_market_accounting import AccountBook
         self.market = market
-        self.store = MarketStore(path)
+        self.store = MarketStore(path, checkpoint_on_commit=not start)
         self.prices = PriceProjection(self.store)
         self.book = AccountBook(self.store)
         self.book.install()

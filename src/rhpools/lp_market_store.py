@@ -151,9 +151,12 @@ class MarketStore:
     ``blocks`` contains both boundaries of every committed coverage interval and
     the actual header for each event block.  The coverage table records the
     contiguous interval those sparse anchors verify.
+
+    A managed indexer may disable commit-time checkpoints when it owns the
+    periodic checkpoint lane. WAL commits remain fully synchronized.
     """
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, checkpoint_on_commit: bool = True) -> None:
         self.path = Path(path) if str(path) != ":memory:" else Path(":memory:")
         self.lock = threading.RLock()
         self._reader_lock = threading.Lock()
@@ -163,6 +166,7 @@ class MarketStore:
         self._closed = False
         self._change_token = 0
         self._pool_metadata_token = 0
+        self._checkpoint_on_commit = checkpoint_on_commit
         if str(path) == ":memory:":
             self._database = f"file:lp-market-{id(self):x}?mode=memory&cache=shared"
             self._uri = True
@@ -192,9 +196,11 @@ class MarketStore:
         if writer:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA synchronous=FULL")
-            # The projection lane checkpoints off the ingestion critical path.
-            # Retain an automatic fallback for standalone stores.
-            connection.execute("PRAGMA wal_autocheckpoint=65536")
+            # Managed services checkpoint on their existing projection lane,
+            # including a large inherited WAL, rather than before HTTP startup.
+            # Standalone stores retain SQLite's automatic checkpoint fallback.
+            pages = 65536 if self._checkpoint_on_commit else 0
+            connection.execute(f"PRAGMA wal_autocheckpoint={pages}")
             connection.execute("PRAGMA journal_size_limit=268435456")
         else:
             connection.execute("PRAGMA query_only=ON")
