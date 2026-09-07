@@ -2278,21 +2278,29 @@ class MarketIndexer:
     ) -> dict[str, Any] | None:
         if _lower(stored.get("protocol")) != "v4":
             return None
-        # Live ingestion may already own the writer lock. Reuse that reentrant
-        # lock rather than taking a second mutex in the opposite order to a
-        # history lane that must persist its recovered identity.
+        decoded = self._stored_pool(stored)
+        normalized = self._normalize_pool(decoded)
+        if normalized is None or not self._identity_verified(normalized):
+            return None
+        fields = (
+            "id", "protocol", "address", "token0", "token1",
+            "symbol0", "symbol1", "decimals0", "decimals1",
+            "fee_ppm", "tick_spacing", "hook", "factory",
+            "created_block", "source", "metadata_json",
+        )
+        if not any(decoded.get(field) != normalized.get(field) for field in fields):
+            return normalized
+
+        # A complete stored identity is a read-only lookup and must not queue
+        # behind the long projection transaction of either scanner lane. Only
+        # legacy normalization repair needs the writer lock. Re-read under that
+        # lock so a concurrent repair cannot be overwritten with stale data.
         with self.store.lock:
             current = self.store.pool(candidate) or dict(stored)
             decoded = self._stored_pool(current)
             normalized = self._normalize_pool(decoded)
             if normalized is None or not self._identity_verified(normalized):
                 return None
-            fields = (
-                "id", "protocol", "address", "token0", "token1",
-                "symbol0", "symbol1", "decimals0", "decimals1",
-                "fee_ppm", "tick_spacing", "hook", "factory",
-                "created_block", "source", "metadata_json",
-            )
             if any(decoded.get(field) != normalized.get(field) for field in fields):
                 # Publish only after the complete, hash-qualified identity is
                 # durable. This is independent of a chain checkpoint: the

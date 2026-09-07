@@ -131,6 +131,71 @@ def test_live_writer_and_history_recovery_cannot_deadlock(tmp_path):
         store.close()
 
 
+def test_complete_v4_pool_lookup_does_not_wait_for_writer(tmp_path):
+    from eth_abi import encode
+    from eth_utils import keccak
+
+    store = MarketStore(tmp_path / "market.sqlite")
+    scanner = indexer(store)
+    token0, token1, hook = (
+        "0x" + "11" * 20,
+        "0x" + "22" * 20,
+        "0x" + "00" * 20,
+    )
+    pool_id = "0x" + keccak(encode(
+        ["address", "address", "uint24", "int24", "address"],
+        [token0, token1, 3000, 8, hook],
+    )).hex()
+    store.upsert_pools([{
+        "id": pool_id, "protocol": "v4", "address": POOL_MANAGER,
+        "token0": token0, "token1": token1, "fee_ppm": 3000,
+        "tick_spacing": 8, "hook": hook, "factory": POOL_MANAGER,
+        "source": "census",
+        "metadata_json": {
+            "configured_fee": 3000,
+            "dynamic_fee": False,
+        },
+    }])
+    writer_held = threading.Event()
+    release_writer = threading.Event()
+    lookup_done = threading.Event()
+    result = []
+    failures = []
+
+    def hold_writer():
+        with store.transaction():
+            writer_held.set()
+            release_writer.wait(2)
+
+    def lookup_pool():
+        try:
+            result.append(scanner._pool(pool_id))
+        except Exception as exc:
+            failures.append(exc)
+        finally:
+            store.close_reader()
+            lookup_done.set()
+
+    writer = threading.Thread(target=hold_writer)
+    lookup = threading.Thread(target=lookup_pool)
+    writer.start()
+    try:
+        assert writer_held.wait(1)
+        lookup.start()
+        assert lookup_done.wait(1), (
+            "complete canonical pool lookup waited for an unrelated writer"
+        )
+        assert failures == []
+        assert result[0]["id"] == pool_id
+        assert result[0]["tick_spacing"] == 8
+    finally:
+        release_writer.set()
+        lookup.join(2)
+        writer.join(2)
+        scanner.close()
+        store.close()
+
+
 def test_pool_lookup_work_is_per_unique_candidate_not_per_log(monkeypatch):
     store = MarketStore(":memory:")
     scanner = indexer(store)
