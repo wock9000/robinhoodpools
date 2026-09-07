@@ -390,3 +390,57 @@ def test_pool_metadata_token_tracks_only_committed_material_changes():
         assert store.pool(pool["id"]) is None
     finally:
         store.close()
+
+def test_close_cancels_running_reader_without_losing_committed_data(tmp_path):
+    import sqlite3
+    import threading
+
+    path = tmp_path / "market.sqlite"
+    store = MarketStore(path)
+    block = header(10)
+    store.ingest([block], [event(block, 0)])
+    running = threading.Event()
+    cleanup = threading.Event()
+    closed = threading.Event()
+    errors = []
+
+    def read_forever():
+        connection = store.read()
+
+        def progress():
+            running.set()
+            return int(cleanup.is_set())
+
+        connection.set_progress_handler(progress, 1000)
+        try:
+            connection.execute(
+                "WITH RECURSIVE work(n) AS "
+                "(VALUES(0) UNION ALL SELECT n+1 FROM work WHERE n<1000000000) "
+                "SELECT SUM(n) FROM work"
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            errors.append(exc.sqlite_errorcode)
+
+    def close_store():
+        store.close()
+        closed.set()
+
+    reader = threading.Thread(target=read_forever, daemon=True)
+    closer = threading.Thread(target=close_store, daemon=True)
+    reader.start()
+    try:
+        assert running.wait(2)
+        closer.start()
+        assert closed.wait(2), "shutdown waited for an abandoned reader"
+    finally:
+        cleanup.set()
+        reader.join(2)
+        if closer.ident is not None:
+            closer.join(2)
+        store.close()
+    assert errors == [sqlite3.SQLITE_INTERRUPT]
+    with MarketStore(path) as reopened:
+        rows = reopened.read().execute(
+            "SELECT block_number,tx_hash FROM events"
+        ).fetchall()
+        assert [tuple(row) for row in rows] == [(10, event(block, 0)["tx_hash"])]

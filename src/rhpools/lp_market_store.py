@@ -2665,6 +2665,13 @@ class MarketStore:
             with self._reader_lock:
                 readers = tuple(self._readers.values())
                 self._readers.clear()
+            # sqlite3.close() waits for a running statement. Cancel readers
+            # first so shutdown never waits for an abandoned history scan.
+            for connection in readers:
+                try:
+                    connection.interrupt()
+                except sqlite3.Error:
+                    pass
             for connection in readers:
                 try:
                     connection.close()
