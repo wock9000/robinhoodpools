@@ -420,6 +420,8 @@ def test_close_cancels_running_reader_without_losing_committed_data(tmp_path):
             ).fetchone()
         except sqlite3.OperationalError as exc:
             errors.append(exc.sqlite_errorcode)
+        finally:
+            store.close_reader()
 
     def close_store():
         store.close()

@@ -52,7 +52,7 @@ accounting complete. Live ingestion and historical backfill share a serialized
 database writer; status exposes both coverage intervals and pending enrichment,
 balance, and reprojection counts.
 
-Select the terminal's **HEAD / INDEX** readout to open **INDEX STATUS**.
+Select the terminal's **HEAD / INDEX** readout, labeled **INDEX STATUS** on mobile, to open index details.
 It shows backlog counts and the last live/history batch's RPC, writer-wait,
 storage, and post-processing timings. Index time lag is the age of indexed
 blocks, not a catch-up ETA. Individual batch timings are not sustained throughput.

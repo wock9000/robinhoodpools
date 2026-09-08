@@ -2699,16 +2699,21 @@ class MarketStore:
                 return
             self._closed = True
             with self._reader_lock:
-                readers = tuple(self._readers.values())
+                readers = tuple(self._readers.items())
                 self._readers.clear()
-            # sqlite3.close() waits for a running statement. Cancel readers
-            # first so shutdown never waits for an abandoned history scan.
-            for connection in readers:
+            # Interrupt active statements, but let live reader threads close
+            # their own connections. Cross-thread close can clear SQLite's
+            # error state before the interrupted call builds its exception.
+            for _ident, connection in readers:
                 try:
                     connection.interrupt()
                 except sqlite3.Error:
                     pass
-            for connection in readers:
+            current_ident = threading.get_ident()
+            active_idents = {thread.ident for thread in threading.enumerate()}
+            for ident, connection in readers:
+                if ident != current_ident and ident in active_idents:
+                    continue
                 try:
                     connection.close()
                 except sqlite3.Error:

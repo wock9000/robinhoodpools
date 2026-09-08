@@ -42,7 +42,7 @@ Production sampling found wallet aggregation repeatedly restarting whenever inge
 
 Late historical events rebuild only the affected position's changed accounting rows rather than deleting and rewriting its entire projection. This preserves synchronous, atomic financial updates while reducing write amplification. Existing durable metadata counters are reused on restart; full-table counts initialize missing counters only.
 
-The terminal's HEAD / INDEX readout opens INDEX STATUS. Its timings come from
+The terminal's HEAD / INDEX readout, labeled INDEX STATUS on mobile, opens index details. Its timings come from
 `live_scan` and `history_scan` in `/api/lp/status`: `fetch_seconds`,
 `store_lock_wait_seconds`, `store_seconds`, and the lane's post-processing or
 publication duration. Each is one completed batch, not a sustained rate or ETA.
