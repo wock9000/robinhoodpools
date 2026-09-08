@@ -1,5 +1,7 @@
 # Robinhood Pools
 
+Live explorer: **[rhpools.lol](https://rhpools.lol)**.
+
 Robinhood Pools is a standalone observatory for liquidity pools on Robinhood Chain (chain ID `4663`). One Python process reads public RPC data, maintains a local SQLite index, serves JSON/SSE APIs, and serves the plain-HTML/CSS/JavaScript terminal and workbench. It does not require another checkout or any private application files.
 
 The service covers reviewed V2, V3-style, Slipstream, and V4 deployments recorded in `rhpools.lp_chain`. Coverage is deliberately chain-specific: addresses or assumptions from other chains must not be added without review. A V4 manager address identifies the manager, not an individual pool.
