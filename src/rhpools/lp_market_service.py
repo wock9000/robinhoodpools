@@ -2342,8 +2342,6 @@ class LPMarketService:
             event_where = " OR ".join(f"e.{column} LIKE ? ESCAPE '\\'" for column in columns)
             conditions.append(f"({pool_where} OR {event_where})")
             args.extend([*pool_args, *([term] * len(columns))])
-        conditions.append("e.timestamp>=?")
-        args.append(start)
         kind = str(params.get("kind") or "lp")
         if kind == "lp":
             conditions.append("(e.kind IN ('add','remove','collect') OR "
@@ -2364,31 +2362,37 @@ class LPMarketService:
             conditions.append("(e.block_number,e.tx_index,e.log_index)<(?,?,?)")
             args.extend(row)
         snapshot_revision = int(status.get("revision") or 0)
+        snapshot_events_revision = int(status.get("events_revision") or 0)
+        snapshot_pool_metadata_token = self.store.pool_metadata_token
         snapshot_epoch = int(status.get("epoch") or 0)
-        # The kind predicate otherwise makes SQLite merge events_kind_id_idx
-        # scans and sort every matching row before applying LIMIT.  An
-        # unfiltered feed can stop directly in canonical order; leave
-        # selective searches to the planner and their dedicated indexes.
-        selective = bool(
-            query or any(params.get(key) for key in ("protocol", "pool", "owner"))
-        )
-        event_source = "events e"
-        if not selective:
-            event_source = "events e INDEXED BY events_block_idx"
+        # Only an exact pool predicate has an index that also satisfies the
+        # canonical feed order. Leading-wildcard search, protocol, and
+        # COALESCE(owner,custody) predicates do not. Letting SQLite choose an
+        # index for those predicates can sort every match before LIMIT.
+        event_source = "events e INDEXED BY events_block_idx"
+        if params.get("pool"):
+            event_source = "events e INDEXED BY lp_events_pool_order"
+        cache_args = tuple(args)
+        window_floor = None
         if start:
-            # Bound every canonical-order scan, including selective searches,
-            # at the first event in the requested time window. Otherwise an
-            # underfilled result can walk events_block_idx to genesis while
-            # holding a WAL reader. Canonical timestamps are monotonic by
-            # block; the covering index chooses the lowest block when several
-            # blocks share a timestamp. Keep the timestamp predicate and let
-            # selective searches use their dedicated indexes when preferable.
-            conditions.append(
-                "e.block_number>=(SELECT block_number FROM events "
-                "INDEXED BY lp_events_time WHERE timestamp>=? "
-                "ORDER BY timestamp,block_number LIMIT 1)"
-            )
+            # Event timestamps come from canonical block headers and increase
+            # with block order. Resolve the moving wall-clock boundary to an
+            # event block so repeated reads share a stable cache key until an
+            # event actually enters or leaves the window. Keep the timestamp
+            # predicate as an independent guard on the requested boundary.
+            floor = self.store.read().execute(
+                "SELECT block_number FROM events INDEXED BY lp_events_time "
+                "WHERE timestamp>=? ORDER BY timestamp,block_number LIMIT 1",
+                (start,),
+            ).fetchone()
+            conditions.append("e.timestamp>=?")
             args.append(start)
+            if floor is None:
+                conditions.append("0")
+            else:
+                window_floor = int(floor["block_number"])
+                conditions.append("e.block_number>=?")
+                args.append(window_floor)
 
         def load():
             rows = self.store.read().execute(
@@ -2423,10 +2427,13 @@ class LPMarketService:
                 output.append(event)
             return {"rows": output, "cursor": output[-1]["id"] if output else None}
 
-        # A durable revision, unlike a wall-clock TTL, exactly identifies when
-        # this materialization can have changed. Coverage/status remain fresh.
+        # Durable event and pool-metadata versions identify when these rows can
+        # change. The response still carries the current revision and coverage.
         materialized = self._cached(
-            ("tape", snapshot_revision, name, *conditions, *args, limit),
+            (
+                "tape", snapshot_events_revision, snapshot_pool_metadata_token,
+                name, *conditions, *cache_args, window_floor, limit,
+            ),
             load, ttl=float("inf"), epoch=snapshot_epoch,
         )
         return {

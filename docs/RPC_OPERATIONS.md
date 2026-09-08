@@ -36,11 +36,29 @@ Goldsky primary references:
 
 ## Indexer bottlenecks
 
-Separate durable cursor progress from the live observed feed. A moving live tape is not evidence of complete historical financial accounting. Compare cursor gain and chain gain over the same interval; recent-gap-first scheduling intentionally pauses older backfill while the recent gap is large.
+Separate durable cursor progress from the live observed feed. A moving live tape is not evidence of complete historical financial accounting. Compare cursor gain and chain gain over the same interval. Live ingestion and historical backfill share one serialized writer; inspect `history_scheduling` and the lane measurements rather than assuming that backfill is paused.
 
 Production sampling found wallet aggregation repeatedly restarting whenever ingestion advanced its revision. This could keep LP Wallets at `SYNCING` indefinitely while consuming CPU needed by the indexer. Wallet totals, gas and coverage now come from one completed WAL read snapshot; appends trigger a later refresh instead of recursive recomputation. Canonical-branch changes still invalidate service publications. The regression exercises an indexer append during an actual wallet read.
 
 Late historical events rebuild only the affected position's changed accounting rows rather than deleting and rewriting its entire projection. This preserves synchronous, atomic financial updates while reducing write amplification. Existing durable metadata counters are reused on restart; full-table counts initialize missing counters only.
+
+The terminal's HEAD / INDEX readout opens INDEX STATUS. Its timings come from
+`live_scan` and `history_scan` in `/api/lp/status`: `fetch_seconds`,
+`store_lock_wait_seconds`, `store_seconds`, and the lane's post-processing or
+publication duration. Each is one completed batch, not a sustained rate or ETA.
+
+Pool valuation retains at most 128 compact inventories and 100,000 position
+triples in total. Changing prices or ticks revalues those positions without
+reloading their inventory; metadata and coverage changes still refresh the
+result. Oversized pools stream from SQLite without retaining an inventory.
+Reads bypass the caches rather than waiting behind an active writer.
+
+Schema version 4 replaces the identity-replay queue's single chronological
+index with partial indexes for immediate work and timed retries. Startup builds
+these indexes without discarding queue rows or changing cursor state. Keep
+disk headroom for the migration. A bounded chronological lookup handles an
+already-ready queue; otherwise selection excludes future retries before
+merging the oldest eligible candidates.
 
 WAL checkpoints run outside the ingestion writer lock. The writer retains at most 256 MiB of reusable journal allocation after a safe reset; this is not a hard cap on active transactions or snapshots. A reader may still pin older WAL frames until its snapshot finishes. A real SQLite smoke kept an old reader at one row while 530 large rows committed, then safely reclaimed the journal after that reader ended; all 532 final rows survived reopen.
 

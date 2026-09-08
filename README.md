@@ -48,9 +48,14 @@ A successful request to `/` establishes only that the HTTP process can serve the
 
 Recent live lag, older historical backfill, and pending accounting enrichment
 are separate backlogs. Closing the live gap does not make historical position
-accounting complete. Recent-gap-first scheduling prioritizes live ingestion,
-then resumes older history; status continues to expose both coverage intervals
-and pending enrichment, balance, and reprojection counts.
+accounting complete. Live ingestion and historical backfill share a serialized
+database writer; status exposes both coverage intervals and pending enrichment,
+balance, and reprojection counts.
+
+Select the terminal's **HEAD / INDEX** readout to open **INDEX STATUS**.
+It shows backlog counts and the last live/history batch's RPC, writer-wait,
+storage, and post-processing timings. Index time lag is the age of indexed
+blocks, not a catch-up ETA. Individual batch timings are not sustained throughput.
 
 ```sh
 curl -fsS http://127.0.0.1:8196/ >/dev/null

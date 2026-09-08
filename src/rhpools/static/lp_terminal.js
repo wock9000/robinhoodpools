@@ -40,6 +40,10 @@
     liveBlockAge: byId("live-block-age"),
     liveBlockGap: byId("live-block-gap"),
     status: byId("status-readout"),
+    indexStatus: byId("index-status"),
+    indexStatusShell: byId("index-status-shell"),
+    indexStatusClose: byId("index-status-close"),
+    indexStatusDetails: byId("index-status-details"),
     overview: byId("overview-readout"),
     endpointHealth: byId("endpoint-health"),
     marketFilter: byId("market-filter"),
@@ -1201,7 +1205,7 @@
     if (hasIndexGap) {
       elements.liveBlockGap.textContent = `INDEX GAP ${formatCount(indexGap)}${hasFeedGap ? " · FEED GAP" : ""}`;
       elements.liveBlockGap.title = [
-        `Live chain head is ${formats.integer.format(indexGap)} block${indexGap === 1 ? "" : "s"} ahead of durable accounting`,
+        `Live chain head is ${formats.integer.format(indexGap)} block${indexGap === 1 ? "" : "s"} ahead of the durable index`,
         hasFeedGap ? `Feed discontinuity: ${typeof feedGap === "object" ? JSON.stringify(feedGap) : String(feedGap)}` : null
       ].filter(Boolean).join("\n");
       return;
@@ -1337,11 +1341,64 @@
   }
 
 
+  function renderIndexDetails(details) {
+    if (elements.indexStatus.hidden) return;
+    const status = state.status;
+    if (!status) {
+      elements.indexStatusDetails.textContent = "Waiting for index status. HTTP availability alone does not establish index freshness.";
+      return;
+    }
+    const lines = [
+      details, "",
+      "Time lag is the age of indexed blocks, not a catch-up ETA.",
+      "A current live index does not imply complete historical accounting.",
+      "",
+      `Historical backfill: ${status.backfill === true ? "in progress" : status.backfill === false ? "complete" : "unknown"}`
+    ];
+    for (const [field, label] of [
+      ["pending_enrichment", "Receipt enrichment transactions"],
+      ["pending_reprojection", "Accounting reprojection events"],
+      ["pending_balances", "Position balance refreshes"]
+    ]) {
+      const count = finite(status[field]);
+      lines.push(`${label}: ${count == null ? "unknown" : formats.integer.format(count)}`);
+    }
+    for (const [field, label] of [["live_scan", "LIVE"], ["history_scan", "HISTORY"]]) {
+      const scan = status[field];
+      lines.push("", `LAST ${label} BATCH`);
+      if (!scan || typeof scan !== "object") {
+        lines.push("No completed batch reported.");
+        continue;
+      }
+      const observed = finite(scan.observed_at);
+      lines.push(`Sample age: ${observed == null ? "unknown" : formatAge(Math.max(0, Date.now() / 1000 - observed))}`);
+      const blocks = finite(scan.blocks);
+      if (blocks != null) lines.push(`Blocks: ${formats.integer.format(blocks)}`);
+      for (const [key, name] of [
+        ["seconds", "Total"], ["fetch_seconds", "RPC fetch"],
+        ["decode_seconds", "Decode"], ["store_lock_wait_seconds", "Writer wait"],
+        ["store_seconds", "Store"], ["postprocess_seconds", "Post-processing"],
+        ["publish_seconds", "Publish"]
+      ]) {
+        const seconds = finite(scan[key]);
+        if (seconds != null) lines.push(`${name}: ${seconds.toFixed(3)} s`);
+      }
+    }
+    lines.push("", "Batch timings are individual samples, not sustained throughput.");
+    elements.indexStatusDetails.textContent = lines.join("\n");
+  }
+
+  function closeIndexStatus() {
+    elements.indexStatus.hidden = true;
+    elements.status.focus({ preventScroll: true });
+  }
+
   function renderStatus() {
     const status = state.status;
     if (!status) {
       elements.status.textContent = "CONNECTING";
       elements.footer.textContent = "INDEX —";
+      renderIndexDetails("");
       renderGlobalGap();
       return;
     }
@@ -1366,13 +1423,14 @@
       : lag != null && lag > 2 ? `INDEX ${formatAge(lag)} BEHIND` : "INDEX CURRENT";
     const details = [
       liveHead != null ? `Live head #${formats.integer.format(liveHead)}` : null,
-      indexedHead != null ? `Durable accounting head #${formats.integer.format(indexedHead)}` : null,
-      gap != null ? `Actual index gap ${formats.integer.format(gap)} block${gap === 1 ? "" : "s"}` : null,
-      lag != null ? `Index time lag ${formatAge(lag)}` : null,
+      indexedHead != null ? `Durable indexed head #${formats.integer.format(indexedHead)}` : null,
+      gap != null ? `Live index gap ${formats.integer.format(gap)} block${gap === 1 ? "" : "s"}` : null,
+      lag != null ? `Indexed block time lag ${formatAge(lag)}` : null,
       ...reportedErrorDetails(status.errors)
     ].filter(Boolean).join("\n");
-    elements.status.title = details;
+    elements.status.title = `Open index status details\n${details}`;
     elements.footer.title = details;
+    renderIndexDetails(details);
     renderGlobalGap();
   }
 
@@ -1451,6 +1509,9 @@
 
   function applyStatus(status) {
     if (!status || typeof status !== "object") return;
+    const observedAt = finite(status.as_of);
+    const currentAt = finite(state.status && state.status.as_of);
+    if (observedAt != null && currentAt != null && observedAt < currentAt) return;
     state.status = { ...(state.status || {}), ...status };
     if ((!state.liveBlock || state.liveBlock.source === "status") && status.head != null) {
       applyBlockFrame({
@@ -2453,10 +2514,28 @@
     if (target && target.isConnected && typeof target.focus === "function") target.focus();
   }
 
-  function trapModalFocus(event) {
+  function trapModalFocus(event, dialog = elements.dialog, close = closeOwner) {
     if (event.key === "Escape") {
       event.preventDefault();
-      closeOwner();
+      event.stopPropagation();
+      close();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    const focusable = Array.from(dialog.querySelectorAll(
+      'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+    )).filter((node) => node.getClientRects().length > 0);
+    const first = focusable[0], last = focusable[focusable.length - 1];
+    const active = document.activeElement;
+    if (!first) {
+      event.preventDefault();
+      dialog.focus();
+    } else if (event.shiftKey && (active === first || active === dialog)) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && (active === last || active === dialog)) {
+      event.preventDefault();
+      first.focus();
     }
   }
 
@@ -2795,6 +2874,7 @@
   }
 
   document.addEventListener("keydown", (event) => {
+    if (!elements.indexStatus.hidden) return;
     if (!elements.poolInspector.hidden && event.key === "Escape") {
       event.preventDefault();
       closePoolInspector();
@@ -2981,6 +3061,18 @@
     setTab(tabs[next].dataset.tab, true);
   });
   elements.ownerFollow.addEventListener("click", () => setOwnerFollow(!state.ownerFollow));
+  elements.status.addEventListener("click", () => {
+    elements.indexStatus.hidden = false;
+    renderStatus();
+    elements.indexStatusShell.focus({ preventScroll: true });
+  });
+  elements.indexStatusClose.addEventListener("click", closeIndexStatus);
+  elements.indexStatusShell.addEventListener("keydown", (event) => {
+    trapModalFocus(event, elements.indexStatusShell, closeIndexStatus);
+  });
+  elements.indexStatus.addEventListener("click", (event) => {
+    if (event.target === elements.indexStatus) closeIndexStatus();
+  });
   elements.modalClose.addEventListener("click", () => closeOwner());
   elements.dialog.addEventListener("keydown", trapModalFocus);
   elements.poolInspectorClose.addEventListener("click", () => closePoolInspector());

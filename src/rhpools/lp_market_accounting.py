@@ -10,12 +10,13 @@ from __future__ import annotations
 
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
+from itertools import groupby
 import json
 import math
 import sqlite3
 import threading
 import time
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, NamedTuple, Sequence
 
 from .lp_math import principal_raw
 
@@ -24,6 +25,19 @@ _ZERO_ADDRESS = "0x" + "0" * 40
 _SCHEMA_VERSION = 3
 _MAX_LIMIT = 200
 _MISSING = object()
+# Each retained position is only (liquidity, lower tick, upper tick). Pools
+# beyond the global position budget are valued from the cursor but not cached.
+_POOL_INVENTORY_CACHE_POOLS = 128
+_POOL_INVENTORY_CACHE_POSITIONS = 100_000
+_POOL_RESULT_CACHE_ENTRIES = 512
+
+
+class _PoolInventory(NamedTuple):
+    """Compact immutable inputs needed to revalue one pool's open positions."""
+
+    positions: tuple[tuple[int | None, int | None, int | None], ...]
+    lp_count: int
+    history_complete: bool
 
 
 
@@ -541,8 +555,13 @@ class AccountBook:
         self.store = store
         self._installed = False
         self._cache_lock = threading.RLock()
-        self._pool_generation: dict[str, int] = defaultdict(int)
+        self._pool_epoch = 0
+        self._pool_generation: dict[str, int] = {}
         self._pool_cache: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
+        self._pool_inventory_cache: OrderedDict[
+            str, tuple[int, int, _PoolInventory]
+        ] = OrderedDict()
+        self._pool_inventory_positions = 0
         self._owners_generation = 0
         self._owners_cache: OrderedDict[
             tuple[Any, ...], tuple[int, int | None, tuple[dict[str, Any], ...], dict[str, Any]]
@@ -638,9 +657,7 @@ class AccountBook:
                events: Sequence[Mapping[str, Any]]) -> None:
         if not events:
             return
-        affected_pools = {
-            str(event["pool_id"]).lower() for event in events if event.get("pool_id")
-        }
+        inventory_pools: set[str] = set()
         ids = [int(event["id"]) for event in events if event.get("id") is not None]
         old_mapping: dict[int, str] = {}
         affected_txs: set[str] = set()
@@ -707,7 +724,7 @@ class AccountBook:
             )):
                 prior_positions[str(row["position_key"])] = row
                 if row.get("pool_id") is not None:
-                    affected_pools.add(str(row["pool_id"]))
+                    inventory_pools.add(str(row["pool_id"]).lower())
             effect_keys.update(str(row[0]) for row in conn.execute(
                 f"SELECT DISTINCT position_key FROM lp_accounting_effects "
                 f"WHERE position_key IN ({marks})", batch,
@@ -733,7 +750,7 @@ class AccountBook:
                 changed_episodes.update(replay_episodes)
         for batch in _batches(keys):
             marks = ",".join("?" for _ in batch)
-            affected_pools.update(str(row[0]) for row in conn.execute(
+            inventory_pools.update(str(row[0]).lower() for row in conn.execute(
                 f"SELECT pool_id FROM lp_accounting_positions "
                 f"WHERE position_key IN ({marks}) AND pool_id IS NOT NULL", batch,
             ).fetchall())
@@ -753,12 +770,12 @@ class AccountBook:
                 (name, str(value)),
             )
         self._invalidate_cache(
-            affected_pools, owners=bool(old_keys or new_keys),
+            inventory_pools, owners=bool(old_keys or new_keys),
         )
 
     def _rollback(self, conn: sqlite3.Connection, ancestor_number: int) -> None:
         ancestor = int(ancestor_number)
-        affected_pools = {str(row[0]) for row in conn.execute(
+        affected_pools = {str(row[0]).lower() for row in conn.execute(
             "SELECT DISTINCT pool_id FROM lp_accounting_positions "
             "WHERE last_block>? AND pool_id IS NOT NULL", (ancestor,),
         ).fetchall()}
@@ -783,6 +800,12 @@ class AccountBook:
                 "SELECT DISTINCT tx_hash FROM lp_accounting_effects "
                 "WHERE position_key=? AND tx_hash<>''", (key,),
             ).fetchall())
+        for batch in _batches(sorted(keys)):
+            marks = ",".join("?" for _ in batch)
+            affected_pools.update(str(row[0]).lower() for row in conn.execute(
+                f"SELECT pool_id FROM lp_accounting_positions "
+                f"WHERE position_key IN ({marks}) AND pool_id IS NOT NULL", batch,
+            ).fetchall())
         conn.execute(
             "DELETE FROM lp_accounting_event_keys WHERE event_id IN "
             "(SELECT id FROM events WHERE block_number>?)", (ancestor,),
@@ -798,6 +821,7 @@ class AccountBook:
             "INSERT INTO lp_accounting_meta(key,value) VALUES('dirty','1') "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
         )
+
     def _invalidate_cache(
             self, pool_ids: Iterable[str] | None = None, *, owners: bool = True,
     ) -> None:
@@ -807,14 +831,19 @@ class AccountBook:
                 self._owners_cache.clear()
                 self._owner_activity_cache.clear()
             if pool_ids is None:
+                self._pool_epoch += 1
                 self._pool_cache.clear()
                 self._pool_generation.clear()
+                self._pool_inventory_cache.clear()
+                self._pool_inventory_positions = 0
                 return
             for pool_id in {str(item).lower() for item in pool_ids}:
-                # Cache keys carry their pool generation, so invalidation is O(1);
-                # stale entries age out of the bounded LRU instead of being scanned
-                # on every live block.
-                self._pool_generation[pool_id] += 1
+                self._pool_generation[pool_id] = (
+                    self._pool_generation.get(pool_id, 0) + 1
+                )
+                cached = self._pool_inventory_cache.pop(pool_id, None)
+                if cached is not None:
+                    self._pool_inventory_positions -= len(cached[2].positions)
 
     def _event_rows(self, conn: sqlite3.Connection, key: str,
                     ids: Sequence[int] | None = None,
@@ -3171,124 +3200,380 @@ class AccountBook:
             "coverage": coverage,
         }
 
+    @staticmethod
+    def _pool_inventory_position(row: Sequence[Any]) -> tuple[
+        int | None, int | None, int | None
+    ]:
+        protocol = str(row[1] or "")
+        liquidity = (
+            _raw_int(row[2])
+            if row[3] and protocol in ("v3", "v4")
+            else None
+        )
+        return liquidity, _raw_int(row[4]), _raw_int(row[5])
+
+    @staticmethod
+    def _reduce_pool_inventory(
+        positions: Iterable[tuple[int | None, int | None, int | None]],
+        *,
+        lp_count: int,
+        history_complete: bool,
+        mark: Mapping[str, Any],
+        metadata: Mapping[str, Any],
+        history_from: int | None,
+        backfill_done: bool,
+        retain_inventory: bool,
+    ) -> tuple[dict[str, Any], _PoolInventory | None]:
+        sqrt = _raw_int(mark.get("sqrt_price_x96"))
+        mark_tick = _raw_int(mark.get("tick"))
+        decimals0 = _raw_int(metadata.get("decimals0"))
+        decimals1 = _raw_int(metadata.get("decimals1"))
+        created = _raw_int(metadata.get("created_block"))
+        retained: list[tuple[int | None, int | None, int | None]] | None = (
+            [] if retain_inventory else None
+        )
+        open_positions = 0
+        classified = 0
+        active_positions = 0
+        principal_known = False
+        principal_total = 0.0
+        principal_error = 0.0
+        active_known = False
+        active_total = 0.0
+        active_error = 0.0
+        for position in positions:
+            open_positions += 1
+            # Stop retaining as soon as one pool exceeds the global cache budget;
+            # the remaining rows still flow through this single-pass reduction.
+            if retained is not None:
+                if len(retained) < _POOL_INVENTORY_CACHE_POSITIONS:
+                    retained.append(position)
+                else:
+                    retained = None
+            liquidity, lower, upper = position
+            active = False
+            if lower is not None and upper is not None and mark_tick is not None:
+                classified += 1
+                active = lower <= mark_tick < upper
+                if active:
+                    active_positions += 1
+            principal: float | None = None
+            if None not in (liquidity, sqrt, lower, upper):
+                try:
+                    amount0, amount1 = principal_raw(
+                        liquidity, sqrt, lower, upper,  # type: ignore[arg-type]
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    pass
+                else:
+                    principal = _token_value(
+                        amount0, amount1,
+                        mark.get("price0_usd"), mark.get("price1_usd"),
+                        decimals0, decimals1,
+                    )
+            if principal is not None:
+                principal_known = True
+                # Keep small positions in the total without retaining a value
+                # list. This matches compensated float summation in sum().
+                total = principal_total + principal
+                principal_error += (
+                    (principal_total - total) + principal
+                    if abs(principal_total) >= abs(principal)
+                    else (principal - total) + principal_total
+                )
+                principal_total = total
+                if active:
+                    active_known = True
+                    total = active_total + principal
+                    active_error += (
+                        (active_total - total) + principal
+                        if abs(active_total) >= abs(principal)
+                        else (principal - total) + active_total
+                    )
+                    active_total = total
+        if math.isfinite(principal_error):
+            principal_total += principal_error
+        if math.isfinite(active_error):
+            active_total += active_error
+        inventory_complete = bool(
+            created is not None
+            and history_from is not None
+            and history_from <= created
+            and backfill_done
+            and history_complete
+        )
+        observed = (
+            principal_total
+            if principal_known
+            else (0.0 if not open_positions and inventory_complete else None)
+        )
+        if active_known:
+            observed_active: float | None = active_total
+        elif active_positions:
+            observed_active = None
+        elif classified == open_positions:
+            observed_active = 0.0
+        else:
+            observed_active = (
+                0.0 if not open_positions and inventory_complete else None
+            )
+        inventory = (
+            _PoolInventory(tuple(retained), lp_count, history_complete)
+            if retained is not None
+            else None
+        )
+        return {
+            "observed_principal_usd": observed,
+            "observed_active_tvl_usd": observed_active,
+            "lp_count": lp_count,
+            "open_positions": open_positions,
+            "complete_inventory": inventory_complete,
+        }, inventory
+
+    def _cache_pool_stats(
+        self,
+        pool_id: str,
+        epoch: int,
+        generation: int,
+        cache_key: tuple[Any, ...],
+        result: Mapping[str, Any],
+        inventory: _PoolInventory | None = None,
+    ) -> None:
+        with self._cache_lock:
+            if (
+                epoch != self._pool_epoch
+                or generation != self._pool_generation.get(pool_id, 0)
+            ):
+                return
+            if inventory is not None:
+                prior = self._pool_inventory_cache.pop(pool_id, None)
+                if prior is not None:
+                    self._pool_inventory_positions -= len(prior[2].positions)
+                size = len(inventory.positions)
+                while self._pool_inventory_cache and (
+                    len(self._pool_inventory_cache) >= _POOL_INVENTORY_CACHE_POOLS
+                    or self._pool_inventory_positions + size
+                    > _POOL_INVENTORY_CACHE_POSITIONS
+                ):
+                    _, evicted = self._pool_inventory_cache.popitem(last=False)
+                    self._pool_inventory_positions -= len(evicted[2].positions)
+                self._pool_inventory_cache[pool_id] = (
+                    epoch, generation, inventory,
+                )
+                self._pool_inventory_positions += size
+            self._pool_cache[cache_key] = dict(result)
+            self._pool_cache.move_to_end(cache_key)
+            while len(self._pool_cache) > _POOL_RESULT_CACHE_ENTRIES:
+                self._pool_cache.popitem(last=False)
+
     def pool_stats(self, pool_ids: list[str]) -> dict[str, dict[str, Any]]:
         """Return observed position principal without pretending it is full TVL."""
-        requested = list(dict.fromkeys(str(item).lower() for item in pool_ids if item))
+        requested = list(dict.fromkeys(
+            str(item).lower() for item in pool_ids if item
+        ))
         if not requested:
             return {}
-        status = self._status_coverage()
+        empty = {
+            "observed_principal_usd": None,
+            "observed_active_tvl_usd": None,
+            "lp_count": 0,
+            "open_positions": 0,
+            "complete_inventory": False,
+        }
         results: dict[str, dict[str, Any]] = {}
         with self._reader() as conn:
-            if not self._table_exists(conn, "lp_pool_state"):
-                return {pool_id: {"observed_principal_usd": None,
-                                  "observed_active_tvl_usd": None,
-                                  "lp_count": 0, "open_positions": 0,
-                                  "complete_inventory": False}
-                        for pool_id in requested}
-            marks = ",".join("?" for _ in requested)
-            state_rows = _dict_rows(conn.execute(
-                f"SELECT pool_id,block_number,tx_index,log_index,tick,sqrt_price_x96,"
-                f"price0_usd,price1_usd FROM lp_pool_state "
-                f"WHERE pool_id IN ({marks})", requested))
-            state_key = {
-                str(row["pool_id"]): (
-                    row.get("block_number"), row.get("tx_index"), row.get("log_index"),
-                    row.get("tick"), row.get("sqrt_price_x96"),
-                    row.get("price0_usd"), row.get("price1_usd"),
+            owns_snapshot = not conn.in_transaction
+            try:
+                marks = ",".join("?" for _ in requested)
+                store_lock = getattr(self.store, "lock", self._cache_lock)
+                # Never queue a reader behind ingestion. Without an uncontended
+                # snapshot boundary, read committed rows but bypass both caches:
+                # a writer may already have invalidated an uncommitted generation.
+                locked = store_lock.acquire(blocking=False)
+                cacheable = locked and owns_snapshot and not getattr(
+                    getattr(self.store, "connection", None), "in_transaction", False,
                 )
-                for row in state_rows
-            }
-            cache_keys: dict[str, tuple[Any, ...]] = {}
-            missing: list[str] = []
-            with self._cache_lock:
-                for pool_id in requested:
-                    key = (self._pool_generation[pool_id], pool_id,
-                           *state_key.get(pool_id, (None,) * 7))
-                    cache_keys[pool_id] = key
-                    cached = self._pool_cache.get(key)
-                    if cached is not None:
-                        results[pool_id] = dict(cached)
-                        self._pool_cache.move_to_end(key)
-                    else:
-                        missing.append(pool_id)
-            if missing:
-                position_marks = ",".join("?" for _ in missing)
-                positions = _dict_rows(conn.execute(
-                    f"SELECT p.position_key,p.pool_id,p.owner,p.custody,p.history_complete,"
-                    f"p.protocol,p.liquidity,p.liquidity_known,p.tick_lower,p.tick_upper,"
-                    f"s.block_number AS mark_block,s.timestamp AS mark_timestamp,"
-                    f"s.sqrt_price_x96 AS mark_sqrt,s.tick AS mark_tick,"
-                    f"s.price0_usd AS mark_price0,s.price1_usd AS mark_price1,"
-                    f"m.decimals0,m.decimals1 "
-                    f"FROM lp_accounting_positions p "
-                    f"LEFT JOIN lp_pool_state s ON s.pool_id=p.pool_id "
-                    f"LEFT JOIN pools m ON m.id=p.pool_id "
-                    f"WHERE p.pool_id IN ({position_marks}) AND p.active_episode_id IS NOT NULL",
-                    missing))
-                pools = {str(row["id"]): row for row in _dict_rows(conn.execute(
-                    f"SELECT id,created_block FROM pools WHERE id IN ({position_marks})", missing))}
-                grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
-                for position in positions:
-                    grouped[str(position["pool_id"])].append(position)
-                for pool_id in missing:
-                    items = grouped.get(pool_id, [])
-                    position_values = [
-                        self._value_position_row(item) for item in items
-                    ]
-                    principals = [value.get("principal_usd") for value in position_values]
-                    known = [float(value) for value in principals if value is not None]
-                    identities = {item.get("owner") or item.get("custody") for item in items
-                                  if item.get("owner") or item.get("custody")}
-                    created = _raw_int(pools.get(pool_id, {}).get("created_block"))
-                    history_from = _raw_int(status.get("history_from_block"))
-                    backfill = status.get("backfill")
-                    backfill_done = backfill is False or backfill == "complete" or (
-                        isinstance(backfill, Mapping) and (_flag(backfill.get("complete")) or
-                                                           backfill.get("remaining") == 0))
-                    inventory_complete = bool(
-                        created is not None and history_from is not None and history_from <= created
-                        and backfill_done and all(item.get("history_complete") for item in items)
-                    )
-                    observed = sum(known) if known else (
-                        0.0 if not items and inventory_complete else None
-                    )
-                    active_positions = [
-                        value for value in position_values
-                        if value.get("_active_at_mark") is True
-                    ]
-                    known_active = [
-                        float(value["principal_usd"]) for value in active_positions
-                        if value.get("principal_usd") is not None
-                    ]
-                    classified = sum(
-                        value.get("_active_at_mark") is not None
-                        for value in position_values
-                    )
-                    if known_active:
-                        observed_active = sum(known_active)
-                    elif active_positions:
-                        observed_active = None
-                    elif classified == len(items):
-                        observed_active = 0.0
-                    else:
-                        observed_active = 0.0 if not items and inventory_complete else None
-                    result = {
-                        "observed_principal_usd": observed,
-                        "observed_active_tvl_usd": observed_active,
-                        "lp_count": len(identities), "open_positions": len(items),
-                        "complete_inventory": inventory_complete,
-                    }
-                    results[pool_id] = result
-                    cache_key = cache_keys[pool_id]
+                try:
+                    if owns_snapshot:
+                        conn.execute("BEGIN")
+                    if not self._table_exists(conn, "lp_pool_state"):
+                        return {pool_id: dict(empty) for pool_id in requested}
+                    state_rows = _dict_rows(conn.execute(
+                        f"SELECT pool_id,tick,sqrt_price_x96,"
+                        f"price0_usd,price1_usd "
+                        f"FROM lp_pool_state WHERE pool_id IN ({marks})",
+                        requested,
+                    ))
                     with self._cache_lock:
-                        self._pool_cache[cache_key] = dict(result)
-                        self._pool_cache.move_to_end(cache_key)
-                        while len(self._pool_cache) > 512:
-                            self._pool_cache.popitem(last=False)
-        return {pool_id: results.get(pool_id, {
-            "observed_principal_usd": None, "observed_active_tvl_usd": None,
-            "lp_count": 0, "open_positions": 0, "complete_inventory": False,
-        }) for pool_id in requested}
+                        epoch = self._pool_epoch if cacheable else -1
+                        generations = {
+                            pool_id: self._pool_generation.get(pool_id, 0)
+                            for pool_id in requested
+                        }
+                finally:
+                    if locked:
+                        store_lock.release()
+                status = self._status_coverage()
+                state = {
+                    str(row["pool_id"]).lower(): row for row in state_rows
+                }
+                metadata = {
+                    str(row["id"]).lower(): row
+                    for row in _dict_rows(conn.execute(
+                        f"SELECT id,created_block,decimals0,decimals1 "
+                        f"FROM pools WHERE id IN ({marks})",
+                        requested,
+                    ))
+                }
+                history_from = _raw_int(status.get("history_from_block"))
+                backfill = status.get("backfill")
+                backfill_done = (
+                    backfill is False
+                    or backfill == "complete"
+                    or (
+                        isinstance(backfill, Mapping)
+                        and (
+                            _flag(backfill.get("complete"))
+                            or backfill.get("remaining") == 0
+                        )
+                    )
+                )
+                cache_keys: dict[str, tuple[Any, ...]] = {}
+                inventory_hits: dict[str, _PoolInventory] = {}
+                missing_results: list[str] = []
+                missing_inventory: list[str] = []
+                with self._cache_lock:
+                    for pool_id in requested:
+                        mark = state.get(pool_id, {})
+                        pool = metadata.get(pool_id, {})
+                        generation = generations[pool_id]
+                        cache_key = (
+                            epoch, generation, pool_id,
+                            mark.get("tick"),
+                            mark.get("sqrt_price_x96"),
+                            mark.get("price0_usd"),
+                            mark.get("price1_usd"),
+                            pool.get("created_block"),
+                            pool.get("decimals0"),
+                            pool.get("decimals1"),
+                            history_from,
+                            backfill_done,
+                        )
+                        cache_keys[pool_id] = cache_key
+                        cached = self._pool_cache.get(cache_key)
+                        if cached is not None:
+                            results[pool_id] = dict(cached)
+                            self._pool_cache.move_to_end(cache_key)
+                            continue
+                        missing_results.append(pool_id)
+                        inventory_entry = self._pool_inventory_cache.get(pool_id)
+                        if (
+                            inventory_entry is not None
+                            and inventory_entry[0] == epoch
+                            and inventory_entry[1] == generation
+                        ):
+                            inventory_hits[pool_id] = inventory_entry[2]
+                            self._pool_inventory_cache.move_to_end(pool_id)
+                        else:
+                            missing_inventory.append(pool_id)
+                for pool_id in missing_results:
+                    inventory = inventory_hits.get(pool_id)
+                    if inventory is None:
+                        continue
+                    result, _ = self._reduce_pool_inventory(
+                        inventory.positions,
+                        lp_count=inventory.lp_count,
+                        history_complete=inventory.history_complete,
+                        mark=state.get(pool_id, {}),
+                        metadata=metadata.get(pool_id, {}),
+                        history_from=history_from,
+                        backfill_done=backfill_done,
+                        retain_inventory=False,
+                    )
+                    results[pool_id] = result
+                    self._cache_pool_stats(
+                        pool_id, epoch, generations[pool_id],
+                        cache_keys[pool_id], result,
+                    )
+                if missing_inventory:
+                    position_marks = ",".join("?" for _ in missing_inventory)
+                    summaries = {
+                        str(row["pool_id"]).lower(): (
+                            int(row["lp_count"] or 0),
+                            bool(row["history_complete"]),
+                        )
+                        for row in _dict_rows(conn.execute(
+                            f"SELECT pool_id,"
+                            f"COUNT(DISTINCT CASE "
+                            f"WHEN owner IS NOT NULL AND owner<>'' THEN owner "
+                            f"WHEN custody IS NOT NULL AND custody<>'' THEN custody "
+                            f"END) AS lp_count,"
+                            f"MIN(history_complete) AS history_complete "
+                            f"FROM lp_accounting_positions "
+                            f"WHERE pool_id IN ({position_marks}) "
+                            f"AND active_episode_id IS NOT NULL GROUP BY pool_id",
+                            missing_inventory,
+                        ))
+                    }
+                    position_rows = conn.execute(
+                        f"SELECT pool_id,protocol,liquidity,liquidity_known,"
+                        f"tick_lower,tick_upper FROM lp_accounting_positions "
+                        f"WHERE pool_id IN ({position_marks}) "
+                        f"AND active_episode_id IS NOT NULL ORDER BY pool_id",
+                        missing_inventory,
+                    )
+                    evaluated: set[str] = set()
+                    for raw_pool_id, group in groupby(
+                        position_rows, key=lambda row: str(row[0]).lower(),
+                    ):
+                        pool_id = str(raw_pool_id)
+                        lp_count, history_complete = summaries.get(
+                            pool_id, (0, True),
+                        )
+                        result, inventory = self._reduce_pool_inventory(
+                            (
+                                self._pool_inventory_position(row)
+                                for row in group
+                            ),
+                            lp_count=lp_count,
+                            history_complete=history_complete,
+                            mark=state.get(pool_id, {}),
+                            metadata=metadata.get(pool_id, {}),
+                            history_from=history_from,
+                            backfill_done=backfill_done,
+                            retain_inventory=cacheable,
+                        )
+                        evaluated.add(pool_id)
+                        results[pool_id] = result
+                        self._cache_pool_stats(
+                            pool_id, epoch, generations[pool_id],
+                            cache_keys[pool_id], result, inventory,
+                        )
+                    for pool_id in missing_inventory:
+                        if pool_id in evaluated:
+                            continue
+                        result, inventory = self._reduce_pool_inventory(
+                            (),
+                            lp_count=0,
+                            history_complete=True,
+                            mark=state.get(pool_id, {}),
+                            metadata=metadata.get(pool_id, {}),
+                            history_from=history_from,
+                            backfill_done=backfill_done,
+                            retain_inventory=cacheable,
+                        )
+                        results[pool_id] = result
+                        self._cache_pool_stats(
+                            pool_id, epoch, generations[pool_id],
+                            cache_keys[pool_id], result, inventory,
+                        )
+            finally:
+                if owns_snapshot and conn.in_transaction:
+                    conn.rollback()
+        return {
+            pool_id: results.get(pool_id, dict(empty))
+            for pool_id in requested
+        }
 
 
 def _json_list(value: Any) -> list[str]:

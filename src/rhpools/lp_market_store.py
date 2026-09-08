@@ -284,9 +284,6 @@ class MarketStore:
             ON pending_enrichment(next_attempt, block_number, tx_hash);
         CREATE INDEX IF NOT EXISTS pending_enrichment_order_idx
             ON pending_enrichment(block_number, tx_hash, next_attempt);
-        CREATE INDEX IF NOT EXISTS pending_enrichment_identity_order_idx
-            ON pending_enrichment(block_number, tx_hash, next_attempt)
-            WHERE last_error GLOB 'pool_identity_pending:*';
         CREATE TABLE IF NOT EXISTS token_metadata(
             address TEXT PRIMARY KEY, symbol TEXT NOT NULL, decimals INTEGER NOT NULL,
             updated_at REAL NOT NULL
@@ -412,6 +409,19 @@ class MarketStore:
                     "WHERE events.id=pending_reprojection.event_id)"
                 )
                 self.connection.execute("PRAGMA user_version=3")
+            if int(self.connection.execute("PRAGMA user_version").fetchone()[0]) < 4:
+                self.connection.executescript("""
+                    DROP INDEX IF EXISTS pending_enrichment_identity_order_idx;
+                    CREATE INDEX IF NOT EXISTS pending_enrichment_identity_immediate_idx
+                        ON pending_enrichment(block_number,tx_hash)
+                        WHERE next_attempt<=0
+                        AND last_error GLOB 'pool_identity_pending:*';
+                    CREATE INDEX IF NOT EXISTS pending_enrichment_identity_retry_ready_idx
+                        ON pending_enrichment(next_attempt,block_number,tx_hash)
+                        WHERE next_attempt>0
+                        AND last_error GLOB 'pool_identity_pending:*';
+                    PRAGMA user_version=4;
+                """)
             self.connection.execute(
                 "CREATE INDEX IF NOT EXISTS pending_reprojection_order_idx "
                 "ON pending_reprojection(block_number,tx_index,log_index,event_id)"
@@ -668,6 +678,32 @@ class MarketStore:
         if not entity_rows:
             return
         entity_rows.sort(key=lambda row: (row[0], row[1]))
+        stable_rows = {
+            (row[0], row[1]): row
+            for row in entity_rows
+            if row[0] in {"owner", "custody"}
+        }
+        unchanged: set[tuple[str, str]] = set()
+        for batch in _batches(tuple(stable_rows), 250):
+            predicates = " OR ".join("(kind=? AND id=?)" for _ in batch)
+            values = tuple(value for key in batch for value in key)
+            for stored in connection.execute(
+                "SELECT kind,id,label,subtitle,href,rank "
+                f"FROM lp_search_entities WHERE {predicates}",
+                values,
+            ):
+                key = (str(stored["kind"]), str(stored["id"]))
+                if tuple(stored) == stable_rows[key]:
+                    unchanged.add(key)
+        if unchanged:
+            entity_rows = [
+                row for row in entity_rows if (row[0], row[1]) not in unchanged
+            ]
+            term_rows = [
+                row for row in term_rows if (row[1], row[2]) not in unchanged
+            ]
+        if not entity_rows:
+            return
         term_rows.sort()
         connection.executemany(
             "INSERT INTO lp_search_entities(kind,id,label,subtitle,href,rank) "

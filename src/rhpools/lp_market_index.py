@@ -2934,14 +2934,46 @@ class MarketIndexer:
     def _pending_pool_identity_replays(
         self, limit: int = DEFERRED_POOL_IDENTITY_BATCH,
     ) -> list[dict[str, Any]]:
-        rows = self.store.read().execute(
-            "SELECT * FROM pending_enrichment WHERE next_attempt<=? "
+        bounded = max(1, min(int(limit), DEFERRED_POOL_IDENTITY_BATCH))
+        now = time.time()
+        reader = self.store.read()
+        # A due chronological prefix needs no retry-wide sort. Bound the
+        # lookahead before filtering, so future retries cannot turn it into
+        # another full-queue scan.
+        rows = reader.execute(
+            "WITH earliest AS ("
+            "SELECT block_number,tx_hash,next_attempt FROM pending_enrichment "
+            "INDEXED BY pending_enrichment_order_idx "
+            "ORDER BY block_number,tx_hash LIMIT ?"
+            ") SELECT p.* FROM earliest e JOIN pending_enrichment p "
+            "ON p.tx_hash=e.tx_hash WHERE e.next_attempt<=? "
+            "AND p.last_error GLOB 'pool_identity_pending:*' "
+            "ORDER BY e.block_number,e.tx_hash LIMIT ?",
+            (bounded * 4, now, bounded),
+        ).fetchall()
+        if len(rows) == bounded:
+            return [dict(row) for row in rows]
+        rows = reader.execute(
+            "WITH immediate AS ("
+            "SELECT block_number,tx_hash FROM pending_enrichment "
+            "INDEXED BY pending_enrichment_identity_immediate_idx "
+            "WHERE next_attempt<=0 "
             "AND last_error GLOB 'pool_identity_pending:*' "
-            "ORDER BY block_number,tx_hash LIMIT ?",
-            (
-                time.time(),
-                max(1, min(int(limit), DEFERRED_POOL_IDENTITY_BATCH)),
-            ),
+            "ORDER BY block_number,tx_hash LIMIT ?"
+            "),retried AS ("
+            "SELECT block_number,tx_hash FROM pending_enrichment "
+            "INDEXED BY pending_enrichment_identity_retry_ready_idx "
+            "WHERE next_attempt>0 AND next_attempt<=? "
+            "AND last_error GLOB 'pool_identity_pending:*' "
+            "ORDER BY block_number,tx_hash LIMIT ?"
+            "),selected AS ("
+            "SELECT block_number,tx_hash FROM immediate "
+            "UNION ALL SELECT block_number,tx_hash FROM retried "
+            "ORDER BY block_number,tx_hash LIMIT ?"
+            ") SELECT p.* FROM selected s JOIN pending_enrichment p "
+            "ON p.tx_hash=s.tx_hash "
+            "ORDER BY s.block_number,s.tx_hash",
+            (bounded, now, bounded, bounded),
         ).fetchall()
         return [dict(row) for row in rows]
 

@@ -68,7 +68,7 @@
 
   <main id="terminal-main">
     <section class="readout" aria-label="LP market status">
-      <div id="status-readout" class="readout-line" aria-live="polite">index connecting</div>
+      <button id="status-readout" type="button" class="readout-line" aria-live="polite" aria-haspopup="dialog" aria-controls="index-status-shell" title="Open index status details">index connecting</button>
       <div id="overview-readout" class="readout-line dim">24h · metrics —</div>
       <div id="endpoint-health" class="sr-only" role="status" aria-live="polite"></div>
     </section>
@@ -229,6 +229,17 @@
       </div>
     </section>
   </main>
+
+  <section id="index-status" class="pool-inspector" hidden>
+    <div id="index-status-shell" class="pool-inspector-shell index-status-shell" role="dialog" aria-modal="true" aria-labelledby="index-status-title" tabindex="-1">
+      <header class="pool-inspector-head">
+        <h2 id="index-status-title">INDEX STATUS</h2>
+        <a href="/api/lp/status" target="_blank" rel="noopener noreferrer">RAW JSON</a>
+        <button id="index-status-close" type="button" aria-label="Close index status">CLOSE</button>
+      </header>
+      <pre id="index-status-details" class="index-status-details" role="region" aria-label="Index diagnostics" tabindex="0">Waiting for index status.</pre>
+    </div>
+  </section>
 
   <section id="pool-inspector" class="pool-inspector" aria-labelledby="pool-inspector-title" hidden>
     <div id="pool-inspector-shell" class="pool-inspector-shell" role="dialog" aria-modal="true" tabindex="-1">

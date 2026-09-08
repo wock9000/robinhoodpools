@@ -204,6 +204,28 @@ body.is-resizing-panes { cursor: row-resize; user-select: none; }
 .readout-warn { color: var(--yellow); }
 .readout-error { color: var(--red); }
 
+button.readout-line {
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  text-align: left;
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+}
+button.readout-line:hover { color: var(--white); }
+.index-status-shell { max-width: 680px; max-height: 100%; margin: auto; }
+.index-status-details {
+  min-height: 0;
+  margin: 0;
+  padding: 14px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: inherit;
+  line-height: 1.65;
+}
+
 .universal-search { border-bottom: 1px solid var(--line); }
 .lp-search-form {
   display: grid;
