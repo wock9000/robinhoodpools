@@ -770,10 +770,20 @@ select:focus { border-color: var(--text); color: var(--text); }
   .readout {
     height: auto;
     min-height: 22px;
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: center;
     padding: 3px 8px;
   }
-  .readout #status-readout { display: none; }
-  .readout #overview-readout { grid-row: 1; }
+  .readout #status-readout {
+    display: block;
+    min-height: 44px;
+    grid-column: 1;
+    grid-row: 1;
+    color: var(--cyan);
+    font-size: 0;
+  }
+  .readout #status-readout::after { content: "INDEX STATUS"; font-size: 11px; }
+  .readout #overview-readout { grid-column: 2; grid-row: 1; }
   .readout #overview-readout::before { content: "USDG · "; }
   #tape-section > .section-head { display: none; min-height: 0; padding: 4px 6px; }
   #tape-section > .section-head:has(#tape-tools.is-open) { display: flex; }
