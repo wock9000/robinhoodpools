@@ -446,3 +446,63 @@ def test_close_cancels_running_reader_without_losing_committed_data(tmp_path):
             "SELECT block_number,tx_hash FROM events"
         ).fetchall()
         assert [tuple(row) for row in rows] == [(10, event(block, 0)["tx_hash"])]
+
+
+def test_rollback_repairs_only_orphan_search_identities(tmp_path):
+    path = tmp_path / "search-reorg.sqlite"
+    with MarketStore(path) as store:
+        first, orphan = header(10), header(11)
+        canonical = event(first, 0)
+        changed = event(orphan, 0)
+        changed.update({"tx_hash": "0x" + "cd" * 32, "token_id": "99"})
+        removed = event(orphan, 1)
+        removed.update({
+            "tx_hash": "0x" + "ef" * 32,
+            "owner": "0x" + "33" * 20,
+            "custody": "0x" + "44" * 20,
+            "position_key": "orphan-position",
+        })
+        store.ingest([first], [canonical])
+        store.ingest([orphan], [changed, removed])
+        store.ensure_search_index()
+        owner_before = store.search(str(canonical["owner"]))
+        store.rollback(10)
+        assert store.search(str(canonical["owner"])) == owner_before
+        for value in (changed["tx_hash"], removed["tx_hash"], removed["owner"],
+                      removed["custody"], removed["position_key"]):
+            assert store.search(str(value)) == ([], 0)
+        position = store.search("shared-position")[0]
+        assert [(row["kind"], row["label"]) for row in position] == [
+            ("position", "Position 7"),
+        ]
+        assert store.search("99") == ([], 0)
+    with MarketStore(path) as reopened:
+        assert reopened.search(str(canonical["owner"])) == owner_before
+        assert reopened.search("orphan-position") == ([], 0)
+
+
+def test_rollback_keeps_shared_tokens_from_unknown_age_cross_protocol_pool():
+    shared_token = "0x" + "55" * 20
+    orphan_token = "0x" + "66" * 20
+    surviving = {
+        "id": "0x" + "77" * 20, "address": "0x" + "77" * 20,
+        "protocol": "v2", "token0": shared_token, "token1": "0x" + "88" * 20,
+        "symbol0": "SHARED", "symbol1": "USDG", "created_block": None,
+    }
+    orphan = {
+        "id": "0x" + "99" * 20, "address": "0x" + "99" * 20,
+        "protocol": "v3", "token0": shared_token, "token1": orphan_token,
+        "symbol0": "SHARED", "symbol1": "ORPHAN", "created_block": 11,
+    }
+    with MarketStore(":memory:") as store:
+        store.upsert_pools([surviving, orphan])
+        store.ensure_search_index()
+        store.rollback(10)
+        assert store.search(orphan["id"]) == ([], 0)
+        assert store.search(orphan_token) == ([], 0)
+        assert store.search("ORPHAN") == ([], 0)
+        shared = store.search(shared_token)[0]
+        assert {(row["kind"], row["id"]) for row in shared} == {
+            ("token", shared_token), ("pool", surviving["id"]),
+        }
+        assert store.search(surviving["id"])[1] == 1

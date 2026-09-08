@@ -739,9 +739,9 @@ class MarketStore:
         return quote(str(value), safe="")
 
     @classmethod
-    def _index_pool_search(
-        cls, connection: sqlite3.Connection, row: Mapping[str, Any],
-    ) -> None:
+    def _pool_search_entities(
+        cls, row: Mapping[str, Any],
+    ) -> Iterator[tuple[str, str, str, str, str, int, Iterable[Any]]]:
         pool_id = str(row.get("id") or "").lower()
         if not pool_id:
             return
@@ -762,12 +762,11 @@ class MarketStore:
             else factory_names.get(factory, protocol.upper())
         )
         pair = f"{symbol0} / {symbol1}"
-        cls._put_search_entity(
-            connection, kind="pool", entity_id=pool_id, label=pair,
-            subtitle=f"{venue} POOL · {pool_id}",
-            href=f"/pool?id={cls._query_value(pool_id)}", rank=0,
-            terms=(protocol, venue, factory, row.get("address"), row.get("token0"),
-                   row.get("token1"), symbol0, symbol1, pair),
+        yield (
+            "pool", pool_id, pair, f"{venue} POOL · {pool_id}",
+            f"/pool?id={cls._query_value(pool_id)}", 0,
+            (protocol, venue, factory, row.get("address"), row.get("token0"),
+             row.get("token1"), symbol0, symbol1, pair),
         )
         for address, symbol in (
             (row.get("token0"), row.get("symbol0")),
@@ -777,19 +776,22 @@ class MarketStore:
             if not address:
                 continue
             token_label = str(symbol or address)
-            cls._put_search_entity(
-                connection, kind="token", entity_id=address, label=token_label,
-                subtitle=f"TOKEN · {address}",
-                href=f"/lp?q={cls._query_value(address)}", rank=1,
-                terms=(symbol, address),
+            yield (
+                "token", address, token_label, f"TOKEN · {address}",
+                f"/lp?q={cls._query_value(address)}", 1, (symbol, address),
             )
         protocol_id = venue.lower().replace(" ", "-")
-        cls._put_search_entity(
-            connection, kind="protocol", entity_id=protocol_id, label=venue,
-            subtitle=f"INDEXED {protocol.upper()} PROTOCOL",
-            href=f"/lp?protocol={cls._query_value(protocol)}", rank=3,
-            terms=(protocol, venue, factory),
+        yield (
+            "protocol", protocol_id, venue, f"INDEXED {protocol.upper()} PROTOCOL",
+            f"/lp?protocol={cls._query_value(protocol)}", 3,
+            (protocol, venue, factory),
         )
+
+    @classmethod
+    def _index_pool_search(
+        cls, connection: sqlite3.Connection, row: Mapping[str, Any],
+    ) -> None:
+        cls._put_search_entities(connection, cls._pool_search_entities(row))
 
     @classmethod
     def _event_search_entities(
@@ -2460,6 +2462,84 @@ class MarketStore:
                 (time.time() + max(0.0, delay), str(error)[:1000], pool_id.lower(), int(block_number)),
             )
 
+    def _rollback_search_index(
+        self, connection: sqlite3.Connection, ancestor: int,
+        removable_pool_where: str,
+    ) -> None:
+        """Repair only identities touched by orphaned events and pools."""
+        # Read the orphan suffix before deleting it. Each surviving lookup uses
+        # the identity index, not a scan of all historical canonical events.
+        for kind, column, index in (
+            ("transaction", "tx_hash", "events_tx_log_idx"),
+            ("owner", "owner", "events_owner_time_idx"),
+            ("custody", "custody", "events_custody_time_idx"),
+            ("position", "position_key", "events_position_order_idx"),
+        ):
+            orphaned = connection.execute(
+                f"SELECT DISTINCT {column} FROM events INDEXED BY events_block_idx "
+                f"WHERE block_number>? AND {column} IS NOT NULL",
+                (ancestor,),
+            )
+            while batch := orphaned.fetchmany(500):
+                identities = [str(row[0]) for row in batch]
+                marks = ",".join("?" for _ in identities)
+                connection.executemany(
+                    "DELETE FROM lp_search_entities WHERE kind=? AND id=?",
+                    ((kind, identity) for identity in identities),
+                )
+                fields = (
+                    "position_key,MAX(token_id) AS token_id,"
+                    "MAX(pool_id) AS pool_id,MAX(protocol) AS protocol"
+                    if kind == "position"
+                    else f"{column},MIN(block_number) AS block_number"
+                )
+                surviving = connection.execute(
+                    f"SELECT {fields} FROM events INDEXED BY {index} "
+                    f"WHERE {column} IN ({marks}) AND block_number<=? "
+                    f"GROUP BY {column}",
+                    (*identities, ancestor),
+                )
+                self._index_event_search_batch(
+                    connection, (dict(row) for row in surviving),
+                )
+
+        affected: set[tuple[str, str]] = set()
+        for row in connection.execute(
+            f"SELECT * FROM pools WHERE {removable_pool_where}",
+            (ancestor, ancestor),
+        ):
+            pool = dict(row)
+            affected.update(
+                (entity[0], entity[1]) for entity in self._pool_search_entities(pool)
+            )
+        if not affected:
+            return
+        connection.executemany(
+            "DELETE FROM lp_search_entities WHERE kind=? AND id=?",
+            sorted(affected),
+        )
+        # Token and venue identities can be shared with surviving pools.
+        for row in connection.execute(
+            "SELECT id,protocol,address,token0,token1,symbol0,symbol1,factory "
+            f"FROM pools WHERE NOT COALESCE(({removable_pool_where}),0)",
+            (ancestor, ancestor),
+        ):
+            self._put_search_entities(
+                connection,
+                (
+                    entity for entity in self._pool_search_entities(dict(row))
+                    if (entity[0], entity[1]) in affected
+                ),
+            )
+        for protocol, label in (("v2", "V2"), ("v3", "V3"), ("v4", "Uniswap V4")):
+            if ("protocol", protocol) in affected:
+                self._put_search_entity(
+                    connection, kind="protocol", entity_id=protocol, label=label,
+                    subtitle=f"INDEXED {protocol.upper()} PROTOCOL",
+                    href=f"/lp?protocol={protocol}", rank=3,
+                    terms=(protocol, label, "uniswap" if protocol in {"v3", "v4"} else None),
+                )
+
     def rollback(
         self, ancestor: int, *, header: Mapping[str, Any] | None = None,
     ) -> None:
@@ -2494,6 +2574,7 @@ class MarketStore:
                 "created_block>? OR (created_block IS NULL AND id IN "
                 "(SELECT pool_id FROM pool_provenance WHERE observed_block>?))"
             )
+            self._rollback_search_index(connection, ancestor, removable_pool_where)
             removed_pools = connection.execute(
                 f"SELECT COUNT(*) FROM pools WHERE {removable_pool_where}",
                 (ancestor, ancestor),
@@ -2601,10 +2682,6 @@ class MarketStore:
             if removed_token_pending:
                 self._bump(connection, "pending_metadata", -removed_token_pending)
             self._bump(connection, "indexed_pools", -removed_pools)
-            connection.execute("DELETE FROM lp_search_entities")
-            self._set_metadata(connection, "search_index_version", 0)
-            self._set_metadata(connection, "search_index_state", "warming")
-            self._set_metadata(connection, "search_index_cursor", 0)
             self._bump(connection, "epoch", 1)
             self._next_revision(connection)
             self._set_metadata(connection, "last_reorg", {

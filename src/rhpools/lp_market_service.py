@@ -1869,6 +1869,20 @@ class LPMarketService:
             "new": "p.created_block",
             "activity": "COALESCE(t.events,0)",
         }
+        bucket_sort_fields = {
+            "volume": ("priced_swaps", "volume_usd"),
+            "fees": ("priced_fees", "fees_usd"),
+            "flow": ("priced_flows", "deposit_usd", "withdrawal_usd"),
+            "swaps": ("swaps",),
+            "adds": ("adds",),
+            "removes": ("removes",),
+            "activity": ("events",),
+        }
+        row_bucket_fields = (
+            "swaps", "adds", "removes", "volume_usd", "fees_usd",
+            "deposit_usd", "withdrawal_usd", "priced_swaps", "priced_fees",
+            "priced_flows",
+        )
         ordering_value = ordering_values.get(sort)
         ordering_args: list[Any] = []
         if sort == "change":
@@ -1893,39 +1907,68 @@ class LPMarketService:
         capital_sort = sort in {"active_tvl", "observed_active_tvl", "lps"}
         snapshot_revision = int(status.get("revision") or 0)
         owner_revision = self.book.owners_revision
-        metric_revision = (snapshot_revision, owner_revision, end // 30)
+        metric_revision = (
+            snapshot_revision,
+            owner_revision if capital_sort else None,
+            start,
+            end,
+        )
         def load():
             clause, args = self._bucket_clause(start, end)
             conn = self.store.read()
-            accounting_cte = (
-                ",a AS (SELECT ap.pool_id,"
-                "SUM(ap.principal_usd) AS observed_principal_usd,"
-                "SUM(CASE WHEN ap.tick_lower IS NULL OR ps.tick IS NULL OR "
-                "(ap.tick_lower<=ps.tick AND ps.tick<ap.tick_upper) "
-                "THEN ap.principal_usd END) AS observed_active_tvl_usd,"
-                "COUNT(DISTINCT COALESCE(ap.owner,ap.custody)) AS lp_count,"
-                "MIN(ap.history_complete) AS all_history_complete "
-                "FROM lp_accounting_positions ap LEFT JOIN lp_pool_state ps "
-                "ON ps.pool_id=ap.pool_id WHERE ap.active_episode_id IS NOT NULL "
-                "GROUP BY ap.pool_id)"
-                if capital_sort else ""
+            metric_ctes = []
+            metric_args: list[Any] = []
+            aggregate_fields = bucket_sort_fields.get(sort)
+            if aggregate_fields is not None:
+                sums = ",".join(
+                    f"SUM({field}) AS {field}" for field in aggregate_fields
+                )
+                metric_ctes.append(
+                    f"t AS (SELECT pool_id,{sums} FROM lp_pool_buckets "
+                    f"WHERE {clause} GROUP BY pool_id)"
+                )
+                metric_args.extend(args)
+            if sort == "lps":
+                metric_ctes.append(
+                    "a AS (SELECT pool_id,"
+                    "COUNT(DISTINCT CASE "
+                    "WHEN owner IS NOT NULL AND owner<>'' THEN owner "
+                    "WHEN custody IS NOT NULL AND custody<>'' THEN custody "
+                    "END) AS lp_count "
+                    "FROM lp_accounting_positions "
+                    "WHERE active_episode_id IS NOT NULL GROUP BY pool_id)"
+                )
+            elif capital_sort:
+                history_complete = (
+                    ",MIN(ap.history_complete) AS all_history_complete"
+                    if sort == "active_tvl" else ""
+                )
+                metric_ctes.append(
+                    "a AS (SELECT ap.pool_id,"
+                    "SUM(CASE WHEN ap.tick_lower IS NULL OR ps.tick IS NULL OR "
+                    "(ap.tick_lower<=ps.tick AND ps.tick<ap.tick_upper) "
+                    "THEN ap.principal_usd END) AS observed_active_tvl_usd"
+                    + history_complete
+                    + " FROM lp_accounting_positions ap "
+                    "LEFT JOIN lp_pool_state ps ON ps.pool_id=ap.pool_id "
+                    "WHERE ap.active_episode_id IS NOT NULL GROUP BY ap.pool_id)"
+                )
+            metric_prefix = (
+                "WITH " + ",".join(metric_ctes) + " " if metric_ctes else ""
             )
-            totals = (
-                f"WITH t AS (SELECT pool_id,{_SUM_FIELDS} FROM lp_pool_buckets "
-                f"WHERE {clause} GROUP BY pool_id){accounting_cte} "
-            )
-            joins = (
-                "FROM pools p LEFT JOIN t ON t.pool_id=p.id "
-                "LEFT JOIN lp_pool_state s ON s.pool_id=p.id "
+            metric_joins = (
+                "FROM pools p "
+                + ("LEFT JOIN t ON t.pool_id=p.id " if aggregate_fields is not None else "")
+                + "LEFT JOIN lp_pool_state s ON s.pool_id=p.id "
                 + ("LEFT JOIN a ON a.pool_id=p.id " if capital_sort else "")
             )
             def metric_rows():
                 return [
                     (str(row["id"]), row["sort_value"])
                     for row in conn.execute(
-                        totals + f"SELECT p.id,{ordering_value} AS sort_value "
-                        + joins + f"WHERE {where}",
-                        [*args, *ordering_args, *filters],
+                        metric_prefix + f"SELECT p.id,{ordering_value} AS sort_value "
+                        + metric_joins + f"WHERE {where}",
+                        [*metric_args, *ordering_args, *filters],
                     ).fetchall()
                 ]
             metrics = self._cached(
@@ -1944,8 +1987,11 @@ class LPMarketService:
             page_ids = ordered_ids[offset:offset + limit]
             if page_ids:
                 marks = ",".join("?" for _ in page_ids)
+                row_sums = ",".join(
+                    f"SUM({field}) AS {field}" for field in row_bucket_fields
+                )
                 page_totals = (
-                    f"WITH t AS (SELECT pool_id,{_SUM_FIELDS} FROM lp_pool_buckets "
+                    f"WITH t AS (SELECT pool_id,{row_sums} FROM lp_pool_buckets "
                     f"WHERE {clause} AND pool_id IN ({marks}) GROUP BY pool_id) "
                 )
                 page_joins = (
@@ -1957,7 +2003,7 @@ class LPMarketService:
                     + "SELECT p.*,s.price,s.price0_usd,s.price1_usd,"
                     "s.timestamp AS last_event_at,s.liquidity AS active_liquidity,"
                     "s.fee_ppm AS current_fee,"
-                    + ",".join(f"t.{field}" for field in BUCKET_FIELDS)
+                    + ",".join(f"t.{field}" for field in row_bucket_fields)
                     + " " + page_joins + f"WHERE p.id IN ({marks})",
                     [*args, *page_ids, *page_ids],
                 ).fetchall()
@@ -1975,7 +2021,7 @@ class LPMarketService:
             result = []
             for row in rows:
                 row = dict(row)
-                for field in BUCKET_FIELDS:
+                for field in row_bucket_fields:
                     row[field] = row.get(field) or 0
                 stats = capital.get(row["id"], {})
                 risks = []
