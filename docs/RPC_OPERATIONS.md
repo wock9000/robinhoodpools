@@ -19,6 +19,11 @@ The corresponding `*_URLS` variables remain suitable for unkeyed endpoints and a
 
 Capability routing checks chain ID 4663 and keeps failure/cooldown state separate for logs, head, current state, archive state, receipts, and traces. A pruned node's missing archive state must not invalidate its valid block headers or logs.
 
+For routed HTTP `eth_call` and `eth_estimateGas`, an EVM execution revert is a
+contract outcome, not a provider outage. The caller receives the RPC error and
+the provider remains available for other calls. Transport failures, malformed
+responses, and missing archive state still trigger capability-specific failover.
+
 ## Goldsky measurements and limits
 
 A small anonymous-output probe from the production host verified the donated provider privately: chain 4663; exact matching block/header and log digests against the local node; old block headers; USDG `decimals()` at blocks 30,000,000 and 56,400,000; receipts; `debug_traceTransaction` with `callTracer`; and a four-item JSON-RPC batch. The local pruned node could not answer those archive-state calls. Individual successful Goldsky requests in this probe took roughly 76–352 ms; these are samples, not percentile/SLA claims.
@@ -42,6 +47,17 @@ Production sampling found wallet aggregation repeatedly restarting whenever inge
 
 Late historical events rebuild only the affected position's changed accounting rows rather than deleting and rewriting its entire projection. This preserves synchronous, atomic financial updates while reducing write amplification. Existing durable metadata counters are reused on restart; full-table counts initialize missing counters only.
 
+Header, event, and search writes use parameterized multi-row inserts bounded by
+SQLite's variable limit. This avoids handing the Python interpreter to competing
+valuation workers between every inserted row. The outer durable transaction and
+its atomic accounting/cursor boundary are unchanged.
+
+A provider head below the durable cursor pauses live ingestion and reports
+degraded source state. Height regression alone cannot delete canonical history.
+Reorganization recovery requires conflicting canonical hash or parent evidence.
+Rollback repairs the affected search identities from surviving events and pools;
+it does not clear the global catalog or restart its historical build.
+
 The terminal's HEAD / INDEX readout, labeled INDEX STATUS on mobile, opens index details. Its timings come from
 `live_scan` and `history_scan` in `/api/lp/status`: `fetch_seconds`,
 `store_lock_wait_seconds`, `store_seconds`, and the lane's post-processing or
@@ -51,7 +67,11 @@ Pool valuation retains at most 128 compact inventories and 100,000 position
 triples in total. Changing prices or ticks revalues those positions without
 reloading their inventory; metadata and coverage changes still refresh the
 result. Oversized pools stream from SQLite without retaining an inventory.
-Reads bypass the caches rather than waiting behind an active writer.
+Each pool's inventory generation commits with its accounting changes. Readers
+compare generations, marks, metadata, and inventory within one WAL snapshot,
+so they can reuse committed caches while a writer is active. Aborted writes
+cannot publish a new generation.
+Caller-owned read snapshots remain open until the caller ends them.
 
 Schema version 4 replaces the identity-replay queue's single chronological
 index with partial indexes for immediate work and timed retries. Startup builds
@@ -60,9 +80,28 @@ disk headroom for the migration. A bounded chronological lookup handles an
 already-ready queue; otherwise selection excludes future retries before
 merging the oldest eligible candidates.
 
+Schema version 5 adds these per-pool generations and an episode activity-time
+index for finite-window owner aggregates. Existing events, accounting state,
+cursors, and coverage survive the migration. New stores create the same schema.
+
+### SQLite storage
+
 WAL checkpoints run outside the ingestion writer lock. The writer retains at most 256 MiB of reusable journal allocation after a safe reset; this is not a hard cap on active transactions or snapshots. A reader may still pin older WAL frames until its snapshot finishes. A real SQLite smoke kept an old reader at one row while 530 large rows committed, then safely reclaimed the journal after that reader ended; all 532 final rows survived reopen.
 
 An oversized WAL can make recovery slow before HTTP is available. Preserve the database, `-wal`, and `-shm` together; never delete the journal to force startup. For planned exclusive checkpoint maintenance, stop the watchdog and all database owners first, let SQLite complete `PRAGMA wal_checkpoint(TRUNCATE)`, verify success, then start exactly one application owner and resume monitoring.
+
+Check filesystem capacity and copy-on-write behavior when durable commit time
+dominates. A nearly full Btrfs volume can make SQLite's write workload expensive
+even on NVMe. For a dedicated non-CoW database directory, set `chattr +C` while
+the directory is empty, before copying any database or sidecar files. This
+disables Btrfs data checksums and compression for those files; SQLite WAL
+checksums and `synchronous=FULL` remain in use.
+
+For relocation, stop the watchdog and owner, verify the copied files by checksum,
+compare committed cursor/accounting/coverage state, then update `RHP_DATABASE`
+and start one owner. Retain the original files until destination readiness and
+index progress are verified. Once the destination accepts new commits, pointing
+the service back at the old copy would lose those commits and is not a rollback.
 
 ## Availability monitoring and recovery
 

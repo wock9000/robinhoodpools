@@ -9,6 +9,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from itertools import chain, islice
 from pathlib import Path
 from typing import Any
 
@@ -129,9 +130,33 @@ def _finite_float(value: Any, name: str) -> float | None:
 def _lower(value: Any) -> str | None:
     return None if value is None else str(value).lower()
 
-def _batches(values: Sequence[Any], size: int = 500) -> Iterator[Sequence[Any]]:
-    for start in range(0, len(values), size):
-        yield values[start:start + size]
+def _batches(values: Iterable[Any], size: int = 500) -> Iterator[tuple[Any, ...]]:
+    iterator = iter(values)
+    while batch := tuple(islice(iterator, size)):
+        yield batch
+
+
+def _insert_rows(
+    connection: sqlite3.Connection,
+    prefix: str,
+    rows: Iterable[Sequence[Any]],
+    *,
+    columns: int,
+    suffix: str = "",
+) -> None:
+    # One SQLite step per batch avoids a GIL handoff for every inserted row.
+    size = max(1, min(
+        500, connection.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER) // columns,
+    ))
+    placeholders = "(" + ",".join("?" for _ in range(columns)) + ")"
+    statement = ""
+    for batch in _batches(rows, size):
+        if not statement or len(batch) != size:
+            statement = (
+                prefix + " VALUES "
+                + ",".join([placeholders] * len(batch)) + suffix
+            )
+        connection.execute(statement, tuple(chain.from_iterable(batch)))
 
 
 
@@ -726,22 +751,23 @@ class MarketStore:
         if not entity_rows:
             return
         term_rows.sort()
-        connection.executemany(
-            "INSERT INTO lp_search_entities(kind,id,label,subtitle,href,rank) "
-            "VALUES(?,?,?,?,?,?) ON CONFLICT(kind,id) DO UPDATE SET "
+        _insert_rows(
+            connection,
+            "INSERT INTO lp_search_entities(kind,id,label,subtitle,href,rank)",
+            entity_rows, columns=6,
+            suffix=" ON CONFLICT(kind,id) DO UPDATE SET "
             "label=excluded.label,subtitle=excluded.subtitle,href=excluded.href,"
             "rank=excluded.rank WHERE "
             "lp_search_entities.label IS NOT excluded.label OR "
             "lp_search_entities.subtitle IS NOT excluded.subtitle OR "
             "lp_search_entities.href IS NOT excluded.href OR "
             "lp_search_entities.rank IS NOT excluded.rank",
-            entity_rows,
         )
         if term_rows:
-            connection.executemany(
-                "INSERT OR IGNORE INTO lp_search_terms(term,kind,id,weight) "
-                "VALUES(?,?,?,?)",
-                term_rows,
+            _insert_rows(
+                connection,
+                "INSERT OR IGNORE INTO lp_search_terms(term,kind,id,weight)",
+                term_rows, columns=4,
             )
 
     @classmethod
@@ -1817,9 +1843,10 @@ class MarketStore:
                 pending.append((
                     number, header["hash"], header["parent_hash"], header["timestamp"],
                 ))
-        connection.executemany(
-            "INSERT INTO blocks(number,hash,parent_hash,timestamp) VALUES(?,?,?,?)",
-            pending,
+        _insert_rows(
+            connection,
+            "INSERT INTO blocks(number,hash,parent_hash,timestamp)",
+            pending, columns=4,
         )
         return normalized
 
@@ -1975,11 +2002,7 @@ class MarketStore:
                 self._upsert_pools(connection, pools)
             inserted_events: list[dict[str, Any]] = []
             inserted_rows: list[dict[str, Any]] = []
-            insert_sql = (
-                f"INSERT INTO events({','.join(EVENT_COLUMNS)}) "
-                f"VALUES({','.join('?' for _ in EVENT_COLUMNS)}) "
-                "ON CONFLICT(block_hash,tx_hash,log_index) DO NOTHING"
-            )
+            insert_sql = f"INSERT INTO events({','.join(EVENT_COLUMNS)})"
             prepared: list[tuple[dict[str, Any], dict[str, Any]]] = []
             stored_blocks: dict[int, sqlite3.Row | None] = {}
             for event in supplied_events:
@@ -2001,9 +2024,11 @@ class MarketStore:
                     raise CanonicalConflict("event block hash/timestamp does not match stored header")
                 prepared.append((event, row))
             before = connection.total_changes
-            connection.executemany(
-                insert_sql,
+            _insert_rows(
+                connection, insert_sql,
                 (tuple(row[column] for column in EVENT_COLUMNS) for _event, row in prepared),
+                columns=len(EVENT_COLUMNS),
+                suffix=" ON CONFLICT(block_hash,tx_hash,log_index) DO NOTHING",
             )
             inserted_count = connection.total_changes - before
             if inserted_count:

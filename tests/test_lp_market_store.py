@@ -1,6 +1,7 @@
 """Focused durable-store batching and canonical-safety regressions."""
 from __future__ import annotations
 
+import sqlite3
 from types import SimpleNamespace
 import pytest
 
@@ -34,6 +35,34 @@ def event(block: dict[str, str], log_index: int) -> dict[str, object]:
         "token_id": "7",
         "data": {},
     }
+
+
+def test_bulk_ingest_preserves_conflicts_under_sqlite_parameter_limit(tmp_path):
+    path = tmp_path / "bounded-inserts.sqlite"
+    block = header(10)
+    rows = [
+        {**event(block, index), "tx_hash": "0x" + f"{index + 1:064x}"}
+        for index in range(70)
+    ]
+    with MarketStore(path) as store:
+        store.connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 128)
+        store.ingest(
+            [block], rows + [rows[0]], lane="live",
+            cursor={"block_number": 10, "block_hash": block["hash"]},
+        )
+        assert store.ingest([block], rows) == []
+        assert [
+            row["log_index"] for row in store.read().execute(
+                "SELECT log_index FROM events ORDER BY log_index"
+            )
+        ] == list(range(70))
+        assert store.status()["indexed_events"] == 70
+
+    with MarketStore(path) as store:
+        assert store.cursor("live")["block_hash"] == block["hash"]
+        found, total = store.search(str(rows[-1]["tx_hash"]))
+        assert total == 1
+        assert found[0]["id"] == rows[-1]["tx_hash"]
 
 
 def test_catalog_replay_and_restart_keep_search_counts_exact(tmp_path):

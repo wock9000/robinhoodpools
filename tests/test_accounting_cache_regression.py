@@ -159,6 +159,9 @@ def test_pool_stats_respects_an_existing_reader_snapshot(inventory):
     with store.transaction() as conn:
         conn.execute("UPDATE lp_pool_state SET price0_usd=4.0")
     assert book.pool_stats([POOL_ID])[POOL_ID] == before
+    # The caller's snapshot must survive repeated accounting reads.
+    assert book.pool_stats([POOL_ID])[POOL_ID] == before
+    reader.rollback()
     assert book.pool_stats([POOL_ID])[POOL_ID]["observed_principal_usd"] == pytest.approx(
         before["observed_principal_usd"] * 2
     )

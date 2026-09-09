@@ -2298,17 +2298,13 @@ class AccountBook:
 
     @contextmanager
     def _reader(self):
-        resource = self.store.read()
-        if hasattr(resource, "__enter__"):
-            with resource as conn:
-                yield conn
-        else:
-            try:
-                yield resource
-            finally:
-                close = getattr(resource, "close", None)
-                if callable(close):
-                    close()
+        connection = self.store.read()
+        owns_snapshot = not connection.in_transaction
+        try:
+            yield connection
+        finally:
+            if owns_snapshot and connection.in_transaction:
+                connection.rollback()
 
     @staticmethod
     def _owner_cost_values(
