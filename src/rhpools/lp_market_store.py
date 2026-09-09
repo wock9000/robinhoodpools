@@ -468,6 +468,21 @@ class MarketStore:
                         "ON lp_accounting_episodes(last_timestamp)"
                     )
                 self.connection.execute("PRAGMA user_version=5")
+            if int(self.connection.execute("PRAGMA user_version").fetchone()[0]) < 6:
+                accounting_installed = self.connection.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type='table' AND name='lp_accounting_positions'"
+                ).fetchone() is not None
+                if accounting_installed:
+                    self.connection.execute(
+                        "CREATE INDEX IF NOT EXISTS "
+                        "lp_accounting_positions_active_inventory "
+                        "ON lp_accounting_positions("
+                        "pool_id,owner,custody,protocol,liquidity,liquidity_known,"
+                        "tick_lower,tick_upper,principal_usd,history_complete) "
+                        "WHERE active_episode_id IS NOT NULL"
+                    )
+                self.connection.execute("PRAGMA user_version=6")
             self.connection.execute(
                 "CREATE INDEX IF NOT EXISTS pending_reprojection_order_idx "
                 "ON pending_reprojection(block_number,tx_index,log_index,event_id)"
@@ -1303,20 +1318,29 @@ class MarketStore:
         tokens = list(dict.fromkeys(_SEARCH_WORD_RE.findall(raw)))[:8]
         if not tokens:
             return [], 0
-        joins: list[str] = []
+        matches: list[str] = []
         args: list[Any] = []
         weights: list[str] = []
         for index, token in enumerate(tokens):
             alias = f"m{index}"
-            joins.append(
-                f"JOIN (SELECT kind,id,MIN(weight) AS weight FROM lp_search_terms "
-                f"WHERE term>=? COLLATE NOCASE AND term<? COLLATE NOCASE "
-                f"GROUP BY kind,id) {alias} "
-                f"ON {alias}.kind=e.kind AND {alias}.id=e.id"
+            match = (
+                "(SELECT DISTINCT kind,id FROM lp_search_terms "
+                "WHERE term>=? COLLATE NOCASE AND term<? COLLATE NOCASE) "
+                + alias
+            )
+            matches.append(
+                match if index == 0 else
+                f"JOIN {match} ON {alias}.kind=m0.kind AND {alias}.id=m0.id"
             )
             args.extend((token, token + "\U0010ffff"))
-            weights.append(f"{alias}.weight")
-        base = " FROM lp_search_entities e " + " ".join(joins)
+            weights.append(
+                "(SELECT MIN(weight) FROM lp_search_terms "
+                "WHERE kind=m0.kind AND id=m0.id "
+                "AND term>=? COLLATE NOCASE AND term<? COLLATE NOCASE)"
+            )
+        # Count matching identities from the term index, without fetching entity
+        # rows or weights. Ranking reads weights from the existing entity index.
+        base = " FROM " + " ".join(matches)
         connection = self.read()
         total = int(connection.execute("SELECT COUNT(*)" + base, args).fetchone()[0])
         bounded = max(1, min(int(limit), 30))
@@ -1324,10 +1348,11 @@ class MarketStore:
         label_shape = "".join(tokens)
         rows = connection.execute(
             "SELECT e.kind,e.id,e.label,e.subtitle,e.href" + base +
-            f" ORDER BY (e.id=?) DESC,"
+            " JOIN lp_search_entities e ON e.kind=m0.kind AND e.id=m0.id"
+            " ORDER BY (e.id=?) DESC,"
             "(LOWER(REPLACE(REPLACE(REPLACE(e.label,' ',''),'/',''),'-',''))=?) DESC,"
             f"({'+'.join(weights)}) ASC,e.rank,e.kind,e.id LIMIT ?",
-            [*args, exact_shape, label_shape, bounded],
+            [*args, exact_shape, label_shape, *args, bounded],
         ).fetchall()
         return [dict(row) for row in rows], total
 

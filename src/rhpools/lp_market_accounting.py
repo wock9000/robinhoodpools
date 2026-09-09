@@ -119,6 +119,11 @@ CREATE INDEX IF NOT EXISTS lp_accounting_positions_custody
     ON lp_accounting_positions(custody, status, last_timestamp);
 CREATE INDEX IF NOT EXISTS lp_accounting_positions_pool
     ON lp_accounting_positions(pool_id, status, last_timestamp);
+CREATE INDEX IF NOT EXISTS lp_accounting_positions_active_inventory
+    ON lp_accounting_positions(
+        pool_id,owner,custody,protocol,liquidity,liquidity_known,
+        tick_lower,tick_upper,principal_usd,history_complete
+    ) WHERE active_episode_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS lp_accounting_episodes (
     id TEXT PRIMARY KEY,

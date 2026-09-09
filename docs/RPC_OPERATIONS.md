@@ -52,6 +52,18 @@ SQLite's variable limit. This avoids handing the Python interpreter to competing
 valuation workers between every inserted row. The outer durable transaction and
 its atomic accounting/cursor boundary are unchanged.
 
+The CLI caps Python's thread-switch interval at 1 ms before starting workers,
+preserving an already-shorter interval. This reduces interpreter handoff delays
+when SQLite releases the GIL during ingestion while valuation threads run.
+In a CPython 3.13 benchmark, median contended ingestion fell from 435 ms to
+68 ms, with a 2.1% reduction in valuation throughput. Importing the server
+module does not change process scheduling.
+
+Search counts intersect identity-only prefix matches using the term index.
+Ranking retrieves each matched token's minimum weight through the existing
+entity/weight index. Exact identifiers, normalized labels, token intersection,
+weights, and typed-result ordering remain unchanged.
+
 A provider head below the durable cursor pauses live ingestion and reports
 degraded source state. Height regression alone cannot delete canonical history.
 Reorganization recovery requires conflicting canonical hash or parent evidence.
@@ -83,6 +95,13 @@ merging the oldest eligible candidates.
 Schema version 5 adds these per-pool generations and an episode activity-time
 index for finite-window owner aggregates. Existing events, accounting state,
 cursors, and coverage survive the migration. New stores create the same schema.
+
+Schema version 6 adds a partial covering index for open-position inventory.
+Active-capital sorting, LP counts, and inventory reads no longer fetch the
+large position-state JSON rows. The existing pool/status/time index remains
+available for other queries. Migration preserves accounting state, per-pool
+generations, cursors, and coverage; allow space and startup time to build
+the new index.
 
 ### SQLite storage
 

@@ -137,8 +137,8 @@ def test_reopen_preserves_durable_counts_and_initializes_only_missing_counts(tmp
         store.close()
 
 
-def test_pool_generation_schema_migration_preserves_durable_state(tmp_path):
-    path = tmp_path / "generation-migration.sqlite"
+def test_schema_migrations_preserve_durable_accounting_state(tmp_path):
+    path = tmp_path / "schema-migration.sqlite"
     block = header(10)
     store = MarketStore(path)
     try:
@@ -163,17 +163,15 @@ def test_pool_generation_schema_migration_preserves_durable_state(tmp_path):
             connection.execute(
                 "DROP INDEX lp_accounting_episodes_last_timestamp"
             )
+            connection.execute(
+                "DROP INDEX lp_accounting_positions_active_inventory"
+            )
             connection.execute("PRAGMA user_version=4")
         store.close()
 
         store = MarketStore(path)
         reader = store.read()
-        assert reader.execute("PRAGMA user_version").fetchone()[0] == 5
-        assert [
-            row["name"] for row in reader.execute(
-                "PRAGMA index_info(lp_accounting_episodes_last_timestamp)"
-            )
-        ] == ["last_timestamp"]
+        assert reader.execute("PRAGMA user_version").fetchone()[0] == 6
         assert [
             tuple(row) for row in reader.execute(
                 "SELECT block_hash,position_key FROM events"
@@ -202,6 +200,39 @@ def test_pool_generation_schema_migration_preserves_durable_state(tmp_path):
         assert reader.execute(
             "SELECT COUNT(*) FROM lp_accounting_pool_generations"
         ).fetchone()[0] == 0
+
+        position_before_v5 = tuple(reader.execute(
+            "SELECT position_key,pool_id,active_episode_id,status,"
+            "history_complete,state_json FROM lp_accounting_positions"
+        ).fetchone())
+        with store.transaction() as connection:
+            connection.execute(
+                "INSERT INTO lp_accounting_pool_generations(pool_id,generation) "
+                "VALUES('preserved-pool',7)"
+            )
+            connection.execute(
+                "DROP INDEX lp_accounting_positions_active_inventory"
+            )
+            connection.execute("PRAGMA user_version=5")
+        store.close()
+
+        store = MarketStore(path)
+        reader = store.read()
+        assert reader.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert tuple(reader.execute(
+            "SELECT position_key,pool_id,active_episode_id,status,"
+            "history_complete,state_json FROM lp_accounting_positions"
+        ).fetchone()) == position_before_v5
+        assert [
+            tuple(row) for row in reader.execute(
+                "SELECT pool_id,generation FROM lp_accounting_pool_generations"
+            )
+        ] == [("preserved-pool", 7)]
+        assert store.cursor("live") == cursor
+        assert reader.execute(
+            "SELECT value FROM lp_accounting_meta "
+            "WHERE key='applied_revision'"
+        ).fetchone()[0] == accounting_revision
     finally:
         store.close()
 

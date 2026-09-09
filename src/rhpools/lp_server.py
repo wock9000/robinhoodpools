@@ -8,6 +8,7 @@ import json
 import os
 import re
 import signal
+import sys
 import threading
 import time
 import zlib
@@ -574,6 +575,8 @@ def parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = parser().parse_args()
+    # Reduce SQLite I/O handoff delays behind CPU-heavy valuation threads.
+    sys.setswitchinterval(min(sys.getswitchinterval(), 0.001))
     data_dir = Path(args.data_dir).expanduser()
     data_dir.mkdir(parents=True, exist_ok=True)
     args.data_dir = data_dir
