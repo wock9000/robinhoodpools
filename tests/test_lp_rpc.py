@@ -217,3 +217,74 @@ def test_execution_revert_in_batch_is_not_replaced_by_another_provider(monkeypat
         assert client.batch([good]) == ["0x01"]
     finally:
         factory.close()
+
+
+@pytest.mark.parametrize("lifecycle", ["mint", "burn"])
+def test_nfpm_lifecycle_absence_survives_routed_batch_fallback(
+        provider, monkeypatch, tmp_path, lifecycle):
+    from eth_abi import encode
+    from rhpools.lp_market_index import MarketIndexer, RpcError
+    from rhpools.lp_market_protocols import (
+        ProtocolDecodeError, UNISWAP_V3_POSITION_MANAGER,
+        decode_position_state_results, position_state_requests,
+    )
+    from rhpools.lp_market_store import MarketStore
+
+    monkeypatch.setattr(provider._registry, "error_type", RpcError)
+    zero, owner = "0x" + "0" * 40, "0x" + "1" * 40
+    missing_pin = "0x9" if lifecycle == "mint" else "0xa"
+    liquidity = 100 if lifecycle == "mint" else 0
+    revert_data = "0x08c379a0" + encode(["string"], ["Invalid token ID"]).hex()
+    position_data = "0x" + encode(
+        ["uint96", "address", "address", "address", "uint24", "int24",
+         "int24", "uint128", "uint256", "uint256", "uint128", "uint128"],
+        [0, zero, owner, "0x" + "2" * 40, 500, -60, 60, liquidity, 0, 0, 0, 0],
+    ).hex()
+
+    def post(_client, _source, payload):
+        def response(item):
+            result = {"jsonrpc": "2.0", "id": item["id"]}
+            if item["method"] == "eth_chainId":
+                result["result"] = hex(CHAIN_ID)
+            elif item["params"][1] == missing_pin:
+                result["error"] = {
+                    "code": 3,
+                    "message": "RuntimeError: execution reverted: Invalid token ID",
+                    "data": revert_data,
+                }
+            else:
+                result["result"] = position_data
+            return result
+        return [response(item) for item in payload] if isinstance(payload, list) else response(payload)
+
+    monkeypatch.setattr(lp_rpc.RoutedRpc, "_post", post)
+    event = {
+        "protocol": "nft", "kind": "transfer", "block_number": 10,
+        "block_hash": "0x" + "a" * 64, "tx_hash": "0x" + "b" * 64,
+        "tx_index": 0, "log_index": 1, "token_id": "42",
+        "custody": UNISWAP_V3_POSITION_MANAGER,
+        "data": {
+            "manager_protocol": "v3", "mint": lifecycle == "mint",
+            "burn": lifecycle == "burn",
+            "prior_owner": zero if lifecycle == "mint" else owner,
+            "new_owner": owner if lifecycle == "mint" else zero,
+        },
+    }
+    with MarketStore(tmp_path / "market.sqlite") as store:
+        scanner = MarketIndexer(store, SimpleNamespace(), "", rpc=provider)
+        try:
+            requests = position_state_requests([event])
+            results = scanner._rpc_state_batch(scanner._state_rpc_calls(requests))
+            update = decode_position_state_results(requests, results)[0]["data"]
+            missing = "position_before" if lifecycle == "mint" else "position_after"
+            present = "position_after" if lifecycle == "mint" else "position_before"
+            assert update[missing]["exists"] is False
+            assert update[missing]["claims_empty"] is True
+            assert update[present]["exists"] is True
+            assert update[present]["liquidity"] == str(liquidity)
+
+            event["data"].update(mint=False, burn=False)
+            with pytest.raises(ProtocolDecodeError, match="pinned eth_call failed"):
+                decode_position_state_results(position_state_requests([event]), results)
+        finally:
+            scanner.close()

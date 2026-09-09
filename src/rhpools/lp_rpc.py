@@ -659,8 +659,10 @@ class RoutedRpc:
         if error is not None:
             code = error.get("code") if isinstance(error, Mapping) else None
             message = error.get("message") if isinstance(error, Mapping) else error
+            # Pinned NFT lifecycle reads need the ABI revert payload, not just
+            # its message. Keep the full error while redacting provider secrets.
             failure = self._error(
-                f"{source.name} {method}: {self._registry._safe_error(source, RuntimeError(str(message)))}",
+                f"{source.name} {method}: {self._registry._safe_error(source, RuntimeError(str(error)))}",
                 code=code if isinstance(code, int) else None,
             )
             if method in {"eth_call", "eth_estimateGas"} and (

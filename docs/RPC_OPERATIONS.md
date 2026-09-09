@@ -24,6 +24,12 @@ contract outcome, not a provider outage. The caller receives the RPC error and
 the provider remains available for other calls. Transport failures, malformed
 responses, and missing archive state still trigger capability-specific failover.
 
+Routed RPC exceptions retain the redacted JSON-RPC error payload, including
+ABI revert data. The pinned-state decoder uses that evidence to recognize
+`Invalid token ID` only at a verified same-receipt NFT mint/burn boundary.
+Keeping only the provider message loses this proof and retries valid receipts
+indefinitely. Unproven absence and unrelated errors still fail enrichment.
+
 ## Goldsky measurements and limits
 
 A small anonymous-output probe from the production host verified the donated provider privately: chain 4663; exact matching block/header and log digests against the local node; old block headers; USDG `decimals()` at blocks 30,000,000 and 56,400,000; receipts; `debug_traceTransaction` with `callTracer`; and a four-item JSON-RPC batch. The local pruned node could not answer those archive-state calls. Individual successful Goldsky requests in this probe took roughly 76–352 ms; these are samples, not percentile/SLA claims.
