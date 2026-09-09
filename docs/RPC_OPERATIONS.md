@@ -103,6 +103,32 @@ available for other queries. Migration preserves accounting state, per-pool
 generations, cursors, and coverage; allow space and startup time to build
 the new index.
 
+Schema version 7 adds a partial chronological index for financial enrichment,
+excluding deferred pool-identity records before the batch limit. Enrichment,
+balance, and repricing batches reserve historical work while preferring recent
+ready records; a delayed retry no longer stops unrelated repricing. Identity
+replay likewise alternates recent and historical work.
+
+Metadata RPC fetches use the bounded enrichment workers and commit one batch.
+V3 balances use a batched pinned-state request and atomic snapshot commit.
+Identity replay commits canonical events and queue completion together.
+Price sample, reserve, mark, and state inserts use the same multi-row helper
+as event ingestion.
+
+Existing V3 NFT positions whose initial add precedes a verified mint in the
+same transaction are repaired by the normal projection lane. Each pass scans
+at most 32 position keys within reviewed V3-manager ranges, reprojects affected
+positions, and commits its cursor with the repair. This also repairs final
+collect-before-burn allocation. The `v3_birth_history_repair_v1` metadata
+checkpoint survives restart; the accounting schema version is unchanged, so
+startup does not replay the entire ledger.
+
+Wallet-only requests skip the unused custody aggregate. On a warm, read-only
+production snapshot of 10,540 wallets, this reduced owner-query time from
+1.34 s to 0.78 s; the reported single-wallet query fell from 1.65 s to 0.63 s.
+Existing financial fields had identical digests. Retain the short-circuit
+missing-gas query: a grouped replacement was slower for the full wallet table.
+
 ### SQLite storage
 
 WAL checkpoints run outside the ingestion writer lock. The writer retains at most 256 MiB of reusable journal allocation after a safe reset; this is not a hard cap on active transactions or snapshots. A reader may still pin older WAL frames until its snapshot finishes. A real SQLite smoke kept an old reader at one row while 530 large rows committed, then safely reclaimed the journal after that reader ended; all 532 final rows survived reopen.

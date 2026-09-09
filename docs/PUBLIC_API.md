@@ -243,6 +243,30 @@ Coverage dimensions are independent:
 
 Preserve nulls and these qualifications in derived data.
 
+### Terminal wallet accounting
+
+The terminal's `/api/lp/owners`, `/api/lp/owner`, and `/api/lp/closed`
+responses distinguish complete collected-fee totals from partial evidence:
+
+- `fees_usd` is available only when the selected beneficial-owner episodes
+  have complete history, fee attribution, and pricing. Unknown totals remain
+  `null`, as do gross/net P/L values without their required evidence.
+- `observed_collected_fees_usd` sums independently priced collected-fee
+  observations even when the complete total is unavailable. It is not a
+  complete total, a guaranteed lower bound, or fiat-oracle USD.
+- `coverage.observed_collected_fees` declares `unit: "USDG_quote"`,
+  `episodes`, `history_complete_episodes`, `total_episodes`, and `complete`.
+  The terminal labels nonzero partial observations **OBS**. Custody alone
+  does not attribute these earnings to a beneficial owner.
+- A finite `window` selects episodes by their last activity, then aggregates
+  their lifetime quantities. Coverage states
+  `episode_selection: "last_activity_within_window"` and
+  `financial_scope: "lifetime_of_selected_episodes"`. Do not treat these
+  values as cash flows earned exclusively during the requested window.
+
+Fresh canonical activity does not imply complete transaction enrichment or
+historical accounting. Preserve both freshness and completeness qualifications.
+
 ## Errors
 
 All errors use a JSON object with an `error` string.

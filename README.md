@@ -52,6 +52,14 @@ accounting complete. Live ingestion and historical backfill share a serialized
 database writer; status exposes both coverage intervals and pending enrichment,
 balance, and reprojection counts.
 
+Financial workers prefer recent work while reserving historical progress.
+Existing V3 positions affected by same-transaction mint/burn log ordering are
+repaired in resumable background batches, not a full-ledger startup replay.
+An **OBS** fee amount is observed, priced collected-fee evidence from only part
+of a wallet's selected episodes; it is not a complete fee total or P/L.
+Wallet time windows select episodes with activity in that window, then report
+those episodes' lifetime financials—not fees earned exclusively within the window.
+
 Select the terminal's **HEAD / INDEX** readout, labeled **INDEX STATUS** on mobile, to open index details.
 It shows backlog counts and the last live/history batch's RPC, writer-wait,
 storage, and post-processing timings. Index time lag is the age of indexed

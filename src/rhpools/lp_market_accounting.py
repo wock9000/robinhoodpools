@@ -994,6 +994,29 @@ class AccountBook:
             if (_event_position_state(data, "before") is not None
                     or _event_position_state(data, "after") is not None):
                 state_events[int(event.get("block_number") or 0)].append(index)
+        # V3 manager transactions emit the pool event before the ERC-721 mint
+        # and the final Collect before the ERC-721 burn.  Those verified
+        # transfers prove the missing boundary state even though their logs
+        # follow the financial event.
+        first_add_by_tx: dict[tuple[int, int, str], dict[str, Any]] = {}
+        last_collect_by_tx: dict[tuple[int, int, str], dict[str, Any]] = {}
+        for event in prepared_events:
+            tx = (
+                int(event.get("block_number") or 0),
+                int(event.get("tx_index") or 0),
+                str(event.get("tx_hash") or "").lower(),
+            )
+            kind = str(event.get("kind") or "").lower()
+            if kind == "add":
+                first_add_by_tx.setdefault(tx, event)
+            elif kind == "collect":
+                last_collect_by_tx[tx] = event
+            elif kind == "transfer":
+                data = event["data"]
+                if _flag(data.get("mint")) and tx in first_add_by_tx:
+                    first_add_by_tx[tx]["data"]["_verified_mint_after"] = True
+                if _flag(data.get("burn")) and tx in last_collect_by_tx:
+                    last_collect_by_tx[tx]["data"]["_verified_burn_after"] = True
         for index, event in enumerate(prepared_events):
             data = event["data"]
             indices = state_events.get(int(event.get("block_number") or 0), [])
@@ -1128,6 +1151,14 @@ class AccountBook:
             state["identity_basis"] = basis if event_owner == target else "verified_nft_transfer"
             if custody:
                 state["custody"] = custody
+            if (
+                source_zero and target == current_owner
+                and isinstance(ownership, Mapping)
+                and ownership.get("acquired_by") == "mint"
+            ):
+                state["minted_to_owner"] = True
+                state["settled"] = False
+                return source
             if source == current_owner and target == current_owner:
                 state["minted_to_owner"] = False
                 return source
@@ -1193,18 +1224,20 @@ class AccountBook:
             if state.get("active_ownership") is None:
                 order = _order(event)
                 state["ownership_ordinal"] = int(state.get("ownership_ordinal") or 0) + 1
+                verified_mint = _flag(data.get("_verified_mint_after"))
                 interval = {
                     "position_key": state["position_key"],
                     "ordinal": state["ownership_ordinal"],
                     "token_id": state.get("token_id") or event.get("token_id"),
                     "owner": owner, "custody": state.get("custody"),
-                    "identity_basis": basis, "acquired_by": "observed",
+                    "identity_basis": basis,
+                    "acquired_by": "mint" if verified_mint else "observed",
                     "start_block": order[0], "start_tx_index": order[1],
                     "start_log_index": order[2],
                     "start_timestamp": int(event.get("timestamp") or 0),
                     "end_block": None, "end_tx_index": None,
                     "end_log_index": None, "end_timestamp": None,
-                    "complete": False,
+                    "complete": verified_mint,
                 }
                 state["active_ownership"] = interval
                 self._save_ownership(conn, interval, writes)
@@ -1248,8 +1281,12 @@ class AccountBook:
                 delta = -delta
             elif kind == "remove" and delta > 0:
                 delta = -delta
+        verified_mint = _flag(data.get("_verified_mint_after"))
         previous_known = bool(state.get("liquidity_known"))
         previous_liq = int(state.get("liquidity") or 0) if previous_known else None
+        if verified_mint:
+            previous_liq = 0
+            previous_known = True
         if before_liq is not None:
             previous_liq = before_liq
             previous_known = True
@@ -1271,23 +1308,27 @@ class AccountBook:
         if before_owed0 is not None and before_owed1 is not None:
             before_claims_empty = before_owed0 == 0 and before_owed1 == 0
         prior_claims_empty = bool(
-            not claims_known_nonempty
-            and (
-                before_claims_empty
-                or state.get("minted_to_owner")
-                or state.get("settled")
-                or (
-                    state.get("pending_known")
-                    and int(state.get("pending0") or 0) == 0
-                    and int(state.get("pending1") or 0) == 0
-                    and state.get("owed_known")
-                    and int(state.get("owed0") or 0) == 0
-                    and int(state.get("owed1") or 0) == 0
+            verified_mint
+            or (
+                not claims_known_nonempty
+                and (
+                    before_claims_empty
+                    or state.get("minted_to_owner")
+                    or state.get("settled")
+                    or (
+                        state.get("pending_known")
+                        and int(state.get("pending0") or 0) == 0
+                        and int(state.get("pending1") or 0) == 0
+                        and state.get("owed_known")
+                        and int(state.get("owed0") or 0) == 0
+                        and int(state.get("owed1") or 0) == 0
+                    )
                 )
             )
         )
         zero_liquidity_proven = bool(
-            previous_known and previous_liq == 0
+            verified_mint
+            or previous_known and previous_liq == 0
             or _flag(data.get("zero_baseline"))
             or state.get("minted_to_owner") and kind == "add" and previous_liq in (None, 0)
         )
@@ -1308,6 +1349,11 @@ class AccountBook:
                 state["pending0"] = "0"
                 state["pending1"] = "0"
                 state["pending_known"] = True
+            if verified_mint:
+                state["owed0"] = "0"
+                state["owed1"] = "0"
+                state["owed_known"] = True
+                state["owed_block"] = int(event.get("block_number") or 0)
         active = state.get("active_episode")
         begins = kind == "add" and delta is not None and delta > 0 and (
             active is None or previous_liq == 0)
@@ -1538,8 +1584,11 @@ class AccountBook:
                     else:
                         after_state = _event_position_state(data, "after")
                         final_settlement = bool(
-                            after_state is not None
-                            and after_state.get("claims_empty") is True
+                            (
+                                after_state is not None
+                                and after_state.get("claims_empty") is True
+                                or _flag(data.get("_verified_burn_after"))
+                            )
                             and pending0 is not None and pending1 is not None
                             and collected0 >= pending0 and collected1 >= pending1
                         )
@@ -1681,6 +1730,11 @@ class AccountBook:
         if after is not None and after.get("claims_empty") is True:
             owed0 = 0 if owed0 is None else owed0
             owed1 = 0 if owed1 is None else owed1
+        event_data = event.get("data")
+        if isinstance(event_data, Mapping) and _flag(
+                event_data.get("_verified_burn_after")):
+            owed0 = 0
+            owed1 = 0
         if owed0 is not None and owed1 is not None:
             state["owed0"], state["owed1"] = str(owed0), str(owed1)
             state["owed_known"] = True
@@ -2420,6 +2474,10 @@ class AccountBook:
         gas_state = "complete" if row.get("gas_usd") is not None else "unknown_or_shared"
         if gas_state != "complete" and "gas_unattributed" not in reasons:
             reasons.append("gas_unattributed")
+        fees_observed = bool(
+            row.get("fees_complete") and row.get("pricing_complete")
+            and row.get("fees_usd") is not None
+        )
         if not row.get("fees_complete") and "fee_allocation_unknown" not in reasons:
             reasons.append("fee_allocation_unknown")
         return {
@@ -2428,6 +2486,11 @@ class AccountBook:
             "cashflows": "exact" if row.get("cashflow_complete") else "partial",
             "pricing": "complete" if row.get("pricing_complete") else "partial",
             "fees": "exact" if row.get("fees_complete") else "unknown",
+            "fee_value": (
+                "complete" if fees_observed and row.get("history_complete")
+                else "observed_partial_history" if fees_observed else "unknown"
+            ),
+            "fee_value_unit": "USDG_quote",
             "trace": "traced" if row.get("trace_complete") else "missing",
             "claims": "settled" if row.get("claims_complete") else (
                 "awaiting" if row.get("status") == "awaiting_claim" else "unknown"),
@@ -2454,6 +2517,11 @@ class AccountBook:
                 "history_complete") else None,
             "fees_usd": row.get("fees_usd") if row.get("fees_complete") and row.get(
                 "pricing_complete") and row.get("history_complete") else None,
+            "observed_collected_fees_usd": (
+                row.get("fees_usd")
+                if row.get("fees_complete") and row.get("pricing_complete")
+                else None
+            ),
             "current_equity_usd": row.get("current_equity_usd"),
             "lp_value_usd": row.get("lp_value_usd"),
             "hold_value_usd": row.get("hold_value_usd"),
@@ -2591,6 +2659,9 @@ class AccountBook:
         protocol = str(params.get("protocol") or "").lower()
         if protocol and protocol not in {"v2", "v3", "v4"}:
             raise ValueError("protocol must be v2, v3 or v4")
+        identity_scope = str(params.get("identity_scope") or "all").lower()
+        if identity_scope not in {"all", "wallets", "custody"}:
+            raise ValueError("identity_scope must be all, wallets or custody")
         pool_id = str(params.get("pool") or params.get("pool_id") or "").lower()
         query = str(params.get("q") or "").strip().lower()[:128]
         now = int(time.time())
@@ -2598,7 +2669,7 @@ class AccountBook:
         with self._cache_lock:
             generation = self._owners_generation
             cache_key = (
-                generation, window, protocol, pool_id, query,
+                generation, window, protocol, pool_id, query, identity_scope,
             )
             cached = self._owners_cache.get(cache_key)
             if cached is not None and (
@@ -2664,6 +2735,14 @@ class AccountBook:
                 "CASE WHEN MIN(e.history_complete AND e.fees_complete "
                 "AND e.pricing_complete)=1 AND COUNT(e.fees_usd)=COUNT(*) "
                 "THEN SUM(e.fees_usd) END AS fees_usd,"
+                "SUM(CASE WHEN e.fees_complete AND e.pricing_complete "
+                "AND e.fees_usd IS NOT NULL THEN e.fees_usd END) "
+                "AS observed_collected_fees_usd,"
+                "SUM(e.fees_complete AND e.pricing_complete "
+                "AND e.fees_usd IS NOT NULL) AS observed_fee_episodes,"
+                "SUM(e.history_complete AND e.fees_complete "
+                "AND e.pricing_complete AND e.fees_usd IS NOT NULL) "
+                "AS complete_fee_episodes,"
                 "CASE WHEN MIN(e.history_complete AND e.pricing_complete)=1 "
                 "AND COUNT(e.deposit_usd)=COUNT(*) AND COUNT(e.proceeds_usd)=COUNT(*) "
                 "THEN SUM(e.deposit_usd+e.proceeds_usd) END AS volume_usd,"
@@ -2688,23 +2767,38 @@ class AccountBook:
                 if not conn.in_transaction:
                     conn.execute("BEGIN")
                 coverage = self._status_coverage()
-                beneficial = _dict_rows(conn.execute(
-                    "SELECT e.owner,NULL AS custody,"
-                    "'verified_owner' AS identity_basis,"
-                    + aggregate + source + where
-                    + " AND e.owner IS NOT NULL GROUP BY e.owner",
-                    args,
-                ))
-                custody_clauses = [*clauses, "e.custody IS NOT NULL"]
-                custody_where = " WHERE " + " AND ".join(custody_clauses)
-                custody_rows = _dict_rows(conn.execute(
-                    "SELECT NULL AS owner,e.custody,"
-                    "CASE WHEN SUM(e.owner IS NOT NULL)>0 "
-                    "THEN 'custody_aggregate' ELSE 'custody_only' END AS identity_basis,"
-                    + aggregate + source + custody_where
-                    + " GROUP BY e.custody",
-                    args,
-                ))
+                coverage.update({
+                    "window": window,
+                    "episode_selection": (
+                        "last_activity_within_window"
+                        if cutoff_seconds is not None else "all_indexed_episodes"
+                    ),
+                    "financial_scope": "lifetime_of_selected_episodes",
+                    "fee_value_unit": "USDG_quote",
+                })
+                beneficial = (
+                    _dict_rows(conn.execute(
+                        "SELECT e.owner,NULL AS custody,"
+                        "'verified_owner' AS identity_basis,"
+                        + aggregate + source + where
+                        + " AND e.owner IS NOT NULL GROUP BY e.owner",
+                        args,
+                    ))
+                    if identity_scope != "custody" else []
+                )
+                custody_rows: list[dict[str, Any]] = []
+                if identity_scope != "wallets":
+                    custody_clauses = [*clauses, "e.custody IS NOT NULL"]
+                    custody_where = " WHERE " + " AND ".join(custody_clauses)
+                    custody_rows = _dict_rows(conn.execute(
+                        "SELECT NULL AS owner,e.custody,"
+                        "CASE WHEN SUM(e.owner IS NOT NULL)>0 "
+                        "THEN 'custody_aggregate' ELSE 'custody_only' END "
+                        "AS identity_basis,"
+                        + aggregate + source + custody_where
+                        + " GROUP BY e.custody",
+                        args,
+                    ))
                 gas_clauses = [
                     clause.replace("e.", "ep.") for clause in clauses
                 ]
@@ -2726,11 +2820,29 @@ class AccountBook:
                     if row.get("gross_pnl_usd") is not None
                     and row.get("gas_usd") is not None else None
                 )
+                episodes = int(row.pop("episodes") or 0)
+                observed_fee_episodes = int(row.pop("observed_fee_episodes") or 0)
+                complete_fee_episodes = int(row.pop("complete_fee_episodes") or 0)
                 row["coverage"] = {
                     "qualified": qualified,
                     "cost_qualified": row.get("net_pnl_usd") is not None,
                     "complete_episodes": int(row.pop("complete_episodes") or 0),
-                    "episodes": int(row.pop("episodes") or 0),
+                    "episodes": episodes,
+                    "window": window,
+                    "episode_selection": (
+                        "last_activity_within_window"
+                        if cutoff_seconds is not None else "all_indexed_episodes"
+                    ),
+                    "financial_scope": "lifetime_of_selected_episodes",
+                    "observed_collected_fees": {
+                        "unit": "USDG_quote",
+                        "episodes": observed_fee_episodes,
+                        "history_complete_episodes": complete_fee_episodes,
+                        "total_episodes": episodes,
+                        "complete": (
+                            episodes > 0 and complete_fee_episodes == episodes
+                        ),
+                    },
                     "reasons": (
                         [] if qualified else ["incomplete_or_unpriced_episodes"]
                     ),
@@ -2740,16 +2852,32 @@ class AccountBook:
                 if cutoff_seconds is not None and timestamp is not None:
                     expires = int(timestamp) + cutoff_seconds + 1
                     valid_until = expires if valid_until is None else min(valid_until, expires)
+                episodes = int(row.pop("episodes") or 0)
                 row["gross_pnl_usd"] = None
                 row["net_pnl_usd"] = None
                 row["gas_usd"] = None
+                row["fees_usd"] = None
+                row["observed_collected_fees_usd"] = None
                 row["win_rate"] = None
                 row["coverage"] = {
                     "qualified": False, "cost_qualified": False,
                     "complete_episodes": 0,
-                    "episodes": int(row.pop("episodes") or 0),
+                    "episodes": episodes,
+                    "window": window,
+                    "episode_selection": (
+                        "last_activity_within_window"
+                        if cutoff_seconds is not None else "all_indexed_episodes"
+                    ),
+                    "financial_scope": "not_attributed_to_custody",
+                    "observed_collected_fees": {
+                        "unit": "USDG_quote", "episodes": 0,
+                        "history_complete_episodes": 0,
+                        "total_episodes": episodes, "complete": False,
+                    },
                     "reasons": [row["identity_basis"], "not_beneficial_owner"],
                 }
+                row.pop("observed_fee_episodes", None)
+                row.pop("complete_fee_episodes", None)
                 row.pop("complete_episodes", None)
                 rows.append(row)
             if query:
@@ -3165,13 +3293,24 @@ class AccountBook:
         )
         gas = _nullable_sum(gas_values) if beneficial else None
         net = gross - gas if gross is not None and gas is not None else None
-        fees = (
-            _nullable_sum(
-                _finite_float(row.get("fees_usd"))
-                if row.get("fees_complete") and row.get("pricing_complete")
-                and row.get("history_complete") else None for row in beneficial
+        observed_fee_values = [
+            value for row in beneficial
+            if row.get("fees_complete") and row.get("pricing_complete")
+            if (value := _finite_float(row.get("fees_usd"))) is not None
+        ]
+        observed_fees = (
+            float(sum(observed_fee_values)) if observed_fee_values else None
+        )
+        complete_fee_episodes = sum(
+            bool(
+                row.get("history_complete") and row.get("fees_complete")
+                and row.get("pricing_complete") and row.get("fees_usd") is not None
             )
-            if beneficial else None
+            for row in beneficial
+        )
+        fees = (
+            observed_fees
+            if beneficial and complete_fee_episodes == len(beneficial) else None
         )
         completed = [row for row in beneficial if row.get("status") == "complete"]
         wins = [_finite_float(row.get("gross_pnl_usd")) for row in completed]
@@ -3196,6 +3335,7 @@ class AccountBook:
             "open_positions": len({row["position_key"] for row in episodes
                                    if row.get("closed_at") is None}),
             "closed_episodes": len(completed), "fees_usd": fees,
+            "observed_collected_fees_usd": observed_fees,
             "gross_pnl_usd": gross, "gas_usd": gas, "net_pnl_usd": net,
             "win_rate": win_rate,
         }
@@ -3219,11 +3359,29 @@ class AccountBook:
         if custody_matches:
             reasons.append("custody_positions_not_beneficial_owner")
             reasons = sorted(set(reasons))
+        window = str(detail_params.get("window") or "all").lower()
         coverage.update({
             "qualified": gross is not None,
             "cost_qualified": net is not None,
             "series_complete": series_known,
             "identity_basis": identity_basis,
+            "window": window,
+            "episode_selection": (
+                "last_activity_within_window"
+                if _cutoff({"window": window}) is not None
+                else "all_indexed_episodes"
+            ),
+            "financial_scope": "lifetime_of_selected_episodes",
+            "observed_collected_fees": {
+                "unit": "USDG_quote",
+                "episodes": len(observed_fee_values),
+                "history_complete_episodes": complete_fee_episodes,
+                "total_episodes": len(beneficial),
+                "complete": (
+                    bool(beneficial)
+                    and complete_fee_episodes == len(beneficial)
+                ),
+            },
             "reasons": reasons,
         })
         return {

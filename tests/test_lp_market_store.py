@@ -37,6 +37,56 @@ def event(block: dict[str, str], log_index: int) -> dict[str, object]:
     }
 
 
+def test_financial_queues_do_not_starve_recent_work_or_history(tmp_path):
+    with MarketStore(tmp_path / "financial-queues.sqlite") as store:
+        pool_id = "0x" + "31" * 20
+        store.upsert_pools([{
+            "id": pool_id, "protocol": "v3", "address": pool_id,
+            "token0": "0x" + "11" * 20, "token1": "0x" + "22" * 20,
+        }])
+        blocks = [header(number) for number in range(1, 49)]
+        store.ingest(blocks, [
+            {
+                **event(block, 0), "pool_id": pool_id, "kind": "add",
+                "tx_hash": "0x" + f"{index:064x}",
+            }
+            for index, block in enumerate(blocks, 1)
+        ])
+        with store.transaction() as connection:
+            connection.execute(
+                "UPDATE pending_enrichment SET last_error="
+                "'pool_identity_pending:{}' WHERE block_number<=8"
+            )
+            connection.execute(
+                "INSERT INTO pending_reprojection"
+                "(event_id,block_number,tx_index,log_index) "
+                "SELECT id,block_number,tx_index,log_index FROM events"
+            )
+            for block in blocks:
+                store.queue_v3_balances(
+                    [pool_id], int(block["number"], 16), block["hash"],
+                )
+            for table in (
+                "pending_enrichment", "pending_reprojection", "pending_balances",
+            ):
+                connection.execute(
+                    f"UPDATE {table} SET next_attempt=1e99 "
+                    "WHERE block_number IN (1,9,48)"
+                )
+
+        for selected, oldest in (
+            (store.pending_enrichments(8), 10),
+            (store.pending_reprojections(8), 2),
+            (store.pending_v3_balances(8), 2),
+        ):
+            numbers = [row["block_number"] for row in selected]
+            assert numbers == sorted(set(numbers))
+            assert len(numbers) == 8
+            assert numbers[0] == oldest
+            assert numbers[-1] == 47
+            assert not {1, 9, 48}.intersection(numbers)
+
+
 def test_bulk_ingest_preserves_conflicts_under_sqlite_parameter_limit(tmp_path):
     path = tmp_path / "bounded-inserts.sqlite"
     block = header(10)
@@ -171,7 +221,7 @@ def test_schema_migrations_preserve_durable_accounting_state(tmp_path):
 
         store = MarketStore(path)
         reader = store.read()
-        assert reader.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert reader.execute("PRAGMA user_version").fetchone()[0] == 7
         assert [
             tuple(row) for row in reader.execute(
                 "SELECT block_hash,position_key FROM events"
@@ -218,7 +268,7 @@ def test_schema_migrations_preserve_durable_accounting_state(tmp_path):
 
         store = MarketStore(path)
         reader = store.read()
-        assert reader.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert reader.execute("PRAGMA user_version").fetchone()[0] == 7
         assert tuple(reader.execute(
             "SELECT position_key,pool_id,active_episode_id,status,"
             "history_complete,state_json FROM lp_accounting_positions"
@@ -232,6 +282,25 @@ def test_schema_migrations_preserve_durable_accounting_state(tmp_path):
         assert reader.execute(
             "SELECT value FROM lp_accounting_meta "
             "WHERE key='applied_revision'"
+        ).fetchone()[0] == accounting_revision
+
+        with store.transaction() as connection:
+            store._queue_enrichment(connection, [{**event(block, 0), "kind": "add"}])
+            connection.execute("DROP INDEX pending_enrichment_financial_order_idx")
+            connection.execute("PRAGMA user_version=6")
+        store.close()
+        store = MarketStore(path)
+        reader = store.read()
+        assert reader.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert store.pending_enrichments(1)[0]["tx_hash"] == event(block, 0)["tx_hash"]
+        assert store.status()["pending_enrichment"] == 1
+        assert store.cursor("live") == cursor
+        assert tuple(reader.execute(
+            "SELECT position_key,pool_id,active_episode_id,status,"
+            "history_complete,state_json FROM lp_accounting_positions"
+        ).fetchone()) == position_before_v5
+        assert reader.execute(
+            "SELECT value FROM lp_accounting_meta WHERE key='applied_revision'"
         ).fetchone()[0] == accounting_revision
     finally:
         store.close()

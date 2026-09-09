@@ -8,7 +8,9 @@ import pytest
 from rhpools.lp_market_protocols import (
     TRANSFER_TOPIC, V3_POOL_CREATED_TOPIC, V3_SWAP_TOPIC,
     V4_INITIALIZE_TOPIC, V4_MODIFY_LIQUIDITY_TOPIC,
+    UNISWAP_V3_POSITION_MANAGER,
 )
+from rhpools.lp_market_index import V3_BIRTH_REPAIR_PREFIXES
 from rhpools.lp_market_service import LPMarketService
 from rhpools.lp_rpc import _WssRpc, build_rpc_factory
 from rhpools.lp_market_store import CanonicalConflict, MarketStore
@@ -666,6 +668,141 @@ def test_flat_range_waits_for_final_claim_and_keeps_costs_after_rebuild(tmp_path
         app.store.rollback(102)
         assert app.book.closed({"window": "all"})["rows"] == []
         assert app.book.owner(TOKEN, {"window": "all"})["positions"][0]["status"] == "awaiting_claim"
+    finally:
+        app.close()
+
+def test_v3_manager_log_order_recovers_complete_fees_without_overstating_wallet_total(
+        tmp_path):
+    app = service(tmp_path / "market.sqlite")
+    try:
+        app.store.upsert_pools(pools())
+        blocks = [header(100 + index, int(time.time()) - 60 + index)
+                  for index in range(5)]
+        position_key = f"nft:{UNISWAP_V3_POSITION_MANAGER}:42"
+
+        def manager_transfer(block, source, target, *, burn, log_index):
+            transfer = swap(block, V3, "v3", index=log_index)
+            transfer.update(
+                protocol="nft", kind="transfer", position_key=position_key,
+                token_id="42", owner=target, custody=UNISWAP_V3_POSITION_MANAGER,
+                liquidity_delta=None, amount0=None, amount1=None,
+                cashflow0=None, cashflow1=None,
+                data={
+                    "from": source, "to": target,
+                    "mint": not burn, "burn": burn,
+                    "manager_protocol": "v3",
+                },
+            )
+            return transfer
+
+        opened = lp_effect(
+            blocks[0], "v3", "add", 1_000, (1_000_000, 1_000_000),
+            None, None, key="manager-order",
+        )
+        opened["data"] = {}
+        opened["position_key"] = position_key
+        minted = manager_transfer(
+            blocks[0], "0x" + "0" * 40, TOKEN, burn=False, log_index=1,
+        )
+        minted["tx_hash"] = opened["tx_hash"]
+
+        first_fees = lp_effect(
+            blocks[1], "v3", "collect", 0, (100_000, 0),
+            None, None, key="manager-order",
+        )
+        first_fees["data"] = {}
+        first_fees["position_key"] = position_key
+        removed = lp_effect(
+            blocks[2], "v3", "remove", -1_000, (1_000_000, 1_000_000),
+            None, None, key="manager-order",
+        )
+        removed["data"] = {}
+        removed["position_key"] = position_key
+        principal = lp_effect(
+            blocks[3], "v3", "collect", 0, (1_000_000, 1_000_000),
+            None, None, key="manager-order",
+        )
+        principal["data"] = {}
+        principal["position_key"] = position_key
+        burned = manager_transfer(
+            blocks[3], TOKEN, None, burn=True, log_index=1,
+        )
+        burned["tx_hash"] = principal["tx_hash"]
+        incomplete_v4 = lp_effect(
+            blocks[4], "v4", "add", 1_000, (1_000_000, 1_000_000),
+            position_state(0), position_state(1_000), key="pending-trace",
+        )
+        events = [
+            opened, minted, first_fees, removed, principal, burned,
+            incomplete_v4,
+        ]
+        for event in events[:-1]:
+            event["custody"] = UNISWAP_V3_POSITION_MANAGER
+        transactions = [
+            {
+                "tx_hash": event["tx_hash"],
+                "block_number": event["block_number"],
+                "block_hash": event["block_hash"],
+                "payer": TOKEN,
+                "gas_usd": 0.01,
+            }
+            for event in {
+                event["tx_hash"]: event for event in events
+            }.values()
+        ]
+        app.store.ingest(blocks, events, transactions=transactions)
+        with app.store.transaction() as connection:
+            connection.execute(
+                "UPDATE lp_accounting_episodes SET history_complete=0,"
+                "status='nft_burn_unsettled',claims_complete=0,"
+                "fees_complete=0,fees_usd=NULL,gross_pnl_usd=NULL,"
+                "net_pnl_usd=NULL WHERE position_key=?",
+                (position_key,),
+            )
+        assert app.book.closed({"window": "all"})["rows"][0]["fees_usd"] is None
+        assert app.store.repair_v3_birth_history(
+            V3_BIRTH_REPAIR_PREFIXES, limit=32,
+        ) is True
+
+        closed = app.book.closed({"window": "all"})["rows"]
+        assert len(closed) == 1
+        assert closed[0]["status"] == "complete"
+        assert closed[0]["coverage"]["history"] == "full"
+        assert closed[0]["coverage"]["fees"] == "exact"
+        assert closed[0]["fees_usd"] == pytest.approx(0.1)
+        assert closed[0]["observed_collected_fees_usd"] == pytest.approx(0.1)
+        assert closed[0]["gross_pnl_usd"] == pytest.approx(0.1)
+
+        wallet = next(
+            row for row in app.book.owners({"window": "all"})["rows"]
+            if row["owner"] == TOKEN
+        )
+        assert wallet["fees_usd"] is None
+        assert wallet["observed_collected_fees_usd"] == pytest.approx(0.1)
+        assert wallet["coverage"]["observed_collected_fees"] == {
+            "unit": "USDG_quote",
+            "episodes": 1,
+            "history_complete_episodes": 1,
+            "total_episodes": 2,
+            "complete": False,
+        }
+        assert wallet["coverage"]["financial_scope"] == (
+            "lifetime_of_selected_episodes"
+        )
+
+        detail = app.book.owner(TOKEN, {"window": "all"})
+        assert detail["summary"]["fees_usd"] is None
+        assert detail["summary"]["observed_collected_fees_usd"] == pytest.approx(
+            0.1,
+        )
+        assert detail["coverage"]["observed_collected_fees"]["complete"] is False
+        historical = next(
+            row for row in detail["positions"]
+            if row["position_key"] == position_key
+        )
+        assert len(historical["ownership"]) == 1
+        assert historical["ownership"][0]["acquired_by"] == "mint"
+        assert historical["ownership"][0]["complete"] is True
     finally:
         app.close()
 

@@ -1028,5 +1028,75 @@ def test_interval_end_is_rechecked_after_logs_before_commit():
         store.close()
 
 
+def test_metadata_and_balance_batches_isolate_invalid_tokens(tmp_path):
+    from rhpools.lp_market_index import (
+        BALANCE_OF_SELECTOR, DECIMALS_SELECTOR, SYMBOL_SELECTOR, RpcError,
+    )
+
+    token, quote, invalid = (
+        "0x" + byte * 20 for byte in ("11", "22", "33")
+    )
+    healthy_pool, reverting_pool = "0x" + "44" * 20, "0x" + "55" * 20
+
+    class TokenRpc(StaticRpc):
+        def call(self, method, params):
+            if method != "eth_call":
+                return super().call(method, params)
+            address, selector = params[0]["to"], params[0]["data"][:10]
+            if selector == SYMBOL_SELECTOR:
+                return "0x" + {
+                    token: b"ASSET", quote: b"USDG", invalid: b"INVALID",
+                }[address].ljust(32, b"\x00").hex()
+            if selector == DECIMALS_SELECTOR:
+                return hex(256 if address == invalid else 6)
+            if selector == BALANCE_OF_SELECTOR:
+                if address == invalid:
+                    raise RpcError("execution reverted")
+                return hex(1_000_000)
+            raise AssertionError(selector)
+
+    store = MarketStore(tmp_path / "batched-state.sqlite")
+    scanner = indexer(store, TokenRpc(), v3_balances=True)
+    try:
+        store.upsert_pools([
+            {
+                "id": pool_id, "protocol": "v3", "address": pool_id,
+                "token0": asset, "token1": quote,
+            }
+            for pool_id, asset in (
+                (healthy_pool, token), (reverting_pool, invalid),
+            )
+        ])
+        block = header(10)
+        store.ingest([block], [])
+        scanner._metadata_once()
+        assert store.pool(healthy_pool)["decimals0"] == 6
+        assert store.pool(reverting_pool)["decimals0"] is None
+        assert [
+            tuple(row) for row in store.read().execute(
+                "SELECT address,attempts FROM pending_token_metadata"
+            )
+        ] == [(invalid, 1)]
+
+        store.queue_v3_balances(
+            [healthy_pool, reverting_pool], 10, block["hash"],
+        )
+        scanner._balances_once()
+        assert [
+            row["pool_id"] for row in store.read().execute(
+                "SELECT pool_id FROM pool_balances"
+            )
+        ] == [healthy_pool]
+        assert [
+            tuple(row) for row in store.read().execute(
+                "SELECT pool_id,attempts FROM pending_balances"
+            )
+        ] == [(reverting_pool, 1)]
+        assert store.status()["pending_balances"] == 1
+    finally:
+        scanner.close()
+        store.close()
+
+
 
 

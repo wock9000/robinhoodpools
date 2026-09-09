@@ -483,6 +483,14 @@ class MarketStore:
                         "WHERE active_episode_id IS NOT NULL"
                     )
                 self.connection.execute("PRAGMA user_version=6")
+            if int(self.connection.execute("PRAGMA user_version").fetchone()[0]) < 7:
+                self.connection.execute(
+                    "CREATE INDEX IF NOT EXISTS pending_enrichment_financial_order_idx "
+                    "ON pending_enrichment(block_number,tx_hash,next_attempt) "
+                    "WHERE last_error IS NULL "
+                    "OR last_error NOT GLOB 'pool_identity_pending:*'"
+                )
+                self.connection.execute("PRAGMA user_version=7")
             self.connection.execute(
                 "CREATE INDEX IF NOT EXISTS pending_reprojection_order_idx "
                 "ON pending_reprojection(block_number,tx_index,log_index,event_id)"
@@ -2254,11 +2262,28 @@ class MarketStore:
     def pending_enrichments(
         self, limit: int = 16, *, now: float | None = None,
     ) -> list[dict[str, Any]]:
+        # Reserve historical progress without making current financials wait
+        # for the entire backfill. Identity discovery has its own worker.
         limit = max(1, min(int(limit), 256))
+        historical = max(1, limit // 4)
+        due = time.time() if now is None else now
         rows = self.read().execute(
-            "SELECT * FROM pending_enrichment WHERE next_attempt<=? "
-            "ORDER BY block_number,tx_hash LIMIT ?",
-            (time.time() if now is None else now, limit),
+            "WITH oldest AS ("
+            "SELECT block_number,tx_hash FROM pending_enrichment "
+            "INDEXED BY pending_enrichment_financial_order_idx "
+            "WHERE next_attempt<=? AND (last_error IS NULL "
+            "OR last_error NOT GLOB 'pool_identity_pending:*') "
+            "ORDER BY block_number,tx_hash LIMIT ?"
+            "),newest AS ("
+            "SELECT block_number,tx_hash FROM pending_enrichment "
+            "INDEXED BY pending_enrichment_financial_order_idx "
+            "WHERE next_attempt<=? AND (last_error IS NULL "
+            "OR last_error NOT GLOB 'pool_identity_pending:*') "
+            "ORDER BY block_number DESC,tx_hash DESC LIMIT ?"
+            "),selected AS (SELECT * FROM oldest UNION SELECT * FROM newest) "
+            "SELECT p.* FROM selected s JOIN pending_enrichment p "
+            "ON p.tx_hash=s.tx_hash ORDER BY s.block_number,s.tx_hash",
+            (due, historical, due, limit - historical),
         ).fetchall()
         return [dict(row) for row in rows]
 
@@ -2345,14 +2370,25 @@ class MarketStore:
             )
 
     def pending_reprojections(self, limit: int = 128) -> list[dict[str, Any]]:
+        limit = max(1, min(int(limit), 512))
+        historical = max(1, limit // 4)
+        due = time.time()
         rows = self.read().execute(
+            "WITH oldest AS ("
+            "SELECT event_id FROM pending_reprojection "
+            "INDEXED BY pending_reprojection_order_idx WHERE next_attempt<=? "
+            "ORDER BY block_number,tx_index,log_index,event_id LIMIT ?"
+            "),newest AS ("
+            "SELECT event_id FROM pending_reprojection "
+            "INDEXED BY pending_reprojection_order_idx WHERE next_attempt<=? "
+            "ORDER BY block_number DESC,tx_index DESC,log_index DESC,event_id DESC LIMIT ?"
+            "),selected AS (SELECT * FROM oldest UNION SELECT * FROM newest) "
             "SELECT e.*,q.attempts AS reprojection_attempts,q.next_attempt "
-            "FROM pending_reprojection q JOIN events e ON e.id=q.event_id "
-            "ORDER BY q.block_number,q.tx_index,q.log_index,q.event_id LIMIT ?",
-            (max(1, min(int(limit), 512)),),
+            "FROM selected s JOIN pending_reprojection q ON q.event_id=s.event_id "
+            "JOIN events e ON e.id=q.event_id "
+            "ORDER BY q.block_number,q.tx_index,q.log_index,q.event_id",
+            (due, historical, due, limit - historical),
         ).fetchall()
-        if rows and float(rows[0]["next_attempt"]) > time.time():
-            return []
         result: list[dict[str, Any]] = []
         for row in rows:
             event = dict(row)
@@ -2397,6 +2433,66 @@ class MarketStore:
             if removed:
                 self._bump(connection, "pending_reprojection", -removed)
             return events
+
+    def repair_v3_birth_history(
+        self, prefixes: Sequence[str], *, limit: int = 32,
+    ) -> bool:
+        """Resume a bounded repair without replaying the ledger at startup."""
+        reader = self.read()
+        checkpoint = self._metadata(reader, "v3_birth_history_repair_v1", {})
+        if checkpoint.get("complete"):
+            return False
+        if reader.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='lp_accounting_positions'"
+        ).fetchone() is None:
+            return False
+        after = str(checkpoint.get("after") or "")
+        rows = []
+        for prefix in prefixes:
+            if after >= prefix + "\uffff":
+                continue
+            rows = reader.execute(
+                "SELECT position_key FROM lp_accounting_positions "
+                "WHERE position_key>=? AND position_key<? AND position_key>? "
+                "ORDER BY position_key LIMIT ?",
+                (prefix, prefix + "\uffff", after, max(1, min(int(limit), 128))),
+            ).fetchall()
+            if rows:
+                break
+        if not rows:
+            with self.transaction() as connection:
+                self._set_metadata(
+                    connection, "v3_birth_history_repair_v1",
+                    {**checkpoint, "complete": True},
+                )
+            return False
+        keys = [str(row["position_key"]) for row in rows]
+        marks = ",".join("?" for _ in keys)
+        repairs = reader.execute(
+            "SELECT MIN(a.id) AS event_id FROM lp_accounting_event_keys ka "
+            "JOIN events a ON a.id=ka.event_id "
+            f"WHERE ka.position_key IN ({marks}) AND a.kind='add' "
+            "AND EXISTS(SELECT 1 FROM lp_accounting_episodes ep "
+            "WHERE ep.position_key=ka.position_key AND ep.protocol='v3' "
+            "AND ep.history_complete=0) "
+            "AND EXISTS(SELECT 1 FROM lp_accounting_event_keys kt "
+            "JOIN events t ON t.id=kt.event_id "
+            "WHERE kt.position_key=ka.position_key AND t.block_hash=a.block_hash "
+            "AND t.tx_hash=a.tx_hash AND t.kind='transfer' "
+            "AND t.log_index>a.log_index AND json_extract(t.data,'$.mint')=1) "
+            "GROUP BY ka.position_key",
+            keys,
+        ).fetchall()
+        with self.transaction() as connection:
+            self.reproject(int(row["event_id"]) for row in repairs)
+            self._set_metadata(connection, "v3_birth_history_repair_v1", {
+                "after": keys[-1],
+                "scanned_positions": int(checkpoint.get("scanned_positions", 0)) + len(keys),
+                "repaired_positions": int(checkpoint.get("repaired_positions", 0)) + len(repairs),
+                "complete": False,
+            })
+        return True
 
     def mark_reprojection_error(
         self, event_ids: Iterable[int], error: str, *, delay: float,
@@ -2465,11 +2561,23 @@ class MarketStore:
                 self._bump(connection, "pending_balances", inserted)
 
     def pending_v3_balances(self, limit: int = 16) -> list[dict[str, Any]]:
+        limit = max(1, min(int(limit), 128))
+        historical = max(1, limit // 4)
+        due = time.time()
         rows = self.read().execute(
-            "SELECT p.*,q.token0,q.token1,q.protocol FROM pending_balances p "
-            "JOIN pools q ON q.id=p.pool_id WHERE p.next_attempt<=? "
-            "ORDER BY p.block_number,p.pool_id LIMIT ?",
-            (time.time(), max(1, min(int(limit), 128))),
+            "WITH oldest AS ("
+            "SELECT block_number,pool_id FROM pending_balances "
+            "INDEXED BY pending_balances_order_idx WHERE next_attempt<=? "
+            "ORDER BY block_number,pool_id LIMIT ?"
+            "),newest AS ("
+            "SELECT block_number,pool_id FROM pending_balances "
+            "INDEXED BY pending_balances_order_idx WHERE next_attempt<=? "
+            "ORDER BY block_number DESC,pool_id DESC LIMIT ?"
+            "),selected AS (SELECT * FROM oldest UNION SELECT * FROM newest) "
+            "SELECT p.*,q.token0,q.token1,q.protocol FROM selected s "
+            "JOIN pending_balances p ON p.pool_id=s.pool_id AND p.block_number=s.block_number "
+            "JOIN pools q ON q.id=p.pool_id ORDER BY s.block_number,s.pool_id",
+            (due, historical, due, limit - historical),
         ).fetchall()
         return [dict(row) for row in rows]
 

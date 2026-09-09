@@ -886,6 +886,39 @@
     age.title = ageView.title;
     return age;
   }
+  function collectedFeeView(item, fallbackCoverage = null, showObservedZero = false) {
+    const complete = finite(item && item.fees_usd);
+    if (complete != null) {
+      return {
+        text: formatUsd(complete),
+        className: "positive",
+        observed: false,
+        title: "Complete attributed collected fees in USDG quote units."
+      };
+    }
+    const observed = finite(item && item.observed_collected_fees_usd);
+    const coverage = item && item.coverage || fallbackCoverage || {};
+    const feeCoverage = coverage && coverage.observed_collected_fees;
+    if (observed == null || (!showObservedZero && observed === 0)) {
+      return {
+        text: "—",
+        className: "unknown",
+        observed: false,
+        title: "Complete collected-fee total unavailable."
+      };
+    }
+    const episodeCoverage = feeCoverage && feeCoverage.episodes != null
+      ? `${formatCount(feeCoverage.episodes)} of ${formatCount(feeCoverage.total_episodes)} selected episodes`
+      : "a subset of selected episodes";
+    return {
+      text: `${formatUsd(observed)} OBS`,
+      className: "unknown",
+      observed: true,
+      title: `Observed priced collected fees from ${episodeCoverage}; not a complete fee total. USDG quote units, not a fiat oracle.`
+    };
+  }
+
+
 
   function patchOwnerRow(row, item) {
     const cells = row.cells;
@@ -903,7 +936,8 @@
       poolId ? internalPoolLink(poolId, item.owner || "", poolLabel, activity.tx_hash || "") : el("span", "dim", poolLabel));
     setNodeCell(cells[3], activitySignature(activity), "owner-activity-cell", () => ownerActivityNodes(item));
     setTextCell(cells[4], formatCount(item.open_positions), `numeric ledger-first ${item.open_positions == null ? "unknown" : ""}`, "Open positions in the historical indexed snapshot; newer activity may not be accounted yet.");
-    setTextCell(cells[5], formatUsd(item.fees_usd), `numeric ${item.fees_usd == null ? "unknown" : "positive"}`);
+    const feeView = collectedFeeView(item);
+    setTextCell(cells[5], feeView.text, `numeric ${feeView.className}`, feeView.title);
     setTextCell(cells[6], formatSignedUsd(item.net_pnl_usd), `numeric ${valueClass(item.net_pnl_usd)}`);
     const pending = item.financials && item.financials.pending;
     const coverage = custody ? "CUSTODY ≠ OWNER" : currentOnly ? "ACTIVITY ONLY"
@@ -966,7 +1000,8 @@
     setTextCell(cells[2], item.protocol || "—", "protocol");
     setTextCell(cells[3], formatUsd(item.deposit_usd), `numeric ${item.deposit_usd == null ? "unknown" : "negative"}`);
     setTextCell(cells[4], formatUsd(item.withdrawal_usd), `numeric ${item.withdrawal_usd == null ? "unknown" : "positive"}`);
-    setTextCell(cells[5], formatUsd(item.fees_usd), `numeric ${item.fees_usd == null ? "unknown" : "positive"}`);
+    const feeView = collectedFeeView(item, null, true);
+    setTextCell(cells[5], feeView.text, `numeric ${feeView.className}`, feeView.title);
     setTextCell(cells[6], formatSignedUsd(item.gross_pnl_usd), `numeric ${valueClass(item.gross_pnl_usd)}`);
     setTextCell(cells[7], item.gas_usd == null ? "—" : `-${formatUsd(Math.abs(numeric(item.gas_usd)))}`, `numeric ${item.gas_usd == null ? "unknown" : "negative"}`);
     setTextCell(cells[8], formatSignedUsd(item.net_pnl_usd), `numeric ${valueClass(item.net_pnl_usd)}`);
@@ -1040,8 +1075,9 @@
   function ownerRenderSignature(row, rank) {
     return [
       rank, row.owner, row.custody, row.identity_basis, row.positions, row.open_positions,
-      row.closed_episodes, row.fees_usd, row.gross_pnl_usd, row.gas_usd, row.net_pnl_usd,
-      row.volume_usd, row.win_rate, activitySignature(row.activity), describeCoverage(row.coverage)
+      row.closed_episodes, row.fees_usd, row.observed_collected_fees_usd,
+      row.gross_pnl_usd, row.gas_usd, row.net_pnl_usd, row.volume_usd, row.win_rate,
+      activitySignature(row.activity), describeCoverage(row.coverage)
     ].join("|");
   }
 
@@ -2260,13 +2296,14 @@
     return wrapper;
   }
 
-  function renderOwnerSummary(summary) {
+  function renderOwnerSummary(summary, coverage = null) {
     const data = summary || {};
+    const feeView = collectedFeeView(data, coverage);
     elements.ownerSummary.replaceChildren(
       summaryEntry("positions", formatCount(data.positions)),
       summaryEntry("open", formatCount(data.open_positions)),
       summaryEntry("closed runs", formatCount(data.closed_episodes)),
-      summaryEntry("fees", formatUsd(data.fees_usd), data.fees_usd == null ? "neutral" : "positive"),
+      summaryEntry(feeView.observed ? "observed fees" : "fees", feeView.text, feeView.className),
       summaryEntry("gross P/L", formatSignedUsd(data.gross_pnl_usd), valueClass(data.gross_pnl_usd)),
       summaryEntry("gas", data.gas_usd == null ? "—" : `-${formatUsd(Math.abs(numeric(data.gas_usd)))}`, data.gas_usd == null ? "neutral" : "negative"),
       summaryEntry("net P/L", formatSignedUsd(data.net_pnl_usd), valueClass(data.net_pnl_usd)),
@@ -2404,7 +2441,7 @@
     state.ownerLastSuccessAt = Date.now();
     state.ownerLastError = "";
     const summary = payload && payload.summary || {};
-    renderOwnerSummary(summary);
+    renderOwnerSummary(summary, payload && payload.coverage);
     renderOwnerIdentity(payload);
     const positions = payload && Array.isArray(payload.positions) ? payload.positions.filter((position) => !["closed", "complete", "historical"].includes(String(position.status || "").toLowerCase())) : [];
     const closed = payload && Array.isArray(payload.closed) ? payload.closed : [];

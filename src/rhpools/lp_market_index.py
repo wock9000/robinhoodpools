@@ -26,6 +26,7 @@ from .lp_market_protocols import (
     EVENT_TOPICS,
     NFT_EVENT_TOPICS,
     NFT_MANAGER_ADDRESSES,
+    V3_NFT_MANAGER_ADDRESSES,
     POOL_MANAGER,
     TRANSFER_TOPIC,
     SLIPSTREAM_FACTORY,
@@ -63,6 +64,9 @@ MAX_INTERVAL_STORE_SECONDS = 2.0
 ENRICH_BATCH = 8
 ENRICHMENT_CAPABILITY_RECHECK_S = 300.0
 REPROJECT_BATCH = 128
+V3_BIRTH_REPAIR_PREFIXES = tuple(
+    sorted(f"nft:{address}:" for address in V3_NFT_MANAGER_ADDRESSES)
+)
 DEFERRED_POOL_IDENTITY_BATCH = 8
 DEFERRED_POOL_IDENTITY_CANDIDATES_PER_POOL = 4
 DEFERRED_POOL_IDENTITY_SEED_BUSY_S = 1.0
@@ -392,6 +396,7 @@ class MarketIndexer:
         self._legacy_v4_identity_after_id = ""
         self._legacy_v4_identity_complete = False
         self._deferred_identity_seed_complete = False
+        self._pool_identity_replay_turn = 0
         self._current_receipt_executor = ThreadPoolExecutor(
             max_workers=2, thread_name_prefix="lp-current-receipt",
         )
@@ -2932,23 +2937,23 @@ class MarketIndexer:
 
 
     def _pending_pool_identity_replays(
-        self, limit: int = DEFERRED_POOL_IDENTITY_BATCH,
+        self, limit: int = DEFERRED_POOL_IDENTITY_BATCH, *, newest: bool = False,
     ) -> list[dict[str, Any]]:
         bounded = max(1, min(int(limit), DEFERRED_POOL_IDENTITY_BATCH))
         now = time.time()
+        direction = "DESC" if newest else "ASC"
         reader = self.store.read()
-        # A due chronological prefix needs no retry-wide sort. Bound the
-        # lookahead before filtering, so future retries cannot turn it into
-        # another full-queue scan.
+        # Bound the lookahead before filtering. Both ends use the same
+        # chronological index without sorting the complete retry queue.
         rows = reader.execute(
             "WITH earliest AS ("
             "SELECT block_number,tx_hash,next_attempt FROM pending_enrichment "
             "INDEXED BY pending_enrichment_order_idx "
-            "ORDER BY block_number,tx_hash LIMIT ?"
+            f"ORDER BY block_number {direction},tx_hash {direction} LIMIT ?"
             ") SELECT p.* FROM earliest e JOIN pending_enrichment p "
             "ON p.tx_hash=e.tx_hash WHERE e.next_attempt<=? "
             "AND p.last_error GLOB 'pool_identity_pending:*' "
-            "ORDER BY e.block_number,e.tx_hash LIMIT ?",
+            f"ORDER BY e.block_number {direction},e.tx_hash {direction} LIMIT ?",
             (bounded * 4, now, bounded),
         ).fetchall()
         if len(rows) == bounded:
@@ -2959,20 +2964,20 @@ class MarketIndexer:
             "INDEXED BY pending_enrichment_identity_immediate_idx "
             "WHERE next_attempt<=0 "
             "AND last_error GLOB 'pool_identity_pending:*' "
-            "ORDER BY block_number,tx_hash LIMIT ?"
+            f"ORDER BY block_number {direction},tx_hash {direction} LIMIT ?"
             "),retried AS ("
             "SELECT block_number,tx_hash FROM pending_enrichment "
             "INDEXED BY pending_enrichment_identity_retry_ready_idx "
             "WHERE next_attempt>0 AND next_attempt<=? "
             "AND last_error GLOB 'pool_identity_pending:*' "
-            "ORDER BY block_number,tx_hash LIMIT ?"
+            f"ORDER BY block_number {direction},tx_hash {direction} LIMIT ?"
             "),selected AS ("
             "SELECT block_number,tx_hash FROM immediate "
             "UNION ALL SELECT block_number,tx_hash FROM retried "
-            "ORDER BY block_number,tx_hash LIMIT ?"
+            f"ORDER BY block_number {direction},tx_hash {direction} LIMIT ?"
             ") SELECT p.* FROM selected s JOIN pending_enrichment p "
             "ON p.tx_hash=s.tx_hash "
-            "ORDER BY s.block_number,s.tx_hash",
+            f"ORDER BY s.block_number {direction},s.tx_hash {direction}",
             (bounded, now, bounded, bounded),
         ).fetchall()
         return [dict(row) for row in rows]
@@ -3053,12 +3058,15 @@ class MarketIndexer:
 
     def _resolve_deferred_pool_identities_once(self) -> bool:
         self._seed_deferred_v4_pool_identities()
-        rows = self._pending_pool_identity_replays()
+        rows = self._pending_pool_identity_replays(
+            newest=self._pool_identity_replay_turn != 0,
+        )
         if not rows:
             return False
         with self._current_receipt_lock:
             if self._current_pool_pending:
                 return False
+        self._pool_identity_replay_turn = (self._pool_identity_replay_turn + 1) % 4
         started = time.monotonic()
         try:
             identity_block = _hex_int(
@@ -3176,9 +3184,13 @@ class MarketIndexer:
                     resolve_unknown=False,
                     known_pools=resolved_v4,
                 )
-                inserted = self.store.ingest(
-                    [header], events, lane="history",
-                )
+                with self.store.transaction():
+                    inserted = self.store.ingest(
+                        [header], events, lane="history",
+                    )
+                    self._finish_pool_identity_replay(
+                        row, marker, payload, addresses,
+                    )
                 inserted_count += len(inserted)
                 resolved_pools = {
                     address: self._verified_pool(address)
@@ -3189,9 +3201,6 @@ class MarketIndexer:
                 )
                 replayed += resolved_count
                 rejected += len(addresses) - resolved_count
-                self._finish_pool_identity_replay(
-                    row, marker, payload, addresses,
-                )
                 publish = list(inserted)
                 publish.extend(
                     {"pool": self._stored_pool(stored)}
@@ -4176,10 +4185,7 @@ class MarketIndexer:
                 enrichment_retry_in_s=round(retry_in, 1),
             )
             return False
-        pending = [
-            row for row in self.store.pending_enrichments(ENRICH_BATCH)
-            if self._pool_identity_marker(row.get("last_error")) is None
-        ]
+        pending = self.store.pending_enrichments(ENRICH_BATCH)
         if not pending:
             return False
         trace = self.source_status().get("trace")
@@ -4319,42 +4325,67 @@ class MarketIndexer:
             raise RpcError("token symbol is empty or oversized")
         return symbol
 
+    def _fetch_token_metadata(self, address: str) -> tuple[str, int]:
+        if self._stop.is_set():
+            raise RpcError("indexer closed before metadata fetch")
+        if len(address) != 42 or not address.startswith("0x"):
+            raise ValueError("token address must be a 20-byte address")
+        results = self._rpc_state_batch([
+            ("eth_call", [{"to": address, "data": SYMBOL_SELECTOR}, "latest"]),
+            ("eth_call", [{"to": address, "data": DECIMALS_SELECTOR}, "latest"]),
+        ], self._worker_rpc())
+        symbol = self._decode_token_symbol(results[0])
+        if isinstance(results[1], Mapping) and results[1].get("error") is not None:
+            raise RpcError(f"decimals eth_call failed: {results[1]['error']}")
+        decimals = _hex_int(results[1], "token decimals")
+        if not 0 <= decimals <= 255:
+            raise ValueError("token decimals are outside uint8")
+        return symbol, decimals
+
     def _metadata_once(self) -> bool:
         pending = self.store.pending_token_metadata(8)
-        if not pending:
+        if not pending or self._stop.is_set():
             return False
-        register = getattr(self.market, "register_index_pool", None)
-        for row in pending:
-            if self._stop.is_set():
-                break
-            address = str(row["address"]).lower()
+        jobs = [
+            (row, self._enrichment_executor.submit(
+                self._fetch_token_metadata, str(row["address"]).lower(),
+            ))
+            for row in pending
+        ]
+        completed = []
+        errors = []
+        for row, future in jobs:
             try:
-                results = self._rpc_state_batch([
-                    ("eth_call", [{"to": address, "data": SYMBOL_SELECTOR}, "latest"]),
-                    ("eth_call", [{"to": address, "data": DECIMALS_SELECTOR}, "latest"]),
-                ])
-                symbol = self._decode_token_symbol(results[0])
-                if isinstance(results[1], Mapping) and results[1].get("error") is not None:
-                    raise RpcError(f"decimals eth_call failed: {results[1]['error']}")
-                decimals = _hex_int(results[1], "token decimals")
-                self.store.save_token_metadata(address, symbol, decimals)
-                with self._cache_lock:
-                    self._pool_cache.clear()
-                    self._pool_misses.discard(address)
-                if callable(register):
-                    try:
-                        self._publish_token_pools(address, register)
-                    except BaseException:
-                        self._publish_after_id = ""
-                        raise
+                symbol, decimals = future.result()
             except Exception as exc:
+                errors.append((row, exc))
+            else:
+                completed.append((str(row["address"]).lower(), symbol, decimals))
+        # Fetch outside the writer lock, then pay one lock wait/commit for the
+        # entire batch rather than making every token yield to live/history.
+        with self.store.transaction():
+            for address, symbol, decimals in completed:
+                self.store.save_token_metadata(address, symbol, decimals)
+            for row, exc in errors:
                 attempts = int(row.get("attempts", 0)) + 1
                 self.store.mark_token_metadata_error(
-                    address, str(exc), delay=min(300.0, 2.0 ** min(attempts, 8)),
+                    str(row["address"]), str(exc),
+                    delay=min(300.0, 2.0 ** min(attempts, 8)),
                 )
-                self._set_runtime("metadata", error=exc)
-            else:
-                self._set_runtime("metadata")
+        register = getattr(self.market, "register_index_pool", None)
+        if completed:
+            with self._cache_lock:
+                self._pool_cache.clear()
+                for address, _symbol, _decimals in completed:
+                    self._pool_misses.discard(address)
+        for address, _symbol, _decimals in completed:
+            if callable(register):
+                try:
+                    self._publish_token_pools(address, register)
+                except BaseException:
+                    self._publish_after_id = ""
+                    raise
+        self._set_runtime("metadata", error=errors[-1][1] if errors else None)
         return True
 
     def _reproject_once(self) -> bool:
@@ -4389,44 +4420,65 @@ class MarketIndexer:
         return "eth_call", [{"to": token, "data": data}, hex(block)]
 
     def _balances_once(self) -> bool:
-        if not self.v3_balances:
+        if not self.v3_balances or self._stop.is_set():
             return False
         pending = self.store.pending_v3_balances(BALANCE_BATCH)
         if not pending:
             return False
         started = time.monotonic()
-        completed = 0
-        batch_error: Exception | None = None
+        requested = []
+        calls = []
+        errors = []
         for row in pending:
-            if self._stop.is_set():
-                break
             try:
-                results = self._rpc_batch("enrichment", [
+                pair = [
                     self._balance_call(
-                        str(row["token0"]), str(row["pool_id"]), int(row["block_number"]),
-                    ),
-                    self._balance_call(
-                        str(row["token1"]), str(row["pool_id"]), int(row["block_number"]),
-                    ),
-                ])
-                balance0 = _hex_int(results[0], "token0 balance")
-                balance1 = _hex_int(results[1], "token1 balance")
-                self.store.save_v3_balance(
-                    str(row["pool_id"]), int(row["block_number"]), str(row["block_hash"]),
-                    balance0, balance1,
-                )
+                        str(row[token]), str(row["pool_id"]), int(row["block_number"]),
+                    )
+                    for token in ("token0", "token1")
+                ]
             except Exception as exc:
-                batch_error = exc
-                attempts = int(row.get("attempts", 0)) + 1
-                self.store.mark_v3_balance_error(
-                    str(row["pool_id"]), int(row["block_number"]), str(exc),
-                    delay=min(300.0, 2.0 ** min(attempts, 8)),
-                )
+                errors.append((row, exc))
             else:
-                completed += 1
+                requested.append(row)
+                calls.extend(pair)
+        completed = []
+        try:
+            results = self._rpc_state_batch(calls) if calls else []
+        except Exception as exc:
+            errors.extend((row, exc) for row in requested)
+        else:
+            for index, row in enumerate(requested):
+                try:
+                    balance0 = _hex_int(results[index * 2], "token0 balance")
+                    balance1 = _hex_int(results[index * 2 + 1], "token1 balance")
+                except Exception as exc:
+                    errors.append((row, exc))
+                else:
+                    completed.append((row, balance0, balance1))
+        saved = 0
+        try:
+            with self.store.transaction():
+                for row, balance0, balance1 in completed:
+                    self.store.save_v3_balance(
+                        str(row["pool_id"]), int(row["block_number"]),
+                        str(row["block_hash"]), balance0, balance1,
+                    )
+        except (CanonicalConflict, ValueError) as exc:
+            errors.extend((row, exc) for row, _balance0, _balance1 in completed)
+        else:
+            saved = len(completed)
+        if errors:
+            with self.store.transaction():
+                for row, exc in errors:
+                    attempts = int(row.get("attempts", 0)) + 1
+                    self.store.mark_v3_balance_error(
+                        str(row["pool_id"]), int(row["block_number"]), str(exc),
+                        delay=min(300.0, 2.0 ** min(attempts, 8)),
+                    )
         self._set_runtime(
-            "balances", error=batch_error, latency=time.monotonic() - started,
-            balances_batch=completed,
+            "balances", error=errors[-1][1] if errors else None,
+            latency=time.monotonic() - started, balances_batch=saved,
         )
         return True
 
@@ -4506,6 +4558,9 @@ class MarketIndexer:
                     self._projection_verified = True
                 worked = self._reproject_once()
                 worked = self._balances_once() or worked
+                worked = self.store.repair_v3_birth_history(
+                    V3_BIRTH_REPAIR_PREFIXES,
+                ) or worked
             except Exception as exc:
                 self._set_runtime("projection", error=exc)
                 self._stop.wait(backoff)

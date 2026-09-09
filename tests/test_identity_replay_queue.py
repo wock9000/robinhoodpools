@@ -51,6 +51,10 @@ def test_migrated_identity_queue_preserves_data_and_ready_order(tmp_path, monkey
         assert status["epoch"] == 7
         assert status["indexed_head"] == 100
         assert [row["block_number"] for row in indexer._pending_pool_identity_replays(4)] == [18, 19, 20, 21]
+        assert [
+            row["block_number"]
+            for row in indexer._pending_pool_identity_replays(4, newest=True)
+        ] == [23, 21, 20, 19]
         with store.transaction() as conn:
             conn.execute("UPDATE pending_enrichment SET next_attempt=? WHERE tx_hash='tx-018'", (now + 30,))
         assert [row["block_number"] for row in indexer._pending_pool_identity_replays(4)] == [19, 20, 21, 23]

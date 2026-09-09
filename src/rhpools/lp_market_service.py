@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from .lp_chain import NATIVE, UNISWAP_V3_FACTORY, USDG, WETH, WETH_USDG_POOL
+from .lp_market_store import _insert_rows
 from .workbench_market import _price_from_sqrt
 
 WINDOWS = {"1h": 3600, "24h": 86400, "7d": 604800, "30d": 2592000, "all": None}
@@ -971,35 +972,37 @@ class PriceProjection:
                 int(event["id"]),
             ))
         if sample_rows is not None:
-            conn.executemany(
-                "INSERT OR REPLACE INTO lp_price_samples VALUES(?,?,?,?,?,?,?,?,?,?)",
-                sample_rows,
+            _insert_rows(
+                conn, "INSERT OR REPLACE INTO lp_price_samples",
+                sample_rows, columns=10,
             )
         if reserve_rows is not None:
-            conn.executemany(
-                "INSERT OR REPLACE INTO lp_v2_reserve_samples VALUES(?,?,?,?,?,?,?,?,?)",
-                reserve_rows,
+            _insert_rows(
+                conn, "INSERT OR REPLACE INTO lp_v2_reserve_samples",
+                reserve_rows, columns=9,
             )
         if mark_rows is not None:
-            conn.executemany(
-                "INSERT OR REPLACE INTO lp_price_marks VALUES(?,?,?,?,?,?,?,?,?)",
-                mark_rows,
+            _insert_rows(
+                conn, "INSERT OR REPLACE INTO lp_price_marks",
+                mark_rows, columns=9,
             )
         conn.executemany(
             "UPDATE events SET price0_usd=?,price1_usd=?,volume_usd=?,fees_usd=?,"
             "deposit_usd=?,withdrawal_usd=?,pricing_basis=?,data=? WHERE id=?",
             event_updates,
         )
-        conn.executemany(
-            "INSERT OR REPLACE INTO lp_pool_state VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        _insert_rows(
+            conn, "INSERT OR REPLACE INTO lp_pool_state",
             (
                 tuple(state_heads[pool_id][name] for name in (
-                    "pool_id", "block_number", "tx_index", "log_index", "timestamp",
-                    "sqrt_price_x96", "tick", "liquidity", "price0_usd",
-                    "price1_usd", "price", "fee_ppm", "pricing_basis",
+                    "pool_id", "block_number", "tx_index", "log_index",
+                    "timestamp", "sqrt_price_x96", "tick", "liquidity",
+                    "price0_usd", "price1_usd", "price", "fee_ppm",
+                    "pricing_basis",
                 ))
                 for pool_id in dirty_states
             ),
+            columns=13,
         )
         if sources and not forward:
             self._queue_successors(conn, sources, revision)
@@ -2512,7 +2515,8 @@ class LPMarketService:
             "owner": row.get("owner"), "custody": row.get("custody"),
             "identity_basis": row.get("identity_basis"),
             "positions": None, "open_positions": None, "closed_episodes": None,
-            "fees_usd": None, "volume_usd": None, "gross_pnl_usd": None,
+            "fees_usd": None, "observed_collected_fees_usd": None,
+            "volume_usd": None, "gross_pnl_usd": None,
             "gas_usd": None, "net_pnl_usd": None, "win_rate": None,
             "coverage": {
                 "qualified": False, "cost_qualified": False,
