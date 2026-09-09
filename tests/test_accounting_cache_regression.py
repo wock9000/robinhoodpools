@@ -99,12 +99,33 @@ def test_uncommitted_inventory_does_not_block_or_poison_readers(inventory):
     store, book = inventory
     before = book.pool_stats([POOL_ID])[POOL_ID]
     with ThreadPoolExecutor(max_workers=1) as executor:
+        with pytest.raises(RuntimeError, match="abort inventory write"):
+            with store.transaction() as conn:
+                conn.execute(
+                    "UPDATE lp_accounting_positions SET liquidity=?",
+                    (str(2 * 10**18),),
+                )
+                book._invalidate_cache(conn, [POOL_ID])
+                during = executor.submit(
+                    book.pool_stats, [POOL_ID],
+                ).result(timeout=2)
+                assert during[POOL_ID] == before
+                raise RuntimeError("abort inventory write")
+        assert book.pool_stats([POOL_ID])[POOL_ID] == before
+
         with store.transaction() as conn:
-            conn.execute("UPDATE lp_accounting_positions SET liquidity=?", (str(2 * 10**18),))
-            book._invalidate_cache([POOL_ID])
-            during = executor.submit(book.pool_stats, [POOL_ID]).result(timeout=2)
+            conn.execute(
+                "UPDATE lp_accounting_positions SET liquidity=?",
+                (str(2 * 10**18),),
+            )
+            book._invalidate_cache(conn, [POOL_ID])
+            during = executor.submit(
+                book.pool_stats, [POOL_ID],
+            ).result(timeout=2)
             assert during[POOL_ID] == before
-        after = book.pool_stats([POOL_ID])[POOL_ID]
+        after = executor.submit(book.pool_stats, [POOL_ID]).result(timeout=2)[
+            POOL_ID
+        ]
     assert after["observed_principal_usd"] == pytest.approx(
         before["observed_principal_usd"] * 2
     )
@@ -117,12 +138,12 @@ def test_small_positions_are_not_lost_beside_large_positions(inventory):
     small = book.pool_stats([POOL_ID])[POOL_ID]["observed_principal_usd"]
     with store.transaction() as conn:
         conn.execute("UPDATE lp_accounting_positions SET liquidity=?", (str(10**34),))
-        book._invalidate_cache([POOL_ID])
+        book._invalidate_cache(conn, [POOL_ID])
     large = book.pool_stats([POOL_ID])[POOL_ID]["observed_principal_usd"]
     with store.transaction() as conn:
         for index in range(100):
             insert_position(conn, f"small-{index}", 10**18)
-        book._invalidate_cache([POOL_ID])
+        book._invalidate_cache(conn, [POOL_ID])
     combined = book.pool_stats([POOL_ID])[POOL_ID]
     expected = math.fsum([large] + [small] * 100)
     assert combined["observed_principal_usd"] == expected

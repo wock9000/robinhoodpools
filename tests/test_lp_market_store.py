@@ -108,6 +108,75 @@ def test_reopen_preserves_durable_counts_and_initializes_only_missing_counts(tmp
         store.close()
 
 
+def test_pool_generation_schema_migration_preserves_durable_state(tmp_path):
+    path = tmp_path / "generation-migration.sqlite"
+    block = header(10)
+    store = MarketStore(path)
+    try:
+        AccountBook(store).install()
+        store.ingest(
+            [block],
+            [event(block, 0)],
+            cursor={
+                "from_block": 10,
+                "to_block": 10,
+                "block_number": 10,
+                "block_hash": block["hash"],
+            },
+        )
+        cursor = store.cursor("live")
+        accounting_revision = store.read().execute(
+            "SELECT value FROM lp_accounting_meta "
+            "WHERE key='applied_revision'"
+        ).fetchone()[0]
+        with store.transaction() as connection:
+            connection.execute("DROP TABLE lp_accounting_pool_generations")
+            connection.execute(
+                "DROP INDEX lp_accounting_episodes_last_timestamp"
+            )
+            connection.execute("PRAGMA user_version=4")
+        store.close()
+
+        store = MarketStore(path)
+        reader = store.read()
+        assert reader.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert [
+            row["name"] for row in reader.execute(
+                "PRAGMA index_info(lp_accounting_episodes_last_timestamp)"
+            )
+        ] == ["last_timestamp"]
+        assert [
+            tuple(row) for row in reader.execute(
+                "SELECT block_hash,position_key FROM events"
+            )
+        ] == [(block["hash"], "shared-position")]
+        assert store.cursor("live") == cursor
+        assert [
+            tuple(row) for row in reader.execute(
+                "SELECT lane,start_block,end_block FROM coverage_intervals"
+            )
+        ] == [("live", 10, 10)]
+        assert [
+            tuple(row) for row in reader.execute(
+                "SELECT position_key FROM lp_accounting_positions"
+            )
+        ] == [("shared-position",)]
+        assert [
+            tuple(row) for row in reader.execute(
+                "SELECT position_key FROM lp_accounting_event_keys"
+            )
+        ] == [("shared-position",)]
+        assert reader.execute(
+            "SELECT value FROM lp_accounting_meta "
+            "WHERE key='applied_revision'"
+        ).fetchone()[0] == accounting_revision
+        assert reader.execute(
+            "SELECT COUNT(*) FROM lp_accounting_pool_generations"
+        ).fetchone()[0] == 0
+    finally:
+        store.close()
+
+
 def test_repeated_search_entities_do_not_duplicate_search_results():
     store = MarketStore(":memory:")
     block = header(10)

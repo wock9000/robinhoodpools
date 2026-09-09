@@ -9,14 +9,16 @@ for already-priced USD presentation values.
 from __future__ import annotations
 
 from collections import OrderedDict, defaultdict
+from collections.abc import Mapping
 from contextlib import contextmanager
+from functools import lru_cache
 from itertools import groupby
 import json
 import math
 import sqlite3
 import threading
 import time
-from typing import Any, Iterable, Mapping, NamedTuple, Sequence
+from typing import Any, Iterable, NamedTuple, Sequence
 
 from .lp_math import principal_raw
 
@@ -181,6 +183,8 @@ CREATE INDEX IF NOT EXISTS lp_accounting_episodes_custody
     ON lp_accounting_episodes(custody, closed_at, opened_at);
 CREATE INDEX IF NOT EXISTS lp_accounting_episodes_pool
     ON lp_accounting_episodes(pool_id, closed_at, opened_at);
+CREATE INDEX IF NOT EXISTS lp_accounting_episodes_last_timestamp
+    ON lp_accounting_episodes(last_timestamp);
 
 CREATE TABLE IF NOT EXISTS lp_accounting_effects (
     event_id INTEGER PRIMARY KEY,
@@ -420,28 +424,41 @@ def _one(cursor: sqlite3.Cursor) -> dict[str, Any] | None:
 
 
 def _json(value: Any) -> dict[str, Any]:
-    if isinstance(value, Mapping):
-        return dict(value)
-    if not isinstance(value, str) or not value:
-        return {}
-    try:
-        parsed = json.loads(value)
-    except (TypeError, ValueError):
-        return {}
-    return dict(parsed) if isinstance(parsed, Mapping) else {}
+    if isinstance(value, str):
+        if not value:
+            return {}
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+        if isinstance(parsed, dict):
+            return parsed
+        return dict(parsed) if isinstance(parsed, Mapping) else {}
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
+@lru_cache(maxsize=4096)
+def _normalized_address(value: str) -> str | None:
+    normalized = value.strip().lower()
+    if len(normalized) == 40 and all(
+        char in "0123456789abcdef" for char in normalized
+    ):
+        normalized = "0x" + normalized
+    if len(normalized) != 42 or not normalized.startswith("0x"):
+        return None
+    if not all(char in "0123456789abcdef" for char in normalized[2:]):
+        return None
+    return normalized
 
 
 def _address(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
-    value = value.strip().lower()
-    if len(value) == 40 and all(c in "0123456789abcdef" for c in value):
-        value = "0x" + value
-    if len(value) != 42 or not value.startswith("0x"):
-        return None
-    if not all(c in "0123456789abcdef" for c in value[2:]):
-        return None
-    return value
+    if len(value) not in (40, 42):
+        value = value.strip()
+        if len(value) not in (40, 42):
+            return None
+    return _normalized_address(value)
 
 
 def _raw_int(value: Any) -> int | None:
@@ -555,11 +572,9 @@ class AccountBook:
         self.store = store
         self._installed = False
         self._cache_lock = threading.RLock()
-        self._pool_epoch = 0
-        self._pool_generation: dict[str, int] = {}
         self._pool_cache: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
         self._pool_inventory_cache: OrderedDict[
-            str, tuple[int, int, _PoolInventory]
+            str, tuple[int, _PoolInventory]
         ] = OrderedDict()
         self._pool_inventory_positions = 0
         self._owners_generation = 0
@@ -683,8 +698,11 @@ class AccountBook:
             event_id = event.get("id")
             if event_id is None:
                 continue
-            data = _json(event.get("data"))
-            key = str(event.get("position_key") or data.get("position_key") or "").strip().lower()
+            key = str(event.get("position_key") or "").strip().lower()
+            if not key:
+                key = str(
+                    _json(event.get("data")).get("position_key") or ""
+                ).strip().lower()
             if not key:
                 # An unlinked NFT transfer cannot safely be attached by token id alone:
                 # token ids collide across managers.  The protocol adapter supplies a
@@ -770,7 +788,7 @@ class AccountBook:
                 (name, str(value)),
             )
         self._invalidate_cache(
-            inventory_pools, owners=bool(old_keys or new_keys),
+            conn, inventory_pools, owners=bool(old_keys or new_keys),
         )
 
     def _rollback(self, conn: sqlite3.Connection, ancestor_number: int) -> None:
@@ -815,7 +833,7 @@ class AccountBook:
         )
         self._rebuild_tx_costs(conn, txs)
         self._refresh_episode_costs(conn, txs)
-        self._invalidate_cache(affected_pools, owners=bool(keys))
+        self._invalidate_cache(conn, affected_pools, owners=bool(keys))
 
         conn.execute(
             "INSERT INTO lp_accounting_meta(key,value) VALUES('dirty','1') "
@@ -823,27 +841,21 @@ class AccountBook:
         )
 
     def _invalidate_cache(
-            self, pool_ids: Iterable[str] | None = None, *, owners: bool = True,
+            self, conn: sqlite3.Connection, pool_ids: Iterable[str], *,
+            owners: bool = True,
     ) -> None:
-        with self._cache_lock:
-            if owners:
+        pools = sorted({str(item).lower() for item in pool_ids})
+        conn.executemany(
+            "INSERT INTO lp_accounting_pool_generations(pool_id,generation) "
+            "VALUES(?,1) ON CONFLICT(pool_id) DO UPDATE SET "
+            "generation=lp_accounting_pool_generations.generation+1",
+            ((pool_id,) for pool_id in pools),
+        )
+        if owners:
+            with self._cache_lock:
                 self._owners_generation += 1
                 self._owners_cache.clear()
                 self._owner_activity_cache.clear()
-            if pool_ids is None:
-                self._pool_epoch += 1
-                self._pool_cache.clear()
-                self._pool_generation.clear()
-                self._pool_inventory_cache.clear()
-                self._pool_inventory_positions = 0
-                return
-            for pool_id in {str(item).lower() for item in pool_ids}:
-                self._pool_generation[pool_id] = (
-                    self._pool_generation.get(pool_id, 0) + 1
-                )
-                cached = self._pool_inventory_cache.pop(pool_id, None)
-                if cached is not None:
-                    self._pool_inventory_positions -= len(cached[2].positions)
 
     def _event_rows(self, conn: sqlite3.Connection, key: str,
                     ids: Sequence[int] | None = None,
@@ -968,26 +980,28 @@ class AccountBook:
             state = self._new_state(key, events[0])
         pool_cache: dict[str, dict[str, Any]] = {}
         state_events: dict[int, list[int]] = defaultdict(list)
-        for index, event in enumerate(events):
-            data = _json(event.get("data"))
-            if (_event_position_state(data, "before") is not None
-                    or _event_position_state(data, "after") is not None):
-                state_events[int(event.get("block_number") or 0)].append(index)
+        prepared_events: list[dict[str, Any]] = []
         for index, source_event in enumerate(events):
             event = dict(source_event)
             data = _json(event.get("data"))
+            event["data"] = data
+            prepared_events.append(event)
+            if (_event_position_state(data, "before") is not None
+                    or _event_position_state(data, "after") is not None):
+                state_events[int(event.get("block_number") or 0)].append(index)
+        for index, event in enumerate(prepared_events):
+            data = event["data"]
             indices = state_events.get(int(event.get("block_number") or 0), [])
             if indices:
                 if index != indices[0]:
                     data.pop("position_before", None)
                 if index != indices[-1]:
                     data.pop("position_after", None)
-            event["data"] = data
             pool_id = event.get("pool_id") or state.get("pool_id")
             if pool_id and pool_id not in pool_cache:
                 pool_cache[str(pool_id)] = self._pool_row(conn, str(pool_id))
             pool = pool_cache.get(str(pool_id), {}) if pool_id else {}
-            self._process_event(conn, state, event, pool, writes)
+            self._process_event(conn, state, event, data, pool, writes)
         active = state.get("active_episode")
         if isinstance(active, Mapping):
             self._save_episode(conn, dict(active), writes)
@@ -1009,16 +1023,22 @@ class AccountBook:
             return {}
 
     @staticmethod
-    def _event_owner(event: Mapping[str, Any]) -> tuple[str | None, str | None, str]:
+    def _event_owner(
+        event: Mapping[str, Any], data: Mapping[str, Any],
+    ) -> tuple[str | None, str | None, str]:
         owner = _address(event.get("owner"))
         custody = _address(event.get("custody"))
-        basis = str(event.get("identity_basis") or _json(event.get("data")).get(
-            "identity_basis") or ("verified" if owner else "custody" if custody else "unknown"))
+        basis = str(
+            event.get("identity_basis")
+            or data.get("identity_basis")
+            or ("verified" if owner else "custody" if custody else "unknown")
+        )
         return owner, custody, basis
 
     @staticmethod
-    def _transfer_parties(event: Mapping[str, Any]) -> tuple[str | None, str | None]:
-        data = _json(event.get("data"))
+    def _transfer_parties(
+        event: Mapping[str, Any], data: Mapping[str, Any],
+    ) -> tuple[str | None, str | None]:
         source = None
         target = None
         for name in ("from", "from_address", "prior_owner", "previous_owner", "sender"):
@@ -1039,9 +1059,10 @@ class AccountBook:
 
     def _process_transfer(
         self, conn: sqlite3.Connection, state: dict[str, Any],
-        event: Mapping[str, Any], writes: _ReplayWrites | None = None,
-    ) -> None:
-        source, target = self._transfer_parties(event)
+        event: Mapping[str, Any], data: Mapping[str, Any],
+        writes: _ReplayWrites | None = None,
+    ) -> str | None:
+        source, target = self._transfer_parties(event, data)
         target = None if target == _ZERO_ADDRESS else target
         source_zero = source == _ZERO_ADDRESS
         current_owner = _address(state.get("owner"))
@@ -1097,14 +1118,14 @@ class AccountBook:
             self._save_episode(conn, old, writes)
             state["active_episode"] = None
         state["owner"] = target
-        event_owner, custody, basis = self._event_owner(event)
+        event_owner, custody, basis = self._event_owner(event, data)
         if target is not None:
             state["identity_basis"] = basis if event_owner == target else "verified_nft_transfer"
             if custody:
                 state["custody"] = custody
             if source == current_owner and target == current_owner:
                 state["minted_to_owner"] = False
-                return
+                return source
             state["ownership_ordinal"] = int(state.get("ownership_ordinal") or 0) + 1
             acquired = "mint" if source_zero else "transfer"
             interval = {
@@ -1143,12 +1164,14 @@ class AccountBook:
                 state["settled"] = False
         elif burn:
             state["identity_basis"] = "burned"
+        return source
 
     def _update_identity(
         self, conn: sqlite3.Connection, state: dict[str, Any],
-        event: Mapping[str, Any], writes: _ReplayWrites | None = None,
+        event: Mapping[str, Any], data: Mapping[str, Any],
+        writes: _ReplayWrites | None = None,
     ) -> None:
-        owner, custody, basis = self._event_owner(event)
+        owner, custody, basis = self._event_owner(event, data)
         if custody:
             state["custody"] = custody
         if owner is None:
@@ -1188,10 +1211,9 @@ class AccountBook:
 
     def _process_event(
         self, conn: sqlite3.Connection, state: dict[str, Any],
-        event: Mapping[str, Any], pool: Mapping[str, Any],
-        writes: _ReplayWrites | None = None,
+        event: Mapping[str, Any], data: Mapping[str, Any],
+        pool: Mapping[str, Any], writes: _ReplayWrites | None = None,
     ) -> None:
-        data = _json(event.get("data"))
         kind = str(event.get("kind") or "unknown").lower()
         protocol = str(event.get("protocol") or state.get("protocol") or "unknown").lower()
         if protocol != "nft":
@@ -1204,10 +1226,13 @@ class AccountBook:
             state["tick_lower"] = int(event["tick_lower"])
         if event.get("tick_upper") is not None:
             state["tick_upper"] = int(event["tick_upper"])
+        transfer_source = None
         if kind == "transfer" or protocol == "nft":
-            self._process_transfer(conn, state, event, writes)
+            transfer_source = self._process_transfer(
+                conn, state, event, data, writes,
+            )
         else:
-            self._update_identity(conn, state, event, writes)
+            self._update_identity(conn, state, event, data, writes)
         before = _event_position_state(data, "before")
         after = _event_position_state(data, "after")
         before_liq = _state_number(before, "liquidity")
@@ -1321,7 +1346,7 @@ class AccountBook:
             )
             active["status"] = "partial_history"
             state["active_episode"] = active
-        effect = self._financial_effect(state, event, pool, active)
+        effect = self._financial_effect(state, event, data, pool, active)
         if isinstance(active, dict):
             self._apply_effect(active, effect, event)
         self._update_claim_state(state, event, before, after, effect)
@@ -1368,8 +1393,9 @@ class AccountBook:
             elif current_liq is not None and current_liq > 0:
                 active["status"] = "open"
         if kind == "transfer" or protocol == "nft":
-            source, _target = self._transfer_parties(event)
-            effect["gas_owner"] = None if source == _ZERO_ADDRESS else source
+            effect["gas_owner"] = (
+                None if transfer_source == _ZERO_ADDRESS else transfer_source
+            )
             effect["episode_id"] = None
         else:
             effect["episode_id"] = (
@@ -1419,12 +1445,13 @@ class AccountBook:
             "accounting_basis": "canonical_events",
         }
 
-    def _financial_effect(self, state: Mapping[str, Any], event: Mapping[str, Any],
-                          pool: Mapping[str, Any],
-                          active: Mapping[str, Any] | None) -> dict[str, Any]:
+    def _financial_effect(
+        self, state: Mapping[str, Any], event: Mapping[str, Any],
+        data: Mapping[str, Any], pool: Mapping[str, Any],
+        active: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
         kind = str(event.get("kind") or "unknown").lower()
         protocol = str(state.get("protocol") or event.get("protocol") or "unknown").lower()
-        data = _json(event.get("data"))
         amount0 = _raw_int(event.get("amount0"))
         amount1 = _raw_int(event.get("amount1"))
         fee0 = _raw_int(event.get("fee_amount0"))
@@ -2130,7 +2157,11 @@ class AccountBook:
             transaction = transactions.get(tx_hash)
             episodes = {row["episode_id"] for row in effects if row.get("episode_id")}
             positions = {row["position_key"] for row in effects if row.get("position_key")}
-            owners = {_address(row.get("owner")) for row in effects if _address(row.get("owner"))}
+            owners = {
+                owner
+                for row in effects
+                if (owner := _address(row.get("owner"))) is not None
+            }
             payer = _address(transaction.get("payer")) if transaction else None
             owner = payer if payer in owners else None
             gas = _finite_float(transaction.get("gas_usd")) if transaction else None
@@ -2528,14 +2559,16 @@ class AccountBook:
         """Count beneficial-owner and custody groups without enrichment."""
         cutoff_seconds = _cutoff({"window": str(window or "all").lower()})
         where = ""
+        source = " FROM lp_accounting_episodes"
         args: tuple[Any, ...] = ()
         if cutoff_seconds is not None:
+            source += " INDEXED BY lp_accounting_episodes_last_timestamp"
             where = " WHERE last_timestamp>=?"
             args = (int(time.time()) - cutoff_seconds,)
         with self._reader() as conn:
             row = conn.execute(
-                "SELECT COUNT(DISTINCT owner)+COUNT(DISTINCT custody) "
-                "FROM lp_accounting_episodes" + where,
+                "SELECT COUNT(DISTINCT owner)+COUNT(DISTINCT custody)"
+                + source + where,
                 args,
             ).fetchone()
         return int(row[0] or 0)
@@ -2642,6 +2675,10 @@ class AccountBook:
                 "MIN(e.last_timestamp) AS _retention_timestamp "
             )
             source = " FROM lp_accounting_episodes e "
+            if cutoff_seconds is not None and not pool_id:
+                source += (
+                    "INDEXED BY lp_accounting_episodes_last_timestamp "
+                )
             if query:
                 source += "LEFT JOIN pools p ON p.id=e.pool_id"
             with self._reader() as conn:
@@ -3333,34 +3370,39 @@ class AccountBook:
     def _cache_pool_stats(
         self,
         pool_id: str,
-        epoch: int,
         generation: int,
         cache_key: tuple[Any, ...],
         result: Mapping[str, Any],
         inventory: _PoolInventory | None = None,
     ) -> None:
         with self._cache_lock:
-            if (
-                epoch != self._pool_epoch
-                or generation != self._pool_generation.get(pool_id, 0)
-            ):
-                return
             if inventory is not None:
-                prior = self._pool_inventory_cache.pop(pool_id, None)
-                if prior is not None:
-                    self._pool_inventory_positions -= len(prior[2].positions)
-                size = len(inventory.positions)
-                while self._pool_inventory_cache and (
-                    len(self._pool_inventory_cache) >= _POOL_INVENTORY_CACHE_POOLS
-                    or self._pool_inventory_positions + size
-                    > _POOL_INVENTORY_CACHE_POSITIONS
-                ):
-                    _, evicted = self._pool_inventory_cache.popitem(last=False)
-                    self._pool_inventory_positions -= len(evicted[2].positions)
-                self._pool_inventory_cache[pool_id] = (
-                    epoch, generation, inventory,
-                )
-                self._pool_inventory_positions += size
+                prior = self._pool_inventory_cache.get(pool_id)
+                # An older snapshot may finish after a newer one. Its result key
+                # is safe to retain, but it must not displace newer inventory.
+                if prior is None or prior[0] <= generation:
+                    if prior is not None:
+                        self._pool_inventory_cache.pop(pool_id)
+                        self._pool_inventory_positions -= len(
+                            prior[1].positions
+                        )
+                    size = len(inventory.positions)
+                    while self._pool_inventory_cache and (
+                        len(self._pool_inventory_cache)
+                        >= _POOL_INVENTORY_CACHE_POOLS
+                        or self._pool_inventory_positions + size
+                        > _POOL_INVENTORY_CACHE_POSITIONS
+                    ):
+                        _, evicted = self._pool_inventory_cache.popitem(
+                            last=False
+                        )
+                        self._pool_inventory_positions -= len(
+                            evicted[1].positions
+                        )
+                    self._pool_inventory_cache[pool_id] = (
+                        generation, inventory,
+                    )
+                    self._pool_inventory_positions += size
             self._pool_cache[cache_key] = dict(result)
             self._pool_cache.move_to_end(cache_key)
             while len(self._pool_cache) > _POOL_RESULT_CACHE_ENTRIES:
@@ -3385,34 +3427,26 @@ class AccountBook:
             owns_snapshot = not conn.in_transaction
             try:
                 marks = ",".join("?" for _ in requested)
-                store_lock = getattr(self.store, "lock", self._cache_lock)
-                # Never queue a reader behind ingestion. Without an uncontended
-                # snapshot boundary, read committed rows but bypass both caches:
-                # a writer may already have invalidated an uncommitted generation.
-                locked = store_lock.acquire(blocking=False)
-                cacheable = locked and owns_snapshot and not getattr(
-                    getattr(self.store, "connection", None), "in_transaction", False,
-                )
-                try:
-                    if owns_snapshot:
-                        conn.execute("BEGIN")
-                    if not self._table_exists(conn, "lp_pool_state"):
-                        return {pool_id: dict(empty) for pool_id in requested}
-                    state_rows = _dict_rows(conn.execute(
-                        f"SELECT pool_id,tick,sqrt_price_x96,"
-                        f"price0_usd,price1_usd "
-                        f"FROM lp_pool_state WHERE pool_id IN ({marks})",
+                if owns_snapshot:
+                    conn.execute("BEGIN")
+                generations = {pool_id: 0 for pool_id in requested}
+                generations.update({
+                    str(row[0]).lower(): int(row[1])
+                    for row in conn.execute(
+                        "SELECT pool_id,generation "
+                        "FROM lp_accounting_pool_generations "
+                        f"WHERE pool_id IN ({marks})",
                         requested,
-                    ))
-                    with self._cache_lock:
-                        epoch = self._pool_epoch if cacheable else -1
-                        generations = {
-                            pool_id: self._pool_generation.get(pool_id, 0)
-                            for pool_id in requested
-                        }
-                finally:
-                    if locked:
-                        store_lock.release()
+                    ).fetchall()
+                })
+                if not self._table_exists(conn, "lp_pool_state"):
+                    return {pool_id: dict(empty) for pool_id in requested}
+                state_rows = _dict_rows(conn.execute(
+                    f"SELECT pool_id,tick,sqrt_price_x96,"
+                    f"price0_usd,price1_usd "
+                    f"FROM lp_pool_state WHERE pool_id IN ({marks})",
+                    requested,
+                ))
                 status = self._status_coverage()
                 state = {
                     str(row["pool_id"]).lower(): row for row in state_rows
@@ -3448,7 +3482,7 @@ class AccountBook:
                         pool = metadata.get(pool_id, {})
                         generation = generations[pool_id]
                         cache_key = (
-                            epoch, generation, pool_id,
+                            generation, pool_id,
                             mark.get("tick"),
                             mark.get("sqrt_price_x96"),
                             mark.get("price0_usd"),
@@ -3469,10 +3503,9 @@ class AccountBook:
                         inventory_entry = self._pool_inventory_cache.get(pool_id)
                         if (
                             inventory_entry is not None
-                            and inventory_entry[0] == epoch
-                            and inventory_entry[1] == generation
+                            and inventory_entry[0] == generation
                         ):
-                            inventory_hits[pool_id] = inventory_entry[2]
+                            inventory_hits[pool_id] = inventory_entry[1]
                             self._pool_inventory_cache.move_to_end(pool_id)
                         else:
                             missing_inventory.append(pool_id)
@@ -3492,7 +3525,7 @@ class AccountBook:
                     )
                     results[pool_id] = result
                     self._cache_pool_stats(
-                        pool_id, epoch, generations[pool_id],
+                        pool_id, generations[pool_id],
                         cache_keys[pool_id], result,
                     )
                 if missing_inventory:
@@ -3541,12 +3574,12 @@ class AccountBook:
                             metadata=metadata.get(pool_id, {}),
                             history_from=history_from,
                             backfill_done=backfill_done,
-                            retain_inventory=cacheable,
+                            retain_inventory=True,
                         )
                         evaluated.add(pool_id)
                         results[pool_id] = result
                         self._cache_pool_stats(
-                            pool_id, epoch, generations[pool_id],
+                            pool_id, generations[pool_id],
                             cache_keys[pool_id], result, inventory,
                         )
                     for pool_id in missing_inventory:
@@ -3560,11 +3593,11 @@ class AccountBook:
                             metadata=metadata.get(pool_id, {}),
                             history_from=history_from,
                             backfill_done=backfill_done,
-                            retain_inventory=cacheable,
+                            retain_inventory=True,
                         )
                         results[pool_id] = result
                         self._cache_pool_stats(
-                            pool_id, epoch, generations[pool_id],
+                            pool_id, generations[pool_id],
                             cache_keys[pool_id], result, inventory,
                         )
             finally:

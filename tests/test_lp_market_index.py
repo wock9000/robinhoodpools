@@ -36,6 +36,23 @@ def header(number: int, *, parent: str | None = None) -> dict[str, str]:
     }
 
 
+def indexed_event(number: int, tx_byte: str) -> dict:
+    block = header(number)
+    return {
+        "block_number": number,
+        "block_hash": block["hash"],
+        "tx_hash": "0x" + tx_byte * 32,
+        "tx_index": 0,
+        "log_index": 0,
+        "timestamp": int(block["timestamp"], 16),
+        "pool_id": None,
+        "protocol": "v3",
+        "kind": "add",
+        "owner": "0x" + "11" * 20,
+        "data": {},
+    }
+
+
 class StaticRpc:
     def __init__(self, head: int = 0) -> None:
         self.head = head
@@ -296,28 +313,166 @@ def test_live_chunk_sizing_excludes_writer_lock_wait(tmp_path, monkeypatch):
         store.close()
 
 
-def test_live_parent_mismatch_never_advances_cursor(monkeypatch):
+def test_stale_provider_head_retains_indexed_history_until_catchup():
     store = MarketStore(":memory:")
-    scanner = indexer(store, StaticRpc(100))
+    rpc = StaticRpc(98)
+    scanner = indexer(store, rpc)
     anchor = header(99)
+    event = indexed_event(99, "ab")
     store.ingest(
-        [anchor], [], lane="live",
+        [anchor], [event], lane="live",
         cursor={
             "block_number": 99,
             "block_hash": anchor["hash"],
             "timestamp": int(anchor["timestamp"], 16),
         },
     )
-    bad = header(100, parent=ZERO_HASH)
-    recovered = []
-    monkeypatch.setattr(
-        scanner, "_fetch_interval", lambda *_args: ([], {100: bad}),
+    try:
+        assert scanner._scan_live_once() is False
+        assert scanner.runtime_status()["state"] == "degraded"
+        cursor = store.cursor("live")
+        assert cursor["block_number"] == 99
+        assert cursor["block_hash"] == anchor["hash"]
+        assert store.read().execute(
+            "SELECT COUNT(*) FROM events WHERE tx_hash=?",
+            (event["tx_hash"],),
+        ).fetchone()[0] == 1
+
+        rpc.head = 100
+        assert scanner._scan_live_once() is True
+        assert store.cursor("live")["block_number"] == 100
+        assert scanner.runtime_status()["state"] == "live"
+        assert store.read().execute(
+            "SELECT COUNT(*) FROM events WHERE tx_hash=?",
+            (event["tx_hash"],),
+        ).fetchone()[0] == 1
+    finally:
+        scanner.close()
+        store.close()
+
+
+def test_reorg_check_retains_cursor_when_provider_drops_before_header():
+    class DroppingRpc(StaticRpc):
+        def __init__(self):
+            super().__init__(99)
+            self.head_reads = 0
+
+        def call(self, method, params):
+            if method == "eth_blockNumber":
+                self.head_reads += 1
+                return hex(99 if self.head_reads == 1 else 98)
+            if method == "eth_getBlockByNumber" and int(params[0], 16) == 99:
+                return None
+            return super().call(method, params)
+
+    store = MarketStore(":memory:")
+    scanner = indexer(store, DroppingRpc())
+    anchor = header(99)
+    event = indexed_event(99, "ac")
+    store.ingest(
+        [anchor], [event], lane="live",
+        cursor={
+            "block_number": 99,
+            "block_hash": anchor["hash"],
+            "timestamp": int(anchor["timestamp"], 16),
+        },
     )
-    monkeypatch.setattr(scanner, "_recover_reorg", lambda cursor, reason: recovered.append(reason))
+    try:
+        scanner._recover_reorg(
+            store.cursor("live"), "concurrent live cursor update",
+        )
+        assert store.cursor("live")["block_number"] == 99
+        assert store.read().execute(
+            "SELECT COUNT(*) FROM events WHERE tx_hash=?",
+            (event["tx_hash"],),
+        ).fetchone()[0] == 1
+    finally:
+        scanner.close()
+        store.close()
+
+
+def test_same_height_conflict_survives_head_drop_during_recovery():
+    canonical_99 = {
+        **header(99),
+        "hash": "0x" + "aa" * 32,
+    }
+
+    class RecedingReorgRpc(StaticRpc):
+        def __init__(self):
+            super().__init__(99)
+            self.head_reads = 0
+
+        def call(self, method, params):
+            if method == "eth_blockNumber":
+                self.head_reads += 1
+                return hex(99 if self.head_reads == 1 else 98)
+            if method == "eth_getBlockByNumber" and int(params[0], 16) == 99:
+                return canonical_99
+            return super().call(method, params)
+
+    store = MarketStore(":memory:")
+    scanner = indexer(store, RecedingReorgRpc())
+    prior = header(98)
+    orphan = header(99)
+    event = indexed_event(99, "bc")
+    store.ingest(
+        [prior, orphan], [event], lane="live",
+        cursor={
+            "block_number": 99,
+            "block_hash": orphan["hash"],
+            "timestamp": int(orphan["timestamp"], 16),
+        },
+    )
     try:
         assert scanner._scan_live_once() is True
-        assert recovered == ["block 100 does not extend live cursor"]
-        assert store.cursor("live")["block_number"] == 99
+        assert store.cursor("live")["block_number"] == 98
+        assert store.read().execute(
+            "SELECT COUNT(*) FROM events WHERE tx_hash=?",
+            (event["tx_hash"],),
+        ).fetchone()[0] == 0
+        assert scanner.runtime_status()["reorg"]["ancestor"] == 98
+    finally:
+        scanner.close()
+        store.close()
+
+
+def test_live_parent_mismatch_rolls_back_to_canonical_ancestor():
+    canonical_99 = {
+        **header(99),
+        "hash": "0x" + "cc" * 32,
+    }
+    canonical_100 = header(100, parent=canonical_99["hash"])
+
+    class ReorgRpc(StaticRpc):
+        def call(self, method, params):
+            if method == "eth_getBlockByNumber":
+                number = int(params[0], 16)
+                if number == 99:
+                    return canonical_99
+                if number == 100:
+                    return canonical_100
+            return super().call(method, params)
+
+    store = MarketStore(":memory:")
+    scanner = indexer(store, ReorgRpc(100))
+    prior = header(98)
+    orphan = header(99)
+    event = indexed_event(99, "cd")
+    store.ingest(
+        [prior, orphan], [event], lane="live",
+        cursor={
+            "block_number": 99,
+            "block_hash": orphan["hash"],
+            "timestamp": int(orphan["timestamp"], 16),
+        },
+    )
+    try:
+        assert scanner._scan_live_once() is True
+        assert store.cursor("live")["block_number"] == 98
+        assert store.read().execute(
+            "SELECT COUNT(*) FROM events WHERE tx_hash=?",
+            (event["tx_hash"],),
+        ).fetchone()[0] == 0
     finally:
         scanner.close()
         store.close()

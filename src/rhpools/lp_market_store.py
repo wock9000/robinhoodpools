@@ -320,6 +320,10 @@ class MarketStore:
         );
         CREATE INDEX IF NOT EXISTS pool_balances_latest_idx
             ON pool_balances(pool_id, block_number DESC);
+        CREATE TABLE IF NOT EXISTS lp_accounting_pool_generations(
+            pool_id TEXT PRIMARY KEY,
+            generation INTEGER NOT NULL CHECK(generation >= 0)
+        );
         """
         with self.lock:
             self.connection.executescript(schema + """
@@ -422,6 +426,23 @@ class MarketStore:
                         AND last_error GLOB 'pool_identity_pending:*';
                     PRAGMA user_version=4;
                 """)
+            if int(self.connection.execute("PRAGMA user_version").fetchone()[0]) < 5:
+                self.connection.execute(
+                    "CREATE TABLE IF NOT EXISTS lp_accounting_pool_generations("
+                    "pool_id TEXT PRIMARY KEY,"
+                    "generation INTEGER NOT NULL CHECK(generation >= 0))"
+                )
+                accounting_installed = self.connection.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type='table' AND name='lp_accounting_episodes'"
+                ).fetchone() is not None
+                if accounting_installed:
+                    self.connection.execute(
+                        "CREATE INDEX IF NOT EXISTS "
+                        "lp_accounting_episodes_last_timestamp "
+                        "ON lp_accounting_episodes(last_timestamp)"
+                    )
+                self.connection.execute("PRAGMA user_version=5")
             self.connection.execute(
                 "CREATE INDEX IF NOT EXISTS pending_reprojection_order_idx "
                 "ON pending_reprojection(block_number,tx_index,log_index,event_id)"

@@ -3549,19 +3549,52 @@ class MarketIndexer:
         return ancestor, header, "sparse-anchor"
 
     def _recover_reorg(
-        self, cursor: Mapping[str, Any], reason: str, *, supplied_anchor: bool = False,
+        self,
+        cursor: Mapping[str, Any],
+        reason: str,
+        *,
+        supplied_anchor: bool = False,
+        conflict_observed: bool = False,
     ) -> None:
         with self._reorg_lock:
-            current = dict(cursor) if supplied_anchor else (self.store.cursor("live") or dict(cursor))
-            number = int(current.get("block_number", cursor.get("block_number", 0)))
-            old_hash = _lower(current.get("block_hash") or cursor.get("block_hash"))
+            supplied = dict(cursor)
+            current = (
+                supplied if supplied_anchor
+                else (self.store.cursor("live") or supplied)
+            )
+            number = int(current.get("block_number", supplied.get("block_number", 0)))
+            old_hash = _lower(current.get("block_hash") or supplied.get("block_hash"))
+            supplied_number = int(supplied.get("block_number", number))
+            supplied_hash = _lower(supplied.get("block_hash"))
+            # A conflict observed against an older cursor cannot justify
+            # rolling back a cursor that another scanner has since advanced.
+            conflict_applies = (conflict_observed or supplied_anchor) and (
+                supplied_anchor
+                or (number == supplied_number and old_hash == supplied_hash)
+            )
             head_number = _hex_int(
                 self._clients["live"].call("eth_blockNumber", []), "head",
             )
             if number <= head_number:
-                canonical = self._block("live", number)
-                if old_hash and canonical["hash"] == old_hash:
-                    return
+                try:
+                    canonical = self._block("live", number)
+                except RpcError:
+                    latest_head = _hex_int(
+                        self._clients["live"].call("eth_blockNumber", []), "head",
+                    )
+                    if latest_head >= number:
+                        raise
+                    head_number = latest_head
+                    if not conflict_applies:
+                        return
+                else:
+                    if old_hash and canonical["hash"] == old_hash:
+                        return
+                    head_number = _hex_int(
+                        self._clients["live"].call("eth_blockNumber", []), "head",
+                    )
+            elif not conflict_applies:
+                return
             previous_history = self.store.cursor("history") or {}
             ancestor, header, method = self._find_common_ancestor(
                 min(number, head_number), old_hash,
@@ -3631,13 +3664,22 @@ class MarketIndexer:
                 - int(cursor.get("timestamp") or _timestamp(head)),
             ),
         )
+        # A lagging provider is not reorg evidence. Keep the durable cursor and
+        # retry until this provider can show either the cursor or its child.
         if head_number < current_number:
-            self._recover_reorg(cursor, "chain head moved behind live cursor")
-            return True
+            self._set_runtime(
+                "live", latency=time.monotonic() - started,
+                error="head provider is behind the durable live cursor",
+                head=head_number, head_hash=head["hash"],
+                head_timestamp=_timestamp(head), lag_s=0,
+            )
+            return False
         if head_number == current_number:
             if head["hash"] != current_hash:
                 self._recover_reorg(
-                    cursor, "stored live cursor hash is no longer canonical",
+                    cursor,
+                    "stored live cursor hash is no longer canonical",
+                    conflict_observed=True,
                 )
                 return True
             self._set_runtime(
@@ -3656,7 +3698,12 @@ class MarketIndexer:
             logs, headers = self._fetch_interval("live", start, end)
             fetch_s = time.monotonic() - fetch_started
             if headers[start]["parentHash"] != current_hash:
-                raise CanonicalConflict(f"block {start} does not extend live cursor")
+                self._recover_reorg(
+                    cursor,
+                    f"block {start} does not extend live cursor",
+                    conflict_observed=True,
+                )
+                return True
             decode_started = time.monotonic()
             events = self._decode(
                 "live", logs, headers, resolve_unknown=False,

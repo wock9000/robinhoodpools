@@ -593,6 +593,15 @@ class _WssPreferredRpc:
         self._fallback.close()
 
 
+class _ExecutionReverted(Exception):
+    """A valid EVM outcome, not a provider's inability to serve the request."""
+
+    def __init__(self, error: Exception, method: str) -> None:
+        super().__init__(str(error))
+        self.error = error
+        self.method = method
+
+
 class RoutedRpc:
     """One lane view over a shared capability/source registry."""
 
@@ -650,10 +659,19 @@ class RoutedRpc:
         if error is not None:
             code = error.get("code") if isinstance(error, Mapping) else None
             message = error.get("message") if isinstance(error, Mapping) else error
-            raise self._error(
+            failure = self._error(
                 f"{source.name} {method}: {self._registry._safe_error(source, RuntimeError(str(message)))}",
                 code=code if isinstance(code, int) else None,
             )
+            if method in {"eth_call", "eth_estimateGas"} and (
+                code == 3
+                or (
+                    code in {-32000, -32015}
+                    and str(message).lower().startswith("execution reverted")
+                )
+            ):
+                raise _ExecutionReverted(failure, method)
+            raise failure
         if "result" not in item:
             raise self._error(f"{source.name} {method} response omitted result")
         return item["result"]
@@ -858,6 +876,11 @@ class RoutedRpc:
                     result = self._validate_item(source, raw, request_id, method)
                     if method == "eth_chainId" and int(str(result), 16) != CHAIN_ID:
                         raise self._error(f"{source.name} changed chain identity")
+                except _ExecutionReverted as exc:
+                    self._registry.success(
+                        source, capability, exc.method, time.monotonic() - started,
+                    )
+                    raise exc.error from None
                 except Exception as exc:
                     self._registry.failure(source, capability, exc)
                     failures.append(self._registry._safe_error(source, exc))
@@ -931,6 +954,11 @@ class RoutedRpc:
                         self._validate_item(source, by_id.get(request_id), request_id, method)
                         for request_id, (method, _params) in zip(ids, specifications)
                     ]
+                except _ExecutionReverted as exc:
+                    self._registry.success(
+                        source, capability, exc.method, time.monotonic() - started,
+                    )
+                    raise exc.error from None
                 except Exception as exc:
                     self._registry.failure(source, capability, exc)
                     failures.append(self._registry._safe_error(source, exc))

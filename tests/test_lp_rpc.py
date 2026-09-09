@@ -163,3 +163,57 @@ def test_rpc_transport_traceback_does_not_expose_url_credentials(monkeypatch):
         assert credential not in json.dumps(factory.status())
     finally:
         factory.close()
+
+
+def test_execution_revert_does_not_disable_state_provider(provider, monkeypatch):
+    def post(_client, _source, payload):
+        response = {"jsonrpc": "2.0", "id": payload["id"]}
+        if payload["method"] == "eth_chainId":
+            response["result"] = hex(CHAIN_ID)
+        elif payload["params"][0]["data"] == "0xbad0":
+            response["error"] = {"code": 3, "message": "execution reverted"}
+        else:
+            response["result"] = "0x01"
+        return response
+
+    monkeypatch.setattr(lp_rpc.RoutedRpc, "_post", post)
+    client = provider("state")
+    with pytest.raises(RuntimeError, match="execution reverted"):
+        client.call("eth_call", [{"to": "0x" + "1" * 40, "data": "0xbad0"}, "latest"])
+    assert client.call(
+        "eth_call", [{"to": "0x" + "1" * 40, "data": "0x600d"}, "latest"],
+    ) == "0x01"
+    assert provider.status()["state"]["sources"][0]["state"] == "available"
+
+
+def test_execution_revert_in_batch_is_not_replaced_by_another_provider(monkeypatch):
+    sources = (
+        lp_rpc._Source("primary", "https://primary.test/rpc"),
+        lp_rpc._Source("fallback", "https://fallback.test/rpc"),
+    )
+    monkeypatch.setattr(lp_rpc, "_source_list", lambda *_args: sources)
+    monkeypatch.setattr(lp_rpc, "head_subscription_urls", lambda: ())
+
+    def post(_client, source, payload):
+        def response(item):
+            result = {"jsonrpc": "2.0", "id": item["id"]}
+            if item["method"] == "eth_chainId":
+                result["result"] = hex(CHAIN_ID)
+            elif source.name == "primary" and item["params"][0]["data"] == "0xbad0":
+                result["error"] = {"code": -32000, "message": "execution reverted: unknown selector"}
+            else:
+                result["result"] = "0x01" if source.name == "primary" else "0x99"
+            return result
+        return [response(item) for item in payload] if isinstance(payload, list) else response(payload)
+
+    monkeypatch.setattr(lp_rpc.RoutedRpc, "_post", post)
+    factory = lp_rpc.build_rpc_factory("", RuntimeError)
+    try:
+        client = factory("state")
+        good = ("eth_call", [{"to": "0x" + "1" * 40, "data": "0x600d"}, "latest"])
+        bad = ("eth_call", [{"to": "0x" + "1" * 40, "data": "0xbad0"}, "latest"])
+        with pytest.raises(RuntimeError, match="execution reverted"):
+            client.batch([good, bad])
+        assert client.batch([good]) == ["0x01"]
+    finally:
+        factory.close()
