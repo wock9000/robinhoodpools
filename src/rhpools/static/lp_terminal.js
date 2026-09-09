@@ -132,6 +132,7 @@
     streamRetryMs: 1_000,
     aggregateController: null,
     aggregateGeneration: 0,
+    statusController: null,
     refreshTimer: null,
     historyTimer: null,
     tapeController: null,
@@ -1819,6 +1820,17 @@
     }
   }
 
+  async function refreshStatus() {
+    if (state.hidden || state.statusController) return;
+    const controller = new AbortController();
+    state.statusController = controller;
+    try {
+      await loadResource("status", "/status", {}, controller, applyStatus);
+    } finally {
+      if (state.statusController === controller) state.statusController = null;
+    }
+  }
+
   function ownersPanelActive() {
     return !state.hidden && state.ownersVisible && elements.modal.hidden && elements.poolInspector.hidden;
   }
@@ -1955,14 +1967,8 @@
     if (elements.modal.hidden && elements.poolInspector.hidden) {
       requests.push(loadResource("overview", "/overview", { window: state.window }, controller, (payload) => {
         state.overview = payload;
-        if (payload.status && typeof payload.status === "object") {
-          applyStatus(payload.status);
-          healthSuccess("status");
-        }
         scheduleRender("overview", renderOverview);
       }));
-    } else {
-      requests.push(loadResource("status", "/status", {}, controller, applyStatus));
     }
     if (poolPanelActive()) refreshPools();
     await Promise.all(requests);
@@ -2728,6 +2734,10 @@
       state.historyTimer = null;
       clearTimeout(state.filterTimer);
       if (state.aggregateController) state.aggregateController.abort();
+      if (state.statusController) {
+        state.statusController.abort();
+        state.statusController = null;
+      }
       abortPoolRequests();
       if (state.tapeController) state.tapeController.abort();
       if (state.ownerController) {
@@ -2742,6 +2752,7 @@
       return;
     }
     if (state.renderQueue.size && !state.renderFrame) state.renderFrame = requestAnimationFrame(flushRenders);
+    refreshStatus();
     reloadTape("resume");
     renderAllTables();
     refreshAggregates("resume");
@@ -3181,7 +3192,11 @@
   renderOverview();
   renderAllTables();
   updateClock();
-  setInterval(updateClock, 1_000);
+  refreshStatus();
+  setInterval(() => {
+    updateClock();
+    refreshStatus();
+  }, 1_000);
   reloadTape("initial");
   const initialOwner = String(initialUrl.searchParams.get("owner") || "").toLowerCase();
   if (ADDRESS_RE.test(initialOwner)) openOwner(initialOwner, null, "replace");

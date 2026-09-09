@@ -72,6 +72,11 @@ Skipped head notifications are not fork evidence and must not clear wallet
 snapshots. Same-height replacements and confirmed parent mismatches still
 withdraw orphaned activity and invalidate wallets.
 
+The browser refreshes durable index status on its one-second heartbeat,
+independently of the slower overview refresh. Requests do not overlap and
+are aborted while the page is hidden. The moving chain head is no longer
+compared against an index cursor held back by a twelve-second overview timer.
+
 The running service commits raw events, cursors, balance jobs, and coalesced
 accounting jobs atomically. A separate accounting worker replays each affected
 position from an immutable WAL snapshot without holding the ingestion writer.
