@@ -732,12 +732,32 @@ def test_v3_manager_log_order_recovers_complete_fees_without_overstating_wallet_
             blocks[4], "v4", "add", 1_000, (1_000_000, 1_000_000),
             position_state(0), position_state(1_000), key="pending-trace",
         )
-        events = [
-            opened, minted, first_fees, removed, principal, burned,
-            incomplete_v4,
-        ]
-        for event in events[:-1]:
+        v3_events = [opened, minted, first_fees, removed, principal, burned]
+        for event in v3_events:
             event["custody"] = UNISWAP_V3_POSITION_MANAGER
+        second_key = f"nft:{UNISWAP_V3_POSITION_MANAGER}:43"
+        second_v3_events = [
+            {
+                **event,
+                "data": dict(event["data"]),
+                "position_key": second_key,
+                "token_id": "43",
+                "tx_hash": f"0x{event['block_number'] + 10_000:064x}",
+                "tx_index": 1,
+            }
+            for event in v3_events
+        ]
+        unrepairable = lp_effect(
+            blocks[4], "v3", "add", 1_000, (1_000_000, 1_000_000),
+            None, None, key="missing-mint",
+        )
+        unrepairable.update(
+            position_key=f"nft:{UNISWAP_V3_POSITION_MANAGER}:0",
+            owner="0x" + "e" * 40,
+            custody=UNISWAP_V3_POSITION_MANAGER,
+            tx_hash=f"0x{20_000:064x}", tx_index=2, data={},
+        )
+        events = [*v3_events, *second_v3_events, incomplete_v4, unrepairable]
         transactions = [
             {
                 "tx_hash": event["tx_hash"],
@@ -756,16 +776,29 @@ def test_v3_manager_log_order_recovers_complete_fees_without_overstating_wallet_
                 "UPDATE lp_accounting_episodes SET history_complete=0,"
                 "status='nft_burn_unsettled',claims_complete=0,"
                 "fees_complete=0,fees_usd=NULL,gross_pnl_usd=NULL,"
-                "net_pnl_usd=NULL WHERE position_key=?",
-                (position_key,),
+                "net_pnl_usd=NULL WHERE position_key IN (?,?)",
+                (position_key, second_key),
             )
         assert app.book.closed({"window": "all"})["rows"][0]["fees_usd"] is None
         assert app.store.repair_v3_birth_history(
-            V3_BIRTH_REPAIR_PREFIXES, limit=32,
+            V3_BIRTH_REPAIR_PREFIXES, limit=1,
         ) is True
+        assert sum(
+            row["coverage"]["history"] == "full"
+            for row in app.book.closed({"window": "all"})["rows"]
+        ) == 1
+        app.close()
+        app = service(tmp_path / "market.sqlite")
+        assert app.store.repair_v3_birth_history(
+            V3_BIRTH_REPAIR_PREFIXES, limit=1,
+        ) is True
+        assert app.store.repair_v3_birth_history(
+            V3_BIRTH_REPAIR_PREFIXES, limit=1,
+        ) is False
 
         closed = app.book.closed({"window": "all"})["rows"]
-        assert len(closed) == 1
+        assert len(closed) == 2
+        assert all(row["coverage"]["history"] == "full" for row in closed)
         assert closed[0]["status"] == "complete"
         assert closed[0]["coverage"]["history"] == "full"
         assert closed[0]["coverage"]["fees"] == "exact"
@@ -778,12 +811,12 @@ def test_v3_manager_log_order_recovers_complete_fees_without_overstating_wallet_
             if row["owner"] == TOKEN
         )
         assert wallet["fees_usd"] is None
-        assert wallet["observed_collected_fees_usd"] == pytest.approx(0.1)
+        assert wallet["observed_collected_fees_usd"] == pytest.approx(0.2)
         assert wallet["coverage"]["observed_collected_fees"] == {
             "unit": "USDG_quote",
-            "episodes": 1,
-            "history_complete_episodes": 1,
-            "total_episodes": 2,
+            "episodes": 2,
+            "history_complete_episodes": 2,
+            "total_episodes": 3,
             "complete": False,
         }
         assert wallet["coverage"]["financial_scope"] == (
@@ -793,7 +826,7 @@ def test_v3_manager_log_order_recovers_complete_fees_without_overstating_wallet_
         detail = app.book.owner(TOKEN, {"window": "all"})
         assert detail["summary"]["fees_usd"] is None
         assert detail["summary"]["observed_collected_fees_usd"] == pytest.approx(
-            0.1,
+            0.2,
         )
         assert detail["coverage"]["observed_collected_fees"]["complete"] is False
         historical = next(

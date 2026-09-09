@@ -97,9 +97,10 @@ index for finite-window owner aggregates. Existing events, accounting state,
 cursors, and coverage survive the migration. New stores create the same schema.
 
 Schema version 6 adds a partial covering index for open-position inventory.
-Active-capital sorting, LP counts, and inventory reads no longer fetch the
-large position-state JSON rows. The existing pool/status/time index remains
-available for other queries. Migration preserves accounting state, per-pool
+Inventory reads and LP-count summaries explicitly select this index: production
+query plans otherwise preferred the older pool/status/time index and fetched
+large position-state rows. The older index remains available for other queries.
+Migration preserves accounting state, per-pool
 generations, cursors, and coverage; allow space and startup time to build
 the new index.
 
@@ -116,18 +117,26 @@ Price sample, reserve, mark, and state inserts use the same multi-row helper
 as event ingestion.
 
 Existing V3 NFT positions whose initial add precedes a verified mint in the
-same transaction are repaired by the normal projection lane. Each pass scans
-at most 32 position keys within reviewed V3-manager ranges, reprojects affected
-positions, and commits its cursor with the repair. This also repairs final
-collect-before-burn allocation. The `v3_birth_history_repair_v1` metadata
-checkpoint survives restart; the accounting schema version is unchanged, so
-startup does not replay the entire ledger.
+same transaction are repaired by the normal projection lane. A default pass
+examines at most 8,192 indexed add events newest-first, selects only affected
+positions within reviewed V3-manager ranges, and reprojects at most 32 positions.
+The event cursor stops at the last selected repair when the write limit is
+reached, so remaining candidates survive the next pass and a restart. This also
+repairs final collect-before-burn allocation. The
+`v3_birth_history_repair_v2` checkpoint replaces the sparse position-key scan;
+the accounting schema version is unchanged, so startup does not replay the
+entire ledger. A read-only production probe admitted 16 repairs from 8,192
+events in 0.092 s.
 
 Wallet-only requests skip the unused custody aggregate. On a warm, read-only
 production snapshot of 10,540 wallets, this reduced owner-query time from
 1.34 s to 0.78 s; the reported single-wallet query fell from 1.65 s to 0.63 s.
 Existing financial fields had identical digests. Retain the short-circuit
 missing-gas query: a grouped replacement was slower for the full wallet table.
+
+For 32 production pools containing 52,393 active positions, selecting the
+covering index reduced inventory reads from 0.524 s to 0.093 s and LP-count
+summaries from 0.110 s to 0.007 s, with identical output digests.
 
 ### SQLite storage
 

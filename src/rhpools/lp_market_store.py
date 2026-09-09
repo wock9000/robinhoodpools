@@ -2437,9 +2437,9 @@ class MarketStore:
     def repair_v3_birth_history(
         self, prefixes: Sequence[str], *, limit: int = 32,
     ) -> bool:
-        """Resume a bounded repair without replaying the ledger at startup."""
+        """Repair indexed births newest-first with bounded reads and writes."""
         reader = self.read()
-        checkpoint = self._metadata(reader, "v3_birth_history_repair_v1", {})
+        checkpoint = self._metadata(reader, "v3_birth_history_repair_v2", {})
         if checkpoint.get("complete"):
             return False
         if reader.execute(
@@ -2447,32 +2447,31 @@ class MarketStore:
             "AND name='lp_accounting_positions'"
         ).fetchone() is None:
             return False
-        after = str(checkpoint.get("after") or "")
-        rows = []
-        for prefix in prefixes:
-            if after >= prefix + "\uffff":
-                continue
-            rows = reader.execute(
-                "SELECT position_key FROM lp_accounting_positions "
-                "WHERE position_key>=? AND position_key<? AND position_key>? "
-                "ORDER BY position_key LIMIT ?",
-                (prefix, prefix + "\uffff", after, max(1, min(int(limit), 128))),
-            ).fetchall()
-            if rows:
-                break
-        if not rows:
+        repair_limit = max(1, min(int(limit), 128))
+        after = int(checkpoint.get("after_event_id", (1 << 63) - 1))
+        page = reader.execute(
+            "SELECT MIN(id) AS first_id,COUNT(*) AS count FROM "
+            "(SELECT id FROM events INDEXED BY events_kind_id_idx "
+            "WHERE kind='add' AND id<=? ORDER BY id DESC LIMIT ?)",
+            (after, max(512, repair_limit * 256)),
+        ).fetchone()
+        if page["first_id"] is None:
             with self.transaction() as connection:
                 self._set_metadata(
-                    connection, "v3_birth_history_repair_v1",
+                    connection, "v3_birth_history_repair_v2",
                     {**checkpoint, "complete": True},
                 )
+                connection.execute(
+                    "DELETE FROM metadata WHERE key='v3_birth_history_repair_v1'",
+                )
             return False
-        keys = [str(row["position_key"]) for row in rows]
-        marks = ",".join("?" for _ in keys)
+        prefix_clause = " OR ".join("ka.position_key GLOB ?" for _ in prefixes) or "0"
         repairs = reader.execute(
-            "SELECT MIN(a.id) AS event_id FROM lp_accounting_event_keys ka "
-            "JOIN events a ON a.id=ka.event_id "
-            f"WHERE ka.position_key IN ({marks}) AND a.kind='add' "
+            "SELECT MAX(a.id) AS event_id FROM events a "
+            "INDEXED BY events_kind_id_idx "
+            "JOIN lp_accounting_event_keys ka ON ka.event_id=a.id "
+            "WHERE a.kind='add' AND a.id>=? AND a.id<=? "
+            f"AND ({prefix_clause}) "
             "AND EXISTS(SELECT 1 FROM lp_accounting_episodes ep "
             "WHERE ep.position_key=ka.position_key AND ep.protocol='v3' "
             "AND ep.history_complete=0) "
@@ -2481,17 +2480,25 @@ class MarketStore:
             "WHERE kt.position_key=ka.position_key AND t.block_hash=a.block_hash "
             "AND t.tx_hash=a.tx_hash AND t.kind='transfer' "
             "AND t.log_index>a.log_index AND json_extract(t.data,'$.mint')=1) "
-            "GROUP BY ka.position_key",
-            keys,
+            "GROUP BY ka.position_key ORDER BY event_id DESC LIMIT ?",
+            (page["first_id"], after, *(prefix + "*" for prefix in prefixes), repair_limit),
         ).fetchall()
+        next_after = (
+            int(repairs[-1]["event_id"])
+            if len(repairs) == repair_limit else int(page["first_id"])
+        ) - 1
         with self.transaction() as connection:
             self.reproject(int(row["event_id"]) for row in repairs)
-            self._set_metadata(connection, "v3_birth_history_repair_v1", {
-                "after": keys[-1],
-                "scanned_positions": int(checkpoint.get("scanned_positions", 0)) + len(keys),
+            self._set_metadata(connection, "v3_birth_history_repair_v2", {
+                "after_event_id": next_after,
+                "scanned_events": int(checkpoint.get("scanned_events", 0)) + int(page["count"]),
                 "repaired_positions": int(checkpoint.get("repaired_positions", 0)) + len(repairs),
                 "complete": False,
             })
+            if not checkpoint:
+                connection.execute(
+                    "DELETE FROM metadata WHERE key='v3_birth_history_repair_v1'",
+                )
         return True
 
     def mark_reprojection_error(

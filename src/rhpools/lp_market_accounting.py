@@ -3702,6 +3702,7 @@ class AccountBook:
                             f"END) AS lp_count,"
                             f"MIN(history_complete) AS history_complete "
                             f"FROM lp_accounting_positions "
+                            f"INDEXED BY lp_accounting_positions_active_inventory "
                             f"WHERE pool_id IN ({position_marks}) "
                             f"AND active_episode_id IS NOT NULL GROUP BY pool_id",
                             missing_inventory,
@@ -3710,6 +3711,7 @@ class AccountBook:
                     position_rows = conn.execute(
                         f"SELECT pool_id,protocol,liquidity,liquidity_known,"
                         f"tick_lower,tick_upper FROM lp_accounting_positions "
+                        f"INDEXED BY lp_accounting_positions_active_inventory "
                         f"WHERE pool_id IN ({position_marks}) "
                         f"AND active_episode_id IS NOT NULL ORDER BY pool_id",
                         missing_inventory,
