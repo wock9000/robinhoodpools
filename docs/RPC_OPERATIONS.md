@@ -60,22 +60,24 @@ Production sampling found wallet aggregation repeatedly restarting whenever inge
 The running service commits raw events, cursors, balance jobs, and coalesced
 accounting jobs atomically. A separate accounting worker replays each affected
 position from an immutable WAL snapshot without holding the ingestion writer.
-Its short publication transaction writes only changed accounting rows. A newer
-same-branch generation retains the job after publishing the coherent snapshot;
-a changed canonical epoch rejects it. Existing financial rows remain readable
-while the queue drains, but cannot be represented as current accounting.
+It prepares up to 128 positions outside the writer, then shares publication
+transactions across their changed rows, releasing the writer after roughly
+200 ms of publication work. A newer same-branch generation retains the job
+after publishing the coherent snapshot; a changed canonical epoch rejects it.
+Existing financial rows remain readable while the queue drains, but cannot be
+represented as current accounting.
 
 Header, event, and search writes use parameterized multi-row inserts bounded by
 SQLite's variable limit. This avoids handing the Python interpreter to competing
 valuation workers between every inserted row. The outer durable transaction
 preserves the raw event/cursor/job boundary.
 
-Adaptive scan sizing targets 50 ms of writer residency, half the observed
-100 ms block interval. Growth is capped by measured store throughput as well as
-log density, and history starts with eight blocks before adapting. This is a
-feedback target, not a hard transaction deadline; indivisible block work can
-exceed it. Multi-second history commits previously starved both the live lane
-and financial workers.
+Adaptive scan sizing uses separate writer targets: two seconds for live
+catch-up and 200 ms for background history. Growth is capped by measured store
+throughput and log density; history starts with eight blocks before adapting.
+These are feedback targets, not hard transaction deadlines; indivisible block
+work can exceed them. Applying a 50 ms target to the live lane shrank it to
+one-block commits and left fixed commit costs unamortized.
 
 Wallet freshness reads walk the canonical event-order index after checking
 whether the requested scope is empty. A timestamp-range plan sorted the entire
@@ -146,6 +148,17 @@ canonical block hash and generation inside the same transaction as enrichment;
 an older in-flight receipt cannot erase newer identity or retry work.
 The accounting queue and its bootstrap checkpoint survive restart without
 discarding published positions, episodes, coverage, or cursors.
+
+Schema version 9 records pending accounting scope and actor hints atomically
+with source changes, including both sides of NFT transfers. Wallet requests
+read those hints and published episodes instead of expanding every queued
+position's raw history. Legacy jobs start unqualified; bounded off-writer
+pages recover their hints without discarding existing financial rows. Recovery
+checks the canonical epoch and per-key cursor before publication.
+
+Legacy V4 identity seeding checks each canonical candidate transaction's queue
+entry by transaction hash. It no longer searches every serialized error
+payload for a pool ID, and it preserves existing candidate retry schedules.
 
 Receipt enrichment, repricing, and accounting continue during live catch-up.
 Receipt workers refill independently rather than waiting for the slowest member

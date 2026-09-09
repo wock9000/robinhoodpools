@@ -231,6 +231,45 @@ class MarketStore:
             connection.execute("PRAGMA query_only=ON")
         return connection
 
+    @staticmethod
+    def _install_accounting_pending_identities(
+        connection: sqlite3.Connection,
+    ) -> None:
+        pending_columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(lp_accounting_pending)"
+            ).fetchall()
+        }
+        if "identities_ready" not in pending_columns:
+            connection.execute(
+                "ALTER TABLE lp_accounting_pending ADD COLUMN "
+                "identities_ready INTEGER NOT NULL DEFAULT 0"
+            )
+        if "identity_cursor" not in pending_columns:
+            connection.execute(
+                "ALTER TABLE lp_accounting_pending ADD COLUMN "
+                "identity_cursor INTEGER NOT NULL DEFAULT 0"
+            )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS "
+            "lp_accounting_pending_identity_bootstrap "
+            "ON lp_accounting_pending(id) WHERE identities_ready=0"
+        )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS lp_accounting_pending_identities("
+            "position_key TEXT NOT NULL "
+            "REFERENCES lp_accounting_pending(position_key) ON DELETE CASCADE,"
+            "kind TEXT NOT NULL,"
+            "identity TEXT NOT NULL,"
+            "protocol TEXT NOT NULL,"
+            "pool_id TEXT NOT NULL,"
+            "timestamp INTEGER NOT NULL,"
+            "PRIMARY KEY(position_key,kind,identity,protocol,pool_id)"
+            ") WITHOUT ROWID"
+        )
+
+
     def _initialize(self) -> None:
         schema = """
         CREATE TABLE IF NOT EXISTS pools(
@@ -505,6 +544,14 @@ class MarketStore:
                         "generation INTEGER NOT NULL DEFAULT 0"
                     )
                 self.connection.execute("PRAGMA user_version=8")
+            if int(self.connection.execute("PRAGMA user_version").fetchone()[0]) < 9:
+                accounting_pending_installed = self.connection.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type='table' AND name='lp_accounting_pending'"
+                ).fetchone() is not None
+                if accounting_pending_installed:
+                    self._install_accounting_pending_identities(self.connection)
+                self.connection.execute("PRAGMA user_version=9")
             self.connection.execute(
                 "CREATE INDEX IF NOT EXISTS pending_reprojection_order_idx "
                 "ON pending_reprojection(block_number,tx_index,log_index,event_id)"

@@ -61,9 +61,10 @@ RECENT_CATCHUP_PRIORITY_BLOCKS = 512
 HISTORY_MIN_CHUNK = 1
 HISTORY_INITIAL_CHUNK = 8
 HISTORY_MAX_CHUNK = 32_768
-# Target half the chain's observed ~100 ms block interval, not multi-second
-# writer monopolies that stall live ingestion and every financial worker.
-MAX_INTERVAL_STORE_SECONDS = 0.05
+# Live catch-up must amortize fixed commit costs across all available blocks.
+# Background history uses a shorter writer target so financial lanes can run.
+MAX_INTERVAL_STORE_SECONDS = 2.0
+HISTORY_MAX_INTERVAL_STORE_SECONDS = 0.2
 ENRICH_BATCH = 8
 ENRICHMENT_CAPABILITY_RECHECK_S = 300.0
 REPROJECT_BATCH = 128
@@ -2955,24 +2956,23 @@ class MarketIndexer:
             stored = self.store.pool(pool_id)
             if stored is not None and self._identity_verified(stored):
                 continue
-            pending = reader.execute(
-                "SELECT 1 FROM pending_enrichment "
-                "WHERE last_error GLOB 'pool_identity_pending:*' "
-                "AND instr(last_error,?)>0 LIMIT 1",
-                (pool_id,),
-            ).fetchone()
-            if pending is not None:
-                continue
             rows = reader.execute(
-                "SELECT * FROM events WHERE pool_id=? AND protocol='v4' "
-                "AND kind IN ('add','remove','collect') "
-                "ORDER BY timestamp DESC,id DESC LIMIT ?",
+                "SELECT e.*,p.last_error AS enrichment_error FROM events e "
+                "LEFT JOIN pending_enrichment p ON p.tx_hash=e.tx_hash "
+                "WHERE e.pool_id=? AND e.protocol='v4' "
+                "AND e.kind IN ('add','remove','collect') "
+                "ORDER BY e.timestamp DESC,e.id DESC LIMIT ?",
                 (
                     pool_id,
                     DEFERRED_POOL_IDENTITY_CANDIDATES_PER_POOL,
                 ),
             ).fetchall()
             for row in rows:
+                # Check only this canonical candidate's job, not every
+                # serialized error payload in the global receipt backlog.
+                pending = self._pool_identity_marker(row["enrichment_error"])
+                if pending is not None and pool_id in pending["addresses"]:
+                    continue
                 log = self._stored_v4_modify_log(dict(row))
                 if log is not None:
                     logs.append(log)
@@ -3513,10 +3513,14 @@ class MarketIndexer:
         current = self._live_chunk if lane == "live" else self._history_chunk
         minimum = LIVE_MIN_CHUNK if lane == "live" else HISTORY_MIN_CHUNK
         maximum = LIVE_MAX_CHUNK if lane == "live" else HISTORY_MAX_CHUNK
+        store_target = (
+            MAX_INTERVAL_STORE_SECONDS if lane == "live"
+            else HISTORY_MAX_INTERVAL_STORE_SECONDS
+        )
         sample_blocks = max(
             1, current if scanned_blocks is None else int(scanned_blocks),
         )
-        if store_seconds > MAX_INTERVAL_STORE_SECONDS and current > minimum:
+        if store_seconds > store_target and current > minimum:
             # Size the next transaction from measured durable-store throughput.
             # This bounds both writers' lock residency during traffic or memory
             # pressure, while successful cheap intervals grow again below.
@@ -3525,7 +3529,7 @@ class MarketIndexer:
                 min(
                     current - 1,
                     int(
-                        sample_blocks * MAX_INTERVAL_STORE_SECONDS
+                        sample_blocks * store_target
                         / max(store_seconds, 1e-9)
                     ),
                 ),
@@ -3548,7 +3552,7 @@ class MarketIndexer:
             )
         if store_seconds > 0:
             candidate = min(candidate, max(
-                minimum, int(sample_blocks * MAX_INTERVAL_STORE_SECONDS / store_seconds),
+                minimum, int(sample_blocks * store_target / store_seconds),
             ))
         if candidate <= current:
             return

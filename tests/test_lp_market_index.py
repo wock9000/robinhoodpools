@@ -999,6 +999,14 @@ def test_scans_durably_replay_unregistered_v4_pool_keys(
         marker = scanner._pool_identity_marker(queued["last_error"])
         assert marker["addresses"] == [pool_id]
         assert store.pool(pool_id) is None
+        store.mark_enrichment_error(tx_hash, queued["last_error"], delay=60)
+        waiting = dict(store.read().execute(
+            "SELECT * FROM pending_enrichment WHERE tx_hash=?", (tx_hash,),
+        ).fetchone())
+        assert scanner._resolve_deferred_pool_identities_once() is False
+        assert dict(store.read().execute(
+            "SELECT * FROM pending_enrichment WHERE tx_hash=?", (tx_hash,),
+        ).fetchone()) == waiting
         # Simulate a database populated by an older indexer, before durable
         # V4 identity markers existed. Restart seeding must recover it too.
         with store.transaction() as connection:
@@ -1008,6 +1016,11 @@ def test_scans_durably_replay_unregistered_v4_pool_keys(
             ).rowcount
             store._bump(connection, "pending_enrichment", -removed)
         assert scanner._pending_pool_identity_replays() == []
+        scanner.close()
+        scanner = MarketIndexer(
+            store, market, "http://unused.invalid", rpc=IdentityRpc(),
+            history_disk_reserve_bytes=0,
+        )
 
         assert scanner._resolve_deferred_pool_identities_once() is True
         pool = store.pool(pool_id)

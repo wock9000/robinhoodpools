@@ -635,6 +635,15 @@ def drain_accounting(book):
         pass
 
 
+def owner_open(block, owner, key):
+    event = lp_effect(
+        block, "v4", "add", 1_000, (1_000_000, 1_000_000),
+        position_state(0), position_state(1_000), key=key,
+    )
+    event.update(owner=owner, custody=MANAGER)
+    return event
+
+
 def test_deferred_accounting_does_not_hold_writer_and_drains_same_branch_prefix(
         tmp_path, monkeypatch):
     blocks = [header(100 + index, 1_000 + index) for index in range(2)]
@@ -892,6 +901,279 @@ def test_deferred_accounting_restart_resumes_queue_and_clears_reassigned_key(
         assert [row["position_key"] for row in after] == ["v4:after"]
         assert after[0]["liquidity"] == "1000"
     finally:
+        store.close()
+
+
+def test_deferred_nft_transfer_hints_mark_both_wallets_pending(
+        tmp_path):
+    sender = "0x" + "56" * 20
+    recipient = "0x" + "78" * 20
+    bystander = "0x" + "9a" * 20
+    blocks = [header(100 + index, 1_000 + index) for index in range(4)]
+    seeds = [
+        owner_open(blocks[0], sender, "sender-seed"),
+        owner_open(blocks[1], recipient, "recipient-seed"),
+        owner_open(blocks[2], bystander, "bystander-seed"),
+    ]
+    store, book = accounting_store(tmp_path / "market.sqlite", deferred=True)
+    position_key = f"nft:{MANAGER}:42"
+    try:
+        store.ingest(blocks[:3], seeds)
+        drain_accounting(book)
+        transfer = swap(blocks[3], V4, "v4")
+        transfer.update(
+            protocol="nft", kind="transfer", position_key=position_key,
+            token_id="42", owner=recipient, custody=MANAGER,
+            liquidity=None, liquidity_delta=None, amount0=None, amount1=None,
+            cashflow0=None, cashflow1=None,
+            data={
+                "from": sender, "to": recipient,
+                "manager_protocol": "v4",
+            },
+        )
+        store.ingest(blocks[3:], [transfer])
+
+        rows = {
+            row["owner"]: row
+            for row in book.owner_candidates({
+                "window": "all", "protocol": "v4", "identity_scope": "wallets",
+            })["rows"]
+        }
+        assert all(rows[owner]["positions"] == 1 for owner in rows)
+        assert rows[sender]["financial_pending"] is True
+        assert rows[recipient]["financial_pending"] is True
+        assert rows[bystander]["financial_pending"] is False
+    finally:
+        store.close()
+
+
+def test_historical_owner_reassignment_survives_identity_cursor(
+        tmp_path, monkeypatch):
+    prior_owner = "0x" + "56" * 20
+    reassigned_owner = "0x" + "78" * 20
+    blocks = [header(100 + index, 1_000 + index) for index in range(2)]
+    original = owner_open(blocks[0], prior_owner, "reassigned")
+    other = owner_open(blocks[1], reassigned_owner, "existing")
+    store, book = accounting_store(tmp_path / "market.sqlite", deferred=True)
+    position_key = str(original["position_key"])
+    try:
+        inserted = store.ingest(blocks, [original, other])
+        event_id = int(inserted[0]["id"])
+        drain_accounting(book)
+        with store.transaction() as conn:
+            book._queue_position_keys(
+                conn, {position_key: (100, 0, 0)},
+            )
+            conn.execute(
+                "UPDATE lp_accounting_pending SET identity_cursor=? "
+                "WHERE position_key=?",
+                (event_id, position_key),
+            )
+            conn.execute(
+                "DELETE FROM lp_accounting_pending_identities "
+                "WHERE position_key=?",
+                (position_key,),
+            )
+
+        store.enrich([{
+            **original, "id": event_id, "owner": reassigned_owner,
+        }])
+        pending = store.read().execute(
+            "SELECT identities_ready,identity_cursor "
+            "FROM lp_accounting_pending WHERE position_key=?",
+            (position_key,),
+        ).fetchone()
+        hinted_owners = {
+            str(row[0])
+            for row in store.read().execute(
+                "SELECT identity "
+                "FROM lp_accounting_pending_identities "
+                "WHERE position_key=? AND kind='owner'",
+                (position_key,),
+            ).fetchall()
+        }
+        assert (
+            int(pending["identities_ready"]),
+            int(pending["identity_cursor"]),
+        ) == (0, event_id)
+        assert hinted_owners == {reassigned_owner}
+
+        monkeypatch.setattr(book, "_prepare_pending", lambda _key: None)
+        assert book.project_pending(limit=1) is True
+        ready = store.read().execute(
+            "SELECT identities_ready FROM lp_accounting_pending "
+            "WHERE position_key=?",
+            (position_key,),
+        ).fetchone()
+        rows = {
+            row["owner"]: row
+            for row in book.owner_candidates({"window": "all"})["rows"]
+        }
+        assert int(ready["identities_ready"]) == 1
+        assert rows[prior_owner]["financial_pending"] is True
+        assert rows[reassigned_owner]["financial_pending"] is True
+    finally:
+        store.close()
+
+
+def test_legacy_pending_identity_recovery_resumes_after_restart(
+        tmp_path, monkeypatch):
+    path = tmp_path / "market.sqlite"
+    queued_owner = "0x" + "56" * 20
+    unrelated_owner = "0x" + "78" * 20
+    blocks = [header(100 + index, 1_000 + index) for index in range(2)]
+    queued = owner_open(blocks[0], queued_owner, "legacy")
+    unrelated = owner_open(blocks[1], unrelated_owner, "unrelated")
+    store, book = accounting_store(path, deferred=True)
+    position_key = str(queued["position_key"])
+    store.ingest(blocks, [queued, unrelated])
+    drain_accounting(book)
+    with store.transaction() as conn:
+        book._queue_position_keys(conn, {position_key: (100, 0, 0)})
+        conn.execute(
+            "DELETE FROM lp_accounting_pending_identities "
+            "WHERE position_key=?",
+            (position_key,),
+        )
+    store.close()
+
+    store = MarketStore(path)
+    PriceProjection(store)
+    book = AccountBook(store, deferred=True)
+
+    def unexpected_replay(*_args, **_kwargs):
+        raise AssertionError("deferred restart replayed the ledger")
+
+    monkeypatch.setattr(book, "_map_existing_events", unexpected_replay)
+    monkeypatch.setattr(book, "_rebuild_position", unexpected_replay)
+    try:
+        book.install()
+        before = {
+            row["owner"]: row
+            for row in book.owner_candidates({"window": "all"})["rows"]
+        }
+        assert before[queued_owner]["positions"] == 1
+        assert before[unrelated_owner]["positions"] == 1
+        assert before[queued_owner]["financial_pending"] is True
+        assert before[unrelated_owner]["financial_pending"] is True
+
+        monkeypatch.setattr(book, "_prepare_pending", lambda _key: None)
+        assert book.project_pending(limit=1) is True
+        pending = store.read().execute(
+            "SELECT identities_ready FROM lp_accounting_pending "
+            "WHERE position_key=?",
+            (position_key,),
+        ).fetchone()
+        after = {
+            row["owner"]: row
+            for row in book.owner_candidates({"window": "all"})["rows"]
+        }
+        assert int(pending["identities_ready"]) == 1
+        assert after[queued_owner]["financial_pending"] is True
+        assert after[unrelated_owner]["financial_pending"] is False
+    finally:
+        store.close()
+
+
+def test_pending_identity_recovery_rejects_orphan_epoch(
+        tmp_path, monkeypatch):
+    old_owner = "0x" + "56" * 20
+    replacement_owner = "0x" + "78" * 20
+    old_block = header(100, 1_000)
+    replacement_block = header(100, 1_001, branch=10_000)
+    old_event = owner_open(old_block, old_owner, "identity-reorg")
+    replacement = owner_open(
+        replacement_block, replacement_owner, "identity-reorg",
+    )
+    store, book = accounting_store(tmp_path / "market.sqlite", deferred=True)
+    position_key = str(old_event["position_key"])
+    prepared = threading.Event()
+    release = threading.Event()
+    failures = []
+    original_prepare = book._prepare_pending_identity_hints
+
+    def paused_prepare():
+        result = original_prepare()
+        prepared.set()
+        if not release.wait(5):
+            raise TimeoutError("test did not release identity recovery")
+        return result
+
+    def recover():
+        try:
+            book.project_pending(limit=1)
+        except BaseException as error:
+            failures.append(error)
+
+    monkeypatch.setattr(
+        book, "_prepare_pending_identity_hints", paused_prepare,
+    )
+    monkeypatch.setattr(book, "_prepare_pending", lambda _key: None)
+    try:
+        store.ingest([old_block], [old_event])
+        with store.transaction() as conn:
+            conn.execute(
+                "UPDATE lp_accounting_pending SET identities_ready=0,"
+                "identity_cursor=0 WHERE position_key=?",
+                (position_key,),
+            )
+            conn.execute(
+                "DELETE FROM lp_accounting_pending_identities "
+                "WHERE position_key=?",
+                (position_key,),
+            )
+        projector = threading.Thread(target=recover)
+        projector.start()
+        assert prepared.wait(2)
+        store.rollback(99)
+        store.ingest([replacement_block], [replacement])
+        release.set()
+        projector.join(2)
+        assert not projector.is_alive()
+        assert failures == []
+
+        hinted_owners = {
+            str(row[0])
+            for row in store.read().execute(
+                "SELECT identity "
+                "FROM lp_accounting_pending_identities "
+                "WHERE position_key=? AND kind='owner'",
+                (position_key,),
+            ).fetchall()
+        }
+        pending = store.read().execute(
+            "SELECT identities_ready,identity_cursor "
+            "FROM lp_accounting_pending WHERE position_key=?",
+            (position_key,),
+        ).fetchone()
+        assert hinted_owners == {replacement_owner}
+        assert (
+            int(pending["identities_ready"]),
+            int(pending["identity_cursor"]),
+        ) == (0, 0)
+
+        monkeypatch.setattr(
+            book, "_prepare_pending_identity_hints", original_prepare,
+        )
+        assert book._recover_pending_identities() is True
+        final_owners = {
+            str(row[0])
+            for row in store.read().execute(
+                "SELECT identity "
+                "FROM lp_accounting_pending_identities "
+                "WHERE position_key=? AND kind='owner'",
+                (position_key,),
+            ).fetchall()
+        }
+        ready = store.read().execute(
+            "SELECT identities_ready FROM lp_accounting_pending "
+            "WHERE position_key=?",
+            (position_key,),
+        ).fetchone()
+        assert final_owners == {replacement_owner}
+        assert int(ready["identities_ready"]) == 1
+    finally:
+        release.set()
         store.close()
 
 

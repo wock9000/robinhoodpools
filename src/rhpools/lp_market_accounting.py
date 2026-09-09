@@ -32,6 +32,10 @@ _MISSING = object()
 _POOL_INVENTORY_CACHE_POOLS = 128
 _POOL_INVENTORY_CACHE_POSITIONS = 100_000
 _POOL_RESULT_CACHE_ENTRIES = 512
+_IDENTITY_BOOTSTRAP_EVENTS = 4096
+_IDENTITY_BOOTSTRAP_KEYS = 256
+_IDENTITY_BOOTSTRAP_PAGE = 256
+_PENDING_PUBLICATION_SECONDS = 0.2
 
 
 class _PoolInventory(NamedTuple):
@@ -462,6 +466,14 @@ class _PreparedProjection(NamedTuple):
     epoch: int
     writes: _ReplayWrites
 
+class _PreparedIdentityHints(NamedTuple):
+    position_key: str
+    cursor: int
+    next_cursor: int
+    complete: bool
+    epoch: int
+    hints: tuple[tuple[str, str, str, str, str, int], ...]
+
 
 def _batches(values: Sequence[Any], size: int = 500) -> Iterable[Sequence[Any]]:
     for start in range(0, len(values), size):
@@ -684,6 +696,7 @@ class AccountBook:
                 return self
             self.store.connection.executescript(_SCHEMA)
             with self.store.transaction() as conn:
+                self.store._install_accounting_pending_identities(conn)
                 prior = {
                     str(row[0]): str(row[1])
                     for row in conn.execute(
@@ -791,6 +804,81 @@ class AccountBook:
             ).strip().lower()
         return key
 
+    @staticmethod
+    def _hint_scope(event: Mapping[str, Any]) -> tuple[str, str, int]:
+        data = _json(event.get("data"))
+        raw_protocol = str(event.get("protocol") or "").strip().lower()
+        protocol = raw_protocol
+        if raw_protocol == "nft":
+            manager_protocol = str(
+                data.get("manager_protocol") or ""
+            ).strip().lower()
+            protocol = (
+                manager_protocol
+                if manager_protocol in {"v2", "v3", "v4"} else "nft"
+            )
+        pool_id = str(event.get("pool_id") or "").strip().lower()
+        return protocol, pool_id, int(event.get("timestamp") or 0)
+
+    @staticmethod
+    def _add_identity_hint(
+            hints: dict[tuple[str, str, str, str, str], int],
+            position_key: str, kind: str, identity: str,
+            protocol: str, pool_id: str, timestamp: int,
+    ) -> None:
+        key = (position_key, kind, identity, protocol, pool_id)
+        hints[key] = max(hints.get(key, timestamp), timestamp)
+
+    def _add_event_identity_hints(
+            self, hints: dict[tuple[str, str, str, str, str], int],
+            position_key: str, event: Mapping[str, Any],
+    ) -> None:
+        protocol, pool_id, timestamp = self._hint_scope(event)
+        self._add_identity_hint(
+            hints, position_key, "scope", "", protocol, pool_id, timestamp,
+        )
+        owner = _address(event.get("owner"))
+        custody = _address(event.get("custody"))
+        if owner is not None and owner != _ZERO_ADDRESS:
+            self._add_identity_hint(
+                hints, position_key, "owner", owner,
+                protocol, pool_id, timestamp,
+            )
+        if custody is not None and custody != _ZERO_ADDRESS:
+            self._add_identity_hint(
+                hints, position_key, "custody", custody,
+                protocol, pool_id, timestamp,
+            )
+        if (
+            str(event.get("protocol") or "").strip().lower() == "nft"
+            and str(event.get("kind") or "").strip().lower() == "transfer"
+        ):
+            source, target = self._transfer_parties(
+                event, _json(event.get("data")),
+            )
+            for actor in (source, target):
+                if actor is not None and actor != _ZERO_ADDRESS:
+                    self._add_identity_hint(
+                        hints, position_key, "owner", actor,
+                        protocol, pool_id, timestamp,
+                    )
+
+
+    @staticmethod
+    def _merge_pending_identity_hints(
+            conn: sqlite3.Connection,
+            hints: Iterable[tuple[str, str, str, str, str, int]],
+    ) -> None:
+        conn.executemany(
+            "INSERT INTO lp_accounting_pending_identities("
+            "position_key,kind,identity,protocol,pool_id,timestamp"
+            ") VALUES(?,?,?,?,?,?) ON CONFLICT("
+            "position_key,kind,identity,protocol,pool_id"
+            ") DO UPDATE SET timestamp=MAX("
+            "lp_accounting_pending_identities.timestamp,excluded.timestamp)",
+            hints,
+        )
+
     def _queue_position_keys(
         self,
         conn: sqlite3.Connection,
@@ -798,6 +886,7 @@ class AccountBook:
         *,
         revision: int | None = None,
         epoch: int | None = None,
+        hinted: bool = False,
     ) -> None:
         if not priorities:
             self._finish_if_idle(conn)
@@ -814,6 +903,7 @@ class AccountBook:
             (
                 key, 0, requested_revision, requested_epoch,
                 int(order[0]), int(order[1]), int(order[2]),
+                int(hinted), 0,
             )
             for key, order in sorted(priorities.items())
         ]
@@ -821,8 +911,9 @@ class AccountBook:
         conn.executemany(
             "INSERT OR IGNORE INTO lp_accounting_pending("
             "position_key,generation,requested_revision,requested_epoch,"
-            "priority_block,priority_tx_index,priority_log_index"
-            ") VALUES(?,?,?,?,?,?,?)",
+            "priority_block,priority_tx_index,priority_log_index,"
+            "identities_ready,identity_cursor"
+            ") VALUES(?,?,?,?,?,?,?,?,?)",
             rows,
         )
         inserted = conn.total_changes - before
@@ -831,15 +922,27 @@ class AccountBook:
             "requested_revision=MAX(requested_revision,?),requested_epoch=?,"
             "priority_block=MAX(priority_block,?),"
             "priority_tx_index=MAX(priority_tx_index,?),"
-            "priority_log_index=MAX(priority_log_index,?) WHERE position_key=?",
+            "priority_log_index=MAX(priority_log_index,?),"
+            "identities_ready=CASE WHEN ? THEN identities_ready ELSE 0 END,"
+            "identity_cursor=CASE WHEN ? THEN identity_cursor ELSE 0 END "
+            "WHERE position_key=?",
             (
                 (
                     requested_revision, requested_epoch,
-                    int(order[0]), int(order[1]), int(order[2]), key,
+                    int(order[0]), int(order[1]), int(order[2]),
+                    int(hinted), int(hinted), key,
                 )
                 for key, order in sorted(priorities.items())
             ),
         )
+        if not hinted:
+            for batch in _batches(sorted(priorities)):
+                marks = ",".join("?" for _ in batch)
+                conn.execute(
+                    "DELETE FROM lp_accounting_pending_identities "
+                    f"WHERE position_key IN ({marks})",
+                    batch,
+                )
         if inserted:
             self.store._bump(conn, "pending_accounting", inserted)
         self._set_accounting_meta(conn, "dirty", 1)
@@ -989,6 +1092,121 @@ class AccountBook:
                 self._finish_if_idle(conn)
             return True
 
+    def _prepare_pending_identity_hints(
+            self,
+    ) -> list[_PreparedIdentityHints]:
+        prepared: list[_PreparedIdentityHints] = []
+        remaining = _IDENTITY_BOOTSTRAP_EVENTS
+        with self._reader() as conn:
+            if self._accounting_meta(
+                conn, "bootstrap_phase", "complete",
+            ) != "complete":
+                return prepared
+            epoch = self._store_metadata_int(conn, "epoch")
+            pending = conn.execute(
+                "SELECT position_key,identity_cursor "
+                "FROM lp_accounting_pending "
+                "INDEXED BY lp_accounting_pending_identity_bootstrap "
+                "WHERE identities_ready=0 ORDER BY id LIMIT ?",
+                (_IDENTITY_BOOTSTRAP_KEYS,),
+            ).fetchall()
+            for row in pending:
+                if remaining <= 0:
+                    break
+                position_key = str(row["position_key"])
+                cursor = int(row["identity_cursor"])
+                page_size = min(_IDENTITY_BOOTSTRAP_PAGE, remaining)
+                events = _dict_rows(conn.execute(
+                    "SELECT e.protocol,e.pool_id,e.timestamp,e.owner,e.custody,"
+                    "e.kind,e.data,k.event_id "
+                    "FROM lp_accounting_event_keys k "
+                    "INDEXED BY lp_accounting_event_keys_position "
+                    "JOIN events e ON e.id=k.event_id "
+                    "WHERE k.position_key=? AND k.event_id>? "
+                    "ORDER BY k.event_id LIMIT ?",
+                    (position_key, cursor, page_size),
+                ))
+                hints: dict[tuple[str, str, str, str, str], int] = {}
+                for event in events:
+                    self._add_event_identity_hints(
+                        hints, position_key, event,
+                    )
+                next_cursor = (
+                    int(events[-1]["event_id"]) if events else cursor
+                )
+                prepared.append(_PreparedIdentityHints(
+                    position_key=position_key,
+                    cursor=cursor,
+                    next_cursor=next_cursor,
+                    complete=len(events) < page_size,
+                    epoch=epoch,
+                    hints=tuple(
+                        (*key, timestamp)
+                        for key, timestamp in hints.items()
+                    ),
+                ))
+                remaining -= len(events)
+        return prepared
+
+    def _publish_pending_identity_hints(
+            self, prepared: Sequence[_PreparedIdentityHints],
+    ) -> None:
+        published = 0
+        while published < len(prepared):
+            with self.store.transaction() as conn:
+                acquired_at = time.monotonic()
+                epoch = self._store_metadata_int(conn, "epoch")
+                changed = False
+                first = published
+                while (
+                    published < len(prepared)
+                    and (
+                        published == first
+                        or time.monotonic() - acquired_at
+                        < _PENDING_PUBLICATION_SECONDS
+                    )
+                ):
+                    item = prepared[published]
+                    published += 1
+                    if epoch != item.epoch:
+                        continue
+                    pending = conn.execute(
+                        "SELECT identity_cursor,identities_ready "
+                        "FROM lp_accounting_pending WHERE position_key=?",
+                        (item.position_key,),
+                    ).fetchone()
+                    if (
+                        pending is None
+                        or int(pending["identities_ready"]) != 0
+                        or int(pending["identity_cursor"]) != item.cursor
+                    ):
+                        continue
+                    self._merge_pending_identity_hints(conn, item.hints)
+                    updated = conn.execute(
+                        "UPDATE lp_accounting_pending SET "
+                        "identity_cursor=?,identities_ready=? "
+                        "WHERE position_key=? AND identities_ready=0 "
+                        "AND identity_cursor=?",
+                        (
+                            item.next_cursor, int(item.complete),
+                            item.position_key, item.cursor,
+                        ),
+                    ).rowcount
+                    changed = bool(updated) or changed
+                if changed and conn.execute(
+                    "SELECT 1 FROM lp_accounting_pending "
+                    "INDEXED BY lp_accounting_pending_identity_bootstrap "
+                    "WHERE identities_ready=0 LIMIT 1"
+                ).fetchone() is None:
+                    self._invalidate_cache(conn, (), owners=True)
+
+    def _recover_pending_identities(self) -> bool:
+        prepared = self._prepare_pending_identity_hints()
+        if not prepared:
+            return False
+        self._publish_pending_identity_hints(prepared)
+        return True
+
     def _pending_rows(self, limit: int) -> list[dict[str, Any]]:
         historical = max(1, limit // 4)
         recent = max(0, limit - historical)
@@ -1035,68 +1253,90 @@ class AccountBook:
             )
 
 
-    def _publish_pending(self, prepared: _PreparedProjection) -> bool:
-        with self.store.transaction() as conn:
-            if self._store_metadata_int(conn, "epoch") != prepared.epoch:
-                return False
-            pending = conn.execute(
-                "SELECT generation FROM lp_accounting_pending "
-                "WHERE position_key=?",
+    def _publish_pending(
+            self, conn: sqlite3.Connection,
+            prepared: _PreparedProjection,
+    ) -> bool:
+        if self._store_metadata_int(conn, "epoch") != prepared.epoch:
+            return False
+        pending = conn.execute(
+            "SELECT generation FROM lp_accounting_pending "
+            "WHERE position_key=?",
+            (prepared.position_key,),
+        ).fetchone()
+        if pending is None:
+            return False
+        # Projection publication is serialized. Same-epoch event changes
+        # therefore cannot race a newer accounting publish: commit this
+        # coherent older snapshot, and let the generation-guarded delete
+        # retain the key for the newer snapshot. Reorgs are rejected above.
+        affected_pools = {
+            str(row[0]).lower()
+            for row in conn.execute(
+                "SELECT pool_id FROM lp_accounting_positions "
+                "WHERE position_key=? AND pool_id IS NOT NULL",
                 (prepared.position_key,),
-            ).fetchone()
-            if pending is None:
-                return False
-            # Projection publication is serialized. Same-epoch event changes
-            # therefore cannot race a newer accounting publish: commit this
-            # coherent older snapshot, and let the generation-guarded delete
-            # retain the key for the newer snapshot. Reorgs are rejected above.
-            affected_pools = {
-                str(row[0]).lower()
-                for row in conn.execute(
-                    "SELECT pool_id FROM lp_accounting_positions "
-                    "WHERE position_key=? AND pool_id IS NOT NULL",
-                    (prepared.position_key,),
-                ).fetchall()
-            }
-            affected_txs, changed_episodes = prepared.writes.flush(conn)
-            affected_pools.update(
-                str(row[0]).lower()
-                for row in conn.execute(
-                    "SELECT pool_id FROM lp_accounting_positions "
-                    "WHERE position_key=? AND pool_id IS NOT NULL",
-                    (prepared.position_key,),
-                ).fetchall()
-            )
-            self._refresh_position_values(conn, [prepared.position_key])
-            self._rebuild_tx_costs(conn, affected_txs)
-            self._refresh_episode_costs(
-                conn, affected_txs, episode_ids=changed_episodes,
-            )
-            removed = conn.execute(
-                "DELETE FROM lp_accounting_pending "
-                "WHERE position_key=? AND generation=?",
-                (prepared.position_key, prepared.generation),
-            ).rowcount
-            if removed:
-                self.store._bump(conn, "pending_accounting", -removed)
-            self._finish_if_idle(conn)
-            self._invalidate_cache(conn, affected_pools)
-            return True
+            ).fetchall()
+        }
+        affected_txs, changed_episodes = prepared.writes.flush(conn)
+        affected_pools.update(
+            str(row[0]).lower()
+            for row in conn.execute(
+                "SELECT pool_id FROM lp_accounting_positions "
+                "WHERE position_key=? AND pool_id IS NOT NULL",
+                (prepared.position_key,),
+            ).fetchall()
+        )
+        self._refresh_position_values(conn, [prepared.position_key])
+        self._rebuild_tx_costs(conn, affected_txs)
+        self._refresh_episode_costs(
+            conn, affected_txs, episode_ids=changed_episodes,
+        )
+        removed = conn.execute(
+            "DELETE FROM lp_accounting_pending "
+            "WHERE position_key=? AND generation=?",
+            (prepared.position_key, prepared.generation),
+        ).rowcount
+        if removed:
+            self.store._bump(conn, "pending_accounting", -removed)
+        self._finish_if_idle(conn)
+        self._invalidate_cache(conn, affected_pools)
+        return True
 
-    def project_pending(self, limit: int = 32) -> bool:
+    def project_pending(self, limit: int = 128) -> bool:
         """Prepare bounded queued histories off-writer, then publish atomically."""
         if not self.deferred:
             return False
         bounded = max(1, min(int(limit), 128))
         with self._projection_lock:
             worked = self._resume_bootstrap(bounded)
+            if self._recover_pending_identities():
+                worked = True
             pending = self._pending_rows(bounded)
             if pending:
                 worked = True
+            prepared_batch = []
             for row in pending:
                 prepared = self._prepare_pending(str(row["position_key"]))
                 if prepared is not None:
-                    self._publish_pending(prepared)
+                    prepared_batch.append(prepared)
+            published = 0
+            while published < len(prepared_batch):
+                with self.store.transaction() as conn:
+                    acquired_at = time.monotonic()
+                    first = published
+                    while (
+                        published < len(prepared_batch)
+                        and (
+                            published == first
+                            or time.monotonic() - acquired_at
+                            < _PENDING_PUBLICATION_SECONDS
+                        )
+                    ):
+                        self._publish_pending(
+                            conn, prepared_batch[published],
+                        )
+                        published += 1
             return worked
 
     def _apply(
@@ -1172,19 +1412,28 @@ class AccountBook:
         keys = sorted(old_keys | new_keys)
         if self.deferred:
             priorities: dict[str, tuple[int, int, int]] = {}
+            identity_hints: dict[
+                tuple[str, str, str, str, str], int
+            ] = {}
             for event in events:
                 if event.get("id") is None:
                     continue
                 event_id = int(event["id"])
                 order = _order(event)[:3]
-                for key in (
-                    old_mapping.get(event_id),
-                    self._event_position_key(event),
-                ):
-                    if key:
-                        priorities[key] = max(
-                            priorities.get(key, order), order,
-                        )
+                event_keys = {
+                    key for key in (
+                        old_mapping.get(event_id),
+                        self._event_position_key(event),
+                    )
+                    if key
+                }
+                for key in event_keys:
+                    priorities[key] = max(
+                        priorities.get(key, order), order,
+                    )
+                    self._add_event_identity_hints(
+                        identity_hints, key, event,
+                    )
                 if event.get("pool_id"):
                     inventory_pools.add(str(event["pool_id"]).lower())
             for batch in _batches(keys):
@@ -1198,7 +1447,14 @@ class AccountBook:
                         batch,
                     ).fetchall()
                 )
-            self._queue_position_keys(conn, priorities)
+            self._queue_position_keys(conn, priorities, hinted=True)
+            self._merge_pending_identity_hints(
+                conn,
+                (
+                    (*key, timestamp)
+                    for key, timestamp in identity_hints.items()
+                ),
+            )
             self._invalidate_cache(
                 conn, inventory_pools, owners=bool(priorities),
             )
@@ -3668,11 +3924,15 @@ class AccountBook:
         event_args: list[Any] = []
         episode_clauses: list[str] = []
         episode_args: list[Any] = []
+        hint_clauses = ["h.kind='scope'"]
+        hint_args: list[Any] = []
         if cutoff is not None:
             event_clauses.append("e.timestamp>=?")
             event_args.append(cutoff)
             episode_clauses.append("ep.last_timestamp>=?")
             episode_args.append(cutoff)
+            hint_clauses.append("h.timestamp>=?")
+            hint_args.append(cutoff)
         if protocol:
             event_clauses.append(
                 "(e.protocol=? OR (e.protocol='nft' AND "
@@ -3681,11 +3941,15 @@ class AccountBook:
             event_args.extend((protocol, protocol))
             episode_clauses.append("ep.protocol=?")
             episode_args.append(protocol)
+            hint_clauses.append("h.protocol=?")
+            hint_args.append(protocol)
         if pool_id:
             event_clauses.append("e.pool_id=?")
             event_args.append(pool_id)
             episode_clauses.append("ep.pool_id=?")
             episode_args.append(pool_id)
+            hint_clauses.append("h.pool_id=?")
+            hint_args.append(pool_id)
         event_where = (
             " WHERE " + " AND ".join(event_clauses)
             if event_clauses else ""
@@ -3727,35 +3991,41 @@ class AccountBook:
             return through_order, through_as_of, set(), set(), False
         if not pending_exists:
             return through_order, through_as_of, set(), set(), True
-        if event_clauses:
-            event_scope = " AND " + " AND ".join(event_clauses)
+        if conn.execute(
+            "SELECT 1 FROM lp_accounting_pending "
+            "INDEXED BY lp_accounting_pending_identity_bootstrap "
+            "WHERE identities_ready=0 LIMIT 1"
+        ).fetchone() is not None:
+            return through_order, through_as_of, set(), set(), False
+        if cutoff is not None or protocol or pool_id:
+            hint_scope = " AND " + " AND ".join(hint_clauses)
             episode_scope = " AND " + " AND ".join(episode_clauses)
             scoped_keys = (
                 "SELECT q.position_key FROM lp_accounting_pending q WHERE "
-                "EXISTS(SELECT 1 FROM lp_accounting_event_keys k "
-                "INDEXED BY lp_accounting_event_keys_position "
-                "JOIN events e ON e.id=k.event_id "
-                "WHERE k.position_key=q.position_key" + event_scope + ") OR "
+                "EXISTS(SELECT 1 "
+                "FROM lp_accounting_pending_identities h "
+                "WHERE h.position_key=q.position_key" + hint_scope + ") OR "
                 "EXISTS(SELECT 1 FROM lp_accounting_episodes ep "
                 "WHERE ep.position_key=q.position_key" + episode_scope + ")"
             )
-            scoped_args = [*event_args, *episode_args]
+            scoped_args = [*hint_args, *episode_args]
         else:
             scoped_keys = (
                 "SELECT q.position_key FROM lp_accounting_pending q"
             )
             scoped_args = []
         pending_rows = conn.execute(
-            "WITH scoped_keys AS (" + scoped_keys + ") "
-            "SELECT ep.owner,ep.custody,NULL AS data "
-            "FROM scoped_keys s JOIN lp_accounting_episodes ep "
+            "WITH scoped_keys AS MATERIALIZED (" + scoped_keys + ") "
+            "SELECT ep.owner,ep.custody "
+            "FROM scoped_keys s CROSS JOIN lp_accounting_episodes ep "
             "ON ep.position_key=s.position_key "
             "UNION "
-            "SELECT e.owner,e.custody,CASE WHEN e.kind='transfer' THEN e.data END "
-            "FROM scoped_keys s JOIN lp_accounting_event_keys k "
-            "INDEXED BY lp_accounting_event_keys_position "
-            "ON k.position_key=s.position_key "
-            "JOIN events e ON e.id=k.event_id",
+            "SELECT CASE WHEN h.kind='owner' THEN h.identity END AS owner,"
+            "CASE WHEN h.kind='custody' THEN h.identity END AS custody "
+            "FROM scoped_keys s "
+            "CROSS JOIN lp_accounting_pending_identities h "
+            "ON h.position_key=s.position_key "
+            "WHERE h.kind IN ('owner','custody')",
             scoped_args,
         )
         owners: set[str] = set()
@@ -3767,12 +4037,6 @@ class AccountBook:
                 owners.add(owner)
             if custody is not None:
                 custodies.add(custody)
-            if row["data"] is not None:
-                source, target = self._transfer_parties(dict(row), _json(row["data"]))
-                if source is not None and source != _ZERO_ADDRESS:
-                    owners.add(source)
-                if target is not None and target != _ZERO_ADDRESS:
-                    owners.add(target)
         return through_order, through_as_of, owners, custodies, True
 
     def decorate_owner_activity(

@@ -299,6 +299,121 @@ def test_schema_migrations_preserve_durable_accounting_state(tmp_path):
         assert reader.execute(
             "SELECT value FROM lp_accounting_meta WHERE key='applied_revision'"
         ).fetchone()[0] == accounting_revision
+
+        with store.transaction() as connection:
+            connection.execute("DELETE FROM lp_accounting_pending")
+            connection.execute(
+                "INSERT INTO lp_accounting_pending("
+                "id,position_key,generation,requested_revision,requested_epoch,"
+                "priority_block,priority_tx_index,priority_log_index"
+                ") VALUES(41,'shared-position',7,19,3,10,2,5)"
+            )
+        def committed_state(connection: sqlite3.Connection) -> dict[str, object]:
+            return {
+                "events": [
+                    tuple(row) for row in connection.execute(
+                        "SELECT id,block_hash,position_key,revision FROM events"
+                    )
+                ],
+                "coverage": [
+                    tuple(row) for row in connection.execute(
+                        "SELECT lane,start_block,end_block,start_hash,end_hash "
+                        "FROM coverage_intervals"
+                    )
+                ],
+                "position": tuple(connection.execute(
+                    "SELECT position_key,pool_id,active_episode_id,status,"
+                    "history_complete,state_json FROM lp_accounting_positions"
+                ).fetchone()),
+                "event_keys": [
+                    tuple(row) for row in connection.execute(
+                        "SELECT event_id,position_key,token_id "
+                        "FROM lp_accounting_event_keys"
+                    )
+                ],
+                "accounting_meta": [
+                    tuple(row) for row in connection.execute(
+                        "SELECT key,value FROM lp_accounting_meta ORDER BY key"
+                    )
+                ],
+                "pool_generations": [
+                    tuple(row) for row in connection.execute(
+                        "SELECT pool_id,generation "
+                        "FROM lp_accounting_pool_generations ORDER BY pool_id"
+                    )
+                ],
+                "pending": tuple(connection.execute(
+                    "SELECT id,position_key,generation,requested_revision,"
+                    "requested_epoch,priority_block,priority_tx_index,"
+                    "priority_log_index FROM lp_accounting_pending"
+                ).fetchone()),
+            }
+
+        committed_before_v9 = committed_state(reader)
+        with store.transaction() as connection:
+            connection.execute("DROP TABLE lp_accounting_pending_identities")
+            connection.execute(
+                "DROP INDEX lp_accounting_pending_identity_bootstrap"
+            )
+            connection.execute("DROP INDEX lp_accounting_pending_recent")
+            connection.execute(
+                "ALTER TABLE lp_accounting_pending "
+                "RENAME TO lp_accounting_pending_v9"
+            )
+            connection.executescript("""
+                CREATE TABLE lp_accounting_pending(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    position_key TEXT NOT NULL UNIQUE,
+                    generation INTEGER NOT NULL,
+                    requested_revision INTEGER NOT NULL,
+                    requested_epoch INTEGER NOT NULL,
+                    priority_block INTEGER NOT NULL,
+                    priority_tx_index INTEGER NOT NULL,
+                    priority_log_index INTEGER NOT NULL
+                );
+                INSERT INTO lp_accounting_pending(
+                    id,position_key,generation,requested_revision,requested_epoch,
+                    priority_block,priority_tx_index,priority_log_index
+                )
+                SELECT
+                    id,position_key,generation,requested_revision,requested_epoch,
+                    priority_block,priority_tx_index,priority_log_index
+                FROM lp_accounting_pending_v9;
+                DROP TABLE lp_accounting_pending_v9;
+                CREATE INDEX lp_accounting_pending_recent
+                    ON lp_accounting_pending(
+                        priority_block DESC,priority_tx_index DESC,
+                        priority_log_index DESC,id DESC
+                    );
+                PRAGMA user_version=8;
+            """)
+        store.close()
+
+        store = MarketStore(path)
+        reader = store.read()
+        committed_after_v9 = committed_state(reader)
+        assert committed_after_v9 == committed_before_v9
+        assert store.cursor("live") == cursor
+        assert tuple(reader.execute(
+            "SELECT identities_ready,identity_cursor "
+            "FROM lp_accounting_pending WHERE position_key='shared-position'"
+        ).fetchone()) == (0, 0)
+
+        with store.transaction() as connection:
+            store._install_accounting_pending_identities(connection)
+            store._install_accounting_pending_identities(connection)
+            connection.execute(
+                "INSERT INTO lp_accounting_pending_identities("
+                "position_key,kind,identity,protocol,pool_id,timestamp"
+                ") VALUES('shared-position','owner','0xowner','v3','',123)"
+            )
+            connection.execute(
+                "DELETE FROM lp_accounting_pending "
+                "WHERE position_key='shared-position'"
+            )
+        assert reader.execute(
+            "SELECT COUNT(*) FROM lp_accounting_pending_identities"
+        ).fetchone()[0] == 0
     finally:
         store.close()
 
