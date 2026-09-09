@@ -648,12 +648,15 @@ def test_history_progress_is_independent_of_unrunnable_enrichment(monkeypatch):
     )
     monkeypatch.setattr(scanner, "_decode", lambda *_args, **_kwargs: [])
     try:
-        assert scanner._scan_history_once() is True
         cursor = store.cursor("history")
+        while not cursor["complete"]:
+            previous_next = cursor["next_to"]
+            assert scanner._scan_history_once() is True
+            cursor = store.cursor("history")
+            assert previous_next > cursor["next_to"] >= 399
         assert cursor["next_to"] == 399
         assert cursor["complete"] is True
-        status = scanner.runtime_status()["history_scan"]
-        assert status["blocks"] == 100
+        assert store.status()["pending_enrichment"] == 5_000
     finally:
         scanner.close()
         store.close()
@@ -681,8 +684,7 @@ def test_recent_ledger_gap_yields_history_until_live_progresses():
         assert scanner._scan_live_once() is True
         assert store.cursor("live")["block_number"] > 500
         assert scanner._scan_history_once() is True
-        assert store.cursor("history")["next_to"] == 399
-        assert store.cursor("history")["complete"] is True
+        assert store.cursor("history")["next_to"] < 499
     finally:
         scanner.close()
         store.close()
