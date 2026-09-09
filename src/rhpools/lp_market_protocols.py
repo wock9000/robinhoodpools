@@ -284,6 +284,19 @@ def nft_position_key(manager: str, token_id: int | str) -> str:
     return f"nft:{address}:{token}"
 
 
+def core_position_key(protocol: str, pool_id: str, core_key: str) -> str:
+    """Qualify an EVM core-position hash by its globally unique pool."""
+    normalized_protocol = str(protocol).lower()
+    if normalized_protocol == "v3":
+        normalized_pool = _address(pool_id, "V3 core position pool")
+    elif normalized_protocol == "v4":
+        normalized_pool = _hash(pool_id, "V4 core position pool")
+    else:
+        raise ProtocolDecodeError("core position protocol must be v3 or v4")
+    raw_key = _hash(core_key, "core position key")
+    return f"{normalized_protocol}:{normalized_pool}:{raw_key}"
+
+
 def unknown_pool_candidates(
     logs: Iterable[Mapping[str, Any]], pools: Mapping[str, Mapping[str, Any]]
 ) -> tuple[str, ...]:
@@ -982,14 +995,17 @@ def _decode_event(
             lower = _topic_sint(topics[2], 24, "V3 tickLower")
             upper = _topic_sint(topics[3], 24, "V3 tickUpper")
             liquidity = _uint(words[1], 128, "V3 Mint liquidity")
+            raw_core_key = _v3_position_key(owner, lower, upper)
             row.update(
-                kind="add", custody=owner, position_key=_v3_position_key(owner, lower, upper),
+                kind="add",
+                custody=owner,
+                position_key=core_position_key("v3", row["pool_id"], raw_core_key),
                 tick_lower=lower, tick_upper=upper, liquidity_delta=str(liquidity),
                 amount0=str(words[2]), amount1=str(words[3]),
                 cashflow0=str(-words[2]), cashflow1=str(-words[3]),
                 accounting_basis="core_mint_exact_position_flow", identity_basis="core_position_custody",
             )
-            row["data"] = {"sender": sender, "core_position_key": row["position_key"]}
+            row["data"] = {"sender": sender, "core_position_key": raw_core_key}
         elif topic0 == V3_BURN_TOPIC:
             if len(topics) != 4:
                 raise ProtocolDecodeError("malformed V3 Burn topics")
@@ -998,10 +1014,13 @@ def _decode_event(
             lower = _topic_sint(topics[2], 24, "V3 tickLower")
             upper = _topic_sint(topics[3], 24, "V3 tickUpper")
             liquidity = _uint(words[0], 128, "V3 Burn liquidity")
+            raw_core_key = _v3_position_key(owner, lower, upper)
             row.update(
                 kind="remove" if liquidity else "checkpoint",
                 custody=owner,
-                position_key=_v3_position_key(owner, lower, upper),
+                position_key=core_position_key(
+                    "v3", row["pool_id"], raw_core_key
+                ),
                 tick_lower=lower,
                 tick_upper=upper,
                 liquidity_delta=str(-liquidity),
@@ -1014,7 +1033,7 @@ def _decode_event(
                 ),
                 identity_basis="core_position_custody",
             )
-            row["data"] = {"core_position_key": row["position_key"]}
+            row["data"] = {"core_position_key": raw_core_key}
         elif topic0 == V3_COLLECT_TOPIC:
             if len(topics) != 4:
                 raise ProtocolDecodeError("malformed V3 Collect topics")
@@ -1025,13 +1044,21 @@ def _decode_event(
             recipient = _word_address(words[0], "V3 Collect recipient")
             amount0 = _uint(words[1], 128, "V3 Collect amount0")
             amount1 = _uint(words[2], 128, "V3 Collect amount1")
+            raw_core_key = _v3_position_key(owner, lower, upper)
             row.update(
-                kind="collect", custody=owner, position_key=_v3_position_key(owner, lower, upper),
+                kind="collect",
+                custody=owner,
+                position_key=core_position_key(
+                    "v3", row["pool_id"], raw_core_key
+                ),
                 tick_lower=lower, tick_upper=upper, amount0=str(amount0), amount1=str(amount1),
                 cashflow0=str(amount0), cashflow1=str(amount1),
                 accounting_basis="core_collect_exact_position_flow", identity_basis="core_position_custody",
             )
-            row["data"] = {"recipient": recipient, "core_position_key": row["position_key"]}
+            row["data"] = {
+                "recipient": recipient,
+                "core_position_key": raw_core_key,
+            }
         elif topic0 == V3_FLASH_TOPIC:
             if len(topics) != 3:
                 raise ProtocolDecodeError("malformed V3 Flash topics")
@@ -1150,12 +1177,12 @@ def _decode_event(
             liquidity_delta = _sint(words[2], 256, "V4 liquidityDelta")
             salt = "0x" + words[3].to_bytes(32, "big").hex()
             kind = "add" if liquidity_delta > 0 else "remove" if liquidity_delta < 0 else "collect"
-            core_position_key = _v4_position_key(custody, lower, upper, salt)
+            raw_core_key = _v4_position_key(custody, lower, upper, salt)
             token_id = str(words[3]) if custody == V4_POSITION_MANAGER else None
             position_key = (
                 nft_position_key(custody, token_id)
                 if token_id is not None
-                else core_position_key
+                else core_position_key("v4", pool_id, raw_core_key)
             )
             row.update(
                 kind=kind, custody=custody, position_key=position_key, token_id=token_id,
@@ -1164,7 +1191,7 @@ def _decode_event(
             )
             row["data"] = {
                 "salt": salt,
-                "core_position_key": core_position_key,
+                "core_position_key": raw_core_key,
                 "trace_complete": False,
                 "cashflow_basis": "pending_trace",
             }
@@ -1481,7 +1508,10 @@ def _correlate_manager_events(
                 continue
             for row, aux in zip(cores, auxiliaries):
                 token_id = aux["token_id"]
-                core_key = row["position_key"]
+                core_key = _hash(
+                    row["data"].get("core_position_key"),
+                    "V3 core position key",
+                )
                 row["token_id"] = str(token_id)
                 row["position_key"] = nft_position_key(aux["manager"], token_id)
                 owner, basis = _owner_from_same_tx_transfers(logs, aux["manager"], token_id, row["log_index"])
@@ -2051,7 +2081,15 @@ def position_state_requests(events: Iterable[Mapping[str, Any]]) -> list[dict[st
         custody = _address(row.get("custody"), "position custody", strict=False)
         token_id_value = row.get("token_id")
         data = row.get("data") if isinstance(row.get("data"), Mapping) else {}
-        core_key = data.get("core_position_key") or row.get("position_key")
+        core_key_value = data.get("core_position_key")
+        if core_key_value is None:
+            legacy_key = str(row.get("position_key") or "").lower()
+            core_key_value = legacy_key if _HASH_RE.fullmatch(legacy_key) else None
+        core_key = (
+            _hash(core_key_value, "core position key")
+            if core_key_value is not None
+            else None
+        )
         pool_value = row.get("pool") if isinstance(row.get("pool"), Mapping) else {}
         token_id: int | None = None
         proof_identity: tuple[str, str, int] | None = None
@@ -2117,7 +2155,7 @@ def position_state_requests(events: Iterable[Mapping[str, Any]]) -> list[dict[st
                     expected_token1=pool_value.get("token1"),
                     expected_fee_ppm=pool_value.get("fee_ppm"),
                 )
-            elif protocol == "v3" and isinstance(core_key, str) and _HASH_RE.fullmatch(core_key.lower()):
+            elif protocol == "v3" and core_key is not None:
                 pool_address = _address(row.get("pool_id"), "V3 pool", strict=False)
                 if pool_address is not None:
                     request = _state_request(
@@ -2132,7 +2170,7 @@ def position_state_requests(events: Iterable[Mapping[str, Any]]) -> list[dict[st
             elif (
                 (protocol == "v4" or custody == V4_POSITION_MANAGER)
                 and isinstance(row.get("pool_id"), str)
-                and isinstance(core_key, str)
+                and core_key is not None
             ):
                 pool_id = _hash(row["pool_id"], "V4 pool id")
                 position_key = _hash(core_key, "V4 position key")
@@ -2541,7 +2579,8 @@ __all__ = [
     "V2_FACTORIES", "V3_FACTORIES", "CONCENTRATED_FACTORIES",
     "SLIPSTREAM_FACTORY", "PANCAKE_V3_FACTORY",
     "MODIFY_LIQUIDITY_SELECTOR", "SWAP_SELECTOR", "ProtocolDecodeError",
-    "decode_logs", "decode_gas_record", "manager_descriptor", "nft_position_key",
+    "core_position_key", "decode_logs", "decode_gas_record", "manager_descriptor",
+    "nft_position_key",
     "repair_v4_owners", "unknown_pool_candidates", "position_state_requests",
     "decode_position_state_results",
 ]

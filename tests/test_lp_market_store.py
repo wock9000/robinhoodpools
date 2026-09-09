@@ -7,6 +7,7 @@ import pytest
 
 from rhpools.lp_market_store import CanonicalConflict, MarketStore
 from rhpools.lp_market_accounting import AccountBook
+from rhpools.lp_market_protocols import core_position_key
 
 
 def header(number: int, *, parent: str | None = None) -> dict[str, str]:
@@ -35,6 +36,53 @@ def event(block: dict[str, str], log_index: int) -> dict[str, object]:
         "token_id": "7",
         "data": {},
     }
+
+
+def v4_core_effect(
+        block, index, raw_key, kind, liquidity_delta, before, after, *,
+        cashflow=(0, 0), fees=(0, 0), deposit_usd=0.0,
+        withdrawal_usd=0.0, fees_usd=0.0):
+    row = event(block, index)
+    row.update({
+        "tx_hash": "0x" + f"{10_000 + index:064x}",
+        "pool_id": None,
+        "protocol": "v4",
+        "kind": kind,
+        "position_key": raw_key,
+        "identity_basis": "verified_owner",
+        "tick_lower": -10,
+        "tick_upper": 10,
+        "liquidity": str(after["liquidity"]),
+        "liquidity_delta": str(liquidity_delta),
+        "amount0": "0",
+        "amount1": "0",
+        "cashflow0": str(cashflow[0]),
+        "cashflow1": str(cashflow[1]),
+        "fee_amount0": str(fees[0]),
+        "fee_amount1": str(fees[1]),
+        "deposit_usd": deposit_usd,
+        "withdrawal_usd": withdrawal_usd,
+        "fees_usd": fees_usd,
+        "accounting_basis": "complete v4 trace",
+        "data": {
+            "core_position_key": raw_key,
+            "position_before": before,
+            "position_after": after,
+            "trace_complete": True,
+            "fees_accrued_exact": True,
+            "principal_delta_exact": True,
+            "principal_delta": {
+                "amount0": str(cashflow[0] - fees[0]),
+                "amount1": str(cashflow[1] - fees[1]),
+            },
+        },
+    })
+    return row
+
+
+def drain_accounting(book):
+    while book.project_pending(limit=32):
+        pass
 
 
 def test_financial_queues_do_not_starve_recent_work_or_history(tmp_path):
@@ -148,6 +196,482 @@ def test_catalog_replay_and_restart_keep_search_counts_exact(tmp_path):
         store = MarketStore(path)
         assert store.search_catalog("v3")[1] == 1
         assert store.search_catalog("BBB USDG")[1] == 1
+    finally:
+        store.close()
+
+
+def test_legacy_core_position_repair_is_bounded_resumable_and_atomic(tmp_path):
+    path = tmp_path / "core-position-repair.sqlite"
+    raw_key = "0x" + "ca" * 32
+    v3_pool = "0x" + "31" * 20
+    v4_pool = "0x" + "42" * 32
+    v3_key = core_position_key("v3", v3_pool, raw_key)
+    v4_key = core_position_key("v4", v4_pool, raw_key)
+    blocks = [header(number) for number in range(10, 16)]
+    cursor = {
+        "from_block": 10,
+        "to_block": 15,
+        "block_number": 15,
+        "block_hash": blocks[-1]["hash"],
+    }
+    rows = []
+    for index, block in enumerate(blocks):
+        protocol = "v3" if index < 3 else "v4"
+        pool_id = v3_pool if protocol == "v3" else v4_pool
+        rows.append({
+            **event(block, index),
+            "tx_hash": "0x" + f"{index + 1:064x}",
+            "pool_id": None if index == 5 else pool_id,
+            "protocol": protocol,
+            "position_key": raw_key,
+            "amount0": str(100 + index),
+            "fees_usd": index + 0.25,
+            "accounting_basis": f"evidence-{index}",
+            "data": {
+                "core_position_key": raw_key,
+                "evidence": {"trace": index, "source": "receipt"},
+            },
+        })
+
+    store = MarketStore(path)
+    try:
+        book = AccountBook(store, deferred=True).install()
+        inserted = store.ingest(blocks, rows, lane="live", cursor=cursor)
+        cursor = store.cursor("live")
+        with store.transaction() as connection:
+            connection.execute("DELETE FROM lp_accounting_pending")
+            store._set_metadata(connection, "pending_accounting", 0)
+            connection.execute(
+                "UPDATE lp_accounting_event_keys SET position_key=?",
+                (raw_key,),
+            )
+            book._queue_position_keys(connection, {raw_key: (15, 0, 5)})
+        event_ids = [int(row["id"]) for row in inserted]
+        source_before = [
+            tuple(row) for row in store.read().execute(
+                "SELECT id,block_number,block_hash,tx_hash,amount0,fees_usd,"
+                "accounting_basis,data FROM events "
+                "ORDER BY block_number,tx_index,log_index"
+            )
+        ]
+        raw_generation = int(store.read().execute(
+            "SELECT generation FROM lp_accounting_pending WHERE position_key=?",
+            (raw_key,),
+        ).fetchone()[0])
+
+        assert store.repair_legacy_core_position_keys(limit=2) is True
+        assert [
+            row["position_key"] for row in store.read().execute(
+                "SELECT position_key FROM events "
+                "ORDER BY block_number,tx_index,log_index"
+            )
+        ] == [v3_key, v3_key, raw_key, raw_key, raw_key, raw_key]
+        assert [
+            row["position_key"] for row in store.read().execute(
+                "SELECT position_key FROM lp_accounting_event_keys "
+                "ORDER BY event_id"
+            )
+        ] == [v3_key, v3_key, raw_key, raw_key, raw_key, raw_key]
+        checkpoint = store._metadata(
+            store.read(), "core_position_key_source_repair_v1", {},
+        )
+        assert checkpoint["after_position_key"] == "0x"
+        assert checkpoint["repaired_events"] == 2
+        assert {
+            row["id"] for row in store.read().execute(
+                "SELECT id FROM lp_search_entities WHERE kind='position'"
+            )
+        } == {raw_key, v3_key}
+        first_pending = {
+            row["position_key"]: int(row["generation"])
+            for row in store.read().execute(
+                "SELECT position_key,generation FROM lp_accounting_pending"
+            )
+        }
+        assert first_pending[raw_key] > raw_generation
+        assert v3_key in first_pending
+        assert store.cursor("live") == cursor
+        store.close()
+
+        store = MarketStore(path)
+        AccountBook(store, deferred=True).install()
+        checkpoint = store._metadata(
+            store.read(), "core_position_key_source_repair_v1", {},
+        )
+        assert checkpoint["after_position_key"] == "0x"
+        assert checkpoint["repaired_events"] == 2
+
+        assert store.repair_legacy_core_position_keys(limit=2) is True
+        assert [
+            row["position_key"] for row in store.read().execute(
+                "SELECT position_key FROM events "
+                "ORDER BY block_number,tx_index,log_index"
+            )
+        ] == [v3_key, v3_key, v3_key, v4_key, raw_key, raw_key]
+        assert store.repair_legacy_core_position_keys(limit=2) is True
+        checkpoint = store._metadata(
+            store.read(), "core_position_key_source_repair_v1", {},
+        )
+        assert checkpoint["after_position_key"] == raw_key
+        assert checkpoint["repaired_events"] == 5
+
+        assert store.repair_legacy_core_position_keys(limit=2) is True
+        reset_checkpoint = store._metadata(
+            store.read(), "core_position_key_source_repair_v1", {},
+        )
+        assert reset_checkpoint["after_position_key"] == "0x"
+        assert reset_checkpoint["cycles"] == 1
+        assert "exhausted_revision" not in reset_checkpoint
+        assert store.repair_legacy_core_position_keys(limit=2) is False
+        exhausted = store._metadata(
+            store.read(), "core_position_key_source_repair_v1", {},
+        )
+        assert exhausted["exhausted_revision"] == store.status()["events_revision"]
+        assert store.repair_legacy_core_position_keys(limit=2) is False
+        assert store._metadata(
+            store.read(), "core_position_key_source_repair_v1", {},
+        ) == exhausted
+
+        store.enrich([{"id": event_ids[-1], "pool_id": v4_pool}])
+        assert store.repair_legacy_core_position_keys(limit=1) is True
+        assert store.repair_legacy_core_position_keys(limit=1) is True
+        assert store.repair_legacy_core_position_keys(limit=1) is False
+        assert [
+            row["position_key"] for row in store.read().execute(
+                "SELECT position_key FROM events "
+                "ORDER BY block_number,tx_index,log_index"
+            )
+        ] == [v3_key, v3_key, v3_key, v4_key, v4_key, v4_key]
+        assert [
+            tuple(row) for row in store.read().execute(
+                "SELECT id,block_number,block_hash,tx_hash,amount0,fees_usd,"
+                "accounting_basis,data FROM events "
+                "ORDER BY block_number,tx_index,log_index"
+            )
+        ] == source_before
+        assert [
+            int(row["id"]) for row in store.read().execute(
+                "SELECT id FROM events ORDER BY block_number,tx_index,log_index"
+            )
+        ] == event_ids
+        assert {
+            row["id"] for row in store.read().execute(
+                "SELECT id FROM lp_search_entities WHERE kind='position'"
+            )
+        } == {v3_key, v4_key}
+        assert store.read().execute(
+            "SELECT 1 FROM lp_search_terms "
+            "WHERE kind='position' AND id=? LIMIT 1",
+            (raw_key,),
+        ).fetchone() is None
+        assert [
+            row["position_key"] for row in store.read().execute(
+                "SELECT position_key FROM lp_accounting_event_keys "
+                "ORDER BY event_id"
+            )
+        ] == [v3_key, v3_key, v3_key, v4_key, v4_key, v4_key]
+        pending = {
+            row["position_key"]: (
+                int(row["generation"]), int(row["requested_revision"])
+            )
+            for row in store.read().execute(
+                "SELECT position_key,generation,requested_revision "
+                "FROM lp_accounting_pending"
+            )
+        }
+        assert set(pending) == {raw_key, v3_key, v4_key}
+        assert pending[raw_key][0] > first_pending[raw_key]
+        events_revision = store.status()["events_revision"]
+        assert pending[v4_key][1] == events_revision
+        assert all(
+            0 < requested_revision <= events_revision
+            for _generation, requested_revision in pending.values()
+        )
+        assert store.cursor("live") == cursor
+        assert store.read().execute(
+            "SELECT COUNT(*) FROM events "
+            "WHERE position_key>=? AND position_key<? "
+            "AND LENGTH(position_key)=66",
+            ("0x", "0y"),
+        ).fetchone()[0] == 0
+    finally:
+        store.close()
+
+
+def test_partial_core_position_repair_unqualifies_legacy_episode_money(tmp_path):
+    raw_key = "0x" + "d1" * 32
+    first_pool = "0x" + "31" * 32
+    second_pool = "0x" + "42" * 32
+    first_key = core_position_key("v4", first_pool, raw_key)
+    second_key = core_position_key("v4", second_pool, raw_key)
+    owner = "0x" + "11" * 20
+    blocks = [header(number) for number in range(10, 14)]
+    empty = {
+        "liquidity": "0", "tokens_owed0": "0", "tokens_owed1": "0",
+        "claims_empty": True,
+    }
+    funded = {
+        "liquidity": "1000", "tokens_owed0": "0", "tokens_owed1": "0",
+        "claims_empty": True,
+    }
+    events = []
+    for offset in (0, 2):
+        events.extend([
+            v4_core_effect(
+                blocks[offset], offset, raw_key, "add", 1000, empty, funded,
+                cashflow=(-10_000_000, -10_000_000), deposit_usd=20.0,
+            ),
+            v4_core_effect(
+                blocks[offset + 1], offset + 1, raw_key, "remove", -1000,
+                funded, empty, cashflow=(11_000_000, 10_000_000),
+                fees=(1_000_000, 0), withdrawal_usd=21.0, fees_usd=1.0,
+            ),
+        ])
+    transactions = [{
+        "tx_hash": row["tx_hash"],
+        "block_number": row["block_number"],
+        "block_hash": row["block_hash"],
+        "payer": owner,
+        "gas_usd": 0.1,
+    } for row in events]
+
+    store = MarketStore(tmp_path / "partial-core-position-repair.sqlite")
+    book = AccountBook(store).install()
+    try:
+        store.upsert_pools([
+            {
+                "id": pool_id, "protocol": "v4", "address": "0x" + "22" * 20,
+                "token0": "0x" + "51" * 20, "token1": "0x" + "62" * 20,
+                "decimals0": 6, "decimals1": 6, "created_block": 10,
+            }
+            for pool_id in (first_pool, second_pool)
+        ])
+        store.ingest(blocks, events, transactions=transactions)
+
+        # AccountBook qualifies pool-aware raw keys at ingestion. Attach the
+        # canonical source scopes after projection to recreate the durable
+        # pre-scope ledger with two closed episodes under one raw identity.
+        with store.transaction() as connection:
+            connection.execute(
+                "UPDATE events SET pool_id=CASE WHEN block_number<=11 THEN ? ELSE ? END "
+                "WHERE position_key=?",
+                (first_pool, second_pool, raw_key),
+            )
+            connection.execute(
+                "UPDATE lp_accounting_episodes "
+                "SET pool_id=CASE WHEN opened_block=10 THEN ? ELSE ? END "
+                "WHERE position_key=?",
+                (first_pool, second_pool, raw_key),
+            )
+            connection.execute(
+                "UPDATE lp_accounting_positions SET pool_id=? WHERE position_key=?",
+                (second_pool, raw_key),
+            )
+
+        original = book.closed({"window": "all"})["rows"]
+        assert len(original) == 2
+        assert all(row["position_key"] == raw_key for row in original)
+        assert all(row["coverage"]["qualified"] for row in original)
+        assert all(row["coverage"]["cost_qualified"] for row in original)
+        baseline_owner = book.owner(owner, {"window": "all"})
+        assert baseline_owner["summary"]["gross_pnl_usd"] == pytest.approx(2.0)
+        assert baseline_owner["summary"]["net_pnl_usd"] == pytest.approx(1.6)
+        store.close()
+        store = MarketStore(tmp_path / "partial-core-position-repair.sqlite")
+        book = AccountBook(store, deferred=True).install()
+
+        assert store.repair_legacy_core_position_keys(limit=2) is True
+        assert book.project_pending(limit=1) is True
+
+        partial = book.closed({"window": "all"})
+        migrated = next(
+            row for row in partial["rows"] if row["position_key"] == first_key
+        )
+        unresolved = [
+            row for row in partial["rows"] if row["position_key"] == raw_key
+        ]
+        assert migrated["coverage"]["qualified"] is True
+        assert migrated["gross_pnl_usd"] == pytest.approx(1.0)
+        assert migrated["net_pnl_usd"] == pytest.approx(0.8)
+        assert unresolved
+        assert all(row["coverage"]["qualified"] is False for row in unresolved)
+        assert all(row["coverage"]["cost_qualified"] is False for row in unresolved)
+        assert all(row[field] is None for row in unresolved for field in (
+            "fees_usd", "gross_pnl_usd", "gas_usd", "net_pnl_usd", "return_pct",
+        ))
+
+        partial_owner = book.owner(owner, {"window": "all"})
+        assert partial_owner["summary"]["gross_pnl_usd"] is None
+        assert partial_owner["summary"]["net_pnl_usd"] is None
+        assert partial_owner["summary"]["fees_usd"] is None
+        assert partial_owner["summary"]["win_rate"] is None
+        assert partial_owner["coverage"]["qualified"] is False
+        owner_row = book.owners({
+            "window": "all", "identity_scope": "wallets",
+        })["rows"][0]
+        assert owner_row["gross_pnl_usd"] is None
+        assert owner_row["net_pnl_usd"] is None
+        assert owner_row["fees_usd"] is None
+        assert owner_row["volume_usd"] is None
+        assert owner_row["win_rate"] is None
+        assert owner_row["coverage"]["qualified"] is False
+
+        assert store.repair_legacy_core_position_keys(limit=2) is True
+        drain_accounting(book)
+
+        repaired = book.closed({"window": "all"})
+        assert repaired["total"] == 2
+        assert {row["position_key"] for row in repaired["rows"]} == {
+            first_key, second_key,
+        }
+        assert all(row["coverage"]["qualified"] for row in repaired["rows"])
+        assert all(row["coverage"]["cost_qualified"] for row in repaired["rows"])
+        assert all(row["gross_pnl_usd"] == pytest.approx(1.0)
+                   for row in repaired["rows"])
+        assert all(row["net_pnl_usd"] == pytest.approx(0.8)
+                   for row in repaired["rows"])
+        final_owner = book.owner(owner, {"window": "all"})
+        assert final_owner["summary"]["positions"] == 2
+        assert final_owner["summary"]["closed_episodes"] == 2
+        assert final_owner["summary"]["gross_pnl_usd"] == pytest.approx(2.0)
+        assert final_owner["summary"]["gas_usd"] == pytest.approx(0.4)
+        assert final_owner["summary"]["net_pnl_usd"] == pytest.approx(1.6)
+        assert final_owner["summary"]["fees_usd"] == pytest.approx(2.0)
+        assert final_owner["summary"]["win_rate"] == pytest.approx(100.0)
+        assert final_owner["coverage"]["qualified"] is True
+        assert final_owner["coverage"]["cost_qualified"] is True
+        final_owner_row = book.owners({
+            "window": "all", "identity_scope": "wallets",
+        })["rows"][0]
+        assert final_owner_row["gross_pnl_usd"] == pytest.approx(2.0)
+        assert final_owner_row["gas_usd"] == pytest.approx(0.4)
+        assert final_owner_row["net_pnl_usd"] == pytest.approx(1.6)
+        assert final_owner_row["fees_usd"] == pytest.approx(2.0)
+        assert final_owner_row["volume_usd"] == pytest.approx(82.0)
+        assert final_owner_row["win_rate"] == pytest.approx(100.0)
+        assert final_owner_row["coverage"]["qualified"] is True
+        assert raw_key not in {
+            row["position_key"] for row in book.positions()["rows"]
+        }
+    finally:
+        store.close()
+
+
+def test_partial_core_position_repair_does_not_double_pool_inventory(tmp_path):
+    raw_key = "0x" + "d2" * 32
+    pool_id = "0x" + "73" * 32
+    scoped_key = core_position_key("v4", pool_id, raw_key)
+    liquidity = 10**18
+    blocks = [header(number) for number in range(10, 140)]
+    empty = {
+        "liquidity": "0", "tokens_owed0": "0", "tokens_owed1": "0",
+        "claims_empty": True,
+    }
+    funded = {
+        "liquidity": str(liquidity), "tokens_owed0": "0", "tokens_owed1": "0",
+        "claims_empty": True,
+    }
+    events = [
+        v4_core_effect(
+            blocks[0], 0, raw_key, "add", liquidity, empty, funded,
+        ),
+        *[
+            v4_core_effect(
+                block, index, raw_key, "checkpoint", 0, funded, funded,
+            )
+            for index, block in enumerate(blocks[1:], 1)
+        ],
+    ]
+
+    store = MarketStore(tmp_path / "partial-core-position-inventory.sqlite")
+    book = AccountBook(store).install()
+    try:
+        store.upsert_pools([{
+            "id": pool_id, "protocol": "v4", "address": "0x" + "22" * 20,
+            "token0": "0x" + "51" * 20, "token1": "0x" + "62" * 20,
+            "decimals0": 6, "decimals1": 6, "created_block": 10,
+        }])
+        with store.transaction() as connection:
+            connection.execute(
+                "CREATE TABLE lp_pool_state("
+                "pool_id TEXT PRIMARY KEY,block_number INTEGER NOT NULL,"
+                "tx_index INTEGER NOT NULL,log_index INTEGER NOT NULL,"
+                "timestamp INTEGER NOT NULL,sqrt_price_x96 TEXT,tick INTEGER,"
+                "liquidity TEXT,price0_usd REAL,price1_usd REAL)"
+            )
+            connection.execute(
+                "INSERT INTO lp_pool_state VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    pool_id, 139, 0, 129, 1_700_000_139, str(1 << 96), 0,
+                    str(liquidity), 1.0, 1.0,
+                ),
+            )
+        store.ingest(blocks, events, cursor={
+            "from_block": 10,
+            "to_block": 139,
+            "block_number": 139,
+            "block_hash": blocks[-1]["hash"],
+        })
+        with store.transaction() as connection:
+            connection.execute(
+                "UPDATE events SET pool_id=? WHERE position_key=?",
+                (pool_id, raw_key),
+            )
+            connection.execute(
+                "UPDATE lp_accounting_positions SET pool_id=? WHERE position_key=?",
+                (pool_id, raw_key),
+            )
+
+        baseline = book.pool_stats([pool_id])[pool_id]
+        assert baseline["open_positions"] == 1
+        assert baseline["complete_inventory"] is True
+        assert baseline["observed_principal_usd"] is not None
+        assert baseline["observed_principal_usd"] > 0
+        assert baseline["observed_active_tvl_usd"] == pytest.approx(
+            baseline["observed_principal_usd"],
+        )
+        store.close()
+        store = MarketStore(tmp_path / "partial-core-position-inventory.sqlite")
+        book = AccountBook(store, deferred=True).install()
+
+        assert store.repair_legacy_core_position_keys(limit=128) is True
+        assert book.project_pending(limit=1) is True
+
+        positions = {
+            row["position_key"]: row
+            for row in book.positions({"status": "open"})["rows"]
+        }
+        assert set(positions) == {raw_key, scoped_key}
+        assert positions[raw_key]["liquidity"] is None
+        assert positions[raw_key]["principal_usd"] is None
+        assert positions[raw_key]["equity_usd"] is None
+        assert positions[raw_key]["coverage"]["qualified"] is False
+        assert int(positions[scoped_key]["liquidity"]) == liquidity
+        partial = book.pool_stats([pool_id])[pool_id]
+        assert partial["open_positions"] == 2
+        assert partial["complete_inventory"] is False
+        assert partial["observed_principal_usd"] == pytest.approx(
+            baseline["observed_principal_usd"],
+        )
+        assert partial["observed_active_tvl_usd"] == pytest.approx(
+            baseline["observed_active_tvl_usd"],
+        )
+
+        assert store.repair_legacy_core_position_keys(limit=128) is True
+        drain_accounting(book)
+
+        repaired_positions = book.positions({"status": "open"})["rows"]
+        assert len(repaired_positions) == 1
+        assert repaired_positions[0]["position_key"] == scoped_key
+        repaired = book.pool_stats([pool_id])[pool_id]
+        assert repaired["open_positions"] == 1
+        assert repaired["complete_inventory"] is True
+        assert repaired["observed_principal_usd"] == pytest.approx(
+            baseline["observed_principal_usd"],
+        )
+        assert repaired["observed_active_tvl_usd"] == pytest.approx(
+            baseline["observed_active_tvl_usd"],
+        )
     finally:
         store.close()
 

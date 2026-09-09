@@ -64,13 +64,15 @@ HISTORY_MAX_CHUNK = 32_768
 # Background history uses a shorter writer target so financial lanes can run.
 MAX_INTERVAL_STORE_SECONDS = 2.0
 HISTORY_MAX_INTERVAL_STORE_SECONDS = 0.2
-ENRICH_BATCH = 4
+ENRICH_BATCH = 8
 ENRICHMENT_CAPABILITY_RECHECK_S = 300.0
 ENRICH_TRACE_BATCH = 2
 ENRICH_WORKERS = 8
 ENRICH_TRACE_WORKERS = 4
-ENRICH_INFLIGHT_LIMIT = ENRICH_BATCH * ENRICH_WORKERS
+ENRICH_REGULAR_INFLIGHT_LIMIT = ENRICH_BATCH * ENRICH_WORKERS
+ENRICH_TRACE_INFLIGHT_LIMIT = ENRICH_TRACE_BATCH * ENRICH_TRACE_WORKERS
 REPROJECT_BATCH = 128
+CORE_POSITION_REPAIR_BATCH = 128
 V4_OWNER_REPAIR_LIMIT = 32
 V4_OWNER_REPAIR_SCAN = 8192
 V3_BIRTH_REPAIR_PREFIXES = tuple(
@@ -4469,13 +4471,19 @@ class MarketIndexer:
     def _fill_enrichment_jobs(
         self, reserved: Iterable[str] = (),
     ) -> None:
-        active = sum(
-            len(rows)
-            for rows, _future, _started, _trace
-            in self._enrichment_jobs.values()
+        active_by_lane = {False: 0, True: 0}
+        for rows, _future, _started, trace in self._enrichment_jobs.values():
+            active_by_lane[trace] += len(rows)
+        regular_capacity = max(
+            0, ENRICH_REGULAR_INFLIGHT_LIMIT - active_by_lane[False],
         )
-        capacity = ENRICH_INFLIGHT_LIMIT - active
-        if capacity <= 0 or self._stop.is_set():
+        trace_capacity = max(
+            0, ENRICH_TRACE_INFLIGHT_LIMIT - active_by_lane[True],
+        )
+        if (
+            (regular_capacity == 0 and trace_capacity == 0)
+            or self._stop.is_set()
+        ):
             return
         blocked = {
             str(row["tx_hash"])
@@ -4483,21 +4491,21 @@ class MarketIndexer:
             for row in rows
         }
         blocked.update(str(tx_hash) for tx_hash in reserved)
-        selection_limit = min(256, capacity + len(blocked))
-        candidates = []
-        for row in self.store.pending_enrichments(selection_limit):
-            if str(row["tx_hash"]) in blocked:
-                continue
-            candidates.append(row)
-            if len(candidates) == capacity:
-                break
+        selection_limit = min(
+            256, regular_capacity + trace_capacity + len(blocked),
+        )
+        candidates = [
+            row
+            for row in self.store.pending_enrichments(selection_limit)
+            if str(row["tx_hash"]) not in blocked
+        ]
         trace_hashes = self._pending_v4_trace_hashes(candidates)
         trace_rows = [
             row for row in candidates if str(row["tx_hash"]) in trace_hashes
-        ]
+        ][:trace_capacity]
         regular_rows = [
             row for row in candidates if str(row["tx_hash"]) not in trace_hashes
-        ]
+        ][:regular_capacity]
         batches = [
             *(
                 (tuple(regular_rows[offset:offset + ENRICH_BATCH]), False)
@@ -5008,7 +5016,12 @@ class MarketIndexer:
         while not self._stop.is_set():
             try:
                 started = time.monotonic()
-                worked = self.store.repair_v3_birth_history(V3_BIRTH_REPAIR_PREFIXES)
+                worked = self.store.repair_legacy_core_position_keys(
+                    limit=CORE_POSITION_REPAIR_BATCH,
+                )
+                worked = worked or self.store.repair_v3_birth_history(
+                    V3_BIRTH_REPAIR_PREFIXES,
+                )
                 worked = self._repair_v4_owners_once() or worked
                 if worked:
                     self._set_runtime("repair", latency=time.monotonic() - started)

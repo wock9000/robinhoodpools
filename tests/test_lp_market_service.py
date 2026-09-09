@@ -644,6 +644,159 @@ def owner_open(block, owner, key):
     return event
 
 
+def test_backfill_preserves_published_episode_ids_and_returns(tmp_path):
+    path = tmp_path / "stable-episodes.sqlite"
+    store, book = accounting_store(path, deferred=True)
+    try:
+        recent_blocks = [header(200 + index, 2_000 + index) for index in range(2)]
+        recent_open, recent_close, recent_gas = traced_v4_episode(recent_blocks)
+        store.ingest(
+            recent_blocks, [recent_open, recent_close],
+            transactions=[{**row, "gas_usd": None} for row in recent_gas],
+        )
+        drain_accounting(book)
+        recent = book.closed({"window": "all"})["rows"][0]
+        assert recent["net_pnl_usd"] is None
+        store.enrich([recent_open, recent_close], transactions=recent_gas)
+        drain_accounting(book)
+        recent = book.closed({"window": "all"})["rows"][0]
+        assert recent["net_pnl_usd"] == pytest.approx(0.08)
+
+        older_blocks = [header(100 + index, 1_000 + index) for index in range(2)]
+        older_open, older_close, older_gas = traced_v4_episode(older_blocks)
+        store.ingest(
+            older_blocks, [older_open, older_close], transactions=older_gas, lane="backfill",
+        )
+        drain_accounting(book)
+        published = {
+            int(row["opened_at"]): row
+            for row in book.closed({"window": "all"})["rows"]
+        }
+        assert published[2000]["id"] == recent["id"]
+        assert published[2000]["net_pnl_usd"] == pytest.approx(
+            recent["net_pnl_usd"],
+        )
+        assert published[1000]["id"] != recent["id"]
+        assert published[1000]["net_pnl_usd"] == pytest.approx(0.08)
+        ids = {block: row["id"] for block, row in published.items()}
+
+        orphan_block = header(202, 2_002)
+        orphan = lp_effect(
+            orphan_block, "v4", "checkpoint", 0, (0, 0),
+            position_state(0), position_state(0), key="deferred",
+        )
+        store.ingest([orphan_block], [orphan], transactions=[{
+            "tx_hash": orphan["tx_hash"],
+            "block_number": orphan["block_number"],
+            "block_hash": orphan["block_hash"],
+            "payer": TOKEN,
+            "gas_usd": 0.01,
+        }])
+        store.rollback(201)
+        store.close()
+
+        store, book = accounting_store(path, deferred=True)
+        drain_accounting(book)
+        replayed = {
+            int(row["opened_at"]): row
+            for row in book.closed({"window": "all"})["rows"]
+        }
+        assert {block: row["id"] for block, row in replayed.items()} == ids
+        assert all(
+            row["net_pnl_usd"] == pytest.approx(0.08)
+            for row in replayed.values()
+        )
+        owner_episodes = {
+            int(row["opened_at"]): row
+            for position in book.owner(TOKEN, {"window": "all"})["positions"]
+            for row in position["episodes"]
+        }
+        assert {
+            block: row["id"] for block, row in owner_episodes.items()
+        } == ids
+        assert all(
+            row["net_pnl_usd"] == pytest.approx(0.08)
+            for row in owner_episodes.values()
+        )
+    finally:
+        store.close()
+
+
+def test_source_correction_removes_stale_episode_gas(tmp_path):
+    blocks = [header(100 + index, 1_000 + index) for index in range(3)]
+    opened, closed, transactions = traced_v4_episode(
+        [blocks[0], blocks[2]], key="gas-correction",
+    )
+    intermediate = lp_effect(
+        blocks[1], "v4", "checkpoint", 0, (0, 0),
+        position_state(1_000), position_state(1_000), key="gas-correction",
+    )
+    intermediate.update(
+        owner=TOKEN, custody=MANAGER,
+        cashflow0="0", cashflow1="0", fee_amount0="0", fee_amount1="0",
+    )
+    intermediate["data"].update(
+        trace_complete=True, fees_accrued_exact=True,
+        principal_delta_exact=True,
+        principal_delta={"amount0": "0", "amount1": "0"},
+    )
+    transactions.insert(1, {
+        "tx_hash": intermediate["tx_hash"],
+        "block_number": intermediate["block_number"],
+        "block_hash": intermediate["block_hash"],
+        "payer": TOKEN,
+        "gas_usd": 0.01,
+    })
+    store, book = accounting_store(
+        tmp_path / "gas-correction.sqlite", deferred=True,
+    )
+    try:
+        store.ingest(
+            blocks, [opened, intermediate, closed], transactions=transactions,
+        )
+        drain_accounting(book)
+        before = book.closed({"window": "all"})["rows"][0]
+        assert before["deposit_usd"] == pytest.approx(2)
+        assert before["withdrawal_usd"] == pytest.approx(2)
+        assert before["fees_usd"] == pytest.approx(0.1)
+        assert before["gross_pnl_usd"] == pytest.approx(0.1)
+        assert before["gas_usd"] == pytest.approx(0.03)
+        assert before["net_pnl_usd"] == pytest.approx(0.07)
+
+        store.enrich([{
+            **intermediate,
+            "position_key": None,
+            "owner": None,
+            "custody": None,
+            "identity_basis": "unresolved_position",
+        }])
+        drain_accounting(book)
+
+        after = book.closed({"window": "all"})["rows"][0]
+        assert after["id"] == before["id"]
+        assert after["deposit_usd"] == pytest.approx(before["deposit_usd"])
+        assert after["withdrawal_usd"] == pytest.approx(before["withdrawal_usd"])
+        assert after["fees_usd"] == pytest.approx(before["fees_usd"])
+        assert after["gross_pnl_usd"] == pytest.approx(before["gross_pnl_usd"])
+        assert after["gas_usd"] == pytest.approx(0.02)
+        assert after["net_pnl_usd"] == pytest.approx(0.08)
+
+        detail = book.owner(TOKEN, {"window": "all"})
+        owner_episode = next(
+            row
+            for position in detail["positions"]
+            if position["position_key"] == "v4:gas-correction"
+            for row in position["episodes"]
+            if row["id"] == before["id"]
+        )
+        assert owner_episode["gas_usd"] == pytest.approx(0.02)
+        assert owner_episode["net_pnl_usd"] == pytest.approx(0.08)
+        assert detail["summary"]["gas_usd"] == pytest.approx(0.02)
+        assert detail["summary"]["net_pnl_usd"] == pytest.approx(0.08)
+    finally:
+        store.close()
+
+
 def test_deferred_accounting_does_not_hold_writer_and_drains_same_branch_prefix(
         tmp_path, monkeypatch):
     blocks = [header(100 + index, 1_000 + index) for index in range(2)]

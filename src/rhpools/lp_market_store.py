@@ -13,6 +13,8 @@ from itertools import chain, islice
 from pathlib import Path
 from typing import Any
 
+from .lp_market_protocols import core_position_key
+
 
 ProjectionApply = Callable[[sqlite3.Connection, list[dict[str, Any]]], None]
 ProjectionRollback = Callable[[sqlite3.Connection, int], None]
@@ -62,6 +64,9 @@ SEARCH_KINDS = frozenset({
     "pool", "token", "protocol", "owner", "custody", "transaction", "position",
 })
 _SEARCH_WORD_RE = re.compile(r"[a-z0-9]+")
+_CORE_POSITION_REPAIR_CHECKPOINT = "core_position_key_source_repair_v1"
+_CORE_POSITION_KEY_START = "0x"
+_CORE_POSITION_KEY_END = "0y"
 
 
 class MarketStoreError(RuntimeError):
@@ -2559,6 +2564,115 @@ class MarketStore:
             if removed:
                 self._bump(connection, "pending_reprojection", -removed)
             return events
+
+    def repair_legacy_core_position_keys(self, *, limit: int = 128) -> bool:
+        """Qualify one bounded chronological page of legacy V3/V4 core rows."""
+        repair_limit = max(1, min(int(limit), 512))
+        eligible = (
+            "position_key=? AND protocol IN ('v3','v4') "
+            "AND pool_id IS NOT NULL AND TRIM(pool_id)<>''"
+        )
+        with self.transaction() as connection:
+            checkpoint = self._metadata(
+                connection, _CORE_POSITION_REPAIR_CHECKPOINT, {},
+            )
+            after = str(
+                checkpoint.get("after_position_key", _CORE_POSITION_KEY_START)
+            ).lower()
+            if after < _CORE_POSITION_KEY_START or after >= _CORE_POSITION_KEY_END:
+                after = _CORE_POSITION_KEY_START
+            events_revision = int(self._metadata(connection, "events_revision", 0))
+            if (
+                checkpoint
+                and after == _CORE_POSITION_KEY_START
+                and int(checkpoint.get("exhausted_revision", -1)) == events_revision
+            ):
+                return False
+            selected = connection.execute(
+                "SELECT position_key FROM events "
+                "INDEXED BY events_position_order_idx "
+                "WHERE position_key>? AND position_key<? "
+                "AND LENGTH(position_key)=66 "
+                "AND SUBSTR(position_key,3) NOT GLOB '*[^0-9a-f]*' "
+                "AND protocol IN ('v3','v4') "
+                "AND pool_id IS NOT NULL AND TRIM(pool_id)<>'' "
+                "ORDER BY position_key,block_number,tx_index,log_index LIMIT 1",
+                (after, _CORE_POSITION_KEY_END),
+            ).fetchone()
+            if selected is None:
+                reset = after != _CORE_POSITION_KEY_START
+                self._set_metadata(connection, _CORE_POSITION_REPAIR_CHECKPOINT, {
+                    "after_position_key": _CORE_POSITION_KEY_START,
+                    "cycles": (
+                        int(checkpoint.get("cycles", 0))
+                        + int(reset or not checkpoint)
+                    ),
+                    "completed_keys": int(checkpoint.get("completed_keys", 0)),
+                    "repaired_events": int(checkpoint.get("repaired_events", 0)),
+                    "repaired_pages": int(checkpoint.get("repaired_pages", 0)),
+                    **({} if reset else {"exhausted_revision": events_revision}),
+                })
+                return reset
+
+            legacy_key = str(selected["position_key"])
+            rows = connection.execute(
+                "SELECT * FROM events INDEXED BY events_position_order_idx "
+                f"WHERE {eligible} "
+                "ORDER BY block_number,tx_index,log_index LIMIT ?",
+                (legacy_key, repair_limit),
+            ).fetchall()
+            events = [dict(row) for row in rows]
+            revision = self._next_revision(connection)
+            for event in events:
+                event["data"] = _decode_json(event.get("data"), event.get("data"))
+                event["position_key"] = core_position_key(
+                    str(event["protocol"]),
+                    str(event["pool_id"]),
+                    legacy_key,
+                )
+                event["revision"] = revision
+            self._set_metadata(connection, "events_revision", revision)
+            connection.executemany(
+                "UPDATE events SET position_key=?,revision=? WHERE id=?",
+                ((event["position_key"], revision, int(event["id"])) for event in events),
+            )
+            for apply, _rollback, _persists_events in self._projections:
+                apply(connection, events)
+            if any(not item[2] for item in self._projections):
+                search_rows = self._persist_projection_mutations(
+                    connection, events, revision,
+                )
+            else:
+                search_rows = [
+                    self._event_row(event, revision) for event in events
+                ]
+            self._index_event_search_batch(connection, search_rows)
+            if connection.execute(
+                "SELECT 1 FROM events INDEXED BY events_position_order_idx "
+                "WHERE position_key=? LIMIT 1",
+                (legacy_key,),
+            ).fetchone() is None:
+                connection.execute(
+                    "DELETE FROM lp_search_entities WHERE kind='position' AND id=?",
+                    (legacy_key,),
+                )
+            key_complete = connection.execute(
+                "SELECT 1 FROM events INDEXED BY events_position_order_idx "
+                f"WHERE {eligible} LIMIT 1",
+                (legacy_key,),
+            ).fetchone() is None
+            self._set_metadata(connection, _CORE_POSITION_REPAIR_CHECKPOINT, {
+                "after_position_key": legacy_key if key_complete else after,
+                "cycles": int(checkpoint.get("cycles", 0)),
+                "completed_keys": (
+                    int(checkpoint.get("completed_keys", 0)) + int(key_complete)
+                ),
+                "repaired_events": (
+                    int(checkpoint.get("repaired_events", 0)) + len(events)
+                ),
+                "repaired_pages": int(checkpoint.get("repaired_pages", 0)) + 1,
+            })
+            return True
 
     def repair_v3_birth_history(
         self, prefixes: Sequence[str], *, limit: int = 32,

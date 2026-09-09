@@ -21,6 +21,7 @@ import time
 from typing import Any, Iterable, NamedTuple, Sequence
 
 from .lp_math import principal_raw
+from .lp_market_protocols import core_position_key
 
 
 _ZERO_ADDRESS = "0x" + "0" * 40
@@ -208,6 +209,12 @@ CREATE INDEX IF NOT EXISTS lp_accounting_episodes_closed_order
 CREATE INDEX IF NOT EXISTS lp_accounting_episodes_owner_position
     ON lp_accounting_episodes(owner,position_key);
 
+CREATE TABLE IF NOT EXISTS lp_accounting_replay_identities (
+    position_key TEXT PRIMARY KEY,
+    episode_ordinal INTEGER NOT NULL,
+    episodes TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS lp_accounting_effects (
     event_id INTEGER PRIMARY KEY,
     position_key TEXT NOT NULL,
@@ -371,6 +378,38 @@ class _ReplayWrites:
         self._prepared_rows: dict[str, list[tuple[Any, ...]]] | None = None
         self._affected_txs: set[str] = set()
         self._changed_episodes: set[str] = set()
+        self.episode_ids: dict[tuple[int, int, int], tuple[str, int]] = {}
+
+    def restore_episode_identity(
+        self, conn: sqlite3.Connection, state: dict[str, Any],
+    ) -> None:
+        """Keep persisted episode IDs when backfill adds earlier boundaries."""
+        ordinal = int(state.get("episode_ordinal") or 0)
+        prior = conn.execute(
+            "SELECT json_extract(state_json,'$.episode_ordinal') "
+            "FROM lp_accounting_positions WHERE position_key=?", (self.position_key,),
+        ).fetchone()
+        if prior is not None:
+            ordinal = max(ordinal, int(prior[0] or 0))
+        saved = conn.execute(
+            "SELECT episode_ordinal,episodes FROM lp_accounting_replay_identities "
+            "WHERE position_key=?", (self.position_key,),
+        ).fetchone()
+        if saved is not None:
+            ordinal = max(ordinal, int(saved[0]))
+            for row in json.loads(saved[1]):
+                self.episode_ids[(int(row[2]), int(row[3]), int(row[4]))] = (
+                    str(row[0]), int(row[1]),
+                )
+        for row in conn.execute(
+            "SELECT id,ordinal,opened_block,opened_tx_index,opened_log_index "
+            "FROM lp_accounting_episodes WHERE position_key=?", (self.position_key,),
+        ):
+            self.episode_ids[(int(row[2]), int(row[3]), int(row[4]))] = (
+                str(row[0]), int(row[1]),
+            )
+            ordinal = max(ordinal, int(row[1]))
+        state["episode_ordinal"] = ordinal
 
     def add(
         self, group: str, key: Any, sql: str, row: tuple[Any, ...],
@@ -407,10 +446,20 @@ class _ReplayWrites:
             deletes[group] = [
                 key if isinstance(key, tuple) else (key,) for key in stale
             ]
-            changed_keys = [
-                key for key, row in desired.items()
-                if existing.get(key) != row
-            ]
+            if group == "episodes":
+                # Valuation and costs (columns 44:52) are derived after
+                # publication. Cleared replay placeholders must not dirty
+                # otherwise unchanged episodes.
+                changed_keys = [
+                    key for key, row in desired.items()
+                    if (prior := existing.get(key)) is None
+                    or prior[:44] != row[:44] or prior[52:] != row[52:]
+                ]
+            else:
+                changed_keys = [
+                    key for key, row in desired.items()
+                    if existing.get(key) != row
+                ]
             changed[group] = [desired[key] for key in changed_keys]
             if group == "episodes":
                 self._changed_episodes.update(
@@ -423,48 +472,73 @@ class _ReplayWrites:
                 )
 
         desired_effects = self._rows["effects"]
-        desired_ids = sorted(int(key) for key in desired_effects)
-        existing_effects: dict[int, tuple[Any, ...]] = {}
-        for batch in _batches(desired_ids):
+        remaining_ids = set(desired_effects)
+        changed_effects: list[int] = []
+        stale_effects: list[int] = []
+        columns = ",".join(_EFFECT_COLUMNS)
+        # Stream the position range instead of retaining a second full history
+        # of Python rows and probing every effect again by primary key.
+        for row in conn.execute(
+            f"SELECT {columns} FROM lp_accounting_effects WHERE position_key=?",
+            (self.position_key,),
+        ):
+            event_id = int(row[0])
+            desired = desired_effects.get(event_id)
+            if desired is None:
+                stale_effects.append(event_id)
+                if row[5]:
+                    self._affected_txs.add(str(row[5]))
+                if row[2]:
+                    self._changed_episodes.add(str(row[2]))
+                continue
+            remaining_ids.discard(event_id)
+            if tuple(row) != desired:
+                changed_effects.append(event_id)
+                if row[5]:
+                    self._affected_txs.add(str(row[5]))
+                if row[2] and row[2] != desired[2]:
+                    self._changed_episodes.add(str(row[2]))
+                if desired[5]:
+                    self._affected_txs.add(str(desired[5]))
+        # A newly mapped event may still belong to another position. Preserve
+        # that prior transaction's attribution when moving the effect.
+        for batch in _batches(sorted(remaining_ids)):
             marks = ",".join("?" for _ in batch)
-            existing_effects.update({
-                int(row[0]): tuple(row)
-                for row in conn.execute(
-                    f"SELECT {','.join(_EFFECT_COLUMNS)} "
-                    f"FROM lp_accounting_effects WHERE event_id IN ({marks})",
-                    batch,
-                ).fetchall()
-            })
-        existing_ids = {
-            int(row[0]) for row in conn.execute(
-                "SELECT event_id FROM lp_accounting_effects "
-                "WHERE position_key=?",
-                (self.position_key,),
-            ).fetchall()
-        }
-        stale_effects = sorted(existing_ids - desired_effects.keys())
-        deletes["effects"] = [(event_id,) for event_id in stale_effects]
-        for batch in _batches(stale_effects):
-            marks = ",".join("?" for _ in batch)
-            self._affected_txs.update(str(row[0]) for row in conn.execute(
-                "SELECT DISTINCT tx_hash FROM lp_accounting_effects "
-                f"WHERE event_id IN ({marks}) AND tx_hash<>''",
-                batch,
-            ).fetchall())
-        changed_effects = [
-            event_id for event_id in desired_ids
-            if existing_effects.get(event_id) != desired_effects[event_id]
-        ]
+            existing = {
+                int(row[0]): tuple(row) for row in conn.execute(
+                    f"SELECT {columns} FROM lp_accounting_effects "
+                    f"WHERE event_id IN ({marks})", batch,
+                )
+            }
+            for event_id in batch:
+                desired = desired_effects[event_id]
+                prior = existing.get(event_id)
+                if prior == desired:
+                    continue
+                changed_effects.append(event_id)
+                if prior is not None and prior[5]:
+                    self._affected_txs.add(str(prior[5]))
+                if prior is not None and prior[2] and prior[2] != desired[2]:
+                    self._changed_episodes.add(str(prior[2]))
+                if desired[5]:
+                    self._affected_txs.add(str(desired[5]))
+        deletes["effects"] = [(event_id,) for event_id in sorted(stale_effects)]
         changed["effects"] = [
-            desired_effects[event_id] for event_id in changed_effects
+            desired_effects[event_id] for event_id in sorted(changed_effects)
         ]
-        for event_id in changed_effects:
-            row = desired_effects[event_id]
-            prior = existing_effects.get(event_id)
-            if prior is not None and prior[5]:
-                self._affected_txs.add(str(prior[5]))
-            if row[5]:
-                self._affected_txs.add(str(row[5]))
+        if desired_effects:
+            # Receipt or price enrichment can change gas without changing any
+            # LP effect. Retain those dependencies instead of waiting for a
+            # later liquidity action to refresh transaction attribution.
+            self._affected_txs.update(str(row[0]) for row in conn.execute(
+                "SELECT observed.tx_hash FROM (SELECT DISTINCT tx_hash "
+                "FROM lp_accounting_effects WHERE position_key=? AND tx_hash<>'') observed "
+                "LEFT JOIN transactions t ON t.tx_hash=observed.tx_hash "
+                "LEFT JOIN lp_accounting_tx_costs c ON c.tx_hash=observed.tx_hash "
+                "WHERE c.tx_hash IS NULL OR (t.tx_hash IS NOT NULL AND "
+                "(c.payer IS NOT t.payer OR c.gas_usd IS NOT t.gas_usd))",
+                (self.position_key,),
+            ))
         for batch in _batches(sorted(owner_changed_episodes)):
             marks = ",".join("?" for _ in batch)
             self._affected_txs.update(str(row[0]) for row in conn.execute(
@@ -474,6 +548,8 @@ class _ReplayWrites:
             ).fetchall())
         self._prepared_deletes = deletes
         self._prepared_rows = changed
+        self._rows.clear()
+        self.episode_ids.clear()
 
     def flush(
         self, conn: sqlite3.Connection,
@@ -490,6 +566,10 @@ class _ReplayWrites:
             statement = self._statements.get(group)
             if changed_rows and statement is not None:
                 conn.executemany(statement, changed_rows)
+        conn.execute(
+            "DELETE FROM lp_accounting_replay_identities WHERE position_key=?",
+            (self.position_key,),
+        )
         return set(self._affected_txs), set(self._changed_episodes)
 
 
@@ -749,6 +829,11 @@ class AccountBook:
                 )
             with self.store.transaction() as conn:
                 self.store._install_accounting_pending_identities(conn)
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS lp_accounting_pending_identities_pool "
+                    "ON lp_accounting_pending_identities(pool_id,position_key) "
+                    "WHERE kind='scope'"
+                )
                 prior = {
                     str(row[0]): str(row[1])
                     for row in conn.execute(
@@ -838,7 +923,11 @@ class AccountBook:
         # of allocator arenas after the rebuild had finished.
         conn.execute(
             "INSERT INTO lp_accounting_event_keys(event_id,position_key,token_id) "
-            "SELECT id,LOWER(TRIM(position_key)),"
+            "SELECT id,CASE WHEN protocol IN ('v3','v4') AND pool_id IS NOT NULL "
+            "AND TRIM(pool_id)<>'' AND LENGTH(TRIM(position_key))=66 "
+            "AND LOWER(TRIM(position_key)) LIKE '0x%' "
+            "THEN protocol||':'||LOWER(TRIM(pool_id))||':'||LOWER(TRIM(position_key)) "
+            "ELSE LOWER(TRIM(position_key)) END,"
             "CASE WHEN token_id IS NULL THEN NULL ELSE CAST(token_id AS TEXT) END "
             "FROM events WHERE position_key IS NOT NULL AND TRIM(position_key)<>'' "
             "ON CONFLICT(event_id) DO UPDATE SET "
@@ -854,6 +943,9 @@ class AccountBook:
             key = str(
                 _json(event.get("data")).get("position_key") or ""
             ).strip().lower()
+        protocol = str(event.get("protocol") or "").lower()
+        if len(key) == 66 and key.startswith("0x") and protocol in ("v3", "v4") and event.get("pool_id"):
+            return core_position_key(protocol, str(event["pool_id"]), key)
         return key
 
     @staticmethod
@@ -1291,6 +1383,18 @@ class AccountBook:
         requested_capacity = min(
             max(0, limit - historical), max(1, limit // 4),
         )
+        # Raw hashes are not global identities. Source repair moves their
+        # mappings into pool scopes; retire the legacy projection only after
+        # those scoped projections finish, without replaying conflated history.
+        eligible = (
+            "(LENGTH(position_key)<>66 OR position_key NOT LIKE '0x%' OR (NOT EXISTS("
+            "SELECT 1 FROM lp_accounting_event_keys k "
+            "WHERE k.position_key=lp_accounting_pending.position_key) AND NOT EXISTS("
+            "SELECT 1 FROM lp_accounting_pending_identities h "
+            "JOIN lp_accounting_pending scoped ON scoped.position_key="
+            "h.protocol||':'||h.pool_id||':'||lp_accounting_pending.position_key "
+            "WHERE h.position_key=lp_accounting_pending.position_key AND h.kind='scope')))"
+        )
         now = time.monotonic()
         with self._priority_lock:
             while self._priority_positions:
@@ -1308,7 +1412,7 @@ class AccountBook:
                 str(row["position_key"]): row
                 for row in _dict_rows(conn.execute(
                     "SELECT * FROM lp_accounting_pending "
-                    f"WHERE position_key IN ({marks})",
+                    f"WHERE position_key IN ({marks}) AND {eligible}",
                     batch,
                 ))
             })
@@ -1329,6 +1433,7 @@ class AccountBook:
         if recent_capacity:
             recent = _dict_rows(conn.execute(
                 "SELECT * FROM lp_accounting_pending "
+                f"WHERE {eligible} "
                 "ORDER BY priority_block DESC,priority_tx_index DESC,"
                 "priority_log_index DESC,id DESC LIMIT ?",
                 (recent_capacity + len(seen),),
@@ -1341,7 +1446,7 @@ class AccountBook:
                     if len(selected) >= limit - historical:
                         break
         oldest = _dict_rows(conn.execute(
-            "SELECT * FROM lp_accounting_pending ORDER BY id LIMIT ?",
+            f"SELECT * FROM lp_accounting_pending WHERE {eligible} ORDER BY id LIMIT ?",
             (historical + len(seen),),
         ))
         for row in oldest:
@@ -1467,9 +1572,10 @@ class AccountBook:
                         affected_txs.update(changes.tx_hashes)
                         changed_episodes.update(changes.episode_ids)
                     if position_keys:
-                        self._refresh_position_values(
+                        values = self._refresh_position_values(
                             conn, sorted(position_keys),
                         )
+                        self._refresh_active_episode_values(conn, values)
                         self._rebuild_tx_costs(conn, affected_txs)
                         self._refresh_episode_costs(
                             conn, affected_txs,
@@ -1573,126 +1679,164 @@ class AccountBook:
                 candidates[position_key] = candidate
         if not candidates:
             return False
-
-        with self._projection_lock:
-            with self.store.transaction() as conn:
-                current_epoch = self._store_metadata_int(conn, "epoch")
-                positions: dict[str, dict[str, Any]] = {}
-                existing_claims: dict[str, dict[str, Any]] = {}
-                for batch in _batches(sorted(candidates)):
-                    marks = ",".join("?" for _ in batch)
-                    positions.update({
-                        str(row["position_key"]): row
-                        for row in _dict_rows(conn.execute(
-                            "SELECT p.position_key,p.pool_id,p.protocol,"
-                            "p.active_episode_id,p.last_block,p.last_tx_index,"
-                            "p.last_log_index,p.liquidity,p.liquidity_known,"
-                            "p.pending_principal0,p.pending_principal1,p.pending_known,p.state_json,"
-                            "q.position_key AS pending_position "
-                            "FROM lp_accounting_positions p "
-                            "LEFT JOIN lp_accounting_pending q "
-                            "ON q.position_key=p.position_key "
-                            f"WHERE p.position_key IN ({marks})",
-                            batch,
-                        ))
-                    })
-                    existing_claims.update({
-                        str(row["position_key"]): row
-                        for row in _dict_rows(conn.execute(
-                            "SELECT * FROM lp_accounting_claims "
-                            f"WHERE position_key IN ({marks})",
-                            batch,
-                        ))
-                    })
-                block_numbers = sorted({
-                    int(candidate[2]) for candidate in candidates.values()
+        with self.store.transaction() as conn:
+            current_epoch = self._store_metadata_int(conn, "epoch")
+            positions: dict[str, dict[str, Any]] = {}
+            existing_claims: dict[str, dict[str, Any]] = {}
+            for batch in _batches(sorted(candidates)):
+                marks = ",".join("?" for _ in batch)
+                positions.update({
+                    str(row["position_key"]): row
+                    for row in _dict_rows(conn.execute(
+                        "SELECT p.position_key,p.pool_id,p.protocol,"
+                        "p.active_episode_id,p.last_block,p.last_tx_index,"
+                        "p.last_log_index,p.liquidity,p.liquidity_known,"
+                        "p.pending_principal0,p.pending_principal1,p.pending_known,p.state_json,"
+                        "q.position_key AS pending_position "
+                        "FROM lp_accounting_positions p "
+                        "LEFT JOIN lp_accounting_pending q "
+                        "ON q.position_key=p.position_key "
+                        f"WHERE p.position_key IN ({marks})",
+                        batch,
+                    ))
                 })
-                blocks: dict[int, dict[str, Any]] = {}
-                for batch in _batches(block_numbers):
-                    marks = ",".join("?" for _ in batch)
-                    blocks.update({
-                        int(row["number"]): row
-                        for row in _dict_rows(conn.execute(
-                            "SELECT number,hash,timestamp FROM blocks "
-                            f"WHERE number IN ({marks})",
-                            batch,
-                        ))
-                    })
-
-                accepted: list[tuple[Any, ...]] = []
-                affected_pools: set[str] = set()
-                claim_columns = (
-                    "position_key", "epoch", "block_number", "block_hash",
-                    "timestamp", "position_last_block",
-                    "position_last_tx_index", "position_last_log_index",
-                    "liquidity", "sqrt_price_x96", "tick",
-                    "price0_usd", "price1_usd", "claim0", "claim1",
-                    "position_state_json",
-                )
-                for position_key, candidate in candidates.items():
-                    position = positions.get(position_key)
-                    block = blocks.get(int(candidate[2]))
+                existing_claims.update({
+                    str(row["position_key"]): row
+                    for row in _dict_rows(conn.execute(
+                        "SELECT * FROM lp_accounting_claims "
+                        f"WHERE position_key IN ({marks})",
+                        batch,
+                    ))
+                })
+            block_numbers = sorted({
+                int(candidate[2]) for candidate in candidates.values()
+            })
+            blocks: dict[int, dict[str, Any]] = {}
+            for batch in _batches(block_numbers):
+                marks = ",".join("?" for _ in batch)
+                blocks.update({
+                    int(row["number"]): row
+                    for row in _dict_rows(conn.execute(
+                        "SELECT number,hash,timestamp FROM blocks "
+                        f"WHERE number IN ({marks})",
+                        batch,
+                    ))
+                })
+    
+            accepted: list[tuple[Any, ...]] = []
+            affected_pools: set[str] = set()
+            claim_columns = (
+                "position_key", "epoch", "block_number", "block_hash",
+                "timestamp", "position_last_block",
+                "position_last_tx_index", "position_last_log_index",
+                "liquidity", "sqrt_price_x96", "tick",
+                "price0_usd", "price1_usd", "claim0", "claim1",
+                "position_state_json",
+            )
+            for position_key, candidate in candidates.items():
+                position = positions.get(position_key)
+                block = blocks.get(int(candidate[2]))
+                if (
+                    int(candidate[1]) != current_epoch
+                    or position is None
+                    or position.get("pending_position") is not None
+                    or position.get("active_episode_id") is None
+                    or str(position.get("protocol") or "") not in ("v3", "v4")
+                    or not position.get("liquidity_known")
+                    or _raw_int(position.get("liquidity")) != int(candidate[8])
+                    or _raw_int(position.get("last_block")) != int(candidate[5])
+                    or _raw_int(position.get("last_tx_index")) != int(candidate[6])
+                    or _raw_int(position.get("last_log_index")) != int(candidate[7])
+                    or _raw_int(position.get("pending_known")) != int(candidate[15])
+                    or (
+                        _raw_int(position.get("pending_principal0"))
+                        != _raw_int(candidate[16])
+                    )
+                    or (
+                        _raw_int(position.get("pending_principal1"))
+                        != _raw_int(candidate[17])
+                    )
+                    or position.get("state_json") != candidate[18]
+                    or int(candidate[2]) < int(candidate[5])
+                    or block is None
+                    or str(block.get("hash") or "").lower() != candidate[3]
+                    or _raw_int(block.get("timestamp")) != int(candidate[4])
+                ):
+                    continue
+                existing = existing_claims.get(position_key)
+                if existing is not None:
                     if (
-                        int(candidate[1]) != current_epoch
-                        or position is None
-                        or position.get("pending_position") is not None
-                        or position.get("active_episode_id") is None
-                        or str(position.get("protocol") or "") not in ("v3", "v4")
-                        or not position.get("liquidity_known")
-                        or _raw_int(position.get("liquidity")) != int(candidate[8])
-                        or _raw_int(position.get("last_block")) != int(candidate[5])
-                        or _raw_int(position.get("last_tx_index")) != int(candidate[6])
-                        or _raw_int(position.get("last_log_index")) != int(candidate[7])
-                        or _raw_int(position.get("pending_known")) != int(candidate[15])
-                        or (
-                            _raw_int(position.get("pending_principal0"))
-                            != _raw_int(candidate[16])
-                        )
-                        or (
-                            _raw_int(position.get("pending_principal1"))
-                            != _raw_int(candidate[17])
-                        )
-                        or position.get("state_json") != candidate[18]
-                        or int(candidate[2]) < int(candidate[5])
-                        or block is None
-                        or str(block.get("hash") or "").lower() != candidate[3]
-                        or _raw_int(block.get("timestamp")) != int(candidate[4])
+                        _raw_int(existing.get("epoch")) == current_epoch
+                        and _raw_int(existing.get("block_number")) is not None
+                        and _raw_int(existing.get("block_number")) > int(candidate[2])
                     ):
                         continue
-                    existing = existing_claims.get(position_key)
-                    if existing is not None:
-                        if (
-                            _raw_int(existing.get("epoch")) == current_epoch
-                            and _raw_int(existing.get("block_number")) is not None
-                            and _raw_int(existing.get("block_number")) > int(candidate[2])
-                        ):
-                            continue
-                        if tuple(
-                            existing.get(column) for column in claim_columns
-                        ) == candidate[:15] + candidate[18:]:
-                            continue
-                    accepted.append(candidate[:15] + candidate[18:])
-                    pool_id = position.get("pool_id")
-                    if pool_id:
-                        affected_pools.add(str(pool_id).lower())
-                if not accepted:
-                    return False
-                conn.executemany(
-                    "INSERT INTO lp_accounting_claims("
-                    + ",".join(claim_columns)
-                    + ") VALUES(" + ",".join("?" for _ in claim_columns) + ") "
-                    "ON CONFLICT(position_key) DO UPDATE SET "
-                    + ",".join(
-                        f"{column}=excluded.{column}"
-                        for column in claim_columns[1:]
-                    ),
-                    accepted,
-                )
-                accepted_keys = [str(row[0]) for row in accepted]
-                self._refresh_position_values(conn, accepted_keys)
-                self._refresh_active_episode_values(conn, accepted_keys)
-                self._invalidate_cache(conn, affected_pools)
-                return True
+                    if tuple(
+                        existing.get(column) for column in claim_columns
+                    ) == candidate[:15] + candidate[18:]:
+                        continue
+                accepted.append(candidate[:15] + candidate[18:])
+                pool_id = position.get("pool_id")
+                if pool_id:
+                    affected_pools.add(str(pool_id).lower())
+            if not accepted:
+                return False
+            conn.executemany(
+                "INSERT INTO lp_accounting_claims("
+                + ",".join(claim_columns)
+                + ") VALUES(" + ",".join("?" for _ in claim_columns) + ") "
+                "ON CONFLICT(position_key) DO UPDATE SET "
+                + ",".join(
+                    f"{column}=excluded.{column}"
+                    for column in claim_columns[1:]
+                ),
+                accepted,
+            )
+            accepted_keys = [str(row[0]) for row in accepted]
+            values = self._refresh_position_values(conn, accepted_keys)
+            self._refresh_active_episode_values(conn, values)
+            self._invalidate_cache(conn, affected_pools)
+            return True
+
+    @staticmethod
+    def _invalidate_legacy_core_values(
+            conn: sqlite3.Connection, keys: Iterable[str],
+    ) -> dict[str, str | None]:
+        legacy = set()
+        for key in keys:
+            raw = key.rsplit(":", 1)[-1] if key.startswith(("v3:", "v4:")) else key
+            if len(raw) == 66 and raw.startswith("0x"):
+                legacy.add(raw)
+        positions: dict[str, str | None] = {}
+        for batch in _batches(sorted(legacy)):
+            marks = ",".join("?" for _ in batch)
+            positions.update(conn.execute(
+                "SELECT position_key,pool_id FROM lp_accounting_positions "
+                f"WHERE position_key IN ({marks}) "
+                "AND valuation_basis IS NOT 'unqualified_pool_scope'",
+                batch,
+            ).fetchall())
+        for batch in _batches(list(positions)):
+            marks = ",".join("?" for _ in batch)
+            # Keep unresolved rows until retirement so pool and owner aggregates
+            # cannot qualify a partial scoped copy as the complete inventory.
+            conn.execute(
+                "UPDATE lp_accounting_positions SET liquidity=NULL,liquidity_known=0,"
+                "pending_known=0,owed_known=0,history_complete=0,principal0=NULL,"
+                "principal1=NULL,principal_usd=NULL,uncollected_fees_usd=NULL,"
+                "equity_usd=NULL,valuation_block=NULL,valuation_timestamp=NULL,"
+                "valuation_basis='unqualified_pool_scope' "
+                f"WHERE position_key IN ({marks})", batch,
+            )
+            conn.execute(
+                "UPDATE lp_accounting_episodes SET history_complete=0,identity_complete=0,"
+                "fees_complete=0,fees_usd=NULL,current_equity_usd=NULL,lp_value_usd=NULL,"
+                "hold_value_usd=NULL,lp_vs_hold_usd=NULL,gross_pnl_usd=NULL,gas_usd=NULL,"
+                "net_pnl_usd=NULL,return_pct=NULL,accounting_basis='unqualified_pool_scope',"
+                "qualifiers=json_insert(qualifiers,'$[#]','unqualified_pool_scope') "
+                f"WHERE position_key IN ({marks})", batch,
+            )
+        return positions
 
     def _apply(
         self, conn: sqlite3.Connection,
@@ -1765,6 +1909,8 @@ class AccountBook:
             mapped_rows,
         )
         keys = sorted(old_keys | new_keys)
+        legacy_positions = self._invalidate_legacy_core_values(conn, keys)
+        inventory_pools.update(pool for pool in legacy_positions.values() if pool)
         if self.deferred:
             priorities: dict[str, tuple[int, int, int]] = {}
             identity_hints: dict[
@@ -1803,6 +1949,11 @@ class AccountBook:
                     ).fetchall()
                 )
             self._queue_position_keys(conn, priorities, hinted=True)
+            if unqueued_legacy := legacy_positions.keys() - priorities.keys():
+                latest = max(_order(event)[:3] for event in events)
+                self._queue_position_keys(
+                    conn, {key: latest for key in unqueued_legacy},
+                )
             self._merge_pending_identity_hints(
                 conn,
                 (
@@ -1858,7 +2009,8 @@ class AccountBook:
                 f"WHERE position_key IN ({marks}) AND pool_id IS NOT NULL",
                 batch,
             ).fetchall())
-        self._refresh_position_values(conn, keys)
+        values = self._refresh_position_values(conn, keys)
+        self._refresh_active_episode_values(conn, values)
         self._rebuild_tx_costs(conn, affected_txs)
         self._refresh_episode_costs(
             conn, affected_txs, episode_ids=changed_episodes,
@@ -2033,6 +2185,19 @@ class AccountBook:
         )
         for batch in _batches(sorted(keys)):
             marks = ",".join("?" for _ in batch)
+            # Financial rows must disappear immediately after rollback, but
+            # surviving openings must retain their published identities even
+            # if the process restarts before deferred replay.
+            conn.execute(
+                "INSERT OR REPLACE INTO lp_accounting_replay_identities "
+                "SELECT p.position_key,"
+                "COALESCE(json_extract(p.state_json,'$.episode_ordinal'),0),"
+                "(SELECT json_group_array(json_array("
+                "e.id,e.ordinal,e.opened_block,e.opened_tx_index,e.opened_log_index)) "
+                "FROM lp_accounting_episodes e WHERE e.position_key=p.position_key) "
+                "FROM lp_accounting_positions p "
+                f"WHERE p.position_key IN ({marks})", batch,
+            )
             for table in (
                 "lp_accounting_effects", "lp_ownership_intervals",
                 "lp_accounting_episodes", "lp_accounting_positions",
@@ -2209,6 +2374,8 @@ class AccountBook:
                 state_events[int(event.get("block_number") or 0)].append(index)
         if state is None:
             state = self._new_state(key, prepared_events[0])
+        if writes is not None:
+            writes.restore_episode_identity(conn, state)
         # V3 manager transactions emit the pool event before the ERC-721 mint
         # and the final Collect before the ERC-721 burn.  Those verified
         # transfers prove the missing boundary state even though their logs
@@ -2411,7 +2578,7 @@ class AccountBook:
             if regular_transfer and has_transferred_inventory:
                 state["active_episode"] = self._new_episode(
                     state, event, history_complete=bool(state.get("history_complete")),
-                    transferred_basis=True,
+                    transferred_basis=True, writes=writes,
                 )
                 state["settled"] = False
         elif burn:
@@ -2600,7 +2767,7 @@ class AccountBook:
             active = self._new_episode(
                 state, event,
                 history_complete=zero_proven and bool(state.get("history_complete")),
-                transferred_basis=False,
+                transferred_basis=False, writes=writes,
             )
             if ambiguous_reentry:
                 active["ambiguous_reentry"] = True
@@ -2609,7 +2776,7 @@ class AccountBook:
             state["active_episode"] = active
         elif active is None and kind in ("remove", "collect", "checkpoint"):
             active = self._new_episode(
-                state, event, history_complete=False, transferred_basis=False,
+                state, event, history_complete=False, transferred_basis=False, writes=writes,
             )
             active["status"] = "partial_history"
             state["active_episode"] = active
@@ -2676,14 +2843,18 @@ class AccountBook:
 
     def _new_episode(self, state: Mapping[str, Any], event: Mapping[str, Any],
                      *, history_complete: bool,
-                     transferred_basis: bool) -> dict[str, Any]:
-        ordinal = int(state.get("episode_ordinal") or 0) + 1
-        # state is always a mutable dict at call sites.
-        state["episode_ordinal"] = ordinal  # type: ignore[index]
+                     transferred_basis: bool,
+                     writes: _ReplayWrites | None = None) -> dict[str, Any]:
         protocol = str(state.get("protocol") or event.get("protocol") or "unknown")
         order = _order(event)
+        prior = writes.episode_ids.get(order[:3]) if writes is not None else None
+        if prior is None:
+            ordinal = int(state.get("episode_ordinal") or 0) + 1
+            state["episode_ordinal"] = ordinal  # type: ignore[index]
+            episode_id = f"{state['position_key']}:{ordinal}"
+        else:
+            episode_id, ordinal = prior
         owner = _address(state.get("owner"))
-        episode_id = f"{state['position_key']}:{ordinal}"
         return {
             "id": episode_id, "position_key": state["position_key"],
             "ordinal": ordinal, "token_id": state.get("token_id"),
@@ -3320,7 +3491,7 @@ class AccountBook:
 
     def _refresh_position_values(
         self, conn: sqlite3.Connection, keys: Sequence[str],
-    ) -> None:
+    ) -> dict[str, dict[str, Any]]:
         values = self._current_values(conn, position_keys=keys)
         conn.executemany(
             "UPDATE lp_accounting_positions SET principal0=?,principal1=?,principal_usd=?,"
@@ -3336,6 +3507,7 @@ class AccountBook:
                 for key, value in values.items()
             ),
         )
+        return values
 
     def _refresh_episode_value(
         self, conn: sqlite3.Connection, episode_id: str,
@@ -3351,6 +3523,12 @@ class AccountBook:
                 (episode_id,),
             ))
         if episode is None:
+            return
+        if episode.get("accounting_basis") == "unqualified_pool_scope":
+            conn.execute(
+                "UPDATE lp_accounting_episodes SET gas_usd=NULL WHERE id=?",
+                (episode_id,),
+            )
             return
         current_equity: float | None = 0.0 if episode.get("status") == "complete" else None
         mark0, mark1 = episode.get("close_price0_usd"), episode.get("close_price1_usd")
@@ -3406,10 +3584,9 @@ class AccountBook:
 
     def _refresh_active_episode_values(
             self, conn: sqlite3.Connection,
-            position_keys: Iterable[str],
+            current_values: Mapping[str, Mapping[str, Any]],
     ) -> None:
-        selected = sorted({str(key) for key in position_keys})
-        for batch in _batches(selected):
+        for batch in _batches(list(current_values)):
             marks = ",".join("?" for _ in batch)
             episodes = _dict_rows(conn.execute(
                 "SELECT e.*,p.active_episode_id,m.decimals0,m.decimals1 "
@@ -3419,9 +3596,6 @@ class AccountBook:
                 f"WHERE p.position_key IN ({marks})",
                 batch,
             ))
-            current_values = self._current_values(
-                conn, position_keys=batch,
-            )
             for episode in episodes:
                 self._refresh_episode_value(
                     conn, str(episode["id"]),
@@ -5237,6 +5411,20 @@ class AccountBook:
                         )
                     )
                 )
+                unknown_scope = conn.execute(
+                    "SELECT 1 FROM lp_accounting_pending WHERE identities_ready=0 LIMIT 1"
+                ).fetchone() is not None
+                pending_pools = {
+                    str(row[0]) for row in conn.execute(
+                        "SELECT DISTINCT h.pool_id FROM lp_accounting_pending_identities h "
+                        "JOIN lp_accounting_pending p ON p.position_key=h.position_key "
+                        f"WHERE h.kind='scope' AND h.pool_id IN ({marks})", requested,
+                    )
+                } if backfill_done and not unknown_scope else set()
+                complete_pools = (
+                    set(requested) - pending_pools
+                    if backfill_done and not unknown_scope else set()
+                )
                 cache_keys: dict[str, tuple[Any, ...]] = {}
                 inventory_hits: dict[str, _PoolInventory] = {}
                 missing_results: list[str] = []
@@ -5256,7 +5444,7 @@ class AccountBook:
                             pool.get("decimals0"),
                             pool.get("decimals1"),
                             history_from,
-                            backfill_done,
+                            pool_id in complete_pools,
                         )
                         cache_keys[pool_id] = cache_key
                         cached = self._pool_cache.get(cache_key)
@@ -5285,7 +5473,7 @@ class AccountBook:
                         mark=state.get(pool_id, {}),
                         metadata=metadata.get(pool_id, {}),
                         history_from=history_from,
-                        backfill_done=backfill_done,
+                        backfill_done=pool_id in complete_pools,
                         retain_inventory=False,
                     )
                     results[pool_id] = result
@@ -5340,7 +5528,7 @@ class AccountBook:
                             mark=state.get(pool_id, {}),
                             metadata=metadata.get(pool_id, {}),
                             history_from=history_from,
-                            backfill_done=backfill_done,
+                            backfill_done=pool_id in complete_pools,
                             retain_inventory=True,
                         )
                         evaluated.add(pool_id)
@@ -5359,7 +5547,7 @@ class AccountBook:
                             mark=state.get(pool_id, {}),
                             metadata=metadata.get(pool_id, {}),
                             history_from=history_from,
-                            backfill_done=backfill_done,
+                            backfill_done=pool_id in complete_pools,
                             retain_inventory=True,
                         )
                         results[pool_id] = result

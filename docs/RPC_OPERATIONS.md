@@ -192,10 +192,11 @@ entry by transaction hash. It no longer searches every serialized error
 payload for a pool ID, and it preserves existing candidate retry schedules.
 
 Receipt enrichment, repricing, and accounting continue during live catch-up.
-Receipt fetches run in four-transaction waves, with up to 32 transactions in
-flight. V4 trace work uses a separate four-worker pool and two-transaction
-waves, so an unavailable or slow trace does not block V3 receipts. The coordinator
-refills completed waves before waiting for the database writer. Receipt fields
+Receipt fetches run in eight-transaction waves, with up to 64 transactions in
+flight. V4 trace work has its own eight-transaction capacity, four-worker pool,
+and two-transaction waves, so slow traces cannot consume receipt-worker capacity.
+The coordinator refills completed waves before waiting for the database writer.
+Receipt fields
 provide payer and effective gas price when available; only incomplete receipts
 need transaction-body requests. Headers and pinned-state calls are deduplicated
 within each wave. The shared provider item-rate and HTTP-concurrency limits
@@ -218,6 +219,21 @@ indivisible position can exceed the target. Epoch checks reject reorged work,
 and generation-guarded completion preserves same-epoch input that arrived during
 preparation. Repricing updates the source revision before projections without
 rewriting every event index; search terms refresh only when identity changes.
+
+Episode IDs remain tied to their opening event when older history arrives;
+backfill no longer renumbers every later episode and rewrites its effects.
+Deferred rollback preserves opening identities separately from financial rows,
+including across a restart before replay.
+Replay compares source fields separately from derived valuation and costs,
+while receipt changes still refresh dependent gas and net P/L.
+
+Core-position identities include protocol and pool. An EVM core hash alone is
+not globally unique: different pools can share owner, ticks, and salt. Bounded
+source repair moves legacy rows to pool-scoped keys without changing event IDs,
+receipt evidence, or discovery cursors. Accounting retires a legacy key after
+its source mappings have moved rather than replaying the conflated history.
+During a partial move, legacy financial rows remain explicitly unqualified;
+their overlapping liquidity and fees cannot inflate qualified wallet or pool totals.
 
 Wallet requests reserve bounded receipt and accounting priority without writing
 to SQLite on the request thread. Historical work retains its reserved quarter.

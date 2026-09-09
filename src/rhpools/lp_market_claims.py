@@ -95,6 +95,10 @@ def fetch_position_claims(
                 decoder = "v3_nfpm_position"
                 indices["position"] = request(manager, NFT_POSITIONS_SELECTOR + _word(int(token_id)))
             else:
+                prefix = f"v3:{pool['id']}:"
+                if not key.startswith(prefix):
+                    continue
+                key = key[len(prefix):]
                 if len(key) != 66 or not key.startswith("0x"):
                     continue
                 decoder = "v3_core_position"
@@ -110,6 +114,11 @@ def fetch_position_claims(
                 if manager != V4_POSITION_MANAGER:
                     continue
                 key = _v4_position_key(manager, lower, upper, "0x" + _word(int(token_id)))
+            else:
+                prefix = f"v4:{pool['id']}:"
+                if not key.startswith(prefix):
+                    continue
+                key = key[len(prefix):]
             if len(key) != 66 or not key.startswith("0x"):
                 continue
             decoder = "v4_state_view_position"

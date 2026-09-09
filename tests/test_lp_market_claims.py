@@ -4,7 +4,9 @@ from copy import deepcopy
 import pytest
 
 from rhpools.lp_market_claims import fetch_position_claims
-from rhpools.lp_market_protocols import _selector, _v3_position_key, _v4_position_key
+from rhpools.lp_market_protocols import (
+    _selector, _v3_position_key, _v4_position_key, core_position_key,
+)
 from rhpools.lp_market_store import CanonicalConflict
 from test_lp_market_service import (
     TOKEN, V3, header, ingest_effects, lp_effect, pools, position_state, service, swap,
@@ -25,10 +27,12 @@ def test_lazy_fees_unlock_open_equity_and_net_pnl_at_a_canonical_pin(tmp_path, p
             opened_block, protocol, "add", 1_000_000, (1_000, 1_000),
             position_state(0), position_state(1_000_000),
         )
-        opened["position_key"] = (
+        raw_key = (
             _v3_position_key(TOKEN, -10, 10) if protocol == "v3"
             else _v4_position_key(TOKEN, -10, 10, "0x" + "00" * 32)
         )
+        opened["position_key"] = core_position_key(protocol, opened["pool_id"], raw_key)
+        opened["data"]["core_position_key"] = raw_key
         opened.update(fee_amount0="0", fee_amount1="0")
         opened["data"].update(
             trace_complete=True, fees_accrued_exact=True, principal_delta_exact=True,
