@@ -1798,6 +1798,34 @@ class AccountBook:
             self._invalidate_cache(conn, affected_pools)
             return True
 
+    def recover_receipt_costs(
+            self, tx_hashes: Iterable[str], *, epoch: int,
+    ) -> None:
+        """Refresh already-published histories whose receipt costs arrived later."""
+        selected = sorted(set(tx_hashes))
+        for offset in range(0, len(selected), 32):
+            batch = selected[offset:offset + 32]
+            marks = ",".join("?" for _ in batch)
+            with self.store.transaction() as conn:
+                if self._store_metadata_int(conn, "epoch") != epoch:
+                    return
+                stale = conn.execute(
+                    "SELECT t.tx_hash,c.episode_id FROM transactions t "
+                    "LEFT JOIN lp_accounting_tx_costs c ON c.tx_hash=t.tx_hash "
+                    f"WHERE t.tx_hash IN ({marks}) AND (c.tx_hash IS NULL "
+                    "OR c.payer IS NOT t.payer OR c.gas_usd IS NOT t.gas_usd)",
+                    batch,
+                ).fetchall()
+                if not stale:
+                    continue
+                affected_txs = {str(row[0]) for row in stale}
+                previous_episodes = {str(row[1]) for row in stale if row[1]}
+                self._rebuild_tx_costs(conn, affected_txs)
+                self._refresh_episode_costs(
+                    conn, affected_txs, episode_ids=previous_episodes,
+                )
+                self._invalidate_cache(conn, ())
+
     @staticmethod
     def _invalidate_legacy_core_values(
             conn: sqlite3.Connection, keys: Iterable[str],

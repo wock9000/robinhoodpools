@@ -12,6 +12,7 @@ from rhpools.lp_market_protocols import (
 )
 from rhpools.lp_market_index import V3_BIRTH_REPAIR_PREFIXES
 from rhpools.lp_market_accounting import AccountBook
+from rhpools.lp_market_claims import PositionClaims
 from rhpools.lp_market_service import LPMarketService, PriceProjection
 from rhpools.lp_rpc import _WssRpc, build_rpc_factory
 from rhpools.lp_market_store import CanonicalConflict, MarketStore
@@ -795,6 +796,33 @@ def test_source_correction_removes_stale_episode_gas(tmp_path):
         assert detail["summary"]["net_pnl_usd"] == pytest.approx(0.08)
     finally:
         store.close()
+
+def test_visible_wallet_recovers_missed_receipt_cost_without_new_activity(tmp_path):
+    blocks = [header(100 + index, 1_000 + index) for index in range(2)]
+    opened, closed, transactions = traced_v4_episode(blocks, key="late-cost")
+    store, book = accounting_store(tmp_path / "late-cost.sqlite", deferred=True)
+    try:
+        store.ingest(blocks, [opened, closed])
+        drain_accounting(book)
+        # This reproduces persisted receipt evidence whose old accounting
+        # publication missed its cost dependency.
+        store.enrich([], transactions=transactions)
+        assert book.owner(TOKEN, {"window": "all"})["summary"]["net_pnl_usd"] is None
+        book.recover_receipt_costs(
+            [row["tx_hash"] for row in transactions], epoch=-1,
+        )
+        assert book.owner(TOKEN, {"window": "all"})["summary"]["net_pnl_usd"] is None
+
+        worker = PositionClaims(store, book, None, lambda: None)
+        worker.request([TOKEN])
+        worker._refresh(*worker._next())
+        summary = book.owner(TOKEN, {"window": "all"})["summary"]
+        assert summary["gas_usd"] == pytest.approx(0.02)
+        assert summary["net_pnl_usd"] == pytest.approx(0.08)
+        assert book.closed({"window": "all"})["rows"][0]["net_pnl_usd"] == pytest.approx(0.08)
+    finally:
+        store.close()
+
 
 
 def test_deferred_accounting_does_not_hold_writer_and_drains_same_branch_prefix(

@@ -306,6 +306,7 @@ class PositionClaims:
             keys = set(historical) | {row["position_key"] for row in positions}
             pending = set()
             tx_hashes = set()
+            stale_costs = set()
             for key in keys:
                 if conn.execute(
                     "SELECT 1 FROM lp_accounting_pending WHERE position_key=?", (key,),
@@ -321,16 +322,26 @@ class PositionClaims:
                 self._event_cursors.move_to_end(key)
                 if page:
                     marks = ",".join("?" for _ in page)
-                    tx_hashes.update(str(row[0]) for row in conn.execute(
-                        "SELECT DISTINCT p.tx_hash FROM events e "
-                        "JOIN pending_enrichment p ON p.tx_hash=e.tx_hash "
+                    for row in conn.execute(
+                        "SELECT DISTINCT e.tx_hash,p.tx_hash,t.tx_hash IS NOT NULL AND "
+                        "(c.tx_hash IS NULL OR c.payer IS NOT t.payer "
+                        "OR c.gas_usd IS NOT t.gas_usd) AS stale_cost "
+                        "FROM events e LEFT JOIN pending_enrichment p ON p.tx_hash=e.tx_hash "
+                        "LEFT JOIN transactions t ON t.tx_hash=e.tx_hash "
+                        "LEFT JOIN lp_accounting_tx_costs c ON c.tx_hash=e.tx_hash "
                         f"WHERE e.id IN ({marks})", tuple(int(row[0]) for row in page),
-                    ))
+                    ):
+                        if row[1] is not None:
+                            tx_hashes.add(str(row[0]))
+                        if row[2]:
+                            stale_costs.add(str(row[0]))
             epoch = int(self.store._metadata(conn, "epoch", 0))
         while len(self._event_cursors) > 2048:
             self._event_cursors.popitem(last=False)
         self.store.prioritize_enrichment(tx_hashes)
         self.book.prioritize_positions(keys)
+        if stale_costs and not self._stop.is_set():
+            self.book.recover_receipt_costs(stale_costs, epoch=epoch)
         positions = [row for row in positions
                      if row["position_key"] not in pending and row["liquidity_known"]
                      and (row["claim_epoch"] != epoch or row["claim_timestamp"] is None

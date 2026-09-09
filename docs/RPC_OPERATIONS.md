@@ -241,6 +241,9 @@ The current-claims worker admits the full selected owner page, keeps at most 512
 wallet interests for 180 seconds, and renews interest when cached API/SSE results
 are served. Each pass walks four active positions, four historical position keys,
 and bounded transaction pages; it does not scan a wallet's entire history.
+Those pages also compare persisted receipt evidence with published gas costs.
+Stale attribution is repaired in 32-transaction, epoch-checked writer batches,
+so an inactive wallet can recover gas and net P/L without another LP action.
 
 Current claims use canonical end-of-block V3/NFPM or V4 StateView fee growth,
 owner and liquidity proof, and integer Q128 fee arithmetic. They borrow at most
