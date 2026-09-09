@@ -192,16 +192,53 @@ entry by transaction hash. It no longer searches every serialized error
 payload for a pool ID, and it preserves existing candidate retry schedules.
 
 Receipt enrichment, repricing, and accounting continue during live catch-up.
-Receipt workers refill independently rather than waiting for the slowest member
-of a batch. Metadata, identity replay, and bounded source repairs run separately
-from receipt scheduling. Follow `pending_accounting` as well as enrichment and
-repricing queues; a small block gap does not prove those queues are complete.
+Receipt fetches run in four-transaction waves, with up to 32 transactions in
+flight. V4 trace work uses a separate four-worker pool and two-transaction
+waves, so an unavailable or slow trace does not block V3 receipts. The coordinator
+refills completed waves before waiting for the database writer. Receipt fields
+provide payer and effective gas price when available; only incomplete receipts
+need transaction-body requests. Headers and pinned-state calls are deduplicated
+within each wave. The shared provider item-rate and HTTP-concurrency limits
+still apply.
+
+Metadata, identity replay, and bounded source repairs run separately from receipt
+scheduling. Follow `pending_accounting` as well as enrichment and repricing queues;
+a small block gap does not prove those queues are complete.
 
 Metadata RPC fetches remain bounded and commit one batch.
 V3 balances use a batched pinned-state request and atomic snapshot commit.
 Identity replay commits canonical events and queue completion together.
 Price sample, reserve, mark, and state inserts use the same multi-row helper
 as event ingestion.
+
+Accounting prepares bounded groups off the writer and publishes each group with
+one valuation, shared-transaction attribution, episode-cost refresh, and cache
+invalidation pass. Preparation and publication target 0.2 seconds each; one
+indivisible position can exceed the target. Epoch checks reject reorged work,
+and generation-guarded completion preserves same-epoch input that arrived during
+preparation. Repricing updates the source revision before projections without
+rewriting every event index; search terms refresh only when identity changes.
+
+Wallet requests reserve bounded receipt and accounting priority without writing
+to SQLite on the request thread. Historical work retains its reserved quarter.
+The current-claims worker admits the full selected owner page, keeps at most 512
+wallet interests for 180 seconds, and renews interest when cached API/SSE results
+are served. Each pass walks four active positions, four historical position keys,
+and bounded transaction pages; it does not scan a wallet's entire history.
+
+Current claims use canonical end-of-block V3/NFPM or V4 StateView fee growth,
+owner and liquidity proof, and integer Q128 fee arithmetic. They borrow at most
+eight state RPC items/second from the existing shared allowance. Pool spot prices
+qualify only with positive pinned active liquidity. Publication checks the
+canonical hash/epoch, absence of pending accounting, and the exact position-state
+snapshot; source corrections cannot reuse a claim against different accounting
+state. Reorgs clear dependent values before pool-price rollback, rather than
+publishing an orphan price. Missing state, trace, gas attribution, acquisition
+basis, or price evidence still leaves dependent totals unknown.
+
+The claims table and owner lookup indexes install without rebuilding the ledger.
+`current_claims` in `/api/lp/status` reports admitted wallets, refreshed positions,
+and the last successful refresh or error.
 
 Existing V3 NFT positions whose initial add precedes a verified mint in the
 same transaction are repaired by the separate source-repair lane. A default pass

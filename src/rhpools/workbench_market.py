@@ -29,7 +29,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from eth_utils import keccak
 
-from .lp_math import MAX_TICK, principal_raw, sqrt_ratio_at_tick
+from .lp_math import MAX_TICK, fee_claim, principal_raw, sqrt_ratio_at_tick
 from .lp_chain import CHAIN_ID
 from . import _mc
 from .lp_market_protocols import resolve_v4_tick_spacing
@@ -333,35 +333,8 @@ def _usd_price(token0: str, token1: str, token1_per_token0: float | None) -> flo
     if token0 == USDG and token1 != USDG:
         return 1.0 / token1_per_token0 if token1_per_token0 else None
     return None
-_UINT256_MASK = (1 << 256) - 1
 
 
-def _v3_fee_claim(
-    liquidity: int,
-    fee_growth0_last: int,
-    fee_growth1_last: int,
-    owed0: int,
-    owed1: int,
-    global0: int,
-    global1: int,
-    lower_outside0: int,
-    lower_outside1: int,
-    upper_outside0: int,
-    upper_outside1: int,
-    tick: int,
-    lower: int,
-    upper: int,
-) -> tuple[int, int, int, int]:
-    """Return total claim and still-lazy fees using V3 uint256 wrapping."""
-    below0 = lower_outside0 if tick >= lower else (global0 - lower_outside0) & _UINT256_MASK
-    below1 = lower_outside1 if tick >= lower else (global1 - lower_outside1) & _UINT256_MASK
-    above0 = upper_outside0 if tick < upper else (global0 - upper_outside0) & _UINT256_MASK
-    above1 = upper_outside1 if tick < upper else (global1 - upper_outside1) & _UINT256_MASK
-    inside0 = (global0 - below0 - above0) & _UINT256_MASK
-    inside1 = (global1 - below1 - above1) & _UINT256_MASK
-    lazy0 = liquidity * ((inside0 - fee_growth0_last) & _UINT256_MASK) // (1 << 128)
-    lazy1 = liquidity * ((inside1 - fee_growth1_last) & _UINT256_MASK) // (1 << 128)
-    return owed0 + lazy0, owed1 + lazy1, lazy0, lazy1
 
 
 def _interval_amounts(
@@ -3390,7 +3363,7 @@ class MarketService:
                 upper_fees = selection.participant_tick_fees.get(upper)
                 if lower_fees is None or upper_fees is None:
                     continue
-                claim0, claim1, lazy0, lazy1 = _v3_fee_claim(
+                claim0, claim1, lazy0, lazy1 = fee_claim(
                     int(state["liquidity"]),
                     int(state["fee_growth0_last"]),
                     int(state["fee_growth1_last"]),

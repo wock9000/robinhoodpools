@@ -85,6 +85,11 @@ def test_financial_queues_do_not_starve_recent_work_or_history(tmp_path):
             assert numbers[0] == oldest
             assert numbers[-1] == 47
             assert not {1, 9, 48}.intersection(numbers)
+        store.prioritize_enrichment("0x" + f"{number:064x}" for number in (20, 21, 48))
+        requested = store.pending_enrichments(8)
+        numbers = {row["block_number"] for row in requested}
+        assert {10, 11, 20, 21, 47} <= numbers
+        assert 48 not in numbers
 
 
 def test_bulk_ingest_preserves_conflicts_under_sqlite_parameter_limit(tmp_path):
@@ -435,41 +440,24 @@ def test_repeated_search_entities_do_not_duplicate_search_results():
         store.close()
 
 
-def test_search_batch_skips_noop_updates_and_keeps_late_enrichment():
-    store = MarketStore(":memory:")
-    initial = {
-        "position_key": "late-position",
-        "protocol": "v3",
-        "token_id": None,
-        "pool_id": None,
-    }
-    try:
-        with store.transaction() as connection:
-            store._index_event_search_batch(connection, [initial])
-        changes = store.connection.total_changes
-        with store.transaction() as connection:
-            store._index_event_search_batch(connection, [initial])
-        assert store.connection.total_changes == changes
+def test_reprojection_refreshes_new_position_search_terms():
+    with MarketStore(":memory:") as store:
+        block = header(10)
+        inserted = store.ingest([block], [event(block, 0)])
+        pool_id = "0x" + "33" * 20
+        assert store.search(pool_id) == ([], 0)
 
-        enriched = {
-            **initial,
-            "token_id": "73",
-            "pool_id": "0x" + "33" * 20,
-        }
-        with store.transaction() as connection:
-            store._index_event_search_batch(connection, [enriched])
+        def resolve_pool(_connection, events):
+            for row in events:
+                row["pool_id"] = pool_id
 
-        results, total = store.search("73")
+        store.register_projection(resolve_pool, lambda _connection, _ancestor: None)
+        store.reproject([inserted[0]["id"]])
+        results, total = store.search(pool_id)
         assert total == 1
-        assert results == [{
-            "kind": "position",
-            "id": "late-position",
-            "label": "Position 73",
-            "subtitle": "V3 POSITION · late-position",
-            "href": "/lp?q=late-position",
-        }]
-    finally:
-        store.close()
+        assert [(row["kind"], row["id"]) for row in results] == [
+            ("position", "shared-position"),
+        ]
 
 
 def test_search_batch_writes_roll_back_with_the_caller_transaction():

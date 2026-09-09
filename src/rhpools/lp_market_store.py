@@ -191,6 +191,8 @@ class MarketStore:
         self._closed = False
         self._change_token = 0
         self._pool_metadata_token = 0
+        self._financial_interest_lock = threading.Lock()
+        self._financial_interest: dict[str, float] = {}
         self._checkpoint_on_commit = checkpoint_on_commit
         if str(path) == ":memory:":
             self._database = f"file:lp-market-{id(self):x}?mode=memory&cache=shared"
@@ -2324,6 +2326,15 @@ class MarketStore:
                     self._bump(connection, "pending_enrichment", -removed)
             return enriched
 
+    def prioritize_enrichment(self, tx_hashes: Iterable[str]) -> None:
+        """Prefer requested financial evidence without writing from a reader."""
+        expires = time.monotonic() + 180.0
+        with self._financial_interest_lock:
+            for tx_hash in islice(tx_hashes, 256):
+                self._financial_interest[str(tx_hash).lower()] = expires
+            while len(self._financial_interest) > 2048:
+                self._financial_interest.pop(next(iter(self._financial_interest)))
+
     def pending_enrichments(
         self, limit: int = 16, *, now: float | None = None,
     ) -> list[dict[str, Any]]:
@@ -2332,6 +2343,36 @@ class MarketStore:
         limit = max(1, min(int(limit), 256))
         historical = max(1, limit // 4)
         due = time.time() if now is None else now
+        with self._financial_interest_lock:
+            current = time.monotonic()
+            expired = [
+                key for key, expires in self._financial_interest.items()
+                if expires <= current
+            ]
+            for key in expired:
+                self._financial_interest.pop(key)
+            interests = dict(self._financial_interest)
+        preferred = {}
+        for batch in _batches(tuple(interests)):
+            marks = ",".join("?" for _ in batch)
+            preferred.update({
+                str(row["tx_hash"]): dict(row)
+                for row in self.read().execute(
+                    f"SELECT * FROM pending_enrichment WHERE tx_hash IN ({marks})",
+                    batch,
+                ).fetchall()
+            })
+        with self._financial_interest_lock:
+            for key, expires in interests.items():
+                if key not in preferred and self._financial_interest.get(key) == expires:
+                    self._financial_interest.pop(key, None)
+        requested = [
+            preferred[key] for key in interests
+            if key in preferred and preferred[key]["next_attempt"] <= due
+            and not str(preferred[key]["last_error"] or "").startswith(
+                "pool_identity_pending:"
+            )
+        ][:min(historical, limit - historical)]
         rows = self.read().execute(
             "WITH oldest AS ("
             "SELECT block_number,tx_hash FROM pending_enrichment "
@@ -2350,7 +2391,15 @@ class MarketStore:
             "ON p.tx_hash=s.tx_hash ORDER BY s.block_number,s.tx_hash",
             (due, historical, due, limit - historical),
         ).fetchall()
-        return [dict(row) for row in rows]
+        # Keep the historical quota; requested wallets borrow recent slots.
+        selected = {}
+        for row in [*rows[:historical], *requested, *reversed(rows[historical:])]:
+            selected.setdefault(str(row["tx_hash"]), dict(row))
+            if len(selected) == limit:
+                break
+        return sorted(
+            selected.values(), key=lambda row: (row["block_number"], row["tx_hash"]),
+        )
 
     def pending_token_metadata(self, limit: int = 16) -> list[dict[str, Any]]:
         rows = self.read().execute(
@@ -2472,6 +2521,10 @@ class MarketStore:
                 "ORDER BY block_number,tx_index,log_index,id",
                 values,
             ).fetchall()
+            search_before = {
+                int(row["id"]): tuple(self._event_search_entities(dict(row)))
+                for row in rows
+            }
             revision = self._next_revision(connection)
             events = [dict(row) for row in rows]
             for event in events:
@@ -2479,8 +2532,12 @@ class MarketStore:
                 event["revision"] = revision
             search_rows: list[dict[str, Any]] = []
             if events:
-                search_rows = self._persist_projection_mutations(
-                    connection, events, revision,
+                # Repricing changes no canonical input before projections run.
+                # Rewriting the whole row here also rewrites every event index.
+                self._set_metadata(connection, "events_revision", revision)
+                connection.execute(
+                    f"UPDATE events SET revision=? WHERE id IN ({placeholders})",
+                    (revision, *values),
                 )
                 for apply, _rollback, _persists_events in self._projections:
                     apply(connection, events)
@@ -2490,7 +2547,11 @@ class MarketStore:
                     )
                 else:
                     search_rows = [self._event_row(event, revision) for event in events]
-            self._index_event_search_batch(connection, search_rows)
+            self._index_event_search_batch(connection, (
+                row for event, row in zip(events, search_rows)
+                if tuple(self._event_search_entities(row))
+                != search_before[int(event["id"])]
+            ))
             removed = connection.execute(
                 f"DELETE FROM pending_reprojection WHERE event_id IN ({placeholders})",
                 values,

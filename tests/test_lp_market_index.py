@@ -1258,5 +1258,261 @@ def test_metadata_and_balance_batches_isolate_invalid_tokens(tmp_path):
         store.close()
 
 
+def test_v4_receipt_trace_and_pinned_state_produce_exact_financial_evidence():
+    from eth_abi import encode
+    from eth_utils import keccak
+    from rhpools.lp_market_protocols import (
+        MODIFY_LIQUIDITY_SELECTOR,
+        STATE_VIEW_LIQUIDITY_SELECTOR,
+        STATE_VIEW_POSITION_SELECTOR,
+        STATE_VIEW_SLOT0_SELECTOR,
+        V4_POSITION_MANAGER,
+    )
+
+    token0, token1 = ("0x" + byte * 20 for byte in ("11", "22"))
+    owner = "0x" + "33" * 20
+    hook = "0x" + "00" * 20
+    fee, spacing, token_id = 3_000, 8, 42
+    observed = header(10)
+    tx_hash = "0x" + "44" * 32
+    pool_id = "0x" + keccak(encode(
+        ["address", "address", "uint24", "int24", "address"],
+        [token0, token1, fee, spacing, hook],
+    )).hex()
+
+    def topic(value):
+        return "0x" + f"{value:064x}"
+
+    common = {
+        "blockNumber": observed["number"],
+        "blockHash": observed["hash"],
+        "transactionHash": tx_hash,
+        "transactionIndex": "0x0",
+    }
+    core = {
+        **common,
+        "address": POOL_MANAGER,
+        "logIndex": "0x0",
+        "topics": [
+            V4_MODIFY_LIQUIDITY_TOPIC,
+            pool_id,
+            topic(int(V4_POSITION_MANAGER, 16)),
+        ],
+        "data": "0x" + encode(
+            ["int24", "int24", "int256", "bytes32"],
+            [-60, 60, 100, token_id.to_bytes(32, "big")],
+        ).hex(),
+    }
+    transfer = {
+        **common,
+        "address": V4_POSITION_MANAGER,
+        "logIndex": "0x1",
+        "topics": [
+            TRANSFER_TOPIC,
+            topic(0),
+            topic(int(owner, 16)),
+            topic(token_id),
+        ],
+        "data": "0x",
+    }
+    calldata = MODIFY_LIQUIDITY_SELECTOR + encode(
+        [
+            "(address,address,uint24,int24,address)",
+            "(int24,int24,int256,bytes32)",
+            "bytes",
+        ],
+        [
+            (token0, token1, fee, spacing, hook),
+            (-60, 60, 100, token_id.to_bytes(32, "big")),
+            b"",
+        ],
+    ).hex()
+    mask = (1 << 128) - 1
+
+    def balance_delta(amount0, amount1):
+        return (
+            ((amount0 & mask) << 128) | (amount1 & mask)
+        ).to_bytes(32, "big").hex()
+
+    trace = {
+        "type": "CALL",
+        "from": V4_POSITION_MANAGER,
+        "to": POOL_MANAGER,
+        "input": calldata,
+        "output": "0x" + balance_delta(-1_000, -2_000) + balance_delta(3, 5),
+        "logs": [core],
+    }
+    receipt = {
+        "transactionHash": tx_hash,
+        "blockNumber": observed["number"],
+        "blockHash": observed["hash"],
+        "transactionIndex": "0x0",
+        "status": "0x1",
+        "from": owner,
+        "gasUsed": hex(21_000),
+        "effectiveGasPrice": hex(1_000_000_000),
+        "logs": [core, transfer],
+    }
+
+    class EnrichmentRpc(StaticRpc):
+        def call(self, method, params):
+            if method == "eth_getTransactionReceipt":
+                return receipt
+            if method == "eth_getTransactionByHash":
+                raise AssertionError("complete receipt must not fetch a body")
+            if method == "debug_traceTransaction":
+                return trace
+            if method == "eth_getBlockByNumber":
+                return observed
+            if method == "eth_call":
+                calldata_ = params[0]["data"]
+                if calldata_.startswith(STATE_VIEW_POSITION_SELECTOR):
+                    values = [100, 1, 2]
+                elif calldata_.startswith(STATE_VIEW_SLOT0_SELECTOR):
+                    values = [1 << 96, 0, 0, fee]
+                elif calldata_.startswith(STATE_VIEW_LIQUIDITY_SELECTOR):
+                    values = [1_000]
+                else:
+                    raise AssertionError(calldata_)
+                return "0x" + encode(
+                    ["uint256"] * len(values), values,
+                ).hex()
+            return super().call(method, params)
+
+    store = MarketStore(":memory:")
+    rpc = EnrichmentRpc()
+    scanner = indexer(store, rpc)
+    try:
+        store.upsert_pools([{
+            "id": pool_id,
+            "protocol": "v4",
+            "address": POOL_MANAGER,
+            "token0": token0,
+            "token1": token1,
+            "fee_ppm": fee,
+            "tick_spacing": spacing,
+            "hook": hook,
+            "factory": POOL_MANAGER,
+            "source": "test",
+        }])
+        pending = {
+            "tx_hash": tx_hash,
+            "block_number": 10,
+            "block_hash": observed["hash"],
+            "attempts": 0,
+            "generation": 0,
+        }
+        _row, events, gas, error = scanner._enrich_transactions([pending])[0]
+        assert error is None
+        action = next(row for row in events if row["protocol"] == "v4")
+        assert (
+            action["cashflow0"],
+            action["cashflow1"],
+            action["fee_amount0"],
+            action["fee_amount1"],
+        ) == ("-1000", "-2000", "3", "5")
+        assert action["data"]["trace_complete"] is True
+        assert action["data"]["position_before"]["absence_basis"] == (
+            "same_receipt_verified_v4_manager_mint"
+        )
+        assert action["data"]["position_after"]["liquidity"] == "100"
+        assert action["data"]["pool_state_before"]["liquidity"] == "1000"
+        assert gas["payer"] == owner
+        assert gas["gas_native"] == str(21_000 * 1_000_000_000)
+    finally:
+        scanner.close()
+        store.close()
+
+
+def test_v4_zero_state_requires_same_receipt_burn_proof():
+    from eth_abi import encode
+    from rhpools.lp_market_protocols import (
+        V4_POSITION_MANAGER,
+        decode_position_state_results,
+        nft_position_key,
+        position_state_requests,
+    )
+
+    owner = "0x" + "11" * 20
+    block_hash = "0x" + "22" * 32
+    tx_hash = "0x" + "33" * 32
+    pool_id = "0x" + "44" * 32
+    core_key = "0x" + "55" * 32
+    token_id = 42
+    position_key = nft_position_key(V4_POSITION_MANAGER, token_id)
+    common = {
+        "block_number": 10,
+        "block_hash": block_hash,
+        "tx_hash": tx_hash,
+        "tx_index": 0,
+        "timestamp": 1_000,
+        "pool_id": pool_id,
+        "owner": owner,
+        "custody": V4_POSITION_MANAGER,
+        "position_key": position_key,
+        "token_id": str(token_id),
+        "tick_lower": -60,
+        "tick_upper": 60,
+    }
+    action = {
+        **common,
+        "protocol": "v4",
+        "kind": "remove",
+        "log_index": 0,
+        "liquidity_delta": "-100",
+        "data": {"core_position_key": core_key},
+    }
+    burn = {
+        **common,
+        "protocol": "nft",
+        "kind": "transfer",
+        "log_index": 1,
+        "liquidity_delta": None,
+        "data": {
+            "manager_protocol": "v4",
+            "prior_owner": owner,
+            "new_owner": "0x" + "00" * 20,
+            "burn": True,
+            "core_position_key": core_key,
+        },
+    }
+    requests = [
+        request
+        for request in position_state_requests([action, burn])
+        if request["correlation"]["decoder"] == "v4_state_view_position"
+    ]
+    results = [
+        "0x" + encode(
+            ["uint128", "uint256", "uint256"],
+            [100, 1, 2]
+            if request["correlation"]["field"] == "position_before"
+            else [0, 0, 0],
+        ).hex()
+        for request in requests
+    ]
+    updates = decode_position_state_results(requests, results)
+    assert updates
+    for update in updates:
+        assert update["data"]["position_after"]["exists"] is None
+        assert update["data"]["position_after"]["nft_exists"] is False
+        assert update["data"]["position_after"]["nft_absence_basis"] == (
+            "same_receipt_verified_v4_manager_burn"
+        )
+
+    unproven_requests = [
+        request
+        for request in position_state_requests([action])
+        if request["correlation"]["decoder"] == "v4_state_view_position"
+    ]
+    unproven = decode_position_state_results(
+        unproven_requests,
+        ["0x" + encode(
+            ["uint128", "uint256", "uint256"], [0, 0, 0],
+        ).hex()] * len(unproven_requests),
+    )
+    assert unproven[0]["data"]["position_after"]["exists"] is None
+    assert "nft_exists" not in unproven[0]["data"]["position_after"]
+
+
 
 

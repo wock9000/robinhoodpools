@@ -1061,6 +1061,7 @@ class LPMarketService:
         from .lp_market_store import MarketStore
         from .lp_market_index import MarketIndexer
         from .lp_market_accounting import AccountBook
+        from .lp_market_claims import PositionClaims
         self.market = market
         self.store = MarketStore(path, checkpoint_on_commit=not start)
         self.prices = PriceProjection(self.store)
@@ -1087,6 +1088,9 @@ class LPMarketService:
             accounting_recovery=(
                 self.book.recover_pending_identities if start else None
             ),
+        )
+        self.claims = PositionClaims(
+            self.store, self.book, self.prices, self.indexer._worker_rpc,
         )
         # Restore the durable catalog before serving requests. Exact cold
         # inspectors can then reuse an already-qualified stored identity even
@@ -1131,6 +1135,7 @@ class LPMarketService:
         ] = [None] * 1024
         if start:
             self.indexer.start(deferred=deferred_start)
+            self.claims.start()
             self._search_thread = threading.Thread(
                 target=self._search_index_run,
                 name="lp-market-search-index",
@@ -1633,6 +1638,7 @@ class LPMarketService:
         self._search_stop.set()
         if self._search_thread is not None:
             self._search_thread.join()
+        self.claims.close()
         self.indexer.close()
         self._frame_executor.shutdown(wait=True, cancel_futures=True)
         self.store.close()
@@ -1665,6 +1671,7 @@ class LPMarketService:
         out["as_of"] = time.time()
         providers = self.indexer.source_status()
         out["providers"] = providers
+        out["current_claims"] = self.claims.status()
         trace = providers.get("trace") or {}
         out["source_coverage"] = {
             "head": "independent newHeads subscription with bounded public-RPC gap reconciliation",
@@ -2852,6 +2859,9 @@ class LPMarketService:
                         return None
                     continue
                 fresh = self._fresh_owner_envelope(envelope)
+                self.claims.request([
+                    row["owner"] for row in fresh.get("rows", ()) if row.get("owner")
+                ])
                 return fresh
             if not wait:
                 return None
@@ -2896,6 +2906,7 @@ class LPMarketService:
             int(owner[2:], 16)
         except ValueError as exc:
             raise ValueError("owner must be a hexadecimal address") from exc
+        self.claims.request([owner], priority=True)
         return self._cached(
             ("owner", *sorted(params.items())),
             lambda: self.book.owner(owner, params), ttl=5.0,

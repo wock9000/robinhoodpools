@@ -64,8 +64,12 @@ HISTORY_MAX_CHUNK = 32_768
 # Background history uses a shorter writer target so financial lanes can run.
 MAX_INTERVAL_STORE_SECONDS = 2.0
 HISTORY_MAX_INTERVAL_STORE_SECONDS = 0.2
-ENRICH_BATCH = 8
+ENRICH_BATCH = 4
 ENRICHMENT_CAPABILITY_RECHECK_S = 300.0
+ENRICH_TRACE_BATCH = 2
+ENRICH_WORKERS = 8
+ENRICH_TRACE_WORKERS = 4
+ENRICH_INFLIGHT_LIMIT = ENRICH_BATCH * ENRICH_WORKERS
 REPROJECT_BATCH = 128
 V4_OWNER_REPAIR_LIMIT = 32
 V4_OWNER_REPAIR_SCAN = 8192
@@ -396,7 +400,10 @@ class MarketIndexer:
         self._publish_after_id = ""
         self._market_epoch = int(self.store.status().get("epoch", 0))
         self._enrichment_local = threading.local()
-        self._enrichment_jobs: dict[str, tuple[Mapping[str, Any], Future, float]] = {}
+        self._enrichment_jobs: dict[
+            tuple[str, ...],
+            tuple[tuple[Mapping[str, Any], ...], Future, float, bool],
+        ] = {}
         self._worker_clients: list[Any] = []
         self._worker_clients_lock = threading.Lock()
         self._feed_condition = threading.Condition()
@@ -423,7 +430,12 @@ class MarketIndexer:
             max_workers=2, thread_name_prefix="lp-current-pool",
         )
         self._enrichment_executor = ThreadPoolExecutor(
-            max_workers=ENRICH_BATCH, thread_name_prefix="lp-market-fetch",
+            max_workers=ENRICH_WORKERS,
+            thread_name_prefix="lp-market-fetch",
+        )
+        self._trace_enrichment_executor = ThreadPoolExecutor(
+            max_workers=ENRICH_TRACE_WORKERS,
+            thread_name_prefix="lp-market-trace",
         )
         self._header_executor = ThreadPoolExecutor(
             max_workers=2, thread_name_prefix="lp-market-headers",
@@ -1929,6 +1941,9 @@ class MarketIndexer:
                     wait=True, cancel_futures=True,
                 )
                 self._enrichment_executor.shutdown(
+                    wait=True, cancel_futures=True,
+                )
+                self._trace_enrichment_executor.shutdown(
                     wait=True, cancel_futures=True,
                 )
                 self._header_executor.shutdown(
@@ -4121,101 +4136,283 @@ class MarketIndexer:
         results = self._batch_on(selected, unique, allow_reverts=True)
         return [results[index] for index in order]
 
+    @staticmethod
+    def _apply_position_state_updates(
+        events: Sequence[dict[str, Any]],
+        state_updates: Sequence[Mapping[str, Any]],
+    ) -> None:
+        by_identity = {
+            (
+                _lower(event.get("block_hash")),
+                _lower(event.get("tx_hash")),
+                int(event.get("log_index", -1)),
+            ): event
+            for event in events
+        }
+        for update in state_updates:
+            identity = update.get("identity")
+            if not isinstance(identity, Mapping):
+                raise ValueError("position state decoder omitted event identity")
+            key = (
+                _lower(identity.get("block_hash")),
+                _lower(identity.get("tx_hash")),
+                int(identity.get("log_index", -1)),
+            )
+            event = by_identity.get(key)
+            if event is None:
+                raise ValueError(
+                    "position state decoder returned an unknown event identity"
+                )
+            data_update = update.get("data")
+            if not isinstance(data_update, Mapping):
+                raise ValueError(
+                    "position state decoder returned malformed event data"
+                )
+            data = event.get("data")
+            merged = dict(data) if isinstance(data, Mapping) else {}
+            merged.update(data_update)
+            event["data"] = merged
+
+    @staticmethod
+    def _requires_v4_trace(receipt: Mapping[str, Any]) -> bool:
+        logs = receipt.get("logs")
+        if not isinstance(logs, Sequence) or isinstance(logs, (str, bytes)):
+            return False
+        for log in logs:
+            if not isinstance(log, Mapping):
+                continue
+            topics = log.get("topics")
+            if (
+                _lower(log.get("address")) == POOL_MANAGER
+                and isinstance(topics, Sequence)
+                and not isinstance(topics, (str, bytes))
+                and bool(topics)
+                and _lower(topics[0]) == V4_MODIFY_LIQUIDITY_TOPIC
+            ):
+                return True
+        return False
+
+    def _enrich_transactions(
+        self, pending_rows: Sequence[Mapping[str, Any]],
+    ) -> list[
+        tuple[
+            Mapping[str, Any],
+            list[dict[str, Any]] | None,
+            dict[str, Any] | None,
+            Exception | None,
+        ]
+    ]:
+        """Fetch one bounded wave while isolating transaction-level evidence."""
+        if self._stop.is_set():
+            raise RpcError("indexer closed before enrichment fetch")
+        rows = tuple(pending_rows)
+        if not rows:
+            return []
+        client = self._worker_rpc()
+        receipts = self._batch_on(client, [
+            ("eth_getTransactionReceipt", [_lower(row["tx_hash"])])
+            for row in rows
+        ])
+        prepared: dict[str, dict[str, Any]] = {}
+        errors: dict[str, Exception] = {}
+        needs_body: list[str] = []
+        for row, receipt in zip(rows, receipts):
+            tx_hash = _lower(row["tx_hash"])
+            try:
+                if not isinstance(receipt, Mapping):
+                    raise RpcError(
+                        f"transaction {tx_hash} receipt unavailable"
+                    )
+                if _lower(receipt.get("transactionHash")) != tx_hash:
+                    raise RpcError(
+                        f"transaction {tx_hash} receipt identity mismatch"
+                    )
+                block_number = _hex_int(
+                    receipt.get("blockNumber"), "receipt block number"
+                )
+                block_hash = _lower(receipt.get("blockHash"))
+                if (
+                    block_number != int(row["block_number"])
+                    or block_hash != _lower(row["block_hash"])
+                ):
+                    raise CanonicalConflict(
+                        f"pending transaction {tx_hash} moved to another block"
+                    )
+                raw_logs = receipt.get("logs")
+                if not isinstance(raw_logs, list):
+                    raise RpcError(f"transaction {tx_hash} receipt omitted logs")
+                if any(not isinstance(log, Mapping) for log in raw_logs):
+                    raise RpcError(
+                        f"transaction {tx_hash} receipt contains malformed logs"
+                    )
+                prepared[tx_hash] = {
+                    "row": row,
+                    "receipt": dict(receipt),
+                    "transaction": {},
+                    "block_number": block_number,
+                    "block_hash": block_hash,
+                    "raw_logs": [dict(log) for log in raw_logs],
+                    "trace": None,
+                }
+                if (
+                    receipt.get("effectiveGasPrice") is None
+                    or receipt.get("from") is None
+                ):
+                    needs_body.append(tx_hash)
+            except Exception as exc:
+                errors[tx_hash] = exc
+
+        if needs_body:
+            bodies = self._batch_on(client, [
+                ("eth_getTransactionByHash", [tx_hash])
+                for tx_hash in needs_body
+            ])
+            for tx_hash, transaction in zip(needs_body, bodies):
+                try:
+                    if (
+                        not isinstance(transaction, Mapping)
+                        or _lower(transaction.get("hash")) != tx_hash
+                    ):
+                        raise RpcError(
+                            f"transaction {tx_hash} fallback body unavailable"
+                        )
+                    prepared[tx_hash]["transaction"] = dict(transaction)
+                except Exception as exc:
+                    errors[tx_hash] = exc
+                    prepared.pop(tx_hash)
+
+        # Trace calls stay independent. One pruned or malformed trace must not
+        # discard successful siblings from the receipt wave.
+        for tx_hash, context in tuple(prepared.items()):
+            if not self._requires_v4_trace(context["receipt"]):
+                continue
+            try:
+                trace = client.call("debug_traceTransaction", [
+                    tx_hash,
+                    {
+                        "tracer": "callTracer",
+                        "tracerConfig": {"withLog": True},
+                        # Missing historical state stays pending; never rebuild
+                        # it on the authoritative live node.
+                        "reexec": 0,
+                        "timeout": "5s",
+                    },
+                ])
+                if not isinstance(trace, Mapping):
+                    raise RpcError(
+                        f"transaction {tx_hash} returned a malformed call trace"
+                    )
+                context["trace"] = dict(trace)
+            except Exception as exc:
+                errors[tx_hash] = exc
+                prepared.pop(tx_hash)
+
+        block_numbers = sorted({
+            int(context["block_number"]) for context in prepared.values()
+        })
+        raw_headers = self._batch_on(client, [
+            ("eth_getBlockByNumber", [hex(number), False])
+            for number in block_numbers
+        ])
+        headers: dict[int, dict[str, Any]] = {}
+        for number, raw_header in zip(block_numbers, raw_headers):
+            try:
+                headers[number] = _header(raw_header, number)
+            except Exception as exc:
+                for tx_hash, context in tuple(prepared.items()):
+                    if int(context["block_number"]) == number:
+                        errors[tx_hash] = exc
+                        prepared.pop(tx_hash)
+        for tx_hash, context in tuple(prepared.items()):
+            header = headers[int(context["block_number"])]
+            if header["hash"] != context["block_hash"]:
+                errors[tx_hash] = CanonicalConflict(
+                    f"pending transaction {tx_hash} is orphaned"
+                )
+                prepared.pop(tx_hash)
+
+        decoded: dict[str, tuple[list[dict[str, Any]], list[dict[str, Any]]]] = {}
+        all_state_requests: list[dict[str, Any]] = []
+        state_slices: dict[str, tuple[int, int]] = {}
+        for tx_hash, context in tuple(prepared.items()):
+            try:
+                block_number = int(context["block_number"])
+                traces = (
+                    {tx_hash: context["trace"]}
+                    if context["trace"] is not None
+                    else None
+                )
+                events = self._decode(
+                    "enrichment",
+                    context["raw_logs"],
+                    {block_number: headers[block_number]},
+                    receipts={tx_hash: context["receipt"]},
+                    traces=traces,
+                    resolve_unknown=False,
+                )
+                if not events:
+                    raise ValueError(
+                        f"enrichment decoder returned no events for {tx_hash}"
+                    )
+                requests_ = list(position_state_requests(events))
+                start = len(all_state_requests)
+                all_state_requests.extend(requests_)
+                state_slices[tx_hash] = (start, len(all_state_requests))
+                decoded[tx_hash] = (events, requests_)
+            except Exception as exc:
+                errors[tx_hash] = exc
+                prepared.pop(tx_hash)
+
+        state_results = (
+            self._rpc_state_batch(
+                self._state_rpc_calls(all_state_requests), client,
+            )
+            if all_state_requests
+            else []
+        )
+        completed: dict[
+            str, tuple[list[dict[str, Any]], dict[str, Any]]
+        ] = {}
+        for tx_hash, context in tuple(prepared.items()):
+            try:
+                events, requests_ = decoded[tx_hash]
+                start, end = state_slices[tx_hash]
+                if requests_:
+                    state_updates = decode_position_state_results(
+                        requests_, state_results[start:end],
+                    )
+                    self._apply_position_state_updates(events, state_updates)
+                gas = decode_gas_record(
+                    context["receipt"], context["transaction"],
+                )
+                if not isinstance(gas, Mapping):
+                    raise ValueError("gas decoder returned a malformed record")
+                gas_record = dict(gas)
+                if gas_record.get("gas_native") is not None:
+                    gas_record["gas_native"] = str(gas_record["gas_native"])
+                completed[tx_hash] = (events, gas_record)
+            except Exception as exc:
+                errors[tx_hash] = exc
+
+        return [
+            (
+                row,
+                completed.get(_lower(row["tx_hash"]), (None, None))[0],
+                completed.get(_lower(row["tx_hash"]), (None, None))[1],
+                errors.get(_lower(row["tx_hash"])),
+            )
+            for row in rows
+        ]
+
     def _enrich_transaction(
         self, pending: Mapping[str, Any],
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        if self._stop.is_set():
-            raise RpcError("indexer closed before enrichment fetch")
-        client = self._worker_rpc()
-        tx_hash = _lower(pending["tx_hash"])
-        receipt, transaction = self._batch_on(client, [
-            ("eth_getTransactionReceipt", [tx_hash]),
-            ("eth_getTransactionByHash", [tx_hash]),
-        ])
-        if not isinstance(receipt, Mapping) or not isinstance(transaction, Mapping):
-            raise RpcError(f"transaction {tx_hash} receipt/body unavailable")
-        block_number = _hex_int(receipt.get("blockNumber"), "receipt block number")
-        block_hash = _lower(receipt.get("blockHash"))
-        if block_number != int(pending["block_number"]) or block_hash != _lower(pending["block_hash"]):
-            raise CanonicalConflict(f"pending transaction {tx_hash} moved to another block")
-        raw_logs = receipt.get("logs")
-        if not isinstance(raw_logs, list):
-            raise RpcError(f"transaction {tx_hash} receipt omitted logs")
-        if any(not isinstance(log, Mapping) for log in raw_logs):
-            raise RpcError(f"transaction {tx_hash} receipt contains malformed logs")
-        traces = None
-        if any(
-            _lower(log.get("address")) == POOL_MANAGER
-            and _lower((log.get("topics") or [None])[0]) == V4_MODIFY_LIQUIDITY_TOPIC
-            for log in raw_logs
-        ):
-            trace = client.call("debug_traceTransaction", [
-                tx_hash,
-                {
-                    "tracer": "callTracer", "tracerConfig": {"withLog": True},
-                    # Missing historical state stays pending; never rebuild it
-                    # on the authoritative live node.
-                    "reexec": 0, "timeout": "5s",
-                },
-            ])
-            if not isinstance(trace, Mapping):
-                raise RpcError(f"transaction {tx_hash} returned a malformed call trace")
-            traces = {tx_hash: dict(trace)}
-        header = _header(
-            client.call("eth_getBlockByNumber", [hex(block_number), False]),
-            block_number,
-        )
-        if header["hash"] != block_hash:
-            raise CanonicalConflict(f"pending transaction {tx_hash} is orphaned")
-        events = self._decode(
-            "enrichment",
-            [dict(log) for log in raw_logs],
-            {block_number: header},
-            receipts={tx_hash: dict(receipt)},
-            traces=traces,
-            resolve_unknown=False,
-        )
-        if not events:
-            raise ValueError(f"enrichment decoder returned no events for {tx_hash}")
-        requests_ = list(position_state_requests(events))
-        if requests_:
-            state_results = self._rpc_state_batch(
-                self._state_rpc_calls(requests_), client,
-            )
-            state_updates = decode_position_state_results(requests_, state_results)
-            if state_updates is not None:
-                by_identity = {
-                    (
-                        _lower(event.get("block_hash")), _lower(event.get("tx_hash")),
-                        int(event.get("log_index", -1)),
-                    ): event
-                    for event in events
-                }
-                for update in state_updates:
-                    identity = update.get("identity")
-                    if not isinstance(identity, Mapping):
-                        raise ValueError("position state decoder omitted event identity")
-                    key = (
-                        _lower(identity.get("block_hash")), _lower(identity.get("tx_hash")),
-                        int(identity.get("log_index", -1)),
-                    )
-                    event = by_identity.get(key)
-                    if event is None:
-                        raise ValueError("position state decoder returned an unknown event identity")
-                    data_update = update.get("data")
-                    if not isinstance(data_update, Mapping):
-                        raise ValueError("position state decoder returned malformed event data")
-                    data = event.get("data")
-                    merged = dict(data) if isinstance(data, Mapping) else {}
-                    merged.update(data_update)
-                    event["data"] = merged
-        gas = decode_gas_record(dict(receipt), dict(transaction))
-        if not isinstance(gas, Mapping):
-            raise ValueError("gas decoder returned a malformed record")
-        gas_record = dict(gas)
-        if gas_record.get("gas_native") is not None:
-            gas_record["gas_native"] = str(gas_record["gas_native"])
-        return events, gas_record
+        _row, events, transaction, error = self._enrich_transactions([pending])[0]
+        if error is not None:
+            raise error
+        if events is None or transaction is None:
+            raise RuntimeError("enrichment wave omitted its transaction result")
+        return events, transaction
 
     @staticmethod
     def _trace_capability_error(error: BaseException) -> bool:
@@ -4251,57 +4448,137 @@ class MarketIndexer:
             self.store.mark_enrichment_error(str(row["tx_hash"]), str(error), delay=delay)
         return True
 
+    def _pending_v4_trace_hashes(
+        self, rows: Sequence[Mapping[str, Any]],
+    ) -> set[str]:
+        hashes = tuple(dict.fromkeys(str(row["tx_hash"]) for row in rows))
+        if not hashes:
+            return set()
+        marks = ",".join("?" for _ in hashes)
+        return {
+            str(row["tx_hash"])
+            for row in self.store.read().execute(
+                "SELECT DISTINCT tx_hash FROM events "
+                "INDEXED BY events_tx_log_idx "
+                f"WHERE tx_hash IN ({marks}) AND protocol='v4' "
+                "AND kind IN ('add','remove','collect')",
+                hashes,
+            )
+        }
+
+    def _fill_enrichment_jobs(
+        self, reserved: Iterable[str] = (),
+    ) -> None:
+        active = sum(
+            len(rows)
+            for rows, _future, _started, _trace
+            in self._enrichment_jobs.values()
+        )
+        capacity = ENRICH_INFLIGHT_LIMIT - active
+        if capacity <= 0 or self._stop.is_set():
+            return
+        blocked = {
+            str(row["tx_hash"])
+            for rows, _future, _started, _trace in self._enrichment_jobs.values()
+            for row in rows
+        }
+        blocked.update(str(tx_hash) for tx_hash in reserved)
+        selection_limit = min(256, capacity + len(blocked))
+        candidates = []
+        for row in self.store.pending_enrichments(selection_limit):
+            if str(row["tx_hash"]) in blocked:
+                continue
+            candidates.append(row)
+            if len(candidates) == capacity:
+                break
+        trace_hashes = self._pending_v4_trace_hashes(candidates)
+        trace_rows = [
+            row for row in candidates if str(row["tx_hash"]) in trace_hashes
+        ]
+        regular_rows = [
+            row for row in candidates if str(row["tx_hash"]) not in trace_hashes
+        ]
+        batches = [
+            *(
+                (tuple(regular_rows[offset:offset + ENRICH_BATCH]), False)
+                for offset in range(0, len(regular_rows), ENRICH_BATCH)
+            ),
+            *(
+                (tuple(trace_rows[offset:offset + ENRICH_TRACE_BATCH]), True)
+                for offset in range(0, len(trace_rows), ENRICH_TRACE_BATCH)
+            ),
+        ]
+        for rows, trace in batches:
+            key = tuple(str(row["tx_hash"]) for row in rows)
+            executor = (
+                self._trace_enrichment_executor
+                if trace
+                else self._enrichment_executor
+            )
+            self._enrichment_jobs[key] = (
+                rows,
+                executor.submit(self._enrich_transactions, rows),
+                time.monotonic(),
+                trace,
+            )
+
     def _enrich_once(self) -> bool:
-        capacity = ENRICH_BATCH - len(self._enrichment_jobs)
-        if capacity and not self._stop.is_set():
-            for row in self.store.pending_enrichments(ENRICH_BATCH):
-                tx_hash = str(row["tx_hash"])
-                if tx_hash in self._enrichment_jobs:
-                    continue
-                self._enrichment_jobs[tx_hash] = (
-                    row, self._enrichment_executor.submit(self._enrich_transaction, row),
-                    time.monotonic(),
-                )
-                capacity -= 1
-                if not capacity:
-                    break
+        self._fill_enrichment_jobs()
         if not self._enrichment_jobs:
             return False
         wait(
             [job[1] for job in self._enrichment_jobs.values()],
-            timeout=0.05, return_when=FIRST_COMPLETED,
+            timeout=0.05,
+            return_when=FIRST_COMPLETED,
         )
         jobs = [
-            self._enrichment_jobs.pop(tx_hash)
-            for tx_hash, job in tuple(self._enrichment_jobs.items())
+            self._enrichment_jobs.pop(key)
+            for key, job in tuple(self._enrichment_jobs.items())
             if job[1].done()
         ]
         if not jobs:
             return False
         started = min(job[2] for job in jobs)
+        outcomes = []
+        completed_hashes: set[str] = set()
+        for rows, future, _submitted_at, _trace in jobs:
+            completed_hashes.update(str(row["tx_hash"]) for row in rows)
+            try:
+                batch_outcomes = future.result()
+                if (
+                    len(batch_outcomes) != len(rows)
+                    or any(
+                        str(expected["tx_hash"]) != str(outcome[0]["tx_hash"])
+                        for expected, outcome in zip(rows, batch_outcomes)
+                    )
+                ):
+                    raise RuntimeError(
+                        "enrichment wave returned an inconsistent result set"
+                    )
+            except Exception as exc:
+                batch_outcomes = [
+                    (row, None, None, exc)
+                    for row in rows
+                ]
+            outcomes.extend(batch_outcomes)
+
         successful_rows: list[Mapping[str, Any]] = []
         events: list[dict[str, Any]] = []
         transactions: list[dict[str, Any]] = []
+        failures: list[tuple[Mapping[str, Any], Exception]] = []
         orphan: Mapping[str, Any] | None = None
-        batch_error: Exception | None = None
-        for row, future, _submitted_at in jobs:
-            try:
-                row_events, transaction = future.result()
-            except CanonicalConflict:
+        for row, row_events, transaction, error in outcomes:
+            if isinstance(error, CanonicalConflict):
                 orphan = orphan or row
-            except Exception as exc:
-                attempts = int(row.get("attempts", 0)) + 1
-                if not self._mark_enrichment_failure(
-                    row, exc,
-                    delay=(
-                        ENRICHMENT_CAPABILITY_RECHECK_S
-                        if self._trace_capability_error(exc)
-                        else min(300.0, 2.0 ** min(attempts, 8))
+            elif error is not None:
+                failures.append((row, error))
+            elif row_events is None or transaction is None:
+                failures.append((
+                    row,
+                    RuntimeError(
+                        "enrichment wave omitted its transaction result"
                     ),
-                ):
-                    continue
-                batch_error = exc
-                self._set_runtime("enrichment", error=exc)
+                ))
             else:
                 successful_rows.append(row)
                 events.extend(row_events)
@@ -4316,6 +4593,26 @@ class MarketIndexer:
                 supplied_anchor=True,
             )
             return True
+
+        # Refill before taking the writer lock. Fetch workers keep using the
+        # provider while completed evidence waits behind live/history commits.
+        self._fill_enrichment_jobs(completed_hashes)
+        batch_error: Exception | None = None
+        for row, exc in failures:
+            attempts = int(row.get("attempts", 0)) + 1
+            if not self._mark_enrichment_failure(
+                row,
+                exc,
+                delay=(
+                    ENRICHMENT_CAPABILITY_RECHECK_S
+                    if self._trace_capability_error(exc)
+                    else min(300.0, 2.0 ** min(attempts, 8))
+                ),
+            ):
+                continue
+            batch_error = exc
+            self._set_runtime("enrichment", error=exc)
+
         if transactions:
             try:
                 with self.store.transaction() as conn:
@@ -4326,13 +4623,19 @@ class MarketIndexer:
                         return True
                     if len(ready) != len(successful_rows):
                         successful_rows = [
-                            row for row in successful_rows if str(row["tx_hash"]) in ready
+                            row
+                            for row in successful_rows
+                            if str(row["tx_hash"]) in ready
                         ]
                         transactions = [
-                            row for row in transactions if str(row["tx_hash"]) in ready
+                            row
+                            for row in transactions
+                            if str(row["tx_hash"]) in ready
                         ]
                         events = [
-                            event for event in events if str(event["tx_hash"]) in ready
+                            event
+                            for event in events
+                            if str(event["tx_hash"]) in ready
                         ]
                     self.store.enrich(events, transactions=transactions)
             except CanonicalConflict:
@@ -4349,7 +4652,8 @@ class MarketIndexer:
                 for row in successful_rows:
                     attempts = int(row.get("attempts", 0)) + 1
                     self._mark_enrichment_failure(
-                        row, exc,
+                        row,
+                        exc,
                         delay=min(300.0, 2.0 ** min(attempts, 8)),
                     )
                 self._set_runtime("enrichment", error=exc)
@@ -4359,12 +4663,14 @@ class MarketIndexer:
                 )
                 if batch_error is None:
                     self._set_runtime(
-                        "enrichment", latency=time.monotonic() - started,
+                        "enrichment",
+                        latency=time.monotonic() - started,
                         enrichment_batch=len(transactions),
                     )
                 else:
                     self._set_runtime(
-                        "enrichment", error=batch_error,
+                        "enrichment",
+                        error=batch_error,
                         latency=time.monotonic() - started,
                         enrichment_batch=len(transactions),
                     )
@@ -4790,6 +5096,9 @@ class MarketIndexer:
                 self._current_receipt_executor.shutdown(wait=True, cancel_futures=True)
                 self._current_pool_executor.shutdown(wait=True, cancel_futures=True)
                 self._enrichment_executor.shutdown(wait=True, cancel_futures=True)
+                self._trace_enrichment_executor.shutdown(
+                    wait=True, cancel_futures=True,
+                )
                 self._header_executor.shutdown(
                     wait=True, cancel_futures=True,
                 )

@@ -1900,6 +1900,17 @@ def test_owner_projection_is_shared_and_never_blocks_current_feed(
             "window": "all", "sort": "activity", "limit": 200,
         }) == envelope
         assert calls == 1
+
+        from types import SimpleNamespace
+        from rhpools import lp_market_claims
+        expired = time.monotonic() + 181
+        monkeypatch.setattr(
+            lp_market_claims, "time", SimpleNamespace(monotonic=lambda: expired),
+        )
+        assert app.claims._next() is None
+        assert app.poll_owners(params, after_revision=envelope["revision"]) is None
+        assert app.claims._next()[0] in {row["owner"] for row in envelope["rows"]}
+        assert calls == 1
     finally:
         release.set()
         app.close()

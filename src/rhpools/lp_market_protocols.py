@@ -2056,6 +2056,7 @@ def position_state_requests(events: Iterable[Mapping[str, Any]]) -> list[dict[st
         token_id: int | None = None
         proof_identity: tuple[str, str, int] | None = None
         mint_absence_basis: str | None = None
+        burn_absence_basis: str | None = None
         if token_id_value is not None and custody in NFT_MANAGER_ADDRESSES:
             token_id = _integer(token_id_value, "NFT token id")
             if (
@@ -2073,6 +2074,12 @@ def position_state_requests(events: Iterable[Mapping[str, Any]]) -> list[dict[st
                     if custody in V3_NFT_MANAGER_ADDRESSES
                     else "same_receipt_verified_v4_manager_mint"
                 )
+            if (
+                custody == V4_POSITION_MANAGER
+                and proof_identity is not None
+                and (*proof_identity, "burn") in lifecycle_proofs
+            ):
+                burn_absence_basis = "same_receipt_verified_v4_manager_burn"
         for field, pin in pins:
             if field == "position_before" and mint_absence_basis is not None:
                 # An allowlisted manager's canonical zero-address mint proves
@@ -2136,6 +2143,9 @@ def position_state_requests(events: Iterable[Mapping[str, Any]]) -> list[dict[st
                         mint_absence_basis if field == "position_after" else None
                     ),
                     position_before_block=max(block - 1, 0),
+                    position_after_absence_basis=(
+                        burn_absence_basis if field == "position_after" else None
+                    ),
                 )
             if request is not None:
                 key = (tuple(request["correlation"]["identity"].items()), field, request["params"][0]["to"], request["params"][0]["data"], pin)
@@ -2281,7 +2291,7 @@ def _decode_position_result(decoder: str, result: str | None) -> dict[str, Any]:
         words = _words(result, "V4 StateView position result", 3)
         liquidity = _uint(words[0], 128, "V4 position liquidity")
         return {
-            "exists": bool(liquidity or words[1] or words[2]),
+            "exists": True if liquidity or words[1] or words[2] else None,
             "liquidity": str(liquidity),
             "fee_growth_inside0_last_x128": str(words[1]),
             "fee_growth_inside1_last_x128": str(words[2]),
@@ -2349,6 +2359,27 @@ def decode_position_state_results(
                             f"NFPM token state {actual_name} does not match core event"
                         )
             update["data"][field] = position
+            after_absence_basis = correlation.get(
+                "position_after_absence_basis"
+            )
+            if after_absence_basis is not None:
+                if (
+                    decoder != "v4_state_view_position"
+                    or field != "position_after"
+                    or after_absence_basis
+                    != "same_receipt_verified_v4_manager_burn"
+                    or position.get("liquidity") != "0"
+                ):
+                    raise ProtocolDecodeError(
+                        "verified V4 manager burn absence proof is inconsistent"
+                    )
+                # StateView reads the PoolManager's position record, whose fee
+                # growth fields may remain after liquidity reaches zero. The
+                # receipt burn proves NFT absence, not storage deletion.
+                position.update(
+                    nft_exists=False,
+                    nft_absence_basis=after_absence_basis,
+                )
             absence_basis = correlation.get("position_before_absence_basis")
             if absence_basis is not None:
                 expected_basis = {
