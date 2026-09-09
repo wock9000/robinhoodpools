@@ -947,8 +947,7 @@ def test_deferred_nft_transfer_hints_mark_both_wallets_pending(
         store.close()
 
 
-def test_historical_owner_reassignment_survives_identity_cursor(
-        tmp_path, monkeypatch):
+def test_historical_owner_reassignment_survives_identity_cursor(tmp_path):
     prior_owner = "0x" + "56" * 20
     reassigned_owner = "0x" + "78" * 20
     blocks = [header(100 + index, 1_000 + index) for index in range(2)]
@@ -998,8 +997,7 @@ def test_historical_owner_reassignment_survives_identity_cursor(
         ) == (0, event_id)
         assert hinted_owners == {reassigned_owner}
 
-        monkeypatch.setattr(book, "_prepare_pending", lambda _key: None)
-        assert book.project_pending(limit=1) is True
+        assert book.recover_pending_identities() is True
         ready = store.read().execute(
             "SELECT identities_ready FROM lp_accounting_pending "
             "WHERE position_key=?",
@@ -1057,8 +1055,7 @@ def test_legacy_pending_identity_recovery_resumes_after_restart(
         assert before[queued_owner]["financial_pending"] is True
         assert before[unrelated_owner]["financial_pending"] is True
 
-        monkeypatch.setattr(book, "_prepare_pending", lambda _key: None)
-        assert book.project_pending(limit=1) is True
+        assert book.recover_pending_identities() is True
         pending = store.read().execute(
             "SELECT identities_ready FROM lp_accounting_pending "
             "WHERE position_key=?",
@@ -1101,14 +1098,13 @@ def test_pending_identity_recovery_rejects_orphan_epoch(
 
     def recover():
         try:
-            book.project_pending(limit=1)
+            book.recover_pending_identities()
         except BaseException as error:
             failures.append(error)
 
     monkeypatch.setattr(
         book, "_prepare_pending_identity_hints", paused_prepare,
     )
-    monkeypatch.setattr(book, "_prepare_pending", lambda _key: None)
     try:
         store.ingest([old_block], [old_event])
         with store.transaction() as conn:
@@ -1155,7 +1151,7 @@ def test_pending_identity_recovery_rejects_orphan_epoch(
         monkeypatch.setattr(
             book, "_prepare_pending_identity_hints", original_prepare,
         )
-        assert book._recover_pending_identities() is True
+        assert book.recover_pending_identities() is True
         final_owners = {
             str(row[0])
             for row in store.read().execute(
@@ -1522,6 +1518,82 @@ def test_v3_manager_log_order_recovers_complete_fees_without_overstating_wallet_
         assert len(historical["ownership"]) == 1
         assert historical["ownership"][0]["acquired_by"] == "mint"
         assert historical["ownership"][0]["complete"] is True
+    finally:
+        app.close()
+
+
+def test_closed_pages_qualified_fees_and_unicode_pair_queries(tmp_path):
+    app = service(tmp_path / "market.sqlite")
+    try:
+        app.store.upsert_pools(pools())
+        keys = ("high", "unicode", "low", "incomplete")
+        blocks = [
+            header(100 + index, int(time.time()) - 120 + index)
+            for index in range(len(keys) * 2)
+        ]
+        events = []
+        transactions = []
+        for index, key in enumerate(keys):
+            opened, closed, episode_transactions = traced_v4_episode(
+                blocks[index * 2:index * 2 + 2], key=key,
+            )
+            events.extend((opened, closed))
+            transactions.extend(episode_transactions)
+        app.store.ingest(blocks, events, transactions=transactions)
+
+        with app.store.transaction() as connection:
+            for key, fees in zip(keys, (3.0, 2.0, 1.0, 99.0)):
+                connection.execute(
+                    "UPDATE lp_accounting_episodes SET fees_usd=? "
+                    "WHERE position_key=?",
+                    (fees, f"v4:{key}"),
+                )
+            connection.execute(
+                "UPDATE lp_accounting_episodes SET history_complete=0 "
+                "WHERE position_key=?",
+                ("v4:incomplete",),
+            )
+            connection.execute(
+                "UPDATE lp_accounting_episodes SET pool_id=? "
+                "WHERE position_key IN (?,?)",
+                (V3, "v4:high", "v4:low"),
+            )
+            connection.execute(
+                "UPDATE pools SET symbol0=NULL,token0=?,"
+                "symbol1=NULL,token1='' WHERE id=?",
+                ("CAFÉ%_TOKEN_LONG", V4),
+            )
+
+        page = app.book.closed({
+            "window": "all", "sort": "fees", "limit": 2, "offset": 1,
+        })
+        assert page["total"] == 4
+        assert [
+            row["position_key"] for row in page["rows"]
+        ] == ["v4:unicode", "v4:low"]
+        assert [row["fees_usd"] for row in page["rows"]] == [2.0, 1.0]
+
+        exhausted = app.book.closed({
+            "window": "all", "sort": "fees", "limit": 2, "offset": 99,
+        })
+        assert exhausted["rows"] == []
+        assert exhausted["total"] == 4
+
+        unicode_query = app.book.closed({
+            "window": "all", "sort": "fees", "q": "FÉ%_",
+        })
+        assert unicode_query["total"] == 2
+        assert [
+            row["position_key"] for row in unicode_query["rows"]
+        ] == ["v4:unicode", "v4:incomplete"]
+        assert unicode_query["rows"][0]["pair"] == "CAFÉ%_TO/?"
+        assert unicode_query["rows"][1]["fees_usd"] is None
+        assert unicode_query["rows"][1][
+            "observed_collected_fees_usd"
+        ] == 99.0
+        assert app.book.closed({
+            "window": "all", "q": "asset%_",
+        })["total"] == 0
     finally:
         app.close()
 

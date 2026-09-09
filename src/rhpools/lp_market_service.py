@@ -1084,6 +1084,9 @@ class LPMarketService:
             history_disk_reserve_bytes=history_disk_reserve_bytes, v3_balances=True,
             current_observer=self,
             accounting_projector=self.book.project_pending if start else None,
+            accounting_recovery=(
+                self.book.recover_pending_identities if start else None
+            ),
         )
         # Restore the durable catalog before serving requests. Exact cold
         # inspectors can then reuse an already-qualified stored identity even

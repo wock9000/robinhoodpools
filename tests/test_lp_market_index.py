@@ -608,6 +608,65 @@ def test_live_gap_and_v4_trace_cannot_block_v3_position_accounting(
         app.close()
 
 
+def test_identity_recovery_waits_for_initialization_and_outlives_blocked_accounting(
+    tmp_path, monkeypatch,
+):
+    store = MarketStore(tmp_path / "market.sqlite")
+    bootstrap_started = threading.Event()
+    release_bootstrap = threading.Event()
+    accounting_started = threading.Event()
+    release_accounting = threading.Event()
+    accounting_finished = threading.Event()
+    recovery_called = threading.Event()
+    recovery_initialization = []
+
+    def project_accounting():
+        accounting_started.set()
+        release_accounting.wait()
+        accounting_finished.set()
+        return False
+
+    def recover_identities():
+        recovery_initialization.append(scanner._initialized.is_set())
+        recovery_called.set()
+        return False
+
+    scanner = indexer(
+        store,
+        accounting_projector=project_accounting,
+        accounting_recovery=recover_identities,
+    )
+    bootstrap = scanner._bootstrap
+
+    def blocked_bootstrap():
+        bootstrap_started.set()
+        release_bootstrap.wait()
+        return bootstrap()
+
+    monkeypatch.setattr(scanner, "_bootstrap", blocked_bootstrap)
+    workers = ()
+    try:
+        scanner.start(deferred=True)
+        workers = tuple(scanner._threads)
+        assert bootstrap_started.wait(2)
+        assert accounting_started.wait(2)
+        assert not recovery_called.wait(0.1)
+
+        release_bootstrap.set()
+        assert recovery_called.wait(2)
+        assert recovery_initialization
+        assert all(recovery_initialization)
+        assert not accounting_finished.is_set()
+    finally:
+        release_bootstrap.set()
+        release_accounting.set()
+        scanner.close()
+        store.close()
+
+    assert workers
+    assert all(not worker.is_alive() for worker in workers)
+
+
 def test_history_progress_is_independent_of_unrunnable_enrichment(monkeypatch):
     store = MarketStore(":memory:")
     scanner = indexer(store)

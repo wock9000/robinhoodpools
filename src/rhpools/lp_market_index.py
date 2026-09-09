@@ -315,6 +315,7 @@ class MarketIndexer:
         history_disk_reserve_bytes: int = DEFAULT_HISTORY_DISK_RESERVE_BYTES,
         current_observer: Any | None = None,
         accounting_projector: Callable[[], bool] | None = None,
+        accounting_recovery: Callable[[], bool] | None = None,
     ) -> None:
         if history_days < 0:
             raise ValueError("history_days must be nonnegative")
@@ -324,6 +325,7 @@ class MarketIndexer:
         self.market = market
         self.current_observer = current_observer
         self._accounting_projector = accounting_projector
+        self._accounting_recovery = accounting_recovery
         self.rpc_url = rpc_url
         self.history_days = int(history_days)
         self.v3_balances = bool(v3_balances)
@@ -1891,6 +1893,12 @@ class MarketIndexer:
                     self._threads.append(threading.Thread(
                         target=self._accounting_run,
                         name="lp-market-accounting",
+                        daemon=True,
+                    ))
+                if self._accounting_recovery is not None:
+                    self._threads.append(threading.Thread(
+                        target=self._accounting_recovery_run,
+                        name="lp-market-identity-recovery",
                         daemon=True,
                     ))
                 if self._head_wss_urls:
@@ -4717,6 +4725,27 @@ class MarketIndexer:
                     self._set_runtime("accounting", latency=time.monotonic() - started)
             except Exception as exc:
                 self._set_runtime("accounting", error=exc)
+                self._stop.wait(backoff)
+                backoff = min(30.0, backoff * 2.0)
+            else:
+                backoff = 0.5
+                self._stop.wait(0.01 if worked else 0.1)
+
+    def _accounting_recovery_run(self) -> None:
+        backoff = 0.5
+        while not self._stop.is_set():
+            if not self._initialized.wait(0.5):
+                continue
+            try:
+                started = time.monotonic()
+                worked = self._accounting_recovery()
+                if worked:
+                    self._set_runtime(
+                        "identity_recovery",
+                        latency=time.monotonic() - started,
+                    )
+            except Exception as exc:
+                self._set_runtime("identity_recovery", error=exc)
                 self._stop.wait(backoff)
                 backoff = min(30.0, backoff * 2.0)
             else:

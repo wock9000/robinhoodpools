@@ -194,6 +194,11 @@ CREATE INDEX IF NOT EXISTS lp_accounting_episodes_pool
     ON lp_accounting_episodes(pool_id, closed_at, opened_at);
 CREATE INDEX IF NOT EXISTS lp_accounting_episodes_last_timestamp
     ON lp_accounting_episodes(last_timestamp);
+CREATE INDEX IF NOT EXISTS lp_accounting_episodes_closed_order
+    ON lp_accounting_episodes(
+        closed_at DESC, opened_block DESC,
+        opened_tx_index DESC, opened_log_index DESC
+    ) WHERE closed_at IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS lp_accounting_effects (
     event_id INTEGER PRIMARY KEY,
@@ -1200,7 +1205,7 @@ class AccountBook:
                 ).fetchone() is None:
                     self._invalidate_cache(conn, (), owners=True)
 
-    def _recover_pending_identities(self) -> bool:
+    def recover_pending_identities(self) -> bool:
         prepared = self._prepare_pending_identity_hints()
         if not prepared:
             return False
@@ -1310,8 +1315,6 @@ class AccountBook:
         bounded = max(1, min(int(limit), 128))
         with self._projection_lock:
             worked = self._resume_bootstrap(bounded)
-            if self._recover_pending_identities():
-                worked = True
             pending = self._pending_rows(bounded)
             if pending:
                 worked = True
@@ -3383,11 +3386,11 @@ class AccountBook:
             "coverage": self._row_coverage(row),
         }
 
-    def _episode_rows(self, conn: sqlite3.Connection,
-                      params: Mapping[str, Any] | None = None,
-                      *, closed_only: bool = False,
-                      identity: str | None = None) -> list[dict[str, Any]]:
-        params = params or {}
+    @staticmethod
+    def _episode_scope_filters(
+            params: Mapping[str, Any], *, closed_only: bool = False,
+            identity: str | None = None, include_query: bool = False,
+    ) -> tuple[list[str], list[Any], bool]:
         clauses: list[str] = []
         args: list[Any] = []
         if closed_only:
@@ -3396,7 +3399,9 @@ class AccountBook:
         if protocol in ("v2", "v3", "v4"):
             clauses.append("e.protocol=?")
             args.append(protocol)
-        pool_id = str(params.get("pool") or params.get("pool_id") or "").lower()
+        pool_id = str(
+            params.get("pool") or params.get("pool_id") or ""
+        ).lower()
         if pool_id:
             clauses.append("e.pool_id=?")
             args.append(pool_id)
@@ -3405,8 +3410,43 @@ class AccountBook:
             args.extend((identity, identity))
         cutoff = _cutoff(params)
         if cutoff is not None:
-            clauses.append("e.last_timestamp>=CAST(strftime('%s','now') AS INTEGER)-?")
-            args.append(cutoff)
+            clauses.append("e.last_timestamp>=?")
+            args.append(int(time.time()) - cutoff)
+        query = str(params.get("q") or "").strip().lower()
+        query_pool = bool(include_query and query)
+        if query_pool:
+            clauses.append(
+                "rhpools_episode_query("
+                "?,e.owner,e.custody,p.symbol0,p.symbol1,"
+                "p.token0,p.token1,e.pool_id)"
+            )
+            args.append(query)
+        return clauses, args, query_pool
+
+    @staticmethod
+    def _episode_query(
+            query: object, owner: object, custody: object,
+            symbol0: object, symbol1: object,
+            token0: object, token1: object, pool_id: object,
+    ) -> int:
+        pair = _pair({
+            "symbol0": symbol0, "symbol1": symbol1,
+            "token0": token0, "token1": token1,
+        })
+        searchable = " ".join((
+            str(owner or ""), str(custody or ""), pair.lower(),
+            str(pool_id or ""),
+        ))
+        return int(str(query) in searchable)
+
+    def _episode_rows(self, conn: sqlite3.Connection,
+                      params: Mapping[str, Any] | None = None,
+                      *, closed_only: bool = False,
+                      identity: str | None = None) -> list[dict[str, Any]]:
+        params = params or {}
+        clauses, args, _ = self._episode_scope_filters(
+            params, closed_only=closed_only, identity=identity,
+        )
         sql = (
             "SELECT e.*,s.active_episode_id,p.symbol0,p.symbol1,p.token0,p.token1 "
             "FROM lp_accounting_episodes e LEFT JOIN lp_accounting_positions s "
@@ -4122,25 +4162,69 @@ class AccountBook:
     def closed(self, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
         params = params or {}
         limit, offset = _limit_offset(params)
-        with self._reader() as conn:
-            rows = self._episode_rows(conn, params, closed_only=True)
-        query = str(params.get("q") or "").strip().lower()
-        views = []
-        for row in rows:
-            pair = _pair(row)
-            if query and query not in " ".join((str(row.get("owner") or ""),
-                                                str(row.get("custody") or ""), pair.lower(),
-                                                str(row.get("pool_id") or ""))):
-                continue
-            views.append(self._episode_view(row, pair))
+        clauses, args, query_pool = self._episode_scope_filters(
+            params, closed_only=True, include_query=True,
+        )
+        source = " FROM lp_accounting_episodes e"
+        if query_pool:
+            source += " LEFT JOIN pools p ON p.id=e.pool_id"
+        where = " WHERE " + " AND ".join(clauses)
+        recent_order = (
+            "e.closed_at DESC,e.opened_block DESC,"
+            "e.opened_tx_index DESC,e.opened_log_index DESC"
+        )
         sort_key = str(params.get("sort") or "recent").lower()
-        field = {"net": "net_pnl_usd", "gross": "gross_pnl_usd", "fees": "fees_usd",
-                 "return": "return_pct", "duration": "duration_s"}.get(sort_key, "closed_at")
-        views.sort(key=lambda row: (row.get(field) is not None,
-                                   row.get(field) if row.get(field) is not None else -math.inf),
-                   reverse=True)
-        total = len(views)
-        selected = views[offset:offset + limit]
+        sort_value = {
+            "net": "e.net_pnl_usd",
+            "gross": "e.gross_pnl_usd",
+            "fees": (
+                "CASE WHEN e.fees_complete AND e.pricing_complete "
+                "AND e.history_complete THEN e.fees_usd END"
+            ),
+            "return": "e.return_pct",
+            "duration": "MAX(0,e.closed_at-e.opened_at)",
+        }.get(sort_key)
+        order = recent_order
+        if sort_value is not None:
+            order = "sort_value IS NULL,sort_value DESC," + recent_order
+        with self._reader() as conn:
+            if query_pool:
+                conn.create_function(
+                    "rhpools_episode_query", 8, self._episode_query,
+                    deterministic=True,
+                )
+            total = int(conn.execute(
+                "SELECT COUNT(*)" + source + where, args,
+            ).fetchone()[0])
+            select = "SELECT e.id"
+            if sort_value is not None:
+                select += "," + sort_value + " AS sort_value"
+            episode_ids = [
+                str(row[0])
+                for row in conn.execute(
+                    select + source + where + " ORDER BY " + order
+                    + " LIMIT ? OFFSET ?",
+                    (*args, limit, offset),
+                ).fetchall()
+            ]
+            rows_by_id: dict[str, dict[str, Any]] = {}
+            for batch in _batches(episode_ids):
+                marks = ",".join("?" for _ in batch)
+                rows_by_id.update({
+                    str(row["id"]): row
+                    for row in _dict_rows(conn.execute(
+                        "SELECT e.*,p.symbol0,p.symbol1,p.token0,p.token1 "
+                        "FROM lp_accounting_episodes e "
+                        "LEFT JOIN pools p ON p.id=e.pool_id "
+                        f"WHERE e.id IN ({marks})",
+                        batch,
+                    ))
+                })
+            selected = [
+                self._episode_view(rows_by_id[episode_id],
+                                   _pair(rows_by_id[episode_id]))
+                for episode_id in episode_ids
+            ]
         coverage = self._status_coverage()
         coverage.update({"rows": len(selected), "qualified_rows": sum(
             bool(row["coverage"]["qualified"]) for row in selected)})

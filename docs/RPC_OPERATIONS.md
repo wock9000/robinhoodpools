@@ -85,6 +85,12 @@ recent ledger before returning its newest event and exceeded 30 seconds on the
 production snapshot; the ordered lookup returned the same boundary in under
 0.25 seconds including process startup.
 
+Closed-position queries count and select the requested page in one WAL snapshot
+with one frozen time cutoff. Only selected episode payloads are materialized.
+Fee sorting uses qualified fee values; incomplete-history amounts remain
+unknown rather than outranking verified fees. Text filtering retains Unicode
+substring matching and literal `%` and `_` characters.
+
 The CLI caps Python's thread-switch interval at 1 ms before starting workers,
 preserving an already-shorter interval. This reduces interpreter handoff delays
 when SQLite releases the GIL during ingestion while valuation threads run.
@@ -153,8 +159,9 @@ Schema version 9 records pending accounting scope and actor hints atomically
 with source changes, including both sides of NFT transfers. Wallet requests
 read those hints and published episodes instead of expanding every queued
 position's raw history. Legacy jobs start unqualified; bounded off-writer
-pages recover their hints without discarding existing financial rows. Recovery
-checks the canonical epoch and per-key cursor before publication.
+pages recover their hints on an independent worker, without waiting behind
+full position replays or discarding existing financial rows. Recovery checks
+the canonical epoch and per-key cursor before publication.
 
 Legacy V4 identity seeding checks each canonical candidate transaction's queue
 entry by transaction hash. It no longer searches every serialized error
