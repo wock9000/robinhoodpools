@@ -59,9 +59,11 @@ LIVE_INITIAL_CHUNK = 256
 LIVE_MAX_CHUNK = 2_048
 RECENT_CATCHUP_PRIORITY_BLOCKS = 512
 HISTORY_MIN_CHUNK = 1
-HISTORY_INITIAL_CHUNK = 4_096
+HISTORY_INITIAL_CHUNK = 8
 HISTORY_MAX_CHUNK = 32_768
-MAX_INTERVAL_STORE_SECONDS = 2.0
+# Target half the chain's observed ~100 ms block interval, not multi-second
+# writer monopolies that stall live ingestion and every financial worker.
+MAX_INTERVAL_STORE_SECONDS = 0.05
 ENRICH_BATCH = 8
 ENRICHMENT_CAPABILITY_RECHECK_S = 300.0
 REPROJECT_BATCH = 128
@@ -3544,6 +3546,10 @@ class MarketIndexer:
                 current * 2,
                 sample_blocks * (MAX_LOGS_PER_RESPONSE * 4 // 5) // count,
             )
+        if store_seconds > 0:
+            candidate = min(candidate, max(
+                minimum, int(sample_blocks * MAX_INTERVAL_STORE_SECONDS / store_seconds),
+            ))
         if candidate <= current:
             return
         resized = min(maximum, max(current + 1, candidate))

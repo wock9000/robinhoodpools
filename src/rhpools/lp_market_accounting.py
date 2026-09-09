@@ -3690,13 +3690,20 @@ class AccountBook:
             " WHERE " + " AND ".join(event_clauses)
             if event_clauses else ""
         )
-        through = conn.execute(
-            "SELECT e.block_number,e.tx_index,e.log_index,e.timestamp "
-            "FROM events e" + event_where
-            + " ORDER BY e.block_number DESC,e.tx_index DESC,"
-            "e.log_index DESC LIMIT 1",
-            event_args,
-        ).fetchone()
+        through = None
+        # A window lookup must not sort the entire recent ledger to find its
+        # newest event. Check empty scopes before walking the ordered index.
+        if not event_clauses or conn.execute(
+            "SELECT 1 FROM events e" + event_where + " LIMIT 1", event_args,
+        ).fetchone() is not None:
+            order_index = "" if pool_id else " INDEXED BY events_block_idx"
+            through = conn.execute(
+                "SELECT e.block_number,e.tx_index,e.log_index,e.timestamp "
+                "FROM events e" + order_index + event_where
+                + " ORDER BY e.block_number DESC,e.tx_index DESC,"
+                "e.log_index DESC LIMIT 1",
+                event_args,
+            ).fetchone()
         through_order = (
             {
                 "block_number": int(through["block_number"]),

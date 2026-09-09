@@ -263,9 +263,9 @@ responses distinguish complete collected-fee totals from partial evidence:
   `episode_selection: "last_activity_within_window"` and
   `financial_scope: "lifetime_of_selected_episodes"`. Do not treat these
   values as cash flows earned exclusively during the requested window.
-- Owner-list `financials.through_order` is the canonical
-  `[block_number, transaction_index, log_index]` boundary captured in the same
-  WAL snapshot as the financial aggregates. `financials.as_of` describes that
+- Owner-list `financials.through_order` contains the canonical `block_number`,
+  `tx_index`, and `log_index` boundary captured in the same WAL snapshot as the
+  financial aggregates. `financials.as_of` describes that
   boundary, not the time of the latest observed activity. Pending projection
   work or later activity keeps `financials.pending` true without advancing the
   captured boundary. A completed snapshot is distinct from complete history,

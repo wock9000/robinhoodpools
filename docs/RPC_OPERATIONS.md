@@ -70,6 +70,19 @@ SQLite's variable limit. This avoids handing the Python interpreter to competing
 valuation workers between every inserted row. The outer durable transaction
 preserves the raw event/cursor/job boundary.
 
+Adaptive scan sizing targets 50 ms of writer residency, half the observed
+100 ms block interval. Growth is capped by measured store throughput as well as
+log density, and history starts with eight blocks before adapting. This is a
+feedback target, not a hard transaction deadline; indivisible block work can
+exceed it. Multi-second history commits previously starved both the live lane
+and financial workers.
+
+Wallet freshness reads walk the canonical event-order index after checking
+whether the requested scope is empty. A timestamp-range plan sorted the entire
+recent ledger before returning its newest event and exceeded 30 seconds on the
+production snapshot; the ordered lookup returned the same boundary in under
+0.25 seconds including process startup.
+
 The CLI caps Python's thread-switch interval at 1 ms before starting workers,
 preserving an already-shorter interval. This reduces interpreter handoff delays
 when SQLite releases the GIL during ingestion while valuation threads run.
