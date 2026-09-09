@@ -1,6 +1,7 @@
 """Focused scanner throughput and canonical-safety regressions."""
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import threading
 import time
@@ -284,31 +285,36 @@ def test_live_chunk_sizing_excludes_writer_lock_wait(tmp_path, monkeypatch):
         scanner, "_fetch_interval",
         lambda _lane, start, end: ([], {start: boundaries[start], end: boundaries[end]}),
     )
+    clock = SimpleNamespace(now=100.0, depth=0)
+    transaction = store.transaction
+
+    @contextmanager
+    def queued_transaction():
+        outer = clock.depth == 0
+        if outer:
+            clock.now += 30.0
+        clock.depth += 1
+        try:
+            with transaction() as connection:
+                yield connection
+        finally:
+            clock.depth -= 1
+            if outer:
+                clock.now += 0.01
+
+    monkeypatch.setattr(store, "transaction", queued_transaction)
     monkeypatch.setattr(
-        "rhpools.lp_market_index.MAX_INTERVAL_STORE_SECONDS", 0.1,
+        "rhpools.lp_market_index.time",
+        SimpleNamespace(monotonic=lambda: clock.now, time=time.time),
     )
-    held = threading.Event()
-    release = threading.Event()
-
-    def hold_writer():
-        with store.transaction():
-            held.set()
-            release.wait(2)
-
-    writer = threading.Thread(target=hold_writer)
-    writer.start()
     try:
-        assert held.wait(1)
-        timer = threading.Timer(0.3, release.set)
-        timer.start()
         assert scanner._scan_live_once() is True
-        timer.join(1)
+        assert store.cursor("live")["block_number"] == 355
         scan = scanner.runtime_status()["live_scan"]
-        assert scan["store_lock_wait_seconds"] >= 0.15
-        assert scan["next_chunk"] == 512
+        assert scan["store_lock_wait_seconds"] == 30.0
+        assert scan["store_seconds"] == pytest.approx(0.01)
+        assert scan["next_chunk"] > scan["requested_chunk"]
     finally:
-        release.set()
-        writer.join(2)
         scanner.close()
         store.close()
 
