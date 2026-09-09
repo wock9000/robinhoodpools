@@ -1905,6 +1905,48 @@ def test_owner_projection_is_shared_and_never_blocks_current_feed(
         app.close()
 
 
+def test_wallet_read_does_not_queue_behind_unrelated_frames(tmp_path, monkeypatch):
+    app = service(tmp_path / "market.sqlite")
+    release = threading.Event()
+    entered = [threading.Event(), threading.Event()]
+    returned = threading.Event()
+    result = {}
+    reader = None
+    original = app.frame
+
+    def slow_frame(params, *args, **kwargs):
+        entered[int(params["q"])].set()
+        assert release.wait(3)
+        return original(params, *args, **kwargs)
+
+    monkeypatch.setattr(app, "frame", slow_frame)
+    try:
+        block = header(100, int(time.time()))
+        event = lp_effect(
+            block, "v4", "add", 1_000, (1_000_000, 1_000_000),
+            position_state(0), position_state(1_000),
+        )
+        app.observe_current_block(block)
+        app.observe_current_events(block, (event,))
+        for index in range(2):
+            assert app.poll_frame({"window": "all", "q": str(index)}, -1, 0) is None
+            assert entered[index].wait(1)
+
+        def read_wallet():
+            result.update(app.owners({"window": "all", "q": TOKEN}))
+            returned.set()
+
+        reader = threading.Thread(target=read_wallet)
+        reader.start()
+        assert returned.wait(1), "wallet read queued behind unrelated frame SQL"
+        assert TOKEN in {row["owner"] for row in result["rows"]}
+    finally:
+        release.set()
+        if reader is not None:
+            reader.join(3)
+        app.close()
+
+
 @pytest.mark.parametrize("reorg", [False, True])
 def test_completed_wallet_projection_is_deliverable_during_live_changes(
         tmp_path, monkeypatch, reorg):

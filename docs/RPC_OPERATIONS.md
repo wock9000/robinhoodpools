@@ -62,6 +62,11 @@ while a newer revision or an expired window refreshes asynchronously; one
 consumer cannot take that snapshot away from another. Blocking wallet reads
 still refresh changed revisions and expired windows. Canonical-branch changes
 invalidate both cached and in-flight publications.
+Cold blocking wallet reads materialize in their existing request thread instead
+of waiting behind unrelated background frames. Concurrent reads of the same
+view still share one future. Its producer assigns and caches the publication
+once, so a waiting request can deliver that exact completed snapshot even if
+a stream consumer has already read it.
 
 The running service commits raw events, cursors, balance jobs, and coalesced
 accounting jobs atomically. A separate accounting worker replays each affected

@@ -2742,6 +2742,24 @@ class LPMarketService:
         }
 
 
+    def _materialize_owner_projection(
+            self, params: Mapping[str, Any],
+    ) -> tuple[tuple[int, int, int, int], float | None, dict[str, Any]]:
+        version, valid_until, envelope = self._owners_result(params)
+        view_key = self._owner_view_key(params)
+        with self._frame_lock:
+            self._owner_result_revision += 1
+            envelope = {**envelope, "revision": self._owner_result_revision}
+            ready = (version, valid_until, envelope)
+            self._owner_results[view_key] = ready
+            self._owner_results.move_to_end(view_key)
+            self._owner_last_started[view_key] = time.monotonic()
+            while len(self._owner_results) > 64:
+                stale_view, _ = self._owner_results.popitem(last=False)
+                if ("owners", stale_view) not in self._frame_futures:
+                    self._owner_last_started.pop(stale_view, None)
+        return ready
+
     def _owner_projection(
             self, raw_params: Mapping[str, Any], *, wait: bool,
     ) -> dict[str, Any] | None:
@@ -2757,29 +2775,17 @@ class LPMarketService:
             ] | None = None
             pending: Future | None = None
             delay = 0.0
+            leader = False
             failure: BaseException | None = None
             with self._frame_lock:
                 pending = self._frame_futures.get(future_key)
                 if pending is not None and pending.done():
                     self._frame_futures.pop(future_key, None)
                     try:
-                        version, valid_until, envelope = pending.result()
+                        ready = pending.result()
                     except BaseException as exc:
                         failure = exc
                     else:
-                        self._owner_result_revision += 1
-                        envelope = {
-                            **envelope,
-                            "revision": self._owner_result_revision,
-                        }
-                        ready = (version, valid_until, envelope)
-                        self._owner_results[view_key] = ready
-                        self._owner_results.move_to_end(view_key)
-                        self._owner_last_started[view_key] = time.monotonic()
-                        while len(self._owner_results) > 64:
-                            stale_view, _ = self._owner_results.popitem(last=False)
-                            if ("owners", stale_view) not in self._frame_futures:
-                                self._owner_last_started.pop(stale_view, None)
                         pending = None
                 if failure is None:
                     cached = self._owner_results.get(view_key)
@@ -2810,13 +2816,30 @@ class LPMarketService:
                         earliest = self._owner_last_started.get(view_key, 0.0) + 1.0
                         delay = max(0.0, earliest - now)
                         if delay == 0.0:
-                            pending = self._frame_executor.submit(
-                                self._owners_result, dict(params),
-                            )
+                            if wait and ready is None:
+                                pending = Future()
+                                leader = True
+                            else:
+                                pending = self._frame_executor.submit(
+                                    self._materialize_owner_projection, dict(params),
+                                )
                             self._frame_futures[future_key] = pending
                             self._owner_last_started[view_key] = now
             if failure is not None:
                 raise failure
+            if leader:
+                assert pending is not None
+                try:
+                    pending.set_result(self._materialize_owner_projection(params))
+                except BaseException as exc:
+                    pending.set_exception(exc)
+            if ready is None and wait and pending is not None:
+                try:
+                    ready = pending.result()
+                finally:
+                    with self._frame_lock:
+                        if self._frame_futures.get(future_key) is pending:
+                            self._frame_futures.pop(future_key, None)
             if ready is not None:
                 version, _valid_until, envelope = ready
                 # Continuous appends cannot starve completed, qualified snapshots.
@@ -2832,15 +2855,6 @@ class LPMarketService:
                 return fresh
             if not wait:
                 return None
-            if pending is not None:
-                try:
-                    pending.result()
-                except BaseException:
-                    with self._frame_lock:
-                        if self._frame_futures.get(future_key) is pending:
-                            self._frame_futures.pop(future_key, None)
-                    raise
-                continue
             if delay:
                 time.sleep(delay)
 
