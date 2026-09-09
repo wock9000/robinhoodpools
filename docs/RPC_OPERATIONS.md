@@ -195,6 +195,10 @@ Receipt enrichment, repricing, and accounting continue during live catch-up.
 Receipt fetches run in eight-transaction waves, with up to 64 transactions in
 flight. V4 trace work has its own eight-transaction capacity, four-worker pool,
 and two-transaction waves, so slow traces cannot consume receipt-worker capacity.
+Each lane rotates historical, requested, recent, and recent admissions across
+refills. Even a one- or two-slot refill must serve requested and current evidence;
+sorting a mixed candidate page oldest-first before truncating a trace lane
+starves both. In-flight hashes are excluded before candidate limits.
 The coordinator refills completed waves before waiting for the database writer.
 Receipt fields
 provide payer and effective gas price when available; only incomplete receipts
@@ -236,7 +240,12 @@ During a partial move, legacy financial rows remain explicitly unqualified;
 their overlapping liquidity and fees cannot inflate qualified wallet or pool totals.
 
 Wallet requests reserve bounded receipt and accounting priority without writing
-to SQLite on the request thread. Historical work retains its reserved quarter.
+to SQLite on the request thread. Historical work retains its reserved quarter
+within each receipt lane. Requested evidence follows the newest renewed wallet
+interest; bounded lookup pages stop once enough eligible work is found.
+Pool-identity replay likewise reserves a requested turn, so a wallet's deferred
+identity prerequisite can reach receipt enrichment without waiting for the
+entire chronological backlog.
 The current-claims worker admits the full selected owner page, keeps at most 512
 wallet interests for 180 seconds, and renews interest when cached API/SSE results
 are served. Each pass walks four active positions, four historical position keys,

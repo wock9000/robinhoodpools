@@ -2333,77 +2333,173 @@ class MarketStore:
 
     def prioritize_enrichment(self, tx_hashes: Iterable[str]) -> None:
         """Prefer requested financial evidence without writing from a reader."""
+        requested: dict[str, None] = {}
+        for value in islice(tx_hashes, 256):
+            tx_hash = str(value).strip().lower()
+            if not tx_hash:
+                continue
+            requested.pop(tx_hash, None)
+            requested[tx_hash] = None
+        if not requested:
+            return
         expires = time.monotonic() + 180.0
         with self._financial_interest_lock:
-            for tx_hash in islice(tx_hashes, 256):
-                self._financial_interest[str(tx_hash).lower()] = expires
+            for tx_hash in requested:
+                self._financial_interest.pop(tx_hash, None)
+                self._financial_interest[tx_hash] = expires
             while len(self._financial_interest) > 2048:
                 self._financial_interest.pop(next(iter(self._financial_interest)))
 
-    def pending_enrichments(
-        self, limit: int = 16, *, now: float | None = None,
+    def requested_enrichments(
+        self,
+        limit: int,
+        *,
+        identity: bool = False,
+        now: float | None = None,
+        exclude: Iterable[str] = (),
     ) -> list[dict[str, Any]]:
-        # Reserve historical progress without making current financials wait
-        # for the entire backfill. Identity discovery has its own worker.
+        """Return the newest requested work eligible for one enrichment lane."""
         limit = max(1, min(int(limit), 256))
-        historical = max(1, limit // 4)
         due = time.time() if now is None else now
+        excluded = {
+            str(value).strip().lower() for value in exclude if str(value).strip()
+        }
         with self._financial_interest_lock:
             current = time.monotonic()
             expired = [
-                key for key, expires in self._financial_interest.items()
-                if expires <= current
+                key for key, expires_at in self._financial_interest.items()
+                if expires_at <= current
             ]
             for key in expired:
-                self._financial_interest.pop(key)
+                self._financial_interest.pop(key, None)
             interests = dict(self._financial_interest)
-        preferred = {}
-        for batch in _batches(tuple(interests)):
+
+        selected: list[dict[str, Any]] = []
+        missing_interests: dict[str, float] = {}
+        for batch in _batches(tuple(reversed(interests)), size=32):
             marks = ",".join("?" for _ in batch)
-            preferred.update({
-                str(row["tx_hash"]): dict(row)
+            found = {
+                str(row["tx_hash"]).lower(): dict(row)
                 for row in self.read().execute(
                     f"SELECT * FROM pending_enrichment WHERE tx_hash IN ({marks})",
                     batch,
                 ).fetchall()
-            })
-        with self._financial_interest_lock:
-            for key, expires in interests.items():
-                if key not in preferred and self._financial_interest.get(key) == expires:
-                    self._financial_interest.pop(key, None)
-        requested = [
-            preferred[key] for key in interests
-            if key in preferred and preferred[key]["next_attempt"] <= due
-            and not str(preferred[key]["last_error"] or "").startswith(
-                "pool_identity_pending:"
-            )
-        ][:min(historical, limit - historical)]
-        rows = self.read().execute(
-            "WITH oldest AS ("
-            "SELECT block_number,tx_hash FROM pending_enrichment "
-            "INDEXED BY pending_enrichment_financial_order_idx "
-            "WHERE next_attempt<=? AND (last_error IS NULL "
-            "OR last_error NOT GLOB 'pool_identity_pending:*') "
-            "ORDER BY block_number,tx_hash LIMIT ?"
-            "),newest AS ("
-            "SELECT block_number,tx_hash FROM pending_enrichment "
-            "INDEXED BY pending_enrichment_financial_order_idx "
-            "WHERE next_attempt<=? AND (last_error IS NULL "
-            "OR last_error NOT GLOB 'pool_identity_pending:*') "
-            "ORDER BY block_number DESC,tx_hash DESC LIMIT ?"
-            "),selected AS (SELECT * FROM oldest UNION SELECT * FROM newest) "
-            "SELECT p.* FROM selected s JOIN pending_enrichment p "
-            "ON p.tx_hash=s.tx_hash ORDER BY s.block_number,s.tx_hash",
-            (due, historical, due, limit - historical),
-        ).fetchall()
-        # Keep the historical quota; requested wallets borrow recent slots.
-        selected = {}
-        for row in [*rows[:historical], *requested, *reversed(rows[historical:])]:
-            selected.setdefault(str(row["tx_hash"]), dict(row))
+            }
+            for tx_hash in batch:
+                if tx_hash not in found:
+                    missing_interests[tx_hash] = interests[tx_hash]
+            for tx_hash in batch:
+                row = found.get(tx_hash)
+                if row is None or tx_hash in excluded or row["next_attempt"] > due:
+                    continue
+                identity_pending = str(row["last_error"] or "").startswith(
+                    "pool_identity_pending:"
+                )
+                if identity_pending != identity:
+                    continue
+                selected.append(row)
+                if len(selected) == limit:
+                    break
             if len(selected) == limit:
                 break
+        if missing_interests:
+            with self._financial_interest_lock:
+                for tx_hash, expires_at in missing_interests.items():
+                    if self._financial_interest.get(tx_hash) == expires_at:
+                        self._financial_interest.pop(tx_hash, None)
+        return selected
+
+    def pending_enrichments(
+        self,
+        limit: int = 16,
+        *,
+        now: float | None = None,
+        exclude: Iterable[str] = (),
+        prioritized: bool = False,
+    ) -> list[dict[str, Any]]:
+        # Reserve historical progress without making current financials wait
+        # for the entire backfill. Identity discovery has its own worker.
+        limit = max(1, min(int(limit), 256))
+        historical_capacity = max(1, limit // 4)
+        requested_capacity = min(
+            max(0, limit - historical_capacity), max(1, limit // 4),
+        )
+        due = time.time() if now is None else now
+        excluded = tuple({
+            str(value).strip().lower() for value in exclude if str(value).strip()
+        })
+        excluded_set = set(excluded)
+        excluded_sql = ""
+        if excluded:
+            excluded_sql = (
+                f" AND tx_hash NOT IN ({','.join('?' for _ in excluded)})"
+            )
+        eligible_sql = (
+            "next_attempt<=? AND (last_error IS NULL "
+            "OR last_error NOT GLOB 'pool_identity_pending:*')"
+        )
+        connection = self.read()
+        historical_rows = [
+            dict(row) for row in connection.execute(
+                "SELECT * FROM pending_enrichment "
+                "INDEXED BY pending_enrichment_financial_order_idx "
+                f"WHERE {eligible_sql}{excluded_sql} "
+                "ORDER BY block_number,tx_hash LIMIT ?",
+                (due, *excluded, historical_capacity),
+            ).fetchall()
+        ]
+        selected_hashes = {
+            str(row["tx_hash"]).lower() for row in historical_rows
+        }
+
+        requested_rows = (
+            self.requested_enrichments(
+                requested_capacity,
+                now=due,
+                exclude=excluded_set | selected_hashes,
+            )
+            if requested_capacity
+            else []
+        )
+        selected_hashes.update(
+            str(row["tx_hash"]).lower() for row in requested_rows
+        )
+
+        recent_capacity = limit - len(historical_rows) - len(requested_rows)
+        recent_rows: list[dict[str, Any]] = []
+        if recent_capacity:
+            recent_excluded = tuple(excluded_set | selected_hashes)
+            recent_excluded_sql = ""
+            if recent_excluded:
+                recent_excluded_sql = (
+                    " AND tx_hash NOT IN "
+                    f"({','.join('?' for _ in recent_excluded)})"
+                )
+            recent_rows = [
+                dict(row) for row in connection.execute(
+                    "SELECT * FROM pending_enrichment "
+                    "INDEXED BY pending_enrichment_financial_order_idx "
+                    f"WHERE {eligible_sql}{recent_excluded_sql} "
+                    "ORDER BY block_number DESC,tx_hash DESC LIMIT ?",
+                    (due, *recent_excluded, recent_capacity),
+                ).fetchall()
+            ]
+
+        buckets = (
+            ("historical", historical_rows),
+            ("requested", requested_rows),
+            ("recent", recent_rows),
+        )
+        if prioritized:
+            selected: list[dict[str, Any]] = []
+            for priority, rows in buckets:
+                for row in rows:
+                    row["_enrichment_priority"] = priority
+                    selected.append(row)
+            return selected
         return sorted(
-            selected.values(), key=lambda row: (row["block_number"], row["tx_hash"]),
+            (row for _priority, rows in buckets for row in rows),
+            key=lambda row: (row["block_number"], row["tx_hash"]),
         )
 
     def pending_token_metadata(self, limit: int = 16) -> list[dict[str, Any]]:

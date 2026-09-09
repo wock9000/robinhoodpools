@@ -608,6 +608,56 @@ def test_live_gap_and_v4_trace_cannot_block_v3_position_accounting(
         app.close()
 
 
+def test_small_trace_refills_rotate_history_requested_and_recent(monkeypatch):
+    from concurrent.futures import Future
+
+    store = MarketStore(":memory:")
+    scanner = indexer(store)
+    numbers = [*range(1, 257), 500, 699, 700, 701]
+    store.ingest([header(number) for number in numbers], [
+        {
+            **indexed_event(number, "11"),
+            "tx_hash": header(number)["hash"],
+            "protocol": "v3" if number == 701 else "v4",
+        }
+        for number in numbers
+    ])
+    store.prioritize_enrichment([header(500)["hash"]])
+    submitted = {False: [], True: []}
+
+    def capture(lane):
+        def submit(_function, rows):
+            submitted[lane].append(tuple(rows))
+            return Future()
+
+        return submit
+
+    monkeypatch.setattr(scanner._enrichment_executor, "submit", capture(False))
+    monkeypatch.setattr(scanner._trace_enrichment_executor, "submit", capture(True))
+    occupied = tuple(dict(row) for row in store.read().execute(
+        "SELECT * FROM pending_enrichment WHERE block_number<=6 ORDER BY block_number",
+    ))
+    scanner._enrichment_jobs[tuple(row["tx_hash"] for row in occupied)] = (
+        occupied, Future(), time.monotonic(), True,
+    )
+    try:
+        scanner._fill_enrichment_jobs()
+        first_trace = tuple(row for batch in submitted[True] for row in batch)
+        first_regular = tuple(row for batch in submitted[False] for row in batch)
+        assert [row["block_number"] for row in first_trace] == [7, 500]
+        assert [row["block_number"] for row in first_regular] == [701]
+
+        first_trace_hashes = tuple(row["tx_hash"] for row in first_trace)
+        scanner._enrichment_jobs.pop(first_trace_hashes)
+        submitted[True].clear()
+        scanner._fill_enrichment_jobs(first_trace_hashes)
+        second_trace = tuple(row for batch in submitted[True] for row in batch)
+        assert [row["block_number"] for row in second_trace] == [700, 699]
+    finally:
+        scanner.close()
+        store.close()
+
+
 def test_identity_recovery_waits_for_initialization_and_outlives_blocked_accounting(
     tmp_path, monkeypatch,
 ):
@@ -783,6 +833,74 @@ def test_live_health_publishes_while_another_lane_holds_writer():
         writer.join(2)
         if publisher.ident is not None:
             publisher.join(2)
+        scanner.close()
+        store.close()
+
+
+def test_requested_identity_replay_keeps_regular_enrichment_interest(monkeypatch):
+    store = MarketStore(":memory:")
+    scanner = indexer(store)
+    identity_marker = scanner._encode_pool_identity_marker({
+        "addresses": ["0x" + "12" * 20],
+        "logs": [],
+    })
+    target_tx = "0x" + f"{50:064x}"
+    regular_tx = "0x" + f"{51:064x}"
+    identity_numbers = [*range(1, 33), 50, *range(68, 100)]
+    now = time.time()
+    with store.transaction() as connection:
+        connection.executemany(
+            "INSERT INTO pending_enrichment"
+            "(tx_hash,block_number,block_hash,attempts,next_attempt,last_error,"
+            "created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+            [
+                (
+                    "0x" + f"{number:064x}",
+                    number,
+                    header(number)["hash"],
+                    0,
+                    0,
+                    identity_marker,
+                    now,
+                    now,
+                )
+                for number in identity_numbers
+            ] + [
+                (
+                    regular_tx,
+                    51,
+                    header(51)["hash"],
+                    0,
+                    0,
+                    None,
+                    now,
+                    now,
+                ),
+            ],
+        )
+        store._set_metadata(
+            connection, "pending_enrichment", len(identity_numbers) + 1,
+        )
+    store.prioritize_enrichment([target_tx, regular_tx])
+
+    def unavailable(_method, _params):
+        raise RpcError("identity RPC unavailable")
+
+    monkeypatch.setattr(scanner, "_seed_deferred_v4_pool_identities", lambda: 0)
+    monkeypatch.setattr(scanner._clients["pool"], "call", unavailable)
+    scanner._pool_identity_replay_turn = 1
+    try:
+        assert scanner._resolve_deferred_pool_identities_once() is True
+        assert [
+            row["tx_hash"] for row in store.read().execute(
+                "SELECT tx_hash FROM pending_enrichment WHERE next_attempt>0",
+            )
+        ] == [target_tx]
+        assert [
+            row["tx_hash"]
+            for row in store.requested_enrichments(8, identity=False)
+        ] == [regular_tx]
+    finally:
         scanner.close()
         store.close()
 

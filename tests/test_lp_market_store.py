@@ -140,6 +140,82 @@ def test_financial_queues_do_not_starve_recent_work_or_history(tmp_path):
         assert 48 not in numbers
 
 
+def test_enrichment_exclusions_do_not_consume_the_selection_limit(tmp_path):
+    with MarketStore(tmp_path / "enrichment-exclusions.sqlite") as store:
+        blocks = [header(number) for number in range(1, 13)]
+        store.ingest(blocks, [
+            {
+                **event(block, 0),
+                "kind": "add",
+                "tx_hash": "0x" + f"{number:064x}",
+            }
+            for number, block in enumerate(blocks, 1)
+        ])
+
+        excluded = {
+            "0x" + f"{number:064x}" for number in (1, 12)
+        }
+        selected = store.pending_enrichments(4, exclude=excluded)
+
+        assert [row["block_number"] for row in selected] == [2, 9, 10, 11]
+
+
+def test_enrichment_uses_the_newest_requested_interest(tmp_path):
+    with MarketStore(tmp_path / "enrichment-interest.sqlite") as store:
+        blocks = [header(number) for number in range(1, 13)]
+        store.ingest(blocks, [
+            {
+                **event(block, 0),
+                "kind": "add",
+                "tx_hash": "0x" + f"{number:064x}",
+            }
+            for number, block in enumerate(blocks, 1)
+        ])
+        hashes = {
+            number: "0x" + f"{number:064x}" for number in (5, 6)
+        }
+
+        store.prioritize_enrichment([hashes[5], hashes[6]])
+        selected = store.pending_enrichments(4, prioritized=True)
+        assert {row["block_number"] for row in selected} == {1, 6, 11, 12}
+
+        store.prioritize_enrichment([hashes[5]])
+        selected = store.pending_enrichments(4, prioritized=True)
+        assert {row["block_number"] for row in selected} == {1, 5, 11, 12}
+
+
+def test_requested_identity_work_preserves_the_normal_lane_interest(tmp_path):
+    with MarketStore(tmp_path / "enrichment-identity-interest.sqlite") as store:
+        blocks = [header(number) for number in range(1, 13)]
+        store.ingest(blocks, [
+            {
+                **event(block, 0),
+                "kind": "add",
+                "tx_hash": "0x" + f"{number:064x}",
+            }
+            for number, block in enumerate(blocks, 1)
+        ])
+        hashes = {
+            number: "0x" + f"{number:064x}" for number in (5, 6)
+        }
+        with store.transaction() as connection:
+            connection.execute(
+                "UPDATE pending_enrichment SET "
+                "last_error='pool_identity_pending:{}' WHERE tx_hash=?",
+                (hashes[5],),
+            )
+        store.prioritize_enrichment([hashes[5], hashes[6]])
+
+        assert [
+            row["block_number"]
+            for row in store.requested_enrichments(1, identity=True)
+        ] == [5]
+        assert [
+            row["block_number"]
+            for row in store.requested_enrichments(1)
+        ] == [6]
+
+
 def test_bulk_ingest_preserves_conflicts_under_sqlite_parameter_limit(tmp_path):
     path = tmp_path / "bounded-inserts.sqlite"
     block = header(10)

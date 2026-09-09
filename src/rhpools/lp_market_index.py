@@ -406,6 +406,7 @@ class MarketIndexer:
             tuple[str, ...],
             tuple[tuple[Mapping[str, Any], ...], Future, float, bool],
         ] = {}
+        self._enrichment_admission_turn = {False: 0, True: 0}
         self._worker_clients: list[Any] = []
         self._worker_clients_lock = threading.Lock()
         self._feed_condition = threading.Condition()
@@ -3136,9 +3137,16 @@ class MarketIndexer:
 
     def _resolve_deferred_pool_identities_once(self) -> bool:
         self._seed_deferred_v4_pool_identities()
-        rows = self._pending_pool_identity_replays(
-            newest=self._pool_identity_replay_turn != 0,
-        )
+        turn = self._pool_identity_replay_turn
+        if turn == 1:
+            rows = self.store.requested_enrichments(
+                DEFERRED_POOL_IDENTITY_BATCH,
+                identity=True,
+            )
+            if not rows:
+                rows = self._pending_pool_identity_replays(newest=True)
+        else:
+            rows = self._pending_pool_identity_replays(newest=turn != 0)
         if not rows:
             return False
         with self._current_receipt_lock:
@@ -4474,16 +4482,16 @@ class MarketIndexer:
         active_by_lane = {False: 0, True: 0}
         for rows, _future, _started, trace in self._enrichment_jobs.values():
             active_by_lane[trace] += len(rows)
-        regular_capacity = max(
-            0, ENRICH_REGULAR_INFLIGHT_LIMIT - active_by_lane[False],
-        )
-        trace_capacity = max(
-            0, ENRICH_TRACE_INFLIGHT_LIMIT - active_by_lane[True],
-        )
-        if (
-            (regular_capacity == 0 and trace_capacity == 0)
-            or self._stop.is_set()
-        ):
+        capacity_by_lane = {
+            False: max(
+                0, ENRICH_REGULAR_INFLIGHT_LIMIT - active_by_lane[False],
+            ),
+            True: max(
+                0, ENRICH_TRACE_INFLIGHT_LIMIT - active_by_lane[True],
+            ),
+        }
+        available_capacity = sum(capacity_by_lane.values())
+        if available_capacity == 0 or self._stop.is_set():
             return
         blocked = {
             str(row["tx_hash"])
@@ -4491,29 +4499,53 @@ class MarketIndexer:
             for row in rows
         }
         blocked.update(str(tx_hash) for tx_hash in reserved)
-        selection_limit = min(
-            256, regular_capacity + trace_capacity + len(blocked),
+        selection_limit = min(256, max(16, available_capacity * 4))
+        candidates = self.store.pending_enrichments(
+            selection_limit,
+            exclude=blocked,
+            prioritized=True,
         )
-        candidates = [
-            row
-            for row in self.store.pending_enrichments(selection_limit)
-            if str(row["tx_hash"]) not in blocked
-        ]
         trace_hashes = self._pending_v4_trace_hashes(candidates)
-        trace_rows = [
-            row for row in candidates if str(row["tx_hash"]) in trace_hashes
-        ][:trace_capacity]
-        regular_rows = [
-            row for row in candidates if str(row["tx_hash"]) not in trace_hashes
-        ][:regular_capacity]
+        admission_pattern = ("historical", "requested", "recent", "recent")
+        selected_by_lane: dict[bool, list[Mapping[str, Any]]] = {
+            False: [],
+            True: [],
+        }
+        for trace, capacity in capacity_by_lane.items():
+            if capacity == 0:
+                continue
+            by_priority: dict[str, deque[Mapping[str, Any]]] = {
+                priority: deque() for priority in dict.fromkeys(admission_pattern)
+            }
+            for row in candidates:
+                if (str(row["tx_hash"]) in trace_hashes) != trace:
+                    continue
+                by_priority[str(row["_enrichment_priority"])].append(row)
+            turn = self._enrichment_admission_turn[trace]
+            while len(selected_by_lane[trace]) < capacity and any(by_priority.values()):
+                for offset in range(len(admission_pattern)):
+                    priority = admission_pattern[
+                        (turn + offset) % len(admission_pattern)
+                    ]
+                    if by_priority[priority]:
+                        selected_by_lane[trace].append(
+                            by_priority[priority].popleft(),
+                        )
+                        turn = (turn + 1) % len(admission_pattern)
+                        break
+            self._enrichment_admission_turn[trace] = turn
         batches = [
             *(
-                (tuple(regular_rows[offset:offset + ENRICH_BATCH]), False)
-                for offset in range(0, len(regular_rows), ENRICH_BATCH)
+                (tuple(selected_by_lane[False][offset:offset + ENRICH_BATCH]), False)
+                for offset in range(0, len(selected_by_lane[False]), ENRICH_BATCH)
             ),
             *(
-                (tuple(trace_rows[offset:offset + ENRICH_TRACE_BATCH]), True)
-                for offset in range(0, len(trace_rows), ENRICH_TRACE_BATCH)
+                (tuple(
+                    selected_by_lane[True][offset:offset + ENRICH_TRACE_BATCH],
+                ), True)
+                for offset in range(
+                    0, len(selected_by_lane[True]), ENRICH_TRACE_BATCH,
+                )
             ),
         ]
         for rows, trace in batches:
