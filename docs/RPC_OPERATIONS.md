@@ -67,6 +67,10 @@ of waiting behind unrelated background frames. Concurrent reads of the same
 view still share one future. Its producer assigns and caches the publication
 once, so a waiting request can deliver that exact completed snapshot even if
 a stream consumer has already read it.
+The browser compares parent hashes only for consecutive block heights.
+Skipped head notifications are not fork evidence and must not clear wallet
+snapshots. Same-height replacements and confirmed parent mismatches still
+withdraw orphaned activity and invalidate wallets.
 
 The running service commits raw events, cursors, balance jobs, and coalesced
 accounting jobs atomically. A separate accounting worker replays each affected

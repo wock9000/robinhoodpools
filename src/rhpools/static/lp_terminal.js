@@ -1266,6 +1266,7 @@
     }
     const parentMismatch = previous && previous.hash && block.parent_hash
       && state.canonicalBlocks.has(String(previous.hash))
+      && finite(block.number) === finite(previous.number) + 1
       && String(previous.hash) !== String(block.parent_hash)
       && String(previous.hash) !== String(block.hash);
     let canonical = null;
