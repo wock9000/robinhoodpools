@@ -2786,17 +2786,27 @@ class LPMarketService:
                     if ready is None and cached is not None:
                         version, valid_until, envelope = cached
                         if (
-                            version == target
+                            version[2:] == target[2:]
                             and (
-                                valid_until is None
-                                or wall_now < valid_until
+                                not wait
+                                or (
+                                    version == target
+                                    and (
+                                        valid_until is None
+                                        or wall_now < valid_until
+                                    )
+                                )
                             )
                         ):
                             self._owner_results.move_to_end(view_key)
                             ready = cached
                         else:
                             ready = None
-                    if ready is None and pending is None:
+                    needs_refresh = (
+                        ready is None or ready[0] != target
+                        or (ready[1] is not None and wall_now >= ready[1])
+                    )
+                    if needs_refresh and pending is None:
                         earliest = self._owner_last_started.get(view_key, 0.0) + 1.0
                         delay = max(0.0, earliest - now)
                         if delay == 0.0:

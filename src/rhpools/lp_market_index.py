@@ -57,7 +57,6 @@ MAX_LOGS_PER_RESPONSE = 10_000
 LIVE_MIN_CHUNK = 1
 LIVE_INITIAL_CHUNK = 256
 LIVE_MAX_CHUNK = 2_048
-RECENT_CATCHUP_PRIORITY_BLOCKS = 512
 HISTORY_MIN_CHUNK = 1
 HISTORY_INITIAL_CHUNK = 8
 HISTORY_MAX_CHUNK = 32_768
@@ -3916,7 +3915,7 @@ class MarketIndexer:
         with self._status_lock:
             head = max(observed_number, int(self._runtime_status.get("head") or 0))
             lag = max(0, head - int(cursor["block_number"]))
-            pending = lag > RECENT_CATCHUP_PRIORITY_BLOCKS
+            pending = lag > 0
             self._runtime_status.update({
                 "recent_catchup_priority": pending,
                 "recent_catchup_lag_blocks": lag,

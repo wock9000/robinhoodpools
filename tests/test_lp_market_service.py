@@ -1957,6 +1957,20 @@ def test_completed_wallet_projection_is_deliverable_during_live_changes(
             assert result is not None, "completed wallets were starved by new activity"
             assert result["current_activity"]["head"] == 100
             assert TOKEN in {row["owner"] for row in result["rows"]}
+            assert app.poll_owners(params) == result, (
+                "another consumer lost the completed wallet snapshot"
+            )
+            updated = None
+            deadline = time.monotonic() + 3
+            while updated is None and time.monotonic() < deadline:
+                updated = app.poll_owners(params, result["revision"])
+                if updated is None:
+                    time.sleep(0.01)
+            assert updated is not None, "cached wallets stopped refreshing"
+            assert updated["current_activity"]["head"] == 101
+            assert "0x" + "78" * 20 in {
+                row["owner"] for row in updated["rows"]
+            }
     finally:
         release.set()
         app.close()

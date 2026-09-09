@@ -55,7 +55,13 @@ Goldsky primary references:
 
 Separate durable cursor progress from the live observed feed. A moving live tape is not evidence of complete historical financial accounting. Compare cursor gain and chain gain over the same interval. Live ingestion and historical backfill share one serialized writer; inspect `history_scheduling` and the lane measurements rather than assuming that backfill is paused.
 
-Production sampling found wallet aggregation repeatedly restarting whenever ingestion advanced its revision. This could keep LP Wallets at `SYNCING` indefinitely while consuming CPU needed by the indexer. Wallet totals, gas and coverage now come from one completed WAL read snapshot; appends trigger a later refresh instead of recursive recomputation. Canonical-branch changes still invalidate service publications. The regression exercises an indexer append during an actual wallet read.
+Production sampling found wallet aggregation repeatedly restarting whenever
+ingestion advanced its revision. Wallet totals, gas and coverage now come from
+one completed WAL read snapshot. Stream consumers reuse the completed snapshot
+while a newer revision or an expired window refreshes asynchronously; one
+consumer cannot take that snapshot away from another. Blocking wallet reads
+still refresh changed revisions and expired windows. Canonical-branch changes
+invalidate both cached and in-flight publications.
 
 The running service commits raw events, cursors, balance jobs, and coalesced
 accounting jobs atomically. A separate accounting worker replays each affected
@@ -75,6 +81,10 @@ preserves the raw event/cursor/job boundary.
 Adaptive scan sizing uses separate writer targets: two seconds for live
 catch-up and 200 ms for background history. Growth is capped by measured store
 throughput and log density; history starts with eight blocks before adapting.
+History starts a scan only when the live cursor has caught up to the observed
+head, rather than competing with live catch-up below a 512-block threshold.
+A new block can arrive during an in-flight transaction; the reported gap
+remains the actual head-minus-cursor difference, without rounding it to zero.
 These are feedback targets, not hard transaction deadlines; indivisible block
 work can exceed them. Applying a 50 ms target to the live lane shrank it to
 one-block commits and left fixed commit costs unamortized.

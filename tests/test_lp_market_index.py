@@ -721,9 +721,10 @@ def test_history_progress_is_independent_of_unrunnable_enrichment(monkeypatch):
         store.close()
 
 
-def test_recent_ledger_gap_yields_history_until_live_progresses():
+@pytest.mark.parametrize("live_head", [501, 1_100])
+def test_recent_ledger_gap_yields_history_until_live_progresses(live_head):
     store = MarketStore(":memory:")
-    scanner = indexer(store, StaticRpc(1_100))
+    scanner = indexer(store, StaticRpc(live_head))
     scanner._history_verified = True
     anchor = header(500)
     store.ingest([anchor], [], lane="history", cursor={
@@ -736,12 +737,15 @@ def test_recent_ledger_gap_yields_history_until_live_progresses():
         "block_number": 500, "block_hash": anchor["hash"],
         "timestamp": int(anchor["timestamp"], 16),
     })
-    scanner._set_runtime("head", head=1_100)
+    scanner._set_runtime("head", head=live_head)
     try:
         assert scanner._scan_history_once() is False
         assert store.cursor("history")["next_to"] == 499
         assert scanner._scan_live_once() is True
         assert store.cursor("live")["block_number"] > 500
+        while store.cursor("live")["block_number"] < live_head:
+            assert scanner._scan_history_once() is False
+            assert scanner._scan_live_once() is True
         assert scanner._scan_history_once() is True
         assert store.cursor("history")["next_to"] < 499
     finally:
