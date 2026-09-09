@@ -303,7 +303,8 @@ class MarketStore:
             tx_hash TEXT PRIMARY KEY, block_number INTEGER NOT NULL,
             block_hash TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
             next_attempt REAL NOT NULL DEFAULT 0, last_error TEXT,
-            created_at REAL NOT NULL, updated_at REAL NOT NULL
+            created_at REAL NOT NULL, updated_at REAL NOT NULL,
+            generation INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS pending_enrichment_ready_idx
             ON pending_enrichment(next_attempt, block_number, tx_hash);
@@ -491,6 +492,19 @@ class MarketStore:
                     "OR last_error NOT GLOB 'pool_identity_pending:*'"
                 )
                 self.connection.execute("PRAGMA user_version=7")
+            if int(self.connection.execute("PRAGMA user_version").fetchone()[0]) < 8:
+                enrichment_columns = {
+                    str(row["name"])
+                    for row in self.connection.execute(
+                        "PRAGMA table_info(pending_enrichment)"
+                    ).fetchall()
+                }
+                if "generation" not in enrichment_columns:
+                    self.connection.execute(
+                        "ALTER TABLE pending_enrichment ADD COLUMN "
+                        "generation INTEGER NOT NULL DEFAULT 0"
+                    )
+                self.connection.execute("PRAGMA user_version=8")
             self.connection.execute(
                 "CREATE INDEX IF NOT EXISTS pending_reprojection_order_idx "
                 "ON pending_reprojection(block_number,tx_index,log_index,event_id)"
@@ -551,7 +565,9 @@ class MarketStore:
                     "pending_pool_unpublish": "pending_pool_unpublish",
                     "pending_reprojection": "pending_reprojection",
                 }
-                default_keys = ("revision", "epoch", *count_tables)
+                default_keys = (
+                    "revision", "epoch", "pending_accounting", *count_tables,
+                )
                 marks = ",".join("?" for _ in default_keys)
                 existing = {
                     str(row[0]) for row in connection.execute(
@@ -560,7 +576,9 @@ class MarketStore:
                     ).fetchall()
                 }
                 defaults = {
-                    key: 0 for key in ("revision", "epoch")
+                    key: 0 for key in (
+                        "revision", "epoch", "pending_accounting",
+                    )
                     if key not in existing
                 }
                 for key, table in count_tables.items():
@@ -2539,9 +2557,13 @@ class MarketStore:
     def mark_enrichment_error(self, tx_hash: str, error: str, *, delay: float) -> None:
         with self.transaction() as connection:
             connection.execute(
-                "UPDATE pending_enrichment SET attempts=attempts+1,next_attempt=?,last_error=?,updated_at=? "
-                "WHERE tx_hash=?",
-                (time.time() + max(0.0, delay), str(error)[:1000], time.time(), tx_hash.lower()),
+                "UPDATE pending_enrichment SET attempts=attempts+1,"
+                "next_attempt=?,last_error=?,updated_at=?,"
+                "generation=generation+1 WHERE tx_hash=?",
+                (
+                    time.time() + max(0.0, delay), str(error)[:1000],
+                    time.time(), tx_hash.lower(),
+                ),
             )
 
     def queue_v3_balances(
@@ -2941,6 +2963,7 @@ class MarketStore:
             "pending_metadata": int(metadata.get("pending_metadata", 0)),
             "pending_pool_unpublish": int(metadata.get("pending_pool_unpublish", 0)),
             "pending_reprojection": int(metadata.get("pending_reprojection", 0)),
+            "pending_accounting": int(metadata.get("pending_accounting", 0)),
             "history_from": history_from,
             "history_to": history_to,
             "history_target": history.get("target_timestamp") if isinstance(history, dict) else None,

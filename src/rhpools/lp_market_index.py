@@ -8,7 +8,7 @@ import shutil
 import threading
 import time
 from collections import OrderedDict, deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
 from urllib.parse import urlsplit
@@ -44,6 +44,7 @@ from .lp_market_protocols import (
     position_state_requests,
     unknown_pool_candidates,
     resolve_v4_tick_spacing,
+    repair_v4_owners,
 )
 from .lp_market_store import (
     LP_ENRICHMENT_KINDS, CanonicalConflict, MarketStore,
@@ -64,6 +65,8 @@ MAX_INTERVAL_STORE_SECONDS = 2.0
 ENRICH_BATCH = 8
 ENRICHMENT_CAPABILITY_RECHECK_S = 300.0
 REPROJECT_BATCH = 128
+V4_OWNER_REPAIR_LIMIT = 32
+V4_OWNER_REPAIR_SCAN = 8192
 V3_BIRTH_REPAIR_PREFIXES = tuple(
     sorted(f"nft:{address}:" for address in V3_NFT_MANAGER_ADDRESSES)
 )
@@ -193,7 +196,10 @@ class _HttpRpc:
             raise RpcError(f"{method} response omitted result")
         return response["result"]
 
-    def batch(self, calls: Iterable[tuple[str, Sequence[Any]]]) -> list[Any]:
+    def batch(
+        self, calls: Iterable[tuple[str, Sequence[Any]]], *,
+        allow_reverts: bool = False,
+    ) -> list[Any]:
         specifications = list(calls)
         if not specifications:
             return []
@@ -223,6 +229,13 @@ class _HttpRpc:
             error = item.get("error")
             if error is not None:
                 code = error.get("code") if isinstance(error, Mapping) else None
+                if (
+                    allow_reverts and method in {"eth_call", "eth_estimateGas"}
+                    and isinstance(error, Mapping)
+                    and (code == 3 or "execution reverted" in str(error.get("message", "")).lower())
+                ):
+                    results.append({"error": dict(error)})
+                    continue
                 raise RpcError(f"{method}: {error}", code=code if isinstance(code, int) else None)
             if "result" not in item:
                 raise RpcError(f"batch RPC {method} omitted result")
@@ -298,6 +311,7 @@ class MarketIndexer:
         v3_balances: bool = False,
         history_disk_reserve_bytes: int = DEFAULT_HISTORY_DISK_RESERVE_BYTES,
         current_observer: Any | None = None,
+        accounting_projector: Callable[[], bool] | None = None,
     ) -> None:
         if history_days < 0:
             raise ValueError("history_days must be nonnegative")
@@ -306,6 +320,7 @@ class MarketIndexer:
         self.store = store
         self.market = market
         self.current_observer = current_observer
+        self._accounting_projector = accounting_projector
         self.rpc_url = rpc_url
         self.history_days = int(history_days)
         self.v3_balances = bool(v3_balances)
@@ -353,6 +368,7 @@ class MarketIndexer:
         self._runtime_persist_at = 0.0
         self._runtime_error_signature: tuple[tuple[str, str], ...] = ()
         self._stop = threading.Event()
+        self._live_wakeup = threading.Event()
         self._started = False
         self._initialized = threading.Event()
         self._lifecycle_lock = threading.Lock()
@@ -372,12 +388,11 @@ class MarketIndexer:
         self._process_lock_fd: int | None = None
         self._history_verified = False
         self._enrichment_verified = False
-        self._enrichment_deferred_until = 0.0
-        self._enrichment_deferred_reason: str | None = None
         self._projection_verified = False
         self._publish_after_id = ""
         self._market_epoch = int(self.store.status().get("epoch", 0))
         self._enrichment_local = threading.local()
+        self._enrichment_jobs: dict[str, tuple[Mapping[str, Any], Future, float]] = {}
         self._worker_clients: list[Any] = []
         self._worker_clients_lock = threading.Lock()
         self._feed_condition = threading.Condition()
@@ -404,7 +419,7 @@ class MarketIndexer:
             max_workers=2, thread_name_prefix="lp-current-pool",
         )
         self._enrichment_executor = ThreadPoolExecutor(
-            max_workers=4, thread_name_prefix="lp-market-fetch",
+            max_workers=ENRICH_BATCH, thread_name_prefix="lp-market-fetch",
         )
         self._header_executor = ThreadPoolExecutor(
             max_workers=2, thread_name_prefix="lp-market-headers",
@@ -1309,6 +1324,7 @@ class MarketIndexer:
             self._observed_blocks.move_to_end(number)
             while len(self._observed_blocks) > HEAD_REPLAY_LIMIT * 2:
                 self._observed_blocks.popitem(last=False)
+        self._live_wakeup.set()
         self._submit_market_observer("observe_current_block", dict(current))
         self._submit_market_observer(
             "observe_current_events", dict(current),
@@ -1661,19 +1677,39 @@ class MarketIndexer:
         return {}
 
     def _batch_on(
-        self, client: Any, calls: list[tuple[str, Sequence[Any]]],
+        self, client: Any, calls: list[tuple[str, Sequence[Any]]], *,
+        allow_reverts: bool = False,
     ) -> list[Any]:
         if not calls:
             return []
         if len(calls) > MAX_BATCH_CALLS:
             output: list[Any] = []
             for index in range(0, len(calls), MAX_BATCH_CALLS):
-                output.extend(self._batch_on(client, calls[index:index + MAX_BATCH_CALLS]))
+                output.extend(self._batch_on(
+                    client, calls[index:index + MAX_BATCH_CALLS],
+                    allow_reverts=allow_reverts,
+                ))
             return output
         batch = getattr(client, "batch", None)
         if callable(batch):
-            return list(batch(calls))
-        return [client.call(method, list(params)) for method, params in calls]
+            results = list(
+                batch(calls, allow_reverts=True) if allow_reverts else batch(calls)
+            )
+            if len(results) != len(calls):
+                raise RpcError("batch RPC returned an incomplete result set")
+            return results
+        results = []
+        for method, params in calls:
+            try:
+                results.append(client.call(method, list(params)))
+            except RpcError as exc:
+                if allow_reverts and method in {"eth_call", "eth_estimateGas"} and (
+                    exc.code == 3 or "execution reverted" in str(exc).lower()
+                ):
+                    results.append({"error": str(exc)})
+                else:
+                    raise
+        return results
 
     def _rpc_batch(self, lane: str, calls: list[tuple[str, Sequence[Any]]]) -> list[Any]:
         return self._batch_on(self._clients[lane], calls)
@@ -1837,7 +1873,23 @@ class MarketIndexer:
                         name="lp-market-projection",
                         daemon=True,
                     ),
+                    threading.Thread(
+                        target=self._metadata_run,
+                        name="lp-market-metadata",
+                        daemon=True,
+                    ),
+                    threading.Thread(
+                        target=self._source_repair_run,
+                        name="lp-market-repair",
+                        daemon=True,
+                    ),
                 ]
+                if self._accounting_projector is not None:
+                    self._threads.append(threading.Thread(
+                        target=self._accounting_run,
+                        name="lp-market-accounting",
+                        daemon=True,
+                    ))
                 if self._head_wss_urls:
                     self._threads[0:0] = [
                         threading.Thread(
@@ -2801,7 +2853,7 @@ class MarketIndexer:
             })
             connection.execute(
                 "UPDATE pending_enrichment SET next_attempt=0,last_error=?,"
-                "updated_at=? WHERE tx_hash=?",
+                "updated_at=?,generation=generation+1 WHERE tx_hash=?",
                 (self._encode_pool_identity_marker(payload), now, tx_hash),
             )
         return len(grouped)
@@ -2996,7 +3048,7 @@ class MarketIndexer:
         with self.store.transaction() as connection:
             connection.execute(
                 "UPDATE pending_enrichment SET next_attempt=?,last_error=?,"
-                "updated_at=? WHERE tx_hash=? AND last_error=?",
+                "updated_at=?,generation=generation+1 WHERE tx_hash=? AND last_error=?",
                 (
                     time.time() + delay,
                     self._encode_pool_identity_marker(updated),
@@ -3023,7 +3075,7 @@ class MarketIndexer:
                 updated.pop("identity_error", None)
                 connection.execute(
                     "UPDATE pending_enrichment SET next_attempt=0,last_error=?,"
-                    "updated_at=? WHERE tx_hash=? AND last_error=?",
+                    "updated_at=?,generation=generation+1 WHERE tx_hash=? AND last_error=?",
                     (
                         self._encode_pool_identity_marker(updated), time.time(),
                         _lower(row["tx_hash"]), marker,
@@ -3039,7 +3091,7 @@ class MarketIndexer:
             if needs_enrichment is not None:
                 connection.execute(
                     "UPDATE pending_enrichment SET next_attempt=?,last_error=?,"
-                    "updated_at=? WHERE tx_hash=? AND last_error=?",
+                    "updated_at=?,generation=generation+1 WHERE tx_hash=? AND last_error=?",
                     (
                         float(payload.get("prior_next_attempt", 0.0)),
                         payload.get("prior_error"), time.time(),
@@ -3737,6 +3789,15 @@ class MarketIndexer:
                         "timestamp": _timestamp(interval_end),
                     },
                 )
+                if self.v3_balances:
+                    latest_by_pool: dict[str, dict[str, Any]] = {}
+                    for event in inserted:
+                        pool = event.get("pool")
+                        if isinstance(pool, Mapping) and pool.get("protocol") == "v3":
+                            latest_by_pool[str(pool["id"])] = event
+                    self.store.queue_v3_balances(
+                        latest_by_pool, end, interval_end["hash"],
+                    )
             store_s = time.monotonic() - store_acquired
         except CanonicalConflict as exc:
             self._recover_reorg(cursor, str(exc))
@@ -3750,15 +3811,6 @@ class MarketIndexer:
             self._publish_event_pools(inserted)
         except Exception as exc:
             self._set_runtime("metadata", error=exc)
-        if self.v3_balances:
-            latest_by_pool: dict[str, dict[str, Any]] = {}
-            for event in inserted:
-                pool = event.get("pool")
-                if isinstance(pool, Mapping) and pool.get("protocol") == "v3":
-                    latest_by_pool[str(pool["id"])] = event
-            self.store.queue_v3_balances(
-                latest_by_pool, end, interval_end["hash"],
-            )
         postprocess_s = time.monotonic() - postprocess_started
         self._resize_after_success(
             "live", len(logs), store_s, end - start + 1,
@@ -4038,21 +4090,19 @@ class MarketIndexer:
         self, calls: list[tuple[str, Sequence[Any]]], client: Any | None = None,
     ) -> list[Any]:
         selected = client or self._clients["enrichment"]
-        try:
-            return self._batch_on(selected, calls)
-        except RpcError:
-            results: list[Any] = []
-            for method, params in calls:
-                if self._stop.is_set():
-                    raise RpcError("indexer closed during pinned state batch")
-                try:
-                    results.append(selected.call(method, list(params)))
-                except RpcError as exc:
-                    if "revert" in str(exc).lower():
-                        results.append({"error": str(exc)})
-                    else:
-                        raise
-            return results
+        unique: list[tuple[str, Sequence[Any]]] = []
+        indexes: dict[tuple[str, str], int] = {}
+        order: list[int] = []
+        for method, params in calls:
+            key = (method, json.dumps(params, sort_keys=True, separators=(",", ":")))
+            index = indexes.get(key)
+            if index is None:
+                index = len(unique)
+                indexes[key] = index
+                unique.append((method, params))
+            order.append(index)
+        results = self._batch_on(selected, unique, allow_reverts=True)
+        return [results[index] for index in order]
 
     def _enrich_transaction(
         self, pending: Mapping[str, Any],
@@ -4071,22 +4121,29 @@ class MarketIndexer:
         block_hash = _lower(receipt.get("blockHash"))
         if block_number != int(pending["block_number"]) or block_hash != _lower(pending["block_hash"]):
             raise CanonicalConflict(f"pending transaction {tx_hash} moved to another block")
-        trace = client.call("debug_traceTransaction", [
-            tx_hash,
-            {
-                "tracer": "callTracer", "tracerConfig": {"withLog": True},
-                # Never rebuild missing historical state on the authoritative
-                # live node. Unavailable traces remain pending, not fabricated.
-                "reexec": 0, "timeout": "5s",
-            },
-        ])
-        if not isinstance(trace, Mapping):
-            raise RpcError(f"transaction {tx_hash} returned a malformed call trace")
         raw_logs = receipt.get("logs")
         if not isinstance(raw_logs, list):
             raise RpcError(f"transaction {tx_hash} receipt omitted logs")
         if any(not isinstance(log, Mapping) for log in raw_logs):
             raise RpcError(f"transaction {tx_hash} receipt contains malformed logs")
+        traces = None
+        if any(
+            _lower(log.get("address")) == POOL_MANAGER
+            and _lower((log.get("topics") or [None])[0]) == V4_MODIFY_LIQUIDITY_TOPIC
+            for log in raw_logs
+        ):
+            trace = client.call("debug_traceTransaction", [
+                tx_hash,
+                {
+                    "tracer": "callTracer", "tracerConfig": {"withLog": True},
+                    # Missing historical state stays pending; never rebuild it
+                    # on the authoritative live node.
+                    "reexec": 0, "timeout": "5s",
+                },
+            ])
+            if not isinstance(trace, Mapping):
+                raise RpcError(f"transaction {tx_hash} returned a malformed call trace")
+            traces = {tx_hash: dict(trace)}
         header = _header(
             client.call("eth_getBlockByNumber", [hex(block_number), False]),
             block_number,
@@ -4098,7 +4155,7 @@ class MarketIndexer:
             [dict(log) for log in raw_logs],
             {block_number: header},
             receipts={tx_hash: dict(receipt)},
-            traces={tx_hash: dict(trace)},
+            traces=traces,
             resolve_unknown=False,
         )
         if not events:
@@ -4152,88 +4209,83 @@ class MarketIndexer:
             or "trace rpc exhausted" in text
         )
 
-    def _defer_enrichment(self, reason: str, delay: float) -> None:
-        self._enrichment_deferred_reason = str(reason)[:1000]
-        self._enrichment_deferred_until = time.monotonic() + max(
-            1.0, float(delay),
+    def _current_enrichment_jobs(
+        self, conn: Any, jobs: Sequence[Mapping[str, Any]],
+    ) -> set[str]:
+        expected = {str(job["tx_hash"]): job for job in jobs}
+        marks = ",".join("?" for _ in expected)
+        current = conn.execute(
+            "SELECT tx_hash,block_hash,generation,last_error FROM pending_enrichment "
+            f"WHERE tx_hash IN ({marks})", tuple(expected),
         )
-        self._set_runtime(
-            "enrichment", error=self._enrichment_deferred_reason,
-            enrichment_deferred=True,
-            enrichment_deferred_reason=self._enrichment_deferred_reason,
-            enrichment_retry_in_s=round(max(1.0, float(delay)), 1),
-        )
+        return {
+            str(row["tx_hash"]) for row in current
+            if row["block_hash"] == expected[str(row["tx_hash"])]["block_hash"]
+            and row["generation"] == expected[str(row["tx_hash"])]["generation"]
+            and self._pool_identity_marker(row["last_error"]) is None
+        }
 
-    def _pool_identity_is_pending(self, tx_hash: str) -> bool:
-        row = self.store.read().execute(
-            "SELECT last_error FROM pending_enrichment WHERE tx_hash=?",
-            (_lower(tx_hash),),
-        ).fetchone()
-        return (
-            row is not None
-            and self._pool_identity_marker(row["last_error"]) is not None
-        )
+    def _mark_enrichment_failure(
+        self, row: Mapping[str, Any], error: Exception, *, delay: float,
+    ) -> bool:
+        with self.store.transaction() as conn:
+            if not self._current_enrichment_jobs(conn, [row]):
+                return False
+            self.store.mark_enrichment_error(str(row["tx_hash"]), str(error), delay=delay)
+        return True
 
     def _enrich_once(self) -> bool:
-        now = time.monotonic()
-        if now < self._enrichment_deferred_until:
-            retry_in = self._enrichment_deferred_until - now
-            self._set_runtime(
-                "enrichment", error=self._enrichment_deferred_reason,
-                enrichment_deferred=True,
-                enrichment_deferred_reason=self._enrichment_deferred_reason,
-                enrichment_retry_in_s=round(retry_in, 1),
-            )
+        capacity = ENRICH_BATCH - len(self._enrichment_jobs)
+        if capacity and not self._stop.is_set():
+            for row in self.store.pending_enrichments(ENRICH_BATCH):
+                tx_hash = str(row["tx_hash"])
+                if tx_hash in self._enrichment_jobs:
+                    continue
+                self._enrichment_jobs[tx_hash] = (
+                    row, self._enrichment_executor.submit(self._enrich_transaction, row),
+                    time.monotonic(),
+                )
+                capacity -= 1
+                if not capacity:
+                    break
+        if not self._enrichment_jobs:
             return False
-        pending = self.store.pending_enrichments(ENRICH_BATCH)
-        if not pending:
-            return False
-        trace = self.source_status().get("trace")
-        if isinstance(trace, Mapping) and trace.get("configured") is False:
-            self._defer_enrichment(
-                "trace RPC unavailable; configure LP_RPC_TRACE_URLS",
-                ENRICHMENT_CAPABILITY_RECHECK_S,
-            )
-            return False
-        started = time.monotonic()
+        wait(
+            [job[1] for job in self._enrichment_jobs.values()],
+            timeout=0.05, return_when=FIRST_COMPLETED,
+        )
         jobs = [
-            (
-                row,
-                self._enrichment_executor.submit(
-                    self._enrich_transaction, row,
-                ),
-            )
-            for row in pending
+            self._enrichment_jobs.pop(tx_hash)
+            for tx_hash, job in tuple(self._enrichment_jobs.items())
+            if job[1].done()
         ]
+        if not jobs:
+            return False
+        started = min(job[2] for job in jobs)
         successful_rows: list[Mapping[str, Any]] = []
         events: list[dict[str, Any]] = []
         transactions: list[dict[str, Any]] = []
         orphan: Mapping[str, Any] | None = None
         batch_error: Exception | None = None
-        capability_error: Exception | None = None
-        for row, future in jobs:
+        for row, future, _submitted_at in jobs:
             try:
                 row_events, transaction = future.result()
             except CanonicalConflict:
                 orphan = orphan or row
             except Exception as exc:
-                batch_error = exc
-                if self._trace_capability_error(exc):
-                    # This is a lane-level prerequisite, not a failure of this
-                    # canonical job. Preserve its attempts/error fields.
-                    capability_error = capability_error or exc
-                    continue
-                if self._pool_identity_is_pending(str(row["tx_hash"])):
-                    continue
                 attempts = int(row.get("attempts", 0)) + 1
-                self.store.mark_enrichment_error(
-                    str(row["tx_hash"]), str(exc),
-                    delay=min(300.0, 2.0 ** min(attempts, 8)),
-                )
+                if not self._mark_enrichment_failure(
+                    row, exc,
+                    delay=(
+                        ENRICHMENT_CAPABILITY_RECHECK_S
+                        if self._trace_capability_error(exc)
+                        else min(300.0, 2.0 ** min(attempts, 8))
+                    ),
+                ):
+                    continue
+                batch_error = exc
                 self._set_runtime("enrichment", error=exc)
             else:
-                if self._pool_identity_is_pending(str(row["tx_hash"])):
-                    continue
                 successful_rows.append(row)
                 events.extend(row_events)
                 transactions.append(transaction)
@@ -4249,7 +4301,23 @@ class MarketIndexer:
             return True
         if transactions:
             try:
-                self.store.enrich(events, transactions=transactions)
+                with self.store.transaction() as conn:
+                    # Identity replay may have added canonical inputs while
+                    # this receipt was in flight. Never clear that newer job.
+                    ready = self._current_enrichment_jobs(conn, successful_rows)
+                    if not ready:
+                        return True
+                    if len(ready) != len(successful_rows):
+                        successful_rows = [
+                            row for row in successful_rows if str(row["tx_hash"]) in ready
+                        ]
+                        transactions = [
+                            row for row in transactions if str(row["tx_hash"]) in ready
+                        ]
+                        events = [
+                            event for event in events if str(event["tx_hash"]) in ready
+                        ]
+                    self.store.enrich(events, transactions=transactions)
             except CanonicalConflict:
                 row = successful_rows[0]
                 self._recover_reorg(
@@ -4263,8 +4331,8 @@ class MarketIndexer:
             except Exception as exc:
                 for row in successful_rows:
                     attempts = int(row.get("attempts", 0)) + 1
-                    self.store.mark_enrichment_error(
-                        str(row["tx_hash"]), str(exc),
+                    self._mark_enrichment_failure(
+                        row, exc,
                         delay=min(300.0, 2.0 ** min(attempts, 8)),
                     )
                 self._set_runtime("enrichment", error=exc)
@@ -4276,9 +4344,6 @@ class MarketIndexer:
                     self._set_runtime(
                         "enrichment", latency=time.monotonic() - started,
                         enrichment_batch=len(transactions),
-                        enrichment_deferred=False,
-                        enrichment_deferred_reason=None,
-                        enrichment_retry_in_s=0.0,
                     )
                 else:
                     self._set_runtime(
@@ -4286,16 +4351,6 @@ class MarketIndexer:
                         latency=time.monotonic() - started,
                         enrichment_batch=len(transactions),
                     )
-        if capability_error is not None:
-            delay = (
-                ENRICHMENT_CAPABILITY_RECHECK_S
-                if "unavailable" in str(capability_error).lower()
-                else 60.0
-            )
-            self._defer_enrichment(str(capability_error), delay)
-        elif successful_rows:
-            self._enrichment_deferred_until = 0.0
-            self._enrichment_deferred_reason = None
         return True
 
     @staticmethod
@@ -4486,6 +4541,7 @@ class MarketIndexer:
         backoff = 0.25
         while not self._stop.is_set():
             try:
+                self._live_wakeup.clear()
                 if not self._initialized.is_set():
                     head_number, head, latency = self._bootstrap()
                     self._initialized.set()
@@ -4502,7 +4558,8 @@ class MarketIndexer:
                 backoff = min(10.0, backoff * 2.0)
             else:
                 backoff = 0.25
-                self._stop.wait(0.05 if worked else 0.35)
+                if not worked:
+                    self._live_wakeup.wait(0.1)
 
     def _history_run(self) -> None:
         backoff = 0.5
@@ -4529,19 +4586,132 @@ class MarketIndexer:
                     self._verify_chain("enrichment")
                     self._enrichment_verified = True
                 worked = self._sync_market_reorg()
-                worked = self._publish_stored_pool_page() or worked
-                if not self._recent_catchup_pending():
-                    worked = self._resolve_deferred_pool_identities_once() or worked
-                    worked = self._enrich_once() or worked
-                worked = self._metadata_once() or worked
-                worked = self._recover_legacy_v4_pool_page() or worked
+                worked = self._enrich_once() or worked
             except Exception as exc:
                 self._set_runtime("enrichment", error=exc)
                 self._stop.wait(backoff)
                 backoff = min(30.0, backoff * 2.0)
             else:
                 backoff = 0.5
+                self._stop.wait(0.05 if worked or self._enrichment_jobs else 0.5)
+
+    def _metadata_run(self) -> None:
+        backoff = 0.5
+        verified = False
+        while not self._stop.is_set():
+            if not self._initialized.wait(0.5):
+                continue
+            try:
+                if not verified:
+                    self._verify_chain("enrichment")
+                    verified = True
+                worked = self._publish_stored_pool_page()
+                worked = self._resolve_deferred_pool_identities_once() or worked
+                worked = self._metadata_once() or worked
+                worked = self._recover_legacy_v4_pool_page() or worked
+            except Exception as exc:
+                self._set_runtime("metadata", error=exc)
+                self._stop.wait(backoff)
+                backoff = min(30.0, backoff * 2.0)
+            else:
+                backoff = 0.5
                 self._stop.wait(0.05 if worked else 0.5)
+
+    def _repair_v4_owners_once(self) -> bool:
+        reader = self.store.read()
+        checkpoint_key = "v4_owner_correlation_repair_v1"
+        checkpoint = self.store._metadata(reader, checkpoint_key, {})
+        if checkpoint.get("complete"):
+            return False
+        epoch = int(self.store._metadata(reader, "epoch", 0))
+        after = int(checkpoint.get("after_event_id", (1 << 63) - 1))
+        page = reader.execute(
+            "SELECT MIN(id) AS first_id,COUNT(*) AS count FROM "
+            "(SELECT id FROM events WHERE id<=? ORDER BY id DESC LIMIT ?)",
+            (after, V4_OWNER_REPAIR_SCAN),
+        ).fetchone()
+        if page["first_id"] is None:
+            with self.store.transaction() as conn:
+                self.store._set_metadata(conn, checkpoint_key, {**checkpoint, "complete": True})
+            return False
+        candidates = reader.execute(
+            "SELECT e.id,e.tx_hash FROM events e "
+            "WHERE e.id>=? AND e.id<=? AND e.protocol='v4' "
+            "AND e.custody=? AND e.token_id IS NOT NULL AND e.owner IS NULL "
+            "AND e.position_key='nft:'||e.custody||':'||e.token_id "
+            "AND json_extract(e.data,'$.trace_complete')=1 "
+            "AND NOT EXISTS(SELECT 1 FROM pending_enrichment p WHERE p.tx_hash=e.tx_hash) "
+            "AND EXISTS(SELECT 1 FROM events t WHERE t.tx_hash=e.tx_hash "
+            "AND t.protocol='nft' AND t.kind='transfer' AND t.custody=e.custody "
+            "AND t.token_id=e.token_id AND t.position_key=e.position_key) "
+            "ORDER BY e.id DESC LIMIT ?",
+            (page["first_id"], after, V4_POSITION_MANAGER, V4_OWNER_REPAIR_LIMIT),
+        ).fetchall()
+        next_after = int(
+            candidates[-1]["id"] if len(candidates) == V4_OWNER_REPAIR_LIMIT
+            else page["first_id"]
+        ) - 1
+        repaired_events = repaired_transactions = 0
+        with self.store.transaction() as conn:
+            if int(self.store._metadata(conn, "epoch", 0)) != epoch:
+                return True
+            for tx_hash in dict.fromkeys(str(row["tx_hash"]) for row in candidates):
+                if conn.execute(
+                    "SELECT 1 FROM pending_enrichment WHERE tx_hash=?", (tx_hash,),
+                ).fetchone() is not None:
+                    continue
+                events = [dict(row) for row in conn.execute(
+                    "SELECT * FROM events WHERE tx_hash=? "
+                    "ORDER BY block_number,tx_index,log_index", (tx_hash,),
+                )]
+                for event in events:
+                    event["data"] = json.loads(event["data"])
+                changes = repair_v4_owners(events)
+                if changes:
+                    self.store.enrich(changes)
+                    repaired_events += len(changes)
+                    repaired_transactions += 1
+            self.store._set_metadata(conn, checkpoint_key, {
+                "after_event_id": next_after,
+                "scanned_events": int(checkpoint.get("scanned_events", 0)) + int(page["count"]),
+                "repaired_events": int(checkpoint.get("repaired_events", 0)) + repaired_events,
+                "repaired_transactions": int(checkpoint.get("repaired_transactions", 0)) + repaired_transactions,
+                "complete": False,
+            })
+        return True
+
+    def _source_repair_run(self) -> None:
+        backoff = 0.5
+        while not self._stop.is_set():
+            try:
+                started = time.monotonic()
+                worked = self.store.repair_v3_birth_history(V3_BIRTH_REPAIR_PREFIXES)
+                worked = self._repair_v4_owners_once() or worked
+                if worked:
+                    self._set_runtime("repair", latency=time.monotonic() - started)
+            except Exception as exc:
+                self._set_runtime("repair", error=exc)
+                self._stop.wait(backoff)
+                backoff = min(30.0, backoff * 2.0)
+            else:
+                backoff = 0.5
+                self._stop.wait(0.05 if worked else 1.0)
+
+    def _accounting_run(self) -> None:
+        backoff = 0.5
+        while not self._stop.is_set():
+            try:
+                started = time.monotonic()
+                worked = self._accounting_projector()
+                if worked:
+                    self._set_runtime("accounting", latency=time.monotonic() - started)
+            except Exception as exc:
+                self._set_runtime("accounting", error=exc)
+                self._stop.wait(backoff)
+                backoff = min(30.0, backoff * 2.0)
+            else:
+                backoff = 0.5
+                self._stop.wait(0.01 if worked else 0.1)
 
     def _projection_run(self) -> None:
         backoff = 0.5
@@ -4550,17 +4720,11 @@ class MarketIndexer:
                 continue
             try:
                 self.store.checkpoint()
-                if self._recent_catchup_pending():
-                    self._stop.wait(0.25)
-                    continue
                 if not self._projection_verified:
                     self._verify_chain("enrichment")
                     self._projection_verified = True
                 worked = self._reproject_once()
                 worked = self._balances_once() or worked
-                worked = self.store.repair_v3_birth_history(
-                    V3_BIRTH_REPAIR_PREFIXES,
-                ) or worked
             except Exception as exc:
                 self._set_runtime("projection", error=exc)
                 self._stop.wait(backoff)
@@ -4579,6 +4743,7 @@ class MarketIndexer:
                 return
             was_started = self._started
             self._stop.set()
+            self._live_wakeup.set()
             try:
                 current = threading.current_thread()
                 for thread in self._threads:

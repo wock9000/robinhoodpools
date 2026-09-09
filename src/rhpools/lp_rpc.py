@@ -340,23 +340,43 @@ class _Registry:
             return self._states[(capability, source.name)].retry_at <= time.monotonic()
 
     @staticmethod
-    def _safe_error(source: _Source, exc: BaseException) -> str:
-        text = str(exc).replace(source.url, source.name)
+    def _redact_text(source: _Source, value: str) -> str:
+        text = value.replace(source.url, source.name)
         parsed = urlsplit(source.url)
-        values = [value for _key, value in parse_qsl(parsed.query)]
-        values.extend(value for _key, value in source.headers)
+        secrets = [item for _key, item in parse_qsl(parsed.query)]
+        secrets.extend(item for _key, item in source.headers)
         if parsed.password:
-            values.append(parsed.password)
+            secrets.append(parsed.password)
         # Path-key providers (e.g. /v2/<key>) and query-key providers must
         # remain redacted even when a remote error echoes just the key.
         if "/v2/" in parsed.path:
-            values.append(unquote(parsed.path.split("/v2/", 1)[1]))
-        for value in values:
-            if len(value) >= 4:
-                text = text.replace(value, "<redacted>")
-                if value.startswith("Bearer "):
-                    text = text.replace(value[7:], "<redacted>")
-        text = _URL_RE.sub("<redacted-url>", text)
+            secrets.append(unquote(parsed.path.split("/v2/", 1)[1]))
+        for secret in secrets:
+            if len(secret) >= 4:
+                text = text.replace(secret, "<redacted>")
+                if secret.startswith("Bearer "):
+                    text = text.replace(secret[7:], "<redacted>")
+        return _URL_RE.sub("<redacted-url>", text)
+
+    @classmethod
+    def _safe_payload(cls, source: _Source, value: Any) -> Any:
+        """Redact provider credentials without discarding JSON-RPC error ABI."""
+        if isinstance(value, Mapping):
+            return {
+                cls._redact_text(source, str(key)): cls._safe_payload(source, item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [cls._safe_payload(source, item) for item in value]
+        if isinstance(value, str):
+            return cls._redact_text(source, value)
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        return cls._redact_text(source, str(value))
+
+    @classmethod
+    def _safe_error(cls, source: _Source, exc: BaseException) -> str:
+        text = cls._redact_text(source, str(exc))
         return f"{type(exc).__name__}: {text}"[:500]
 
     def success(
@@ -579,11 +599,14 @@ class _WssPreferredRpc:
         except Exception:
             return self._fallback.call(method, params)
 
-    def batch(self, calls: Iterable[tuple[str, Sequence[Any]]]) -> list[Any]:
+    def batch(
+        self, calls: Iterable[tuple[str, Sequence[Any]]], *,
+        allow_reverts: bool = False,
+    ) -> list[Any]:
         # Bulk snapshots must use capability-specific providers and their
         # shared concurrency/rate budgets, not the public head-subscription
         # socket that is optimized for individual latency-sensitive calls.
-        return self._fallback.batch(calls)
+        return self._fallback.batch(calls, allow_reverts=allow_reverts)
 
     def status(self) -> dict[str, Any]:
         return self._fallback.status()
@@ -619,6 +642,21 @@ class RoutedRpc:
         except TypeError:
             return self._registry.error_type(message)
 
+    @staticmethod
+    def _is_execution_revert(method: str, error: Any) -> bool:
+        if method not in {"eth_call", "eth_estimateGas"} or not isinstance(error, Mapping):
+            return False
+        code = error.get("code")
+        message = str(error.get("message") or "")
+        return (
+            code == 3
+            or (
+                code in {-32000, -32015}
+                and message.lower().startswith("execution reverted")
+            )
+        )
+
+
     def _post(self, source: _Source, payload: Any) -> Any:
         response: requests.Response | None = None
         gate = _gate(source.url)
@@ -652,26 +690,24 @@ class RoutedRpc:
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise self._error(f"{source.name} returned invalid JSON") from None
 
-    def _validate_item(self, source: _Source, item: Any, request_id: int, method: str) -> Any:
+    def _validate_item(
+        self, source: _Source, item: Any, request_id: int, method: str, *,
+        allow_revert: bool = False,
+    ) -> Any:
         if not isinstance(item, Mapping) or item.get("id") != request_id:
             raise self._error(f"{source.name} returned malformed {method} response")
         error = item.get("error")
         if error is not None:
+            if allow_revert and self._is_execution_revert(method, error):
+                return {"error": self._registry._safe_payload(source, error)}
             code = error.get("code") if isinstance(error, Mapping) else None
-            message = error.get("message") if isinstance(error, Mapping) else error
             # Pinned NFT lifecycle reads need the ABI revert payload, not just
             # its message. Keep the full error while redacting provider secrets.
             failure = self._error(
                 f"{source.name} {method}: {self._registry._safe_error(source, RuntimeError(str(error)))}",
                 code=code if isinstance(code, int) else None,
             )
-            if method in {"eth_call", "eth_estimateGas"} and (
-                code == 3
-                or (
-                    code in {-32000, -32015}
-                    and str(message).lower().startswith("execution reverted")
-                )
-            ):
+            if self._is_execution_revert(method, error):
                 raise _ExecutionReverted(failure, method)
             raise failure
         if "result" not in item:
@@ -910,15 +946,35 @@ class RoutedRpc:
             raise self._error(f"{capability} RPC deferred during provider cooldown")
         raise self._error(f"{capability} RPC exhausted: " + "; ".join(failures))
 
-    def batch(self, calls: Iterable[tuple[str, Sequence[Any]]]) -> list[Any]:
+    def batch(
+        self, calls: Iterable[tuple[str, Sequence[Any]]], *,
+        allow_reverts: bool = False,
+    ) -> list[Any]:
         specifications = [(method, list(params)) for method, params in calls]
         if not specifications:
             return []
         if len(specifications) > MAX_BATCH_CALLS:
             raise ValueError(f"RPC batch exceeds {MAX_BATCH_CALLS} calls")
-        capabilities = {_capability(method, params, self._lane) for method, params in specifications}
+        capabilities = {
+            _capability(method, params, self._lane)
+            for method, params in specifications
+        }
         if len(capabilities) != 1:
-            return [self.call(method, params) for method, params in specifications]
+            grouped: dict[str, list[tuple[int, tuple[str, list[Any]]]]] = {}
+            for index, specification in enumerate(specifications):
+                capability = _capability(
+                    specification[0], specification[1], self._lane,
+                )
+                grouped.setdefault(capability, []).append((index, specification))
+            output: list[Any] = [None] * len(specifications)
+            for group in grouped.values():
+                results = self.batch(
+                    (specification for _index, specification in group),
+                    allow_reverts=allow_reverts,
+                )
+                for (index, _specification), result in zip(group, results):
+                    output[index] = result
+            return output
         capability = capabilities.pop()
         sources = self._registry.candidates(capability)
         if not sources and not self._registry.sources[capability]:
@@ -953,7 +1009,10 @@ class RoutedRpc:
                         raise self._error(f"{source.name} returned non-list batch response")
                     by_id = {item.get("id"): item for item in raw if isinstance(item, Mapping)}
                     output = [
-                        self._validate_item(source, by_id.get(request_id), request_id, method)
+                        self._validate_item(
+                            source, by_id.get(request_id), request_id, method,
+                            allow_revert=allow_reverts,
+                        )
                         for request_id, (method, _params) in zip(ids, specifications)
                     ]
                 except _ExecutionReverted as exc:

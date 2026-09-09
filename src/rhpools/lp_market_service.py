@@ -1064,7 +1064,7 @@ class LPMarketService:
         self.market = market
         self.store = MarketStore(path, checkpoint_on_commit=not start)
         self.prices = PriceProjection(self.store)
-        self.book = AccountBook(self.store)
+        self.book = AccountBook(self.store, deferred=start)
         self.book.install()
         self._current_activity_lock = threading.RLock()
         self._current_activity_headers: OrderedDict[int, dict[str, Any]] = OrderedDict()
@@ -1083,6 +1083,7 @@ class LPMarketService:
             self.store, market, rpc_url, history_days=history_days,
             history_disk_reserve_bytes=history_disk_reserve_bytes, v3_balances=True,
             current_observer=self,
+            accounting_projector=self.book.project_pending if start else None,
         )
         # Restore the durable catalog before serving requests. Exact cold
         # inspectors can then reuse an already-qualified stored identity even
@@ -2629,12 +2630,18 @@ class LPMarketService:
                     "tx_hash": None, "event_count": 1,
                     "qualification": "durable_canonical_index",
                 }
-            current_at = int(row["activity"].get("timestamp") or 0)
-            pending = (
+            through_order = row.pop("financial_through_order", None)
+            financial_as_of = row.pop("financial_through_as_of", accounting_as_of)
+            current_order = row.get("_activity_order")
+            pending = bool(row.pop("financial_pending", False)) or (
                 row["activity"].get("qualification") == "provisional_canonical"
                 and (
-                    accounting_as_of is None
-                    or current_at > int(accounting_as_of)
+                    not isinstance(through_order, Mapping)
+                    or not current_order
+                    or tuple(current_order) > tuple(
+                        int(through_order.get(name) or 0)
+                        for name in ("block_number", "tx_index", "log_index")
+                    )
                 )
             )
             row["coverage"] = {
@@ -2650,7 +2657,8 @@ class LPMarketService:
                 )
             row["financials"] = {
                 "qualification": "durable_canonical_accounting",
-                "as_of": accounting_as_of,
+                "as_of": financial_as_of,
+                "through_order": through_order,
                 "current_activity_included": False,
                 "pending": pending,
             }

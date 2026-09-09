@@ -11,7 +11,8 @@ from rhpools.lp_market_protocols import (
     UNISWAP_V3_POSITION_MANAGER,
 )
 from rhpools.lp_market_index import V3_BIRTH_REPAIR_PREFIXES
-from rhpools.lp_market_service import LPMarketService
+from rhpools.lp_market_accounting import AccountBook
+from rhpools.lp_market_service import LPMarketService, PriceProjection
 from rhpools.lp_rpc import _WssRpc, build_rpc_factory
 from rhpools.lp_market_store import CanonicalConflict, MarketStore
 from rhpools.workbench_market import USDG, UNISWAP_V3_FACTORY
@@ -581,6 +582,409 @@ def ingest_effects(app, blocks, events):
                     for event in events]
     app.store.ingest(blocks, events, transactions=transactions)
     return transactions
+
+
+def accounting_store(path, *, deferred):
+    store = MarketStore(path)
+    PriceProjection(store)
+    book = AccountBook(store, deferred=deferred).install()
+    store.upsert_pools(pools())
+    return store, book
+
+
+def traced_v4_episode(blocks, *, owner=TOKEN, key="deferred"):
+    opened = lp_effect(
+        blocks[0], "v4", "add", 1_000, (1_000_000, 1_000_000),
+        position_state(0), position_state(1_000), key=key,
+    )
+    closed = lp_effect(
+        blocks[1], "v4", "remove", -1_000, (1_000_000, 1_000_000),
+        position_state(1_000), position_state(0), key=key,
+    )
+    for event, principal, cash, fees in (
+        (opened, (-1_000_000, -1_000_000), (-1_000_000, -1_000_000), (0, 0)),
+        (closed, (1_000_000, 1_000_000), (1_100_000, 1_000_000), (100_000, 0)),
+    ):
+        event.update(
+            owner=owner, custody=MANAGER,
+            cashflow0=str(cash[0]), cashflow1=str(cash[1]),
+            fee_amount0=str(fees[0]), fee_amount1=str(fees[1]),
+        )
+        event["data"].update(
+            trace_complete=True, fees_accrued_exact=True,
+            principal_delta_exact=True,
+            principal_delta={
+                "amount0": str(principal[0]), "amount1": str(principal[1]),
+            },
+        )
+    transactions = [
+        {
+            "tx_hash": event["tx_hash"],
+            "block_number": event["block_number"],
+            "block_hash": event["block_hash"],
+            "payer": owner,
+            "gas_usd": 0.01,
+        }
+        for event in (opened, closed)
+    ]
+    return opened, closed, transactions
+
+
+def drain_accounting(book):
+    while book.project_pending(limit=32):
+        pass
+
+
+def test_deferred_accounting_does_not_hold_writer_and_drains_same_branch_prefix(
+        tmp_path, monkeypatch):
+    blocks = [header(100 + index, 1_000 + index) for index in range(2)]
+    opened, closed, transactions = traced_v4_episode(blocks)
+    store, book = accounting_store(
+        tmp_path / "deferred.sqlite", deferred=True,
+    )
+    baseline, baseline_book = accounting_store(
+        tmp_path / "synchronous.sqlite", deferred=False,
+    )
+    derived = threading.Event()
+    release = threading.Event()
+    committed = threading.Event()
+    failures = []
+    original = book._derive
+
+    def paused(*args, **kwargs):
+        result = original(*args, **kwargs)
+        derived.set()
+        release.wait(5)
+        return result
+
+    monkeypatch.setattr(book, "_derive", paused)
+    try:
+        inserted = store.ingest(
+            blocks[:1], [opened], transactions=transactions[:1],
+        )
+        opened_id = int(inserted[0]["id"])
+        projector = threading.Thread(
+            target=lambda: book.project_pending(limit=1),
+        )
+        projector.start()
+        assert derived.wait(2)
+
+        def commit_arrival():
+            try:
+                store.ingest(
+                    blocks[1:], [closed], transactions=transactions[1:],
+                )
+                store.enrich([{
+                    "id": opened_id,
+                    "accounting_basis": "same-epoch trace enrichment",
+                }])
+            except BaseException as error:
+                failures.append(error)
+            finally:
+                committed.set()
+
+        writer = threading.Thread(target=commit_arrival)
+        writer.start()
+        assert committed.wait(2)
+        assert failures == []
+        assert store.status()["indexed_events"] == 2
+        assert store.status()["pending_accounting"] == 1
+        release.set()
+        writer.join(2)
+        projector.join(2)
+        assert not writer.is_alive()
+        assert not projector.is_alive()
+
+        prefix = book.positions({"owner": TOKEN})["rows"]
+        assert len(prefix) == 1
+        assert prefix[0]["status"] == "open"
+        assert store.status()["pending_accounting"] == 1
+        prefix_candidates = book.owner_candidates({"window": "all"})
+        assert prefix_candidates["accounting_as_of"] is None
+        prefix_owner = book.decorate_owner_activity(
+            prefix_candidates["rows"], {"window": "all"},
+        )[0]
+        assert prefix_owner["financial_pending"] is True
+        assert prefix_owner["financial_through_order"] is None
+
+        monkeypatch.setattr(book, "_derive", original)
+        drain_accounting(book)
+        baseline.ingest(blocks, [opened, closed], transactions=transactions)
+        deferred_row = book.closed({"window": "all"})["rows"][0]
+        synchronous_row = baseline_book.closed({"window": "all"})["rows"][0]
+        for field in (
+            "status", "deposit_usd", "withdrawal_usd", "fees_usd",
+            "gross_pnl_usd", "gas_usd", "net_pnl_usd",
+        ):
+            assert deferred_row[field] == synchronous_row[field]
+        assert deferred_row["net_pnl_usd"] == pytest.approx(0.08)
+        owner = book.decorate_owner_activity(
+            book.owner_candidates({"window": "all"})["rows"],
+            {"window": "all"},
+        )[0]
+        assert owner["financial_pending"] is False
+        assert owner["financial_through_order"] == {
+            "block_number": 101, "tx_index": 0, "log_index": 0,
+        }
+        assert owner["financial_through_as_of"] == 1_001
+    finally:
+        release.set()
+        baseline.close()
+        store.close()
+
+
+def test_owner_financial_boundary_uses_the_aggregate_snapshot(
+        tmp_path, monkeypatch):
+    blocks = [header(100 + index, 1_000 + index) for index in range(2)]
+    opened, closed, transactions = traced_v4_episode(
+        blocks, key="owner-snapshot",
+    )
+    store, book = accounting_store(tmp_path / "market.sqlite", deferred=True)
+    aggregate_read = threading.Event()
+    release = threading.Event()
+    failures = []
+    captured = []
+    original_gas = book._owner_gas_values
+
+    def paused_gas(*args, **kwargs):
+        result = original_gas(*args, **kwargs)
+        aggregate_read.set()
+        if not release.wait(5):
+            raise TimeoutError("test did not release owner aggregate snapshot")
+        return result
+
+    monkeypatch.setattr(book, "_owner_gas_values", paused_gas)
+    try:
+        store.ingest(
+            blocks[:1], [opened], transactions=transactions[:1],
+        )
+        drain_accounting(book)
+
+        def read_candidates():
+            try:
+                captured.append(book.owner_candidates({"window": "all"}))
+            except BaseException as error:
+                failures.append(error)
+
+        reader = threading.Thread(target=read_candidates)
+        reader.start()
+        assert aggregate_read.wait(2)
+        store.ingest(
+            blocks[1:], [closed], transactions=transactions[1:],
+        )
+        drain_accounting(book)
+        release.set()
+        reader.join(2)
+        assert not reader.is_alive()
+        assert failures == []
+
+        stale = captured[0]["rows"][0]
+        assert stale["closed_episodes"] == 0
+        assert stale["financial_pending"] is False
+        assert stale["financial_through_order"] == {
+            "block_number": 100, "tx_index": 0, "log_index": 0,
+        }
+        decorated = book.decorate_owner_activity(
+            captured[0]["rows"], {"window": "all"},
+        )[0]
+        assert decorated["closed_episodes"] == 0
+        assert decorated["financial_pending"] is True
+        assert decorated["financial_through_order"] is None
+        latest = book.owner_candidates({"window": "all"})["rows"][0]
+        assert latest["closed_episodes"] == 1
+        assert latest["financial_through_order"] == {
+            "block_number": 101, "tx_index": 0, "log_index": 0,
+        }
+    finally:
+        release.set()
+        store.close()
+
+
+def test_deferred_accounting_rejects_prepared_orphan_branch(
+        tmp_path, monkeypatch):
+    first_block = header(100, 1_000)
+    replacement_block = header(100, 1_001, branch=10_000)
+    old_event = lp_effect(
+        first_block, "v4", "add", 1_000, (1_000_000, 1_000_000),
+        position_state(0), position_state(1_000), key="reorg",
+    )
+    replacement_owner = "0x" + "78" * 20
+    replacement = lp_effect(
+        replacement_block, "v4", "add", 1_000, (1_000_000, 1_000_000),
+        position_state(0), position_state(1_000), key="reorg",
+    )
+    replacement.update(owner=replacement_owner, custody=MANAGER)
+    store, book = accounting_store(tmp_path / "market.sqlite", deferred=True)
+    derived = threading.Event()
+    release = threading.Event()
+    original = book._derive
+
+    def paused(*args, **kwargs):
+        result = original(*args, **kwargs)
+        derived.set()
+        release.wait(5)
+        return result
+
+    monkeypatch.setattr(book, "_derive", paused)
+    try:
+        store.ingest([first_block], [old_event])
+        projector = threading.Thread(
+            target=lambda: book.project_pending(limit=1),
+        )
+        projector.start()
+        assert derived.wait(2)
+        store.rollback(99)
+        store.ingest([replacement_block], [replacement])
+        release.set()
+        projector.join(2)
+        assert not projector.is_alive()
+        assert book.positions({"owner": TOKEN})["rows"] == []
+
+        monkeypatch.setattr(book, "_derive", original)
+        drain_accounting(book)
+        rows = book.positions({"owner": replacement_owner})["rows"]
+        assert len(rows) == 1
+        assert rows[0]["position_key"] == "v4:reorg"
+        assert book.positions({"owner": TOKEN})["rows"] == []
+    finally:
+        release.set()
+        store.close()
+
+
+def test_deferred_accounting_restart_resumes_queue_and_clears_reassigned_key(
+        tmp_path, monkeypatch):
+    path = tmp_path / "market.sqlite"
+    block = header(100, 1_000)
+    event = lp_effect(
+        block, "v4", "add", 1_000, (1_000_000, 1_000_000),
+        position_state(0), position_state(1_000), key="before",
+    )
+    store, _book = accounting_store(path, deferred=True)
+    inserted = store.ingest([block], [event])
+    event_id = int(inserted[0]["id"])
+    assert store.status()["pending_accounting"] == 1
+    store.close()
+
+    store = MarketStore(path)
+    PriceProjection(store)
+    book = AccountBook(store, deferred=True)
+
+    def unexpected_replay(*_args, **_kwargs):
+        raise AssertionError("deferred install replayed the ledger")
+
+    monkeypatch.setattr(book, "_map_existing_events", unexpected_replay)
+    monkeypatch.setattr(book, "_rebuild_position", unexpected_replay)
+    try:
+        book.install()
+        assert store.status()["pending_accounting"] == 1
+        drain_accounting(book)
+        before = book.positions({"owner": TOKEN})["rows"]
+        assert [row["position_key"] for row in before] == ["v4:before"]
+
+        moved = {
+            **event, "id": event_id, "position_key": "v4:after",
+            "data": {**event["data"], "position_key": "v4:after"},
+        }
+        store.enrich([moved])
+        assert store.status()["pending_accounting"] == 2
+        drain_accounting(book)
+        after = book.positions({"owner": TOKEN})["rows"]
+        assert [row["position_key"] for row in after] == ["v4:after"]
+        assert after[0]["liquidity"] == "1000"
+    finally:
+        store.close()
+
+
+def test_v4_fee_action_before_same_tx_transfer_stays_with_prior_owner(
+        tmp_path):
+    app = service(tmp_path / "market.sqlite")
+    prior_owner = "0x" + "56" * 20
+    recipient = TOKEN
+    position_key = f"nft:{MANAGER}:42"
+    opened_block = header(99, 999)
+    transferred_block = header(100, 1_000)
+    opened = lp_effect(
+        opened_block, "v4", "add", 1_000, (1_000_000, 1_000_000),
+        position_state(0), position_state(1_000), key="unused",
+    )
+    opened.update(
+        log_index=1, position_key=position_key, token_id="42",
+        owner=prior_owner, custody=MANAGER,
+        cashflow0="-1000000", cashflow1="-1000000",
+        fee_amount0="0", fee_amount1="0",
+    )
+    opened["data"].update(
+        trace_complete=True, fees_accrued_exact=True,
+        principal_delta_exact=True,
+        principal_delta={"amount0": "-1000000", "amount1": "-1000000"},
+    )
+    collected = lp_effect(
+        transferred_block, "v4", "collect", 0, (100_000, 0),
+        position_state(1_000, 100_000, 0),
+        position_state(1_000), key="unused",
+    )
+    collected.update(
+        log_index=0, position_key=position_key, token_id="42",
+        owner=prior_owner, custody=MANAGER,
+        cashflow0="100000", cashflow1="0",
+        fee_amount0="100000", fee_amount1="0",
+    )
+    collected["data"].update(
+        trace_complete=True, fees_accrued_exact=True,
+        principal_delta_exact=True,
+        principal_delta={"amount0": "0", "amount1": "0"},
+    )
+
+    def transfer(block, tx_hash, log_index, source, target, *, mint=False):
+        event = swap(block, V4, "v4", index=log_index)
+        event.update(
+            tx_hash=tx_hash, log_index=log_index, protocol="nft",
+            kind="transfer", position_key=position_key, token_id="42",
+            owner=target, custody=MANAGER, liquidity_delta=None,
+            amount0=None, amount1=None, cashflow0=None, cashflow1=None,
+            data={
+                "from": source, "to": target, "mint": mint,
+                "manager_protocol": "v4",
+            },
+        )
+        return event
+
+    minted = transfer(
+        opened_block, opened["tx_hash"], 0, "0x" + "0" * 40,
+        prior_owner, mint=True,
+    )
+    delivered = transfer(
+        transferred_block, collected["tx_hash"], 1, prior_owner, recipient,
+    )
+    try:
+        app.store.upsert_pools(pools())
+        app.store.ingest(
+            [opened_block, transferred_block],
+            [minted, opened, collected, delivered],
+            transactions=[{
+                "tx_hash": event["tx_hash"],
+                "block_number": event["block_number"],
+                "block_hash": event["block_hash"],
+                "payer": prior_owner,
+                "gas_usd": 0.01,
+            } for event in (opened, collected)],
+        )
+        prior = app.book.owner(prior_owner, {"window": "all"})
+        prior_episode = prior["positions"][0]["episodes"][0]
+        assert prior_episode["observed_collected_fees_usd"] == pytest.approx(0.1)
+        assert prior_episode["status"] == "transferred_out"
+
+        received = app.book.owner(recipient, {"window": "all"})
+        position = received["positions"][0]
+        assert position["owner"] == recipient
+        assert position["liquidity"] == "1000"
+        recipient_episode = position["episodes"][0]
+        assert recipient_episode["net_pnl_usd"] is None
+        assert "transferred_basis_unknown" in (
+            recipient_episode["coverage"]["reasons"]
+        )
+    finally:
+        app.close()
 
 
 def test_receipt_enrichment_adds_missed_logs_once_and_never_revives_orphans(tmp_path):

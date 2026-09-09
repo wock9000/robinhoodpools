@@ -1327,8 +1327,116 @@ def _owner_from_same_tx_transfers(
     return prior, "manager_transfer_same_tx_prestate"
 
 
+def repair_v4_owners(
+    events: Iterable[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return V4 manager core rows whose owner is proven by same-tx transfers.
+
+    The input is not mutated.  Returned rows retain all canonical enrichment
+    fields and differ only in owner attribution and its evidence basis.
+    """
+    rows: list[Mapping[str, Any]] = []
+    transfers: dict[
+        tuple[str, int], dict[int, tuple[str, str]]
+    ] = defaultdict(dict)
+    for row in events:
+        if not isinstance(row, Mapping):
+            raise TypeError("normalized transaction events must be mappings")
+        rows.append(row)
+        custody = _address(row.get("custody"), "normalized event custody", strict=False)
+        if (
+            row.get("protocol") != "nft"
+            or row.get("kind") != "transfer"
+            or custody != V4_POSITION_MANAGER
+        ):
+            continue
+        token_id = _integer(row.get("token_id"), "V4 transfer token id")
+        if (
+            str(row.get("position_key") or "").lower()
+            != nft_position_key(V4_POSITION_MANAGER, token_id)
+        ):
+            raise ProtocolDecodeError(
+                "V4 manager transfer has inconsistent NFT position key"
+            )
+        data = row.get("data")
+        if not isinstance(data, Mapping):
+            raise ProtocolDecodeError("V4 manager transfer data is missing")
+        prior_owner = _address(data.get("prior_owner"), "V4 transfer prior owner")
+        new_owner = _address(data.get("new_owner"), "V4 transfer new owner")
+        if prior_owner == ZERO_ADDRESS and new_owner == ZERO_ADDRESS:
+            raise ProtocolDecodeError("V4 manager transfer has two zero endpoints")
+        identity = (
+            _hash(row.get("tx_hash"), "V4 transfer transaction"),
+            token_id,
+        )
+        log_index = _integer(row.get("log_index"), "V4 transfer log index")
+        existing = transfers[identity].get(log_index)
+        endpoints = (prior_owner, new_owner)
+        if existing is not None and existing != endpoints:
+            raise ProtocolDecodeError("conflicting normalized V4 manager transfers")
+        transfers[identity][log_index] = endpoints
+
+    changed: list[dict[str, Any]] = []
+    for row in rows:
+        custody = _address(row.get("custody"), "normalized event custody", strict=False)
+        if (
+            row.get("protocol") != "v4"
+            or custody != V4_POSITION_MANAGER
+            or row.get("liquidity_delta") is None
+        ):
+            continue
+        token_id = _integer(row.get("token_id"), "V4 core token id")
+        if (
+            str(row.get("position_key") or "").lower()
+            != nft_position_key(V4_POSITION_MANAGER, token_id)
+        ):
+            raise ProtocolDecodeError(
+                "V4 manager core row has inconsistent NFT position key"
+            )
+        tx_hash = _hash(row.get("tx_hash"), "V4 core transaction")
+        candidates = sorted(
+            (index, *owners)
+            for index, owners in transfers.get((tx_hash, token_id), {}).items()
+        )
+        if not candidates:
+            continue
+        action_index = _integer(row.get("log_index"), "V4 core log index")
+        before = [item for item in candidates if item[0] <= action_index]
+        if before:
+            _index, prior_owner, new_owner = before[-1]
+            owner = new_owner if new_owner != ZERO_ADDRESS else prior_owner
+            basis = "manager_transfer_same_tx"
+        else:
+            _index, prior_owner, new_owner = candidates[0]
+            if prior_owner == ZERO_ADDRESS:
+                owner = new_owner
+                basis = "manager_mint_transfer_same_tx"
+            else:
+                owner = prior_owner
+                basis = "manager_transfer_same_tx_prestate"
+        if owner == ZERO_ADDRESS:
+            raise ProtocolDecodeError("V4 manager transfer cannot prove a zero owner")
+        data = row.get("data")
+        if not isinstance(data, Mapping):
+            raise ProtocolDecodeError("V4 manager core data is missing")
+        if (
+            row.get("owner") == owner
+            and row.get("identity_basis") == basis
+            and data.get("identity_basis") == basis
+        ):
+            continue
+        repaired = dict(row)
+        repaired_data = dict(data)
+        repaired.update(owner=owner, identity_basis=basis, data=repaired_data)
+        repaired_data["identity_basis"] = basis
+        changed.append(repaired)
+    return changed
+
+
 def _correlate_manager_events(
-    rows: list[dict[str, Any]], evidence: Mapping[str, Sequence[Mapping[str, Any]]]
+    rows: list[dict[str, Any]],
+    evidence: Mapping[str, Sequence[Mapping[str, Any]]],
+    headers: Mapping[Any, Mapping[str, Any]],
 ) -> None:
     by_tx: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
@@ -1398,6 +1506,33 @@ def _correlate_manager_events(
                 int(row["liquidity_delta"]), row["data"]["salt"],
             )
             v4_core_groups[key].append(row)
+        if v4_core_groups:
+            repair_input: list[Mapping[str, Any]] = list(tx_rows)
+            known = {_identity(row) for row in tx_rows}
+            for log in logs:
+                if (
+                    _topic0(log) != TRANSFER_TOPIC
+                    or _address(
+                        log.get("address"), "transfer emitter", strict=False
+                    ) != V4_POSITION_MANAGER
+                ):
+                    continue
+                transfer = _decode_transfer(log, headers)
+                if transfer is not None and _identity(transfer) not in known:
+                    repair_input.append(transfer)
+            repairs = {
+                _identity(row): row for row in repair_v4_owners(repair_input)
+            }
+            for row in tx_rows:
+                repaired = repairs.get(_identity(row))
+                if repaired is None:
+                    continue
+                row["owner"] = repaired["owner"]
+                row["identity_basis"] = repaired["identity_basis"]
+                row["data"] = repaired["data"]
+            for cores in v4_core_groups.values():
+                for row in cores:
+                    row["data"].setdefault("identity_basis", row["identity_basis"])
         v4_aux_groups: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
         for aux in v4_aux:
             key = (aux["pool_id"], aux["tick_lower"], aux["tick_upper"], aux["liquidity_delta"], aux["salt"])
@@ -1410,14 +1545,9 @@ def _correlate_manager_events(
             if len(cores) != len(auxiliaries):
                 raise ProtocolDecodeError("ambiguous V4 PositionManager/core event correlation")
             for row, aux in zip(cores, auxiliaries):
-                token_id = int(row["token_id"])
-                owner, basis = _owner_from_same_tx_transfers(logs, V4_POSITION_MANAGER, token_id, row["log_index"])
-                row["owner"] = owner
-                row["identity_basis"] = basis or "verified_v4_nft_salt"
                 row["data"].update(
                     position_manager_operator=aux["operator"],
                     position_manager_event_log_index=aux["log_index"],
-                    identity_basis=row["identity_basis"],
                 )
 
         # Enrich Transfer rows when a same-transaction core action resolved the
@@ -1780,7 +1910,7 @@ def decode_logs(
             rows.append(row)
 
     evidence = _evidence_logs(ordered_logs, receipts)
-    _correlate_manager_events(rows, evidence)
+    _correlate_manager_events(rows, evidence, headers)
     _enrich_v4_traces(rows, receipts, traces, local_pools)
     rows.sort(key=lambda row: (row["block_number"], row["tx_index"], row["log_index"]))
     return rows
@@ -1882,12 +2012,17 @@ def position_state_requests(events: Iterable[Mapping[str, Any]]) -> list[dict[st
         if (
             proof_row.get("protocol") != "nft"
             or proof_row.get("kind") != "transfer"
-            or manager not in V3_NFT_MANAGER_ADDRESSES
-            or proof_data.get("manager_protocol") != "v3"
+            or manager not in NFT_MANAGER_ADDRESSES
+            or proof_data.get("manager_protocol") != MANAGER_INFO[manager]["protocol"]
             or token_value is None
         ):
             continue
         token_id = _integer(token_value, "lifecycle proof token id")
+        if (
+            str(proof_row.get("position_key") or "").lower()
+            != nft_position_key(manager, token_id)
+        ):
+            continue
         tx_hash = _hash(proof_row.get("tx_hash"), "lifecycle proof transaction")
         prior_owner = _address(
             proof_data.get("prior_owner"), "lifecycle prior owner", strict=False
@@ -1918,23 +2053,39 @@ def position_state_requests(events: Iterable[Mapping[str, Any]]) -> list[dict[st
         data = row.get("data") if isinstance(row.get("data"), Mapping) else {}
         core_key = data.get("core_position_key") or row.get("position_key")
         pool_value = row.get("pool") if isinstance(row.get("pool"), Mapping) else {}
-        for field, pin in pins:
-            request: dict[str, Any] | None = None
-            if token_id_value is not None and custody in V3_NFT_MANAGER_ADDRESSES:
-                token_id = _integer(token_id_value, "NFT token id")
+        token_id: int | None = None
+        proof_identity: tuple[str, str, int] | None = None
+        mint_absence_basis: str | None = None
+        if token_id_value is not None and custody in NFT_MANAGER_ADDRESSES:
+            token_id = _integer(token_id_value, "NFT token id")
+            if (
+                str(row.get("position_key") or "").lower()
+                == nft_position_key(custody, token_id)
+            ):
                 proof_identity = (
-                    _hash(row.get("tx_hash"), "NFPM event transaction"),
+                    _hash(row.get("tx_hash"), "NFT event transaction"),
                     custody,
                     token_id,
                 )
+            if proof_identity is not None and (*proof_identity, "mint") in lifecycle_proofs:
+                mint_absence_basis = (
+                    "same_receipt_verified_nfpm_mint"
+                    if custody in V3_NFT_MANAGER_ADDRESSES
+                    else "same_receipt_verified_v4_manager_mint"
+                )
+        for field, pin in pins:
+            if field == "position_before" and mint_absence_basis is not None:
+                # An allowlisted manager's canonical zero-address mint proves
+                # this monotonically assigned NFT position did not exist at
+                # the parent block. Attach that proof to the required after
+                # read instead of spending an archive call on a known revert.
+                continue
+            request: dict[str, Any] | None = None
+            if token_id is not None and custody in V3_NFT_MANAGER_ADDRESSES:
                 missing_basis = None
                 if (
-                    field == "position_before"
-                    and (*proof_identity, "mint") in lifecycle_proofs
-                ):
-                    missing_basis = "same_receipt_verified_nfpm_mint"
-                elif (
                     field == "position_after"
+                    and proof_identity is not None
                     and (*proof_identity, "burn") in lifecycle_proofs
                 ):
                     missing_basis = "same_receipt_verified_nfpm_burn"
@@ -1949,6 +2100,10 @@ def position_state_requests(events: Iterable[Mapping[str, Any]]) -> list[dict[st
                     token_id=str(token_id),
                     allow_missing=missing_basis is not None,
                     missing_basis=missing_basis,
+                    position_before_absence_basis=(
+                        mint_absence_basis if field == "position_after" else None
+                    ),
+                    position_before_block=max(block - 1, 0),
                     expected_tick_lower=row.get("tick_lower"),
                     expected_tick_upper=row.get("tick_upper"),
                     expected_token0=pool_value.get("token0"),
@@ -1977,6 +2132,10 @@ def position_state_requests(events: Iterable[Mapping[str, Any]]) -> list[dict[st
                 request = _state_request(
                     row, field, "v4_state_view_position", STATE_VIEW,
                     STATE_VIEW_POSITION_SELECTOR + pool_id[2:] + position_key[2:], pin,
+                    position_before_absence_basis=(
+                        mint_absence_basis if field == "position_after" else None
+                    ),
+                    position_before_block=max(block - 1, 0),
                 )
             if request is not None:
                 key = (tuple(request["correlation"]["identity"].items()), field, request["params"][0]["to"], request["params"][0]["data"], pin)
@@ -2190,6 +2349,44 @@ def decode_position_state_results(
                             f"NFPM token state {actual_name} does not match core event"
                         )
             update["data"][field] = position
+            absence_basis = correlation.get("position_before_absence_basis")
+            if absence_basis is not None:
+                expected_basis = {
+                    "v3_nfpm_position": "same_receipt_verified_nfpm_mint",
+                    "v4_state_view_position": "same_receipt_verified_v4_manager_mint",
+                }.get(decoder)
+                parent_block = _integer(
+                    correlation.get("position_before_block"),
+                    "verified mint parent block",
+                )
+                if (
+                    absence_basis != expected_basis
+                    or field != "position_after"
+                    or parent_block
+                    != max(_integer(correlation.get("block_number"), "pinned block") - 1, 0)
+                ):
+                    raise ProtocolDecodeError(
+                        "verified manager mint absence proof is inconsistent"
+                    )
+                if decoder == "v4_state_view_position":
+                    before = {
+                        "exists": False,
+                        "liquidity": "0",
+                        "fee_growth_inside0_last_x128": "0",
+                        "fee_growth_inside1_last_x128": "0",
+                        "tokens_owed0": None,
+                        "tokens_owed1": None,
+                        "claims_empty": True,
+                        "claim_model": "fees_settled_on_modify_no_tokens_owed_storage",
+                        "source": "verified_v4_manager_mint_absence",
+                    }
+                else:
+                    before = _decode_position_result(decoder, None)
+                before.update(
+                    pinned_block=parent_block,
+                    absence_basis=absence_basis,
+                )
+                update["data"]["position_before"] = before
             if decoder == "v3_nfpm_position" and position.get("exists"):
                 update["data"]["position_identity"] = {
                     "manager": correlation.get("manager"),
@@ -2314,6 +2511,6 @@ __all__ = [
     "SLIPSTREAM_FACTORY", "PANCAKE_V3_FACTORY",
     "MODIFY_LIQUIDITY_SELECTOR", "SWAP_SELECTOR", "ProtocolDecodeError",
     "decode_logs", "decode_gas_record", "manager_descriptor", "nft_position_key",
-    "unknown_pool_candidates", "position_state_requests",
+    "repair_v4_owners", "unknown_pool_candidates", "position_state_requests",
     "decode_position_state_results",
 ]

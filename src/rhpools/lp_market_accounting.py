@@ -238,6 +238,21 @@ CREATE TABLE IF NOT EXISTS lp_accounting_tx_costs (
 CREATE INDEX IF NOT EXISTS lp_accounting_tx_costs_owner
     ON lp_accounting_tx_costs(owner, block_number);
 
+CREATE TABLE IF NOT EXISTS lp_accounting_pending (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    position_key TEXT NOT NULL UNIQUE,
+    generation INTEGER NOT NULL,
+    requested_revision INTEGER NOT NULL,
+    requested_epoch INTEGER NOT NULL,
+    priority_block INTEGER NOT NULL,
+    priority_tx_index INTEGER NOT NULL,
+    priority_log_index INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS lp_accounting_pending_recent
+    ON lp_accounting_pending(
+        priority_block DESC,priority_tx_index DESC,priority_log_index DESC,id DESC
+    );
+
 CREATE TABLE IF NOT EXISTS lp_accounting_meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -284,7 +299,7 @@ def _dict_rows(cursor: sqlite3.Cursor) -> list[dict[str, Any]]:
 
 
 class _ReplayWrites:
-    """Coalesce a full position replay into its final durable rows."""
+    """Coalesce and pre-diff a full position replay outside the writer."""
 
     _GROUPS = {
         "ownership": (
@@ -302,6 +317,11 @@ class _ReplayWrites:
             lambda row: int(row[0]),
             "DELETE FROM lp_accounting_effects WHERE event_id=?",
         ),
+        "positions": (
+            "lp_accounting_positions",
+            lambda row: str(row[0]),
+            "DELETE FROM lp_accounting_positions WHERE position_key=?",
+        ),
     }
 
     def __init__(self, position_key: str) -> None:
@@ -310,23 +330,34 @@ class _ReplayWrites:
         self._rows: dict[str, dict[Any, tuple[Any, ...]]] = {
             group: {} for group in self._GROUPS
         }
+        self._prepared_deletes: dict[str, list[tuple[Any, ...]]] | None = None
+        self._prepared_rows: dict[str, list[tuple[Any, ...]]] | None = None
+        self._affected_txs: set[str] = set()
+        self._changed_episodes: set[str] = set()
 
     def add(
         self, group: str, key: Any, sql: str, row: tuple[Any, ...],
     ) -> None:
+        if self._prepared_rows is not None:
+            raise RuntimeError("cannot append to a prepared replay")
         prior = self._statements.setdefault(group, sql)
         if prior != sql:
             raise RuntimeError(f"conflicting replay statement for {group}")
         self._rows[group][key] = row
 
-    def flush(
-        self, conn: sqlite3.Connection,
-    ) -> tuple[set[str], set[str]]:
-        affected_txs: set[str] = set()
-        changed_episodes: set[str] = set()
+    def prepare(self, conn: sqlite3.Connection) -> None:
+        """Load and diff existing rows on the caller's consistent snapshot."""
+        if self._prepared_rows is not None:
+            return
+        deletes: dict[str, list[tuple[Any, ...]]] = {
+            group: [] for group in self._GROUPS
+        }
+        changed: dict[str, list[tuple[Any, ...]]] = {
+            group: [] for group in self._GROUPS
+        }
         owner_changed_episodes: set[str] = set()
-        for group in ("ownership", "episodes"):
-            table, row_key, delete_sql = self._GROUPS[group]
+        for group in ("ownership", "episodes", "positions"):
+            table, row_key, _delete_sql = self._GROUPS[group]
             desired = self._rows[group]
             existing: dict[Any, tuple[Any, ...]] = {
                 row_key(row): tuple(row)
@@ -336,32 +367,37 @@ class _ReplayWrites:
                 ).fetchall()
             }
             stale = sorted(existing.keys() - desired.keys())
-            conn.executemany(
-                delete_sql,
-                (
-                    key if isinstance(key, tuple) else (key,)
-                    for key in stale
-                ),
-            )
+            deletes[group] = [
+                key if isinstance(key, tuple) else (key,) for key in stale
+            ]
             changed_keys = [
                 key for key, row in desired.items()
                 if existing.get(key) != row
             ]
+            changed[group] = [desired[key] for key in changed_keys]
             if group == "episodes":
-                changed_episodes.update(str(key) for key in changed_keys)
+                self._changed_episodes.update(
+                    str(key) for key in changed_keys
+                )
                 owner_changed_episodes.update(
                     str(key) for key in changed_keys
                     if key not in existing
                     or existing[key][6] != desired[key][6]
                 )
-            statement = self._statements.get(group)
-            if statement is not None:
-                conn.executemany(
-                    statement, (desired[key] for key in changed_keys),
-                )
 
         desired_effects = self._rows["effects"]
         desired_ids = sorted(int(key) for key in desired_effects)
+        existing_effects: dict[int, tuple[Any, ...]] = {}
+        for batch in _batches(desired_ids):
+            marks = ",".join("?" for _ in batch)
+            existing_effects.update({
+                int(row[0]): tuple(row)
+                for row in conn.execute(
+                    f"SELECT {','.join(_EFFECT_COLUMNS)} "
+                    f"FROM lp_accounting_effects WHERE event_id IN ({marks})",
+                    batch,
+                ).fetchall()
+            })
         existing_ids = {
             int(row[0]) for row in conn.execute(
                 "SELECT event_id FROM lp_accounting_effects "
@@ -370,52 +406,61 @@ class _ReplayWrites:
             ).fetchall()
         }
         stale_effects = sorted(existing_ids - desired_effects.keys())
+        deletes["effects"] = [(event_id,) for event_id in stale_effects]
         for batch in _batches(stale_effects):
             marks = ",".join("?" for _ in batch)
-            affected_txs.update(str(row[0]) for row in conn.execute(
-                f"SELECT DISTINCT tx_hash FROM lp_accounting_effects "
+            self._affected_txs.update(str(row[0]) for row in conn.execute(
+                "SELECT DISTINCT tx_hash FROM lp_accounting_effects "
                 f"WHERE event_id IN ({marks}) AND tx_hash<>''",
                 batch,
             ).fetchall())
-        conn.executemany(
-            self._GROUPS["effects"][2],
-            ((event_id,) for event_id in stale_effects),
-        )
-
-        existing_costs: dict[int, tuple[Any, ...]] = {}
-        for batch in _batches(desired_ids):
-            marks = ",".join("?" for _ in batch)
-            existing_costs.update({
-                int(row[0]): tuple(row[1:])
-                for row in conn.execute(
-                    "SELECT event_id,position_key,episode_id,owner,tx_hash,"
-                    f"block_number FROM lp_accounting_effects WHERE event_id IN ({marks})",
-                    batch,
-                ).fetchall()
-            })
-        for event_id in desired_ids:
+        changed_effects = [
+            event_id for event_id in desired_ids
+            if existing_effects.get(event_id) != desired_effects[event_id]
+        ]
+        changed["effects"] = [
+            desired_effects[event_id] for event_id in changed_effects
+        ]
+        for event_id in changed_effects:
             row = desired_effects[event_id]
-            cost = (row[1], row[2], row[3], row[5], row[6])
-            prior = existing_costs.get(event_id)
-            if prior != cost:
-                if prior is not None and prior[3]:
-                    affected_txs.add(str(prior[3]))
-                if row[5]:
-                    affected_txs.add(str(row[5]))
-        effect_sql = self._statements.get("effects")
-        if effect_sql is not None:
-            conn.executemany(
-                effect_sql, (desired_effects[event_id] for event_id in desired_ids),
-            )
-
+            prior = existing_effects.get(event_id)
+            if prior is not None and prior[5]:
+                self._affected_txs.add(str(prior[5]))
+            if row[5]:
+                self._affected_txs.add(str(row[5]))
         for batch in _batches(sorted(owner_changed_episodes)):
             marks = ",".join("?" for _ in batch)
-            affected_txs.update(str(row[0]) for row in conn.execute(
-                f"SELECT DISTINCT tx_hash FROM lp_accounting_effects "
+            self._affected_txs.update(str(row[0]) for row in conn.execute(
+                "SELECT DISTINCT tx_hash FROM lp_accounting_effects "
                 f"WHERE episode_id IN ({marks}) AND tx_hash<>''",
                 batch,
             ).fetchall())
-        return affected_txs, changed_episodes
+        self._prepared_deletes = deletes
+        self._prepared_rows = changed
+
+    def flush(
+        self, conn: sqlite3.Connection,
+    ) -> tuple[set[str], set[str]]:
+        if self._prepared_rows is None or self._prepared_deletes is None:
+            self.prepare(conn)
+        assert self._prepared_rows is not None
+        assert self._prepared_deletes is not None
+        for group in ("effects", "ownership", "episodes", "positions"):
+            delete_rows = self._prepared_deletes[group]
+            if delete_rows:
+                conn.executemany(self._GROUPS[group][2], delete_rows)
+            changed_rows = self._prepared_rows[group]
+            statement = self._statements.get(group)
+            if changed_rows and statement is not None:
+                conn.executemany(statement, changed_rows)
+        return set(self._affected_txs), set(self._changed_episodes)
+
+
+class _PreparedProjection(NamedTuple):
+    position_key: str
+    generation: int
+    epoch: int
+    writes: _ReplayWrites
 
 
 def _batches(values: Sequence[Any], size: int = 500) -> Iterable[Sequence[Any]]:
@@ -573,9 +618,11 @@ def _pair(pool: Mapping[str, Any]) -> str:
 class AccountBook:
     """Canonical, reorg-safe LP ownership and episode projection."""
 
-    def __init__(self, store: Any):
+    def __init__(self, store: Any, *, deferred: bool = False):
         self.store = store
+        self.deferred = bool(deferred)
         self._installed = False
+        self._projection_lock = threading.Lock()
         self._cache_lock = threading.RLock()
         self._pool_cache: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
         self._pool_inventory_cache: OrderedDict[
@@ -607,8 +654,28 @@ class AccountBook:
             return int(json.loads(row[0]))
         except (TypeError, ValueError, json.JSONDecodeError):
             return 0
+
+    @staticmethod
+    def _accounting_meta(
+        conn: sqlite3.Connection, key: str, default: str = "",
+    ) -> str:
+        row = conn.execute(
+            "SELECT value FROM lp_accounting_meta WHERE key=?", (key,),
+        ).fetchone()
+        return default if row is None else str(row[0])
+
+    @staticmethod
+    def _set_accounting_meta(
+        conn: sqlite3.Connection, key: str, value: Any,
+    ) -> None:
+        conn.execute(
+            "INSERT INTO lp_accounting_meta(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, str(value)),
+        )
+
     def install(self) -> "AccountBook":
-        """Create the projection, catch up existing events and register callbacks."""
+        """Create the projection and register its atomic ledger callbacks."""
         if self._installed:
             return self
         lock = getattr(self.store, "lock", threading.RLock())
@@ -624,34 +691,76 @@ class AccountBook:
                 }
                 current_revision = self._store_metadata_int(conn, "events_revision")
                 current_epoch = self._store_metadata_int(conn, "epoch")
+                pending = int(conn.execute(
+                    "SELECT COUNT(*) FROM lp_accounting_pending",
+                ).fetchone()[0])
                 clean = (
                     prior.get("schema_version") == str(_SCHEMA_VERSION)
                     and prior.get("applied_revision") == str(current_revision)
                     and prior.get("applied_epoch") == str(current_epoch)
                     and prior.get("dirty") == "0"
+                    and pending == 0
                 )
-                if not clean:
-                    self._map_existing_events(conn)
-                    keys = {str(row[0]) for row in conn.execute(
-                        "SELECT DISTINCT position_key FROM lp_accounting_event_keys"
-                    ).fetchall()}
-                    keys.update(str(row[0]) for row in conn.execute(
-                        "SELECT position_key FROM lp_accounting_positions").fetchall())
-                    for key in sorted(keys):
-                        self._rebuild_position(conn, key)
-                    self._rebuild_tx_costs(conn, None)
-                    self._refresh_episode_costs(conn, None)
-                for name, value in (
-                    ("schema_version", _SCHEMA_VERSION),
-                    ("applied_revision", current_revision),
-                    ("applied_epoch", current_epoch),
-                    ("dirty", 0),
-                ):
-                    conn.execute(
-                        "INSERT INTO lp_accounting_meta(key,value) VALUES(?,?) "
-                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                        (name, str(value)),
+                if self.deferred:
+                    phase = prior.get("bootstrap_phase")
+                    if clean:
+                        phase = "complete"
+                    elif phase not in {"events", "stale", "positions", "complete"}:
+                        if pending:
+                            phase = "complete"
+                        else:
+                            ledger = conn.execute(
+                                "SELECT EXISTS(SELECT 1 FROM events LIMIT 1) OR "
+                                "EXISTS(SELECT 1 FROM lp_accounting_positions LIMIT 1)"
+                            ).fetchone()[0]
+                            phase = "events" if ledger else "complete"
+                            self._set_accounting_meta(
+                                conn, "bootstrap_event_cursor", 0,
+                            )
+                            self._set_accounting_meta(
+                                conn, "bootstrap_position_cursor", "",
+                            )
+                    self._set_accounting_meta(conn, "bootstrap_phase", phase)
+                    self._set_accounting_meta(
+                        conn, "schema_version", _SCHEMA_VERSION,
                     )
+                    if clean or (phase == "complete" and pending == 0):
+                        self._set_accounting_meta(
+                            conn, "applied_revision", current_revision,
+                        )
+                        self._set_accounting_meta(
+                            conn, "applied_epoch", current_epoch,
+                        )
+                        self._set_accounting_meta(conn, "dirty", 0)
+                    else:
+                        self._set_accounting_meta(conn, "dirty", 1)
+                else:
+                    if not clean:
+                        self._map_existing_events(conn)
+                        keys = {str(row[0]) for row in conn.execute(
+                            "SELECT DISTINCT position_key "
+                            "FROM lp_accounting_event_keys"
+                        ).fetchall()}
+                        keys.update(str(row[0]) for row in conn.execute(
+                            "SELECT position_key FROM lp_accounting_positions"
+                        ).fetchall())
+                        for key in sorted(keys):
+                            self._rebuild_position(conn, key)
+                        self._rebuild_tx_costs(conn, None)
+                        self._refresh_episode_costs(conn, None)
+                    conn.execute("DELETE FROM lp_accounting_pending")
+                    for name, value in (
+                        ("schema_version", _SCHEMA_VERSION),
+                        ("applied_revision", current_revision),
+                        ("applied_epoch", current_epoch),
+                        ("bootstrap_phase", "complete"),
+                        ("dirty", 0),
+                    ):
+                        self._set_accounting_meta(conn, name, value)
+                    pending = 0
+                self.store._set_metadata(
+                    conn, "pending_accounting", pending,
+                )
             self.store.register_projection(
                 self._apply, self._rollback, persists_events=True,
             )
@@ -673,12 +782,334 @@ class AccountBook:
             "OR lp_accounting_event_keys.token_id IS NOT excluded.token_id"
         )
 
-    def _apply(self, conn: sqlite3.Connection,
-               events: Sequence[Mapping[str, Any]]) -> None:
+    @staticmethod
+    def _event_position_key(event: Mapping[str, Any]) -> str:
+        key = str(event.get("position_key") or "").strip().lower()
+        if not key:
+            key = str(
+                _json(event.get("data")).get("position_key") or ""
+            ).strip().lower()
+        return key
+
+    def _queue_position_keys(
+        self,
+        conn: sqlite3.Connection,
+        priorities: Mapping[str, tuple[int, int, int]],
+        *,
+        revision: int | None = None,
+        epoch: int | None = None,
+    ) -> None:
+        if not priorities:
+            self._finish_if_idle(conn)
+            return
+        requested_revision = (
+            self._store_metadata_int(conn, "events_revision")
+            if revision is None else int(revision)
+        )
+        requested_epoch = (
+            self._store_metadata_int(conn, "epoch")
+            if epoch is None else int(epoch)
+        )
+        rows = [
+            (
+                key, 0, requested_revision, requested_epoch,
+                int(order[0]), int(order[1]), int(order[2]),
+            )
+            for key, order in sorted(priorities.items())
+        ]
+        before = conn.total_changes
+        conn.executemany(
+            "INSERT OR IGNORE INTO lp_accounting_pending("
+            "position_key,generation,requested_revision,requested_epoch,"
+            "priority_block,priority_tx_index,priority_log_index"
+            ") VALUES(?,?,?,?,?,?,?)",
+            rows,
+        )
+        inserted = conn.total_changes - before
+        conn.executemany(
+            "UPDATE lp_accounting_pending SET generation=generation+1,"
+            "requested_revision=MAX(requested_revision,?),requested_epoch=?,"
+            "priority_block=MAX(priority_block,?),"
+            "priority_tx_index=MAX(priority_tx_index,?),"
+            "priority_log_index=MAX(priority_log_index,?) WHERE position_key=?",
+            (
+                (
+                    requested_revision, requested_epoch,
+                    int(order[0]), int(order[1]), int(order[2]), key,
+                )
+                for key, order in sorted(priorities.items())
+            ),
+        )
+        if inserted:
+            self.store._bump(conn, "pending_accounting", inserted)
+        self._set_accounting_meta(conn, "dirty", 1)
+
+    def _finish_if_idle(
+        self, conn: sqlite3.Connection, *, epoch: int | None = None,
+    ) -> None:
+        if self._accounting_meta(conn, "bootstrap_phase") != "complete":
+            return
+        if conn.execute(
+            "SELECT 1 FROM lp_accounting_pending LIMIT 1",
+        ).fetchone() is not None:
+            return
+        self._set_accounting_meta(
+            conn, "applied_revision",
+            self._store_metadata_int(conn, "events_revision"),
+        )
+        self._set_accounting_meta(
+            conn, "applied_epoch",
+            self._store_metadata_int(conn, "epoch") if epoch is None else epoch,
+        )
+        self._set_accounting_meta(conn, "dirty", 0)
+
+    def _resume_bootstrap(self, limit: int) -> bool:
+        batch_size = max(64, min(2048, int(limit) * 32))
+        with self.store.transaction() as conn:
+            phase = self._accounting_meta(conn, "bootstrap_phase", "complete")
+            if phase == "complete":
+                return False
+            if phase == "events":
+                cursor = int(self._accounting_meta(
+                    conn, "bootstrap_event_cursor", "0",
+                ))
+                rows = _dict_rows(conn.execute(
+                    "SELECT id,position_key,token_id,data,block_number,"
+                    "tx_index,log_index,revision FROM events "
+                    "WHERE id>? ORDER BY id LIMIT ?",
+                    (cursor, batch_size),
+                ))
+                ids = [int(row["id"]) for row in rows]
+                old_mapping: dict[int, str] = {}
+                for batch in _batches(ids):
+                    marks = ",".join("?" for _ in batch)
+                    old_mapping.update({
+                        int(item[0]): str(item[1])
+                        for item in conn.execute(
+                            "SELECT event_id,position_key "
+                            "FROM lp_accounting_event_keys "
+                            f"WHERE event_id IN ({marks})",
+                            batch,
+                        ).fetchall()
+                    })
+                mapped_rows = []
+                mapped_ids: set[int] = set()
+                priorities: dict[str, tuple[int, int, int]] = {}
+                for row in rows:
+                    event_id = int(row["id"])
+                    order = (
+                        int(row["block_number"]), int(row["tx_index"]),
+                        int(row["log_index"]),
+                    )
+                    old_key = old_mapping.get(event_id)
+                    if old_key:
+                        priorities[old_key] = max(
+                            priorities.get(old_key, order), order,
+                        )
+                    key = self._event_position_key(row)
+                    if not key:
+                        continue
+                    mapped_ids.add(event_id)
+                    mapped_rows.append((
+                        event_id, key,
+                        None if row.get("token_id") is None
+                        else str(row["token_id"]),
+                    ))
+                    priorities[key] = max(priorities.get(key, order), order)
+                stale_ids = sorted(set(old_mapping) - mapped_ids)
+                for batch in _batches(stale_ids):
+                    marks = ",".join("?" for _ in batch)
+                    conn.execute(
+                        "DELETE FROM lp_accounting_event_keys "
+                        f"WHERE event_id IN ({marks})",
+                        batch,
+                    )
+                conn.executemany(
+                    "INSERT INTO lp_accounting_event_keys("
+                    "event_id,position_key,token_id) VALUES(?,?,?) "
+                    "ON CONFLICT(event_id) DO UPDATE SET "
+                    "position_key=excluded.position_key,"
+                    "token_id=excluded.token_id",
+                    mapped_rows,
+                )
+                self._queue_position_keys(conn, priorities)
+                if rows:
+                    self._set_accounting_meta(
+                        conn, "bootstrap_event_cursor", int(rows[-1]["id"]),
+                    )
+                else:
+                    self._set_accounting_meta(conn, "bootstrap_phase", "stale")
+                return True
+            if phase == "stale":
+                rows = conn.execute(
+                    "SELECT k.event_id,k.position_key "
+                    "FROM lp_accounting_event_keys k "
+                    "LEFT JOIN events e ON e.id=k.event_id "
+                    "WHERE e.id IS NULL ORDER BY k.event_id LIMIT ?",
+                    (batch_size,),
+                ).fetchall()
+                if rows:
+                    priorities = {
+                        str(row["position_key"]): (0, 0, int(row["event_id"]))
+                        for row in rows
+                    }
+                    self._queue_position_keys(conn, priorities)
+                    conn.executemany(
+                        "DELETE FROM lp_accounting_event_keys WHERE event_id=?",
+                        ((int(row["event_id"]),) for row in rows),
+                    )
+                else:
+                    self._set_accounting_meta(
+                        conn, "bootstrap_phase", "positions",
+                    )
+                return True
+            cursor = self._accounting_meta(
+                conn, "bootstrap_position_cursor", "",
+            )
+            rows = conn.execute(
+                "SELECT position_key,last_block,last_tx_index,last_log_index "
+                "FROM lp_accounting_positions WHERE position_key>? "
+                "ORDER BY position_key LIMIT ?",
+                (cursor, batch_size),
+            ).fetchall()
+            if rows:
+                self._queue_position_keys(conn, {
+                    str(row["position_key"]): (
+                        int(row["last_block"]), int(row["last_tx_index"]),
+                        int(row["last_log_index"]),
+                    )
+                    for row in rows
+                })
+                self._set_accounting_meta(
+                    conn, "bootstrap_position_cursor",
+                    str(rows[-1]["position_key"]),
+                )
+            else:
+                self._set_accounting_meta(conn, "bootstrap_phase", "complete")
+                self._finish_if_idle(conn)
+            return True
+
+    def _pending_rows(self, limit: int) -> list[dict[str, Any]]:
+        historical = max(1, limit // 4)
+        recent = max(0, limit - historical)
+        conn = self.store.read()
+        selected: list[dict[str, Any]] = []
+        if recent:
+            selected.extend(_dict_rows(conn.execute(
+                "SELECT * FROM lp_accounting_pending "
+                "ORDER BY priority_block DESC,priority_tx_index DESC,"
+                "priority_log_index DESC,id DESC LIMIT ?",
+                (recent,),
+            )))
+        seen = {str(row["position_key"]) for row in selected}
+        oldest = _dict_rows(conn.execute(
+            "SELECT * FROM lp_accounting_pending ORDER BY id LIMIT ?",
+            (historical + len(seen),),
+        ))
+        selected.extend(
+            row for row in oldest
+            if str(row["position_key"]) not in seen
+        )
+        return selected[:limit]
+
+    def _prepare_pending(self, position_key: str) -> _PreparedProjection | None:
+        with self._reader() as conn:
+            pending = conn.execute(
+                "SELECT generation FROM lp_accounting_pending "
+                "WHERE position_key=?",
+                (position_key,),
+            ).fetchone()
+            if pending is None:
+                return None
+            epoch = self._store_metadata_int(conn, "epoch")
+            events = self._event_rows(conn, position_key)
+            writes = _ReplayWrites(position_key)
+            if events:
+                self._derive(
+                    conn, position_key, events, None,
+                    refresh_values=False, writes=writes, flush_writes=False,
+                )
+            writes.prepare(conn)
+            return _PreparedProjection(
+                position_key, int(pending["generation"]), epoch, writes,
+            )
+
+
+    def _publish_pending(self, prepared: _PreparedProjection) -> bool:
+        with self.store.transaction() as conn:
+            if self._store_metadata_int(conn, "epoch") != prepared.epoch:
+                return False
+            pending = conn.execute(
+                "SELECT generation FROM lp_accounting_pending "
+                "WHERE position_key=?",
+                (prepared.position_key,),
+            ).fetchone()
+            if pending is None:
+                return False
+            # Projection publication is serialized. Same-epoch event changes
+            # therefore cannot race a newer accounting publish: commit this
+            # coherent older snapshot, and let the generation-guarded delete
+            # retain the key for the newer snapshot. Reorgs are rejected above.
+            affected_pools = {
+                str(row[0]).lower()
+                for row in conn.execute(
+                    "SELECT pool_id FROM lp_accounting_positions "
+                    "WHERE position_key=? AND pool_id IS NOT NULL",
+                    (prepared.position_key,),
+                ).fetchall()
+            }
+            affected_txs, changed_episodes = prepared.writes.flush(conn)
+            affected_pools.update(
+                str(row[0]).lower()
+                for row in conn.execute(
+                    "SELECT pool_id FROM lp_accounting_positions "
+                    "WHERE position_key=? AND pool_id IS NOT NULL",
+                    (prepared.position_key,),
+                ).fetchall()
+            )
+            self._refresh_position_values(conn, [prepared.position_key])
+            self._rebuild_tx_costs(conn, affected_txs)
+            self._refresh_episode_costs(
+                conn, affected_txs, episode_ids=changed_episodes,
+            )
+            removed = conn.execute(
+                "DELETE FROM lp_accounting_pending "
+                "WHERE position_key=? AND generation=?",
+                (prepared.position_key, prepared.generation),
+            ).rowcount
+            if removed:
+                self.store._bump(conn, "pending_accounting", -removed)
+            self._finish_if_idle(conn)
+            self._invalidate_cache(conn, affected_pools)
+            return True
+
+    def project_pending(self, limit: int = 32) -> bool:
+        """Prepare bounded queued histories off-writer, then publish atomically."""
+        if not self.deferred:
+            return False
+        bounded = max(1, min(int(limit), 128))
+        with self._projection_lock:
+            worked = self._resume_bootstrap(bounded)
+            pending = self._pending_rows(bounded)
+            if pending:
+                worked = True
+            for row in pending:
+                prepared = self._prepare_pending(str(row["position_key"]))
+                if prepared is not None:
+                    self._publish_pending(prepared)
+            return worked
+
+    def _apply(
+        self, conn: sqlite3.Connection,
+        events: Sequence[Mapping[str, Any]],
+    ) -> None:
         if not events:
             return
         inventory_pools: set[str] = set()
-        ids = [int(event["id"]) for event in events if event.get("id") is not None]
+        ids = [
+            int(event["id"]) for event in events
+            if event.get("id") is not None
+        ]
         old_mapping: dict[int, str] = {}
         affected_txs: set[str] = set()
         for batch in _batches(ids):
@@ -686,71 +1117,109 @@ class AccountBook:
             old_mapping.update({
                 int(row[0]): str(row[1])
                 for row in conn.execute(
-                    f"SELECT event_id,position_key FROM lp_accounting_event_keys "
-                    f"WHERE event_id IN ({marks})", batch,
+                    "SELECT event_id,position_key "
+                    "FROM lp_accounting_event_keys "
+                    f"WHERE event_id IN ({marks})",
+                    batch,
                 ).fetchall()
             })
-            affected_txs.update(str(row[0]) for row in conn.execute(
-                f"SELECT DISTINCT tx_hash FROM lp_accounting_effects "
-                f"WHERE event_id IN ({marks})", batch,
-            ).fetchall())
+            if not self.deferred:
+                affected_txs.update(str(row[0]) for row in conn.execute(
+                    "SELECT DISTINCT tx_hash FROM lp_accounting_effects "
+                    f"WHERE event_id IN ({marks})",
+                    batch,
+                ).fetchall())
         old_keys = set(old_mapping.values())
         new_keys: set[str] = set()
         ids_by_key: dict[str, list[int]] = defaultdict(list)
-        mapped_rows = []
-        mapped_ids = set()
+        mapped_rows: list[tuple[int, str, str | None]] = []
+        mapped_ids: set[int] = set()
         for event in events:
-            event_id = event.get("id")
-            if event_id is None:
+            raw_event_id = event.get("id")
+            if raw_event_id is None:
                 continue
-            key = str(event.get("position_key") or "").strip().lower()
+            event_id = int(raw_event_id)
+            key = self._event_position_key(event)
             if not key:
-                key = str(
-                    _json(event.get("data")).get("position_key") or ""
-                ).strip().lower()
-            if not key:
-                # An unlinked NFT transfer cannot safely be attached by token id alone:
-                # token ids collide across managers.  The protocol adapter supplies a
-                # manager-qualified position_key when the manager is verified.
+                # Token ids collide across managers; only a manager-qualified
+                # protocol position key can safely connect a transfer.
                 continue
             token_id = event.get("token_id")
-            event_id = int(event_id)
             mapped_rows.append((
-                event_id, key, None if token_id is None else str(token_id),
+                event_id, key,
+                None if token_id is None else str(token_id),
             ))
             mapped_ids.add(event_id)
             new_keys.add(key)
             ids_by_key[key].append(event_id)
-            if event.get("tx_hash"):
+            if not self.deferred and event.get("tx_hash"):
                 affected_txs.add(str(event["tx_hash"]).lower())
         stale_ids = sorted(set(old_mapping) - mapped_ids)
         for batch in _batches(stale_ids):
             marks = ",".join("?" for _ in batch)
             conn.execute(
-                f"DELETE FROM lp_accounting_event_keys WHERE event_id IN ({marks})",
+                "DELETE FROM lp_accounting_event_keys "
+                f"WHERE event_id IN ({marks})",
                 batch,
             )
         conn.executemany(
-            "INSERT INTO lp_accounting_event_keys(event_id,position_key,token_id) "
-            "VALUES(?,?,?) ON CONFLICT(event_id) DO UPDATE SET "
+            "INSERT INTO lp_accounting_event_keys("
+            "event_id,position_key,token_id) VALUES(?,?,?) "
+            "ON CONFLICT(event_id) DO UPDATE SET "
             "position_key=excluded.position_key,token_id=excluded.token_id",
             mapped_rows,
         )
         keys = sorted(old_keys | new_keys)
+        if self.deferred:
+            priorities: dict[str, tuple[int, int, int]] = {}
+            for event in events:
+                if event.get("id") is None:
+                    continue
+                event_id = int(event["id"])
+                order = _order(event)[:3]
+                for key in (
+                    old_mapping.get(event_id),
+                    self._event_position_key(event),
+                ):
+                    if key:
+                        priorities[key] = max(
+                            priorities.get(key, order), order,
+                        )
+                if event.get("pool_id"):
+                    inventory_pools.add(str(event["pool_id"]).lower())
+            for batch in _batches(keys):
+                marks = ",".join("?" for _ in batch)
+                inventory_pools.update(
+                    str(row[0]).lower()
+                    for row in conn.execute(
+                        "SELECT pool_id FROM lp_accounting_positions "
+                        f"WHERE position_key IN ({marks}) "
+                        "AND pool_id IS NOT NULL",
+                        batch,
+                    ).fetchall()
+                )
+            self._queue_position_keys(conn, priorities)
+            self._invalidate_cache(
+                conn, inventory_pools, owners=bool(priorities),
+            )
+            return
+
         prior_positions = {}
         effect_keys: set[str] = set()
         for batch in _batches(keys):
             marks = ",".join("?" for _ in batch)
             for row in _dict_rows(conn.execute(
-                f"SELECT * FROM lp_accounting_positions "
-                f"WHERE position_key IN ({marks})", batch,
+                "SELECT * FROM lp_accounting_positions "
+                f"WHERE position_key IN ({marks})",
+                batch,
             )):
                 prior_positions[str(row["position_key"])] = row
                 if row.get("pool_id") is not None:
                     inventory_pools.add(str(row["pool_id"]).lower())
             effect_keys.update(str(row[0]) for row in conn.execute(
-                f"SELECT DISTINCT position_key FROM lp_accounting_effects "
-                f"WHERE position_key IN ({marks})", batch,
+                "SELECT DISTINCT position_key FROM lp_accounting_effects "
+                f"WHERE position_key IN ({marks})",
+                batch,
             ).fetchall())
         changed_episodes: set[str] = set()
         for key in keys:
@@ -774,8 +1243,9 @@ class AccountBook:
         for batch in _batches(keys):
             marks = ",".join("?" for _ in batch)
             inventory_pools.update(str(row[0]).lower() for row in conn.execute(
-                f"SELECT pool_id FROM lp_accounting_positions "
-                f"WHERE position_key IN ({marks}) AND pool_id IS NOT NULL", batch,
+                "SELECT pool_id FROM lp_accounting_positions "
+                f"WHERE position_key IN ({marks}) AND pool_id IS NOT NULL",
+                batch,
             ).fetchall())
         self._refresh_position_values(conn, keys)
         self._rebuild_tx_costs(conn, affected_txs)
@@ -787,17 +1257,16 @@ class AccountBook:
             ("applied_epoch", self._store_metadata_int(conn, "epoch")),
             ("dirty", 0),
         ):
-            conn.execute(
-                "INSERT INTO lp_accounting_meta(key,value) VALUES(?,?) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (name, str(value)),
-            )
+            self._set_accounting_meta(conn, name, value)
         self._invalidate_cache(
             conn, inventory_pools, owners=bool(old_keys or new_keys),
         )
 
     def _rollback(self, conn: sqlite3.Connection, ancestor_number: int) -> None:
         ancestor = int(ancestor_number)
+        if self.deferred:
+            self._rollback_deferred(conn, ancestor)
+            return
         affected_pools = {str(row[0]).lower() for row in conn.execute(
             "SELECT DISTINCT pool_id FROM lp_accounting_positions "
             "WHERE last_block>? AND pool_id IS NOT NULL", (ancestor,),
@@ -843,6 +1312,87 @@ class AccountBook:
         conn.execute(
             "INSERT INTO lp_accounting_meta(key,value) VALUES('dirty','1') "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+        )
+
+    def _rollback_deferred(
+        self, conn: sqlite3.Connection, ancestor: int,
+    ) -> None:
+        keys = {
+            str(row[0]) for row in conn.execute(
+                "SELECT DISTINCT k.position_key "
+                "FROM lp_accounting_event_keys k "
+                "JOIN events e ON e.id=k.event_id "
+                "WHERE e.block_number>?",
+                (ancestor,),
+            ).fetchall()
+        }
+        keys.update(str(row[0]) for row in conn.execute(
+            "SELECT DISTINCT position_key FROM lp_accounting_effects "
+            "WHERE block_number>?",
+            (ancestor,),
+        ).fetchall())
+        keys.update(str(row[0]) for row in conn.execute(
+            "SELECT position_key FROM lp_accounting_positions "
+            "WHERE last_block>?",
+            (ancestor,),
+        ).fetchall())
+        affected_pools: set[str] = set()
+        affected_txs: set[str] = set()
+        for batch in _batches(sorted(keys)):
+            marks = ",".join("?" for _ in batch)
+            affected_pools.update(
+                str(row[0]).lower()
+                for row in conn.execute(
+                    "SELECT pool_id FROM lp_accounting_positions "
+                    f"WHERE position_key IN ({marks}) "
+                    "AND pool_id IS NOT NULL",
+                    batch,
+                ).fetchall()
+            )
+            affected_txs.update(
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT DISTINCT tx_hash FROM lp_accounting_effects "
+                    f"WHERE position_key IN ({marks}) AND tx_hash<>''",
+                    batch,
+                ).fetchall()
+            )
+        next_epoch = self._store_metadata_int(conn, "epoch") + 1
+        self._queue_position_keys(
+            conn,
+            {key: (ancestor + 1, 0, 0) for key in keys},
+            epoch=next_epoch,
+        )
+        conn.execute(
+            "DELETE FROM lp_accounting_event_keys WHERE event_id IN "
+            "(SELECT id FROM events WHERE block_number>?)",
+            (ancestor,),
+        )
+        conn.execute(
+            "DELETE FROM lp_accounting_event_keys "
+            "WHERE event_id NOT IN (SELECT id FROM events)"
+        )
+        for batch in _batches(sorted(keys)):
+            marks = ",".join("?" for _ in batch)
+            for table in (
+                "lp_accounting_effects", "lp_ownership_intervals",
+                "lp_accounting_episodes", "lp_accounting_positions",
+            ):
+                conn.execute(
+                    f"DELETE FROM {table} WHERE position_key IN ({marks})",
+                    batch,
+                )
+        for batch in _batches(sorted(affected_txs)):
+            marks = ",".join("?" for _ in batch)
+            conn.execute(
+                "DELETE FROM lp_accounting_tx_costs "
+                f"WHERE tx_hash IN ({marks})",
+                batch,
+            )
+        if not keys:
+            self._finish_if_idle(conn, epoch=next_epoch)
+        self._invalidate_cache(
+            conn, affected_pools, owners=bool(keys),
         )
 
     def _invalidate_cache(
@@ -976,11 +1526,13 @@ class AccountBook:
             "last_timestamp": int(event.get("timestamp") or 0),
         }
 
-    def _derive(self, conn: sqlite3.Connection, key: str,
-                events: Sequence[Mapping[str, Any]], state: dict[str, Any] | None,
-                *, refresh_values: bool = True,
-                writes: _ReplayWrites | None = None,
-                ) -> tuple[set[str], set[str]]:
+    def _derive(
+        self, conn: sqlite3.Connection, key: str,
+        events: Sequence[Mapping[str, Any]], state: dict[str, Any] | None,
+        *, refresh_values: bool = True,
+        writes: _ReplayWrites | None = None,
+        flush_writes: bool = True,
+    ) -> tuple[set[str], set[str]]:
         if state is None:
             state = self._new_state(key, events[0])
         pool_cache: dict[str, dict[str, Any]] = {}
@@ -1033,11 +1585,12 @@ class AccountBook:
         active = state.get("active_episode")
         if isinstance(active, Mapping):
             self._save_episode(conn, dict(active), writes)
+        self._save_position(conn, state, writes)
         replay_changes = (
-            writes.flush(conn) if writes is not None else (set(), set())
+            writes.flush(conn)
+            if writes is not None and flush_writes else (set(), set())
         )
-        self._save_position(conn, state)
-        if refresh_values:
+        if refresh_values and (writes is None or flush_writes):
             self._refresh_position_value(conn, key)
             active = state.get("active_episode")
             if isinstance(active, Mapping):
@@ -1900,7 +2453,10 @@ class AccountBook:
         else:
             writes.add("episodes", str(episode["id"]), sql, row)
 
-    def _save_position(self, conn: sqlite3.Connection, state: Mapping[str, Any]) -> None:
+    def _save_position(
+        self, conn: sqlite3.Connection, state: Mapping[str, Any],
+        writes: _ReplayWrites | None = None,
+    ) -> None:
         active = state.get("active_episode")
         active_id = active.get("id") if isinstance(active, Mapping) else None
         if active_id:
@@ -1912,33 +2468,37 @@ class AccountBook:
         settled = bool(state.get("settled") and status == "closed")
         first_order = state["first_order"]
         last_order = state["last_order"]
-        conn.execute(
-            "INSERT OR REPLACE INTO lp_accounting_positions(" 
+        sql = (
+            "INSERT OR REPLACE INTO lp_accounting_positions("
             "position_key,token_id,pool_id,protocol,owner,custody,identity_basis,tick_lower,"
             "tick_upper,liquidity,liquidity_known,pending_principal0,pending_principal1,"
             "pending_known,tokens_owed0,tokens_owed1,owed_known,active_episode_id,status,"
             "history_complete,first_block,first_timestamp,last_block,last_tx_index,last_log_index,"
             "last_timestamp,principal0,principal1,principal_usd,uncollected_fees_usd,equity_usd,"
-            "valuation_block,valuation_timestamp,valuation_basis,state_json) VALUES(" +
-            ",".join("?" for _ in range(35)) + ")",
-            (
-                state["position_key"], state.get("token_id"), state.get("pool_id"),
-                state.get("protocol"), _address(state.get("owner")),
-                _address(state.get("custody")), state.get("identity_basis"),
-                state.get("tick_lower"), state.get("tick_upper"), state.get("liquidity"),
-                int(bool(state.get("liquidity_known"))), state.get("pending0"),
-                state.get("pending1"), int(bool(state.get("pending_known"))),
-                state.get("owed0"), state.get("owed1"), int(bool(state.get("owed_known"))),
-                active_id, status, int(bool(state.get("history_complete"))),
-                int(first_order[0]), int(state["first_timestamp"]), int(last_order[0]),
-                int(last_order[1]), int(last_order[2]), int(state["last_timestamp"]),
-                "0" if settled else None, "0" if settled else None,
-                0.0 if settled else None, 0.0 if settled else None,
-                0.0 if settled else None, None, None,
-                "settled_zero" if settled else "unvalued",
-                json.dumps(state, separators=(",", ":"), sort_keys=True),
-            ),
+            "valuation_block,valuation_timestamp,valuation_basis,state_json) VALUES("
+            + ",".join("?" for _ in range(35)) + ")"
         )
+        row = (
+            state["position_key"], state.get("token_id"), state.get("pool_id"),
+            state.get("protocol"), _address(state.get("owner")),
+            _address(state.get("custody")), state.get("identity_basis"),
+            state.get("tick_lower"), state.get("tick_upper"), state.get("liquidity"),
+            int(bool(state.get("liquidity_known"))), state.get("pending0"),
+            state.get("pending1"), int(bool(state.get("pending_known"))),
+            state.get("owed0"), state.get("owed1"), int(bool(state.get("owed_known"))),
+            active_id, status, int(bool(state.get("history_complete"))),
+            int(first_order[0]), int(state["first_timestamp"]), int(last_order[0]),
+            int(last_order[1]), int(last_order[2]), int(state["last_timestamp"]),
+            "0" if settled else None, "0" if settled else None,
+            0.0 if settled else None, 0.0 if settled else None,
+            0.0 if settled else None, None, None,
+            "settled_zero" if settled else "unvalued",
+            json.dumps(state, separators=(",", ":"), sort_keys=True),
+        )
+        if writes is None:
+            conn.execute(sql, row)
+        else:
+            writes.add("positions", str(state["position_key"]), sql, row)
 
     @staticmethod
     def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
@@ -2359,6 +2919,8 @@ class AccountBook:
     def _reader(self):
         connection = self.store.read()
         owns_snapshot = not connection.in_transaction
+        if owns_snapshot:
+            connection.execute("BEGIN")
         try:
             yield connection
         finally:
@@ -2450,6 +3012,28 @@ class AccountBook:
             status = dict(self.store.status())
         except Exception:
             status = {}
+        accounting: dict[str, str] = {}
+        if self.deferred:
+            try:
+                accounting = {
+                    str(row[0]): str(row[1])
+                    for row in self.store.read().execute(
+                        "SELECT key,value FROM lp_accounting_meta "
+                        "WHERE key IN ('applied_revision','applied_epoch','dirty',"
+                        "'bootstrap_phase')"
+                    ).fetchall()
+                }
+            except sqlite3.OperationalError:
+                accounting = {}
+        pending = int(status.get("pending_accounting", 0) or 0)
+        complete = (
+            not self.deferred
+            or (
+                pending == 0
+                and accounting.get("dirty", "1") == "0"
+                and accounting.get("bootstrap_phase", "complete") == "complete"
+            )
+        )
         coverage = status.get("coverage")
         starts = [
             lane["from_block"] for lane in coverage.values()
@@ -2459,13 +3043,23 @@ class AccountBook:
         return {
             "history_from": status.get("history_from"),
             "history_from_block": history_from_block,
-            "history_to": status.get("history_to"),
+            "history_to": status.get("history_to") if complete else None,
             "history_target": status.get("history_target"),
             "backfill": status.get("backfill"),
             "state": status.get("state"),
             "indexed_head": status.get("indexed_head"),
             "revision": status.get("revision"),
             "epoch": status.get("epoch"),
+            "accounting_pending": pending,
+            "accounting_complete": complete,
+            "accounting_applied_revision": (
+                int(accounting["applied_revision"])
+                if accounting.get("applied_revision", "").isdigit() else None
+            ),
+            "accounting_applied_epoch": (
+                int(accounting["applied_epoch"])
+                if accounting.get("applied_epoch", "").isdigit() else None
+            ),
         }
 
     @staticmethod
@@ -2607,6 +3201,10 @@ class AccountBook:
             copied["coverage"] = dict(row["coverage"])
         if isinstance(row.get("activity"), Mapping):
             copied["activity"] = dict(row["activity"])
+        if isinstance(row.get("financial_through_order"), Mapping):
+            copied["financial_through_order"] = dict(
+                row["financial_through_order"]
+            )
         return copied
 
     @staticmethod
@@ -2807,7 +3405,32 @@ class AccountBook:
                     conn, (row.get("owner") for row in beneficial),
                     gas_clauses, args,
                 )
+                financial_state = self._scoped_owner_financial_state(
+                    conn, params,
+                    now - cutoff_seconds
+                    if cutoff_seconds is not None else None,
+                )
             rows = beneficial
+            (
+                through_order, through_as_of, pending_owners,
+                pending_custodies, mapping_complete,
+            ) = financial_state
+            for row in (*beneficial, *custody_rows):
+                owner = _address(row.get("owner"))
+                custody = _address(row.get("custody"))
+                pending = (
+                    not mapping_complete
+                    or owner is not None and owner in pending_owners
+                    or custody is not None and custody in pending_custodies
+                )
+                row["financial_pending"] = pending
+                row["financial_through_order"] = (
+                    None if pending or through_order is None
+                    else dict(through_order)
+                )
+                row["financial_through_as_of"] = (
+                    None if pending else through_as_of
+                )
             for row in rows:
                 timestamp = row.pop("_retention_timestamp", None)
                 if cutoff_seconds is not None and timestamp is not None:
@@ -2916,7 +3539,37 @@ class AccountBook:
             "tx_hash": row.get("tx_hash"),
             "event_count": 1,
             "qualification": "durable_canonical_index",
+            "_order": (
+                int(row.get("block_number") or 0),
+                int(row.get("tx_index") or 0),
+                int(row.get("log_index") or 0),
+            ),
         }
+
+    @staticmethod
+    def _attach_owner_activity(
+            row: dict[str, Any], activity: Mapping[str, Any] | None,
+    ) -> None:
+        if activity is None:
+            row["activity"] = None
+            return
+        view = dict(activity)
+        activity_order = view.pop("_order", None)
+        row["activity"] = view
+        through = row.get("financial_through_order")
+        if (
+            isinstance(activity_order, (list, tuple))
+            and (
+                not isinstance(through, Mapping)
+                or tuple(int(item) for item in activity_order) > tuple(
+                    int(through.get(name) or 0)
+                    for name in ("block_number", "tx_index", "log_index")
+                )
+            )
+        ):
+            row["financial_pending"] = True
+            row["financial_through_order"] = None
+            row["financial_through_as_of"] = None
 
     def _historical_owner_activity(
             self, conn: sqlite3.Connection, owner_row: Mapping[str, Any],
@@ -3001,6 +3654,120 @@ class AccountBook:
         )
         return self._activity_view(latest)
 
+    def _scoped_owner_financial_state(
+            self, conn: sqlite3.Connection, params: Mapping[str, Any],
+            cutoff_timestamp: int | None,
+    ) -> tuple[
+        dict[str, int] | None, int | None, set[str], set[str], bool,
+    ]:
+        """Describe the immutable ledger snapshot backing owner aggregates."""
+        cutoff = cutoff_timestamp
+        protocol = str(params.get("protocol") or "").lower()
+        pool_id = str(params.get("pool") or params.get("pool_id") or "").lower()
+        event_clauses: list[str] = []
+        event_args: list[Any] = []
+        episode_clauses: list[str] = []
+        episode_args: list[Any] = []
+        if cutoff is not None:
+            event_clauses.append("e.timestamp>=?")
+            event_args.append(cutoff)
+            episode_clauses.append("ep.last_timestamp>=?")
+            episode_args.append(cutoff)
+        if protocol:
+            event_clauses.append(
+                "(e.protocol=? OR (e.protocol='nft' AND "
+                "json_extract(e.data,'$.manager_protocol')=?))"
+            )
+            event_args.extend((protocol, protocol))
+            episode_clauses.append("ep.protocol=?")
+            episode_args.append(protocol)
+        if pool_id:
+            event_clauses.append("e.pool_id=?")
+            event_args.append(pool_id)
+            episode_clauses.append("ep.pool_id=?")
+            episode_args.append(pool_id)
+        event_where = (
+            " WHERE " + " AND ".join(event_clauses)
+            if event_clauses else ""
+        )
+        through = conn.execute(
+            "SELECT e.block_number,e.tx_index,e.log_index,e.timestamp "
+            "FROM events e" + event_where
+            + " ORDER BY e.block_number DESC,e.tx_index DESC,"
+            "e.log_index DESC LIMIT 1",
+            event_args,
+        ).fetchone()
+        through_order = (
+            {
+                "block_number": int(through["block_number"]),
+                "tx_index": int(through["tx_index"]),
+                "log_index": int(through["log_index"]),
+            }
+            if through is not None else None
+        )
+        through_as_of = (
+            int(through["timestamp"]) if through is not None else None
+        )
+        bootstrap_complete = (
+            self._accounting_meta(conn, "bootstrap_phase", "complete")
+            == "complete"
+        )
+        pending_exists = conn.execute(
+            "SELECT 1 FROM lp_accounting_pending LIMIT 1"
+        ).fetchone() is not None
+        dirty = self._accounting_meta(conn, "dirty", "1") != "0"
+        if not bootstrap_complete or dirty and not pending_exists:
+            return through_order, through_as_of, set(), set(), False
+        if not pending_exists:
+            return through_order, through_as_of, set(), set(), True
+        if event_clauses:
+            event_scope = " AND " + " AND ".join(event_clauses)
+            episode_scope = " AND " + " AND ".join(episode_clauses)
+            scoped_keys = (
+                "SELECT q.position_key FROM lp_accounting_pending q WHERE "
+                "EXISTS(SELECT 1 FROM lp_accounting_event_keys k "
+                "INDEXED BY lp_accounting_event_keys_position "
+                "JOIN events e ON e.id=k.event_id "
+                "WHERE k.position_key=q.position_key" + event_scope + ") OR "
+                "EXISTS(SELECT 1 FROM lp_accounting_episodes ep "
+                "WHERE ep.position_key=q.position_key" + episode_scope + ")"
+            )
+            scoped_args = [*event_args, *episode_args]
+        else:
+            scoped_keys = (
+                "SELECT q.position_key FROM lp_accounting_pending q"
+            )
+            scoped_args = []
+        pending_rows = conn.execute(
+            "WITH scoped_keys AS (" + scoped_keys + ") "
+            "SELECT ep.owner,ep.custody,NULL AS data "
+            "FROM scoped_keys s JOIN lp_accounting_episodes ep "
+            "ON ep.position_key=s.position_key "
+            "UNION "
+            "SELECT e.owner,e.custody,CASE WHEN e.kind='transfer' THEN e.data END "
+            "FROM scoped_keys s JOIN lp_accounting_event_keys k "
+            "INDEXED BY lp_accounting_event_keys_position "
+            "ON k.position_key=s.position_key "
+            "JOIN events e ON e.id=k.event_id",
+            scoped_args,
+        )
+        owners: set[str] = set()
+        custodies: set[str] = set()
+        for row in pending_rows:
+            owner = _address(row["owner"])
+            custody = _address(row["custody"])
+            if owner is not None:
+                owners.add(owner)
+            if custody is not None:
+                custodies.add(custody)
+            if row["data"] is not None:
+                source, target = self._transfer_parties(dict(row), _json(row["data"]))
+                if source is not None and source != _ZERO_ADDRESS:
+                    owners.add(source)
+                if target is not None and target != _ZERO_ADDRESS:
+                    owners.add(target)
+        return through_order, through_as_of, owners, custodies, True
+
     def decorate_owner_activity(
             self, rows: Sequence[Mapping[str, Any]],
             params: Mapping[str, Any] | None = None,
@@ -3029,18 +3796,24 @@ class AccountBook:
             if cached is ...:
                 missing.append((index, key))
             else:
-                row["activity"] = dict(cached) if isinstance(cached, Mapping) else None
+                self._attach_owner_activity(
+                    row, cached if isinstance(cached, Mapping) else None,
+                )
         if missing:
             with self._reader() as conn:
                 for index, key in missing:
-                    activity = self._historical_owner_activity(conn, output[index], params)
-                    output[index]["activity"] = (
-                        dict(activity) if isinstance(activity, Mapping) else None
+                    activity = self._historical_owner_activity(
+                        conn, output[index], params,
+                    )
+                    self._attach_owner_activity(
+                        output[index],
+                        activity if isinstance(activity, Mapping) else None,
                     )
                     with self._cache_lock:
                         if generation == self._owners_generation:
                             self._owner_activity_cache[key] = (
-                                dict(activity) if isinstance(activity, Mapping) else None
+                                dict(activity)
+                                if isinstance(activity, Mapping) else None
                             )
                             self._owner_activity_cache.move_to_end(key)
                             while len(self._owner_activity_cache) > 2048:

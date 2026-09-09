@@ -14,6 +14,7 @@ from rhpools.lp_market_index import (
     TOKEN0_SELECTOR,
     TOKEN1_SELECTOR,
     MarketIndexer,
+    RpcError,
 )
 from rhpools.lp_market_store import CanonicalConflict, MarketStore
 from rhpools.lp_market_protocols import (
@@ -69,8 +70,19 @@ class StaticRpc:
             return []
         raise AssertionError(method)
 
-    def batch(self, calls):
-        return [self.call(method, params) for method, params in calls]
+    def batch(self, calls, *, allow_reverts=False):
+        results = []
+        for method, params in calls:
+            try:
+                results.append(self.call(method, params))
+            except RpcError as exc:
+                if allow_reverts and method == "eth_call" and (
+                    exc.code == 3 or "execution reverted" in str(exc).lower()
+                ):
+                    results.append({"error": str(exc)})
+                else:
+                    raise
+        return results
 
 
 class Market:
@@ -484,46 +496,116 @@ def test_live_parent_mismatch_rolls_back_to_canonical_ancestor():
         store.close()
 
 
-def test_missing_trace_capability_defers_lane_without_rewriting_jobs():
-    class NoTraceRpc(StaticRpc):
+@pytest.mark.parametrize("blocked_trace", [False, True], ids=["unavailable-trace", "slow-trace"])
+def test_live_gap_and_v4_trace_cannot_block_v3_position_accounting(
+    tmp_path, blocked_trace,
+):
+    from eth_abi import encode
+    from rhpools.lp_market_protocols import (
+        LIQUIDITY_SELECTOR, POSITIONS_SELECTOR, SLOT0_SELECTOR, V3_MINT_TOPIC,
+    )
+    from rhpools.lp_market_service import LPMarketService
+    from rhpools.workbench_market import USDG, UNISWAP_V3_FACTORY
+
+    owner, pool, token = ("0x" + byte * 20 for byte in ("11", "22", "33"))
+    v4_tx, v3_tx = ("0x" + byte * 32 for byte in ("ab", "cd"))
+    trace_started, release_trace = threading.Event(), threading.Event()
+    blocks = {tx: header(n) for tx, n in ((v4_tx, 20), (v3_tx, 21))}
+    raw_logs = {}
+    for tx_hash, block in blocks.items():
+        raw_logs[tx_hash] = {
+            "blockNumber": block["number"], "blockHash": block["hash"],
+            "transactionHash": tx_hash, "transactionIndex": "0x0", "logIndex": "0x0",
+            "address": POOL_MANAGER if tx_hash == v4_tx else pool,
+            "topics": (
+                [V4_MODIFY_LIQUIDITY_TOPIC, "0x" + "44" * 32, "0x" + owner[2:].zfill(64)]
+                if tx_hash == v4_tx else [
+                    V3_MINT_TOPIC, "0x" + owner[2:].zfill(64),
+                    "0x" + "00" * 32, "0x" + f"{10:064x}",
+                ]
+            ),
+            "data": "0x" + encode(
+                ["address", "uint128", "uint256", "uint256"],
+                [owner, 10, 1_000_000, 2_000_000],
+            ).hex(),
+        }
+
+    class ReceiptRpc(StaticRpc):
         @staticmethod
         def status():
-            return {
-                "trace": {
-                    "active": None,
-                    "configured": False,
-                    "sources": [],
-                },
-            }
+            return {"trace": {"active": None, "configured": False, "sources": []}}
 
-    store = MarketStore(":memory:")
-    scanner = indexer(store, NoTraceRpc())
-    block = header(10)
-    pending_event = {
-        "block_number": 10,
-        "block_hash": block["hash"],
-        "tx_hash": "0x" + "ab" * 32,
-        "tx_index": 0,
-        "log_index": 0,
-        "timestamp": int(block["timestamp"], 16),
-        "pool_id": None,
-        "protocol": "v3",
-        "kind": "add",
-        "owner": "0x" + "11" * 20,
-        "data": {},
-    }
-    store.ingest([block], [pending_event])
+        def call(self, method, params):
+            if method == "eth_getTransactionReceipt":
+                tx_hash = params[0]
+                block = blocks[tx_hash]
+                return {
+                    "transactionHash": tx_hash, "blockNumber": block["number"],
+                    "blockHash": block["hash"], "transactionIndex": "0x0",
+                    "status": "0x1", "from": owner, "gasUsed": hex(21_000),
+                    "effectiveGasPrice": hex(1_000_000_000),
+                    "logs": [raw_logs[tx_hash]],
+                }
+            if method == "eth_getTransactionByHash":
+                return {"hash": params[0], "from": owner, "gasPrice": hex(1_000_000_000)}
+            if method == "debug_traceTransaction":
+                assert params[0] == v4_tx
+                trace_started.set()
+                if blocked_trace:
+                    assert release_trace.wait(5)
+                raise RpcError("trace RPC unavailable")
+            if method == "eth_call":
+                selector = params[0]["data"][:10]
+                if selector == POSITIONS_SELECTOR:
+                    values = [10, 0, 0, 3, 5] if params[1] == "0x15" else [0] * 5
+                elif selector == SLOT0_SELECTOR:
+                    values = [1 << 96, 0, 0, 1, 1, 0, 1]
+                elif selector == LIQUIDITY_SELECTOR:
+                    values = [1_000]
+                else:
+                    raise AssertionError(selector)
+                return "0x" + encode(["uint256"] * len(values), values).hex()
+            return super().call(method, params)
+
+    app = LPMarketService(Market(), "http://unused.invalid", tmp_path / "receipts.sqlite", start=False)
+    scanner = indexer(app.store, ReceiptRpc())
     try:
-        assert scanner._enrich_once() is False
-        row = store.read().execute(
-            "SELECT attempts,last_error FROM pending_enrichment",
-        ).fetchone()
-        assert (row["attempts"], row["last_error"]) == (0, None)
-        status = scanner.runtime_status()
-        assert status["enrichment_deferred"] is True
+        app.store.upsert_pools([{
+            "id": pool, "address": pool, "protocol": "v3",
+            "token0": token, "token1": USDG, "decimals0": 6, "decimals1": 6,
+            "symbol0": "ASSET", "symbol1": "USDG", "fee_ppm": 3_000,
+            "tick_spacing": 1, "factory": UNISWAP_V3_FACTORY,
+            "created_block": 1, "source": "factory-live",
+            "metadata_json": {"discovery_basis": "factory_creation_event"},
+        }])
+        events = scanner._decode("live", [raw_logs[v3_tx]], {21: blocks[v3_tx]}, resolve_unknown=False)
+        app.store.ingest(list(blocks.values()), [
+            {**indexed_event(20, "ab"), "protocol": "v4"}, *events,
+        ], cursor={"block_number": 21, "block_hash": blocks[v3_tx]["hash"]})
+        assert app.book.positions({"pool": pool})["rows"][0]["liquidity"] is None
+        scanner._publish_current_block(header(2_000), (), source="test")
+        scanner._initialized.set()
+        worker = threading.Thread(target=scanner._enrichment_run)
+        scanner._threads.append(worker)
+        worker.start()
+        assert trace_started.wait(2)
+        deadline = time.monotonic() + 3
+        while True:
+            position = app.book.positions({"pool": pool})["rows"][0]
+            if position["liquidity"] == "10" or time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)
+        assert (
+            position["liquidity"], position["tokens_owed0"], position["tokens_owed1"],
+        ) == ("10", "3", "5")
+        assert position["coverage"]["history"] == "full"
+        assert [row["tx_hash"] for row in app.store.read().execute(
+            "SELECT tx_hash FROM pending_enrichment"
+        )] == [v4_tx]
     finally:
+        release_trace.set()
         scanner.close()
-        store.close()
+        app.close()
 
 
 def test_history_progress_is_independent_of_unrunnable_enrichment(monkeypatch):
@@ -974,7 +1056,7 @@ def test_interval_headers_and_logs_use_overlapping_bounded_lanes():
                 return hex(4663)
             raise AssertionError(method)
 
-        def batch(self, calls):
+        def batch(self, calls, *, allow_reverts=False):
             if self.lane == "live" and self.ordinal == 1:
                 header_started.set()
                 assert log_started.wait(1)
@@ -1010,7 +1092,7 @@ def test_interval_end_is_rechecked_after_logs_before_commit():
                 return block
             return super().call(method, params)
 
-        def batch(self, calls):
+        def batch(self, calls, *, allow_reverts=False):
             return [
                 header(int(params[0], 16))
                 if method == "eth_getBlockByNumber"

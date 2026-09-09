@@ -30,6 +30,12 @@ ABI revert data. The pinned-state decoder uses that evidence to recognize
 Keeping only the provider message loses this proof and retries valid receipts
 indefinitely. Unproven absence and unrelated errors still fail enrichment.
 
+Pinned-state batches retain successful siblings when one contract call reverts;
+they do not repeat the batch serially. A verified same-receipt mint proves the
+parent-block position absent, but the current-block position read remains
+required. V3 receipts do not wait for trace capability. Successful receipts
+containing V4 PoolManager liquidity modifications still require `callTracer`.
+
 ## Goldsky measurements and limits
 
 A small anonymous-output probe from the production host verified the donated provider privately: chain 4663; exact matching block/header and log digests against the local node; old block headers; USDG `decimals()` at blocks 30,000,000 and 56,400,000; receipts; `debug_traceTransaction` with `callTracer`; and a four-item JSON-RPC batch. The local pruned node could not answer those archive-state calls. Individual successful Goldsky requests in this probe took roughly 76–352 ms; these are samples, not percentile/SLA claims.
@@ -51,12 +57,18 @@ Separate durable cursor progress from the live observed feed. A moving live tape
 
 Production sampling found wallet aggregation repeatedly restarting whenever ingestion advanced its revision. This could keep LP Wallets at `SYNCING` indefinitely while consuming CPU needed by the indexer. Wallet totals, gas and coverage now come from one completed WAL read snapshot; appends trigger a later refresh instead of recursive recomputation. Canonical-branch changes still invalidate service publications. The regression exercises an indexer append during an actual wallet read.
 
-Late historical events rebuild only the affected position's changed accounting rows rather than deleting and rewriting its entire projection. This preserves synchronous, atomic financial updates while reducing write amplification. Existing durable metadata counters are reused on restart; full-table counts initialize missing counters only.
+The running service commits raw events, cursors, balance jobs, and coalesced
+accounting jobs atomically. A separate accounting worker replays each affected
+position from an immutable WAL snapshot without holding the ingestion writer.
+Its short publication transaction writes only changed accounting rows. A newer
+same-branch generation retains the job after publishing the coherent snapshot;
+a changed canonical epoch rejects it. Existing financial rows remain readable
+while the queue drains, but cannot be represented as current accounting.
 
 Header, event, and search writes use parameterized multi-row inserts bounded by
 SQLite's variable limit. This avoids handing the Python interpreter to competing
-valuation workers between every inserted row. The outer durable transaction and
-its atomic accounting/cursor boundary are unchanged.
+valuation workers between every inserted row. The outer durable transaction
+preserves the raw event/cursor/job boundary.
 
 The CLI caps Python's thread-switch interval at 1 ms before starting workers,
 preserving an already-shorter interval. This reduces interpreter handoff delays
@@ -116,14 +128,26 @@ balance, and repricing batches reserve historical work while preferring recent
 ready records; a delayed retry no longer stops unrelated repricing. Identity
 replay likewise alternates recent and historical work.
 
-Metadata RPC fetches use the bounded enrichment workers and commit one batch.
+Schema version 8 adds a generation to receipt jobs. Completion checks the
+canonical block hash and generation inside the same transaction as enrichment;
+an older in-flight receipt cannot erase newer identity or retry work.
+The accounting queue and its bootstrap checkpoint survive restart without
+discarding published positions, episodes, coverage, or cursors.
+
+Receipt enrichment, repricing, and accounting continue during live catch-up.
+Receipt workers refill independently rather than waiting for the slowest member
+of a batch. Metadata, identity replay, and bounded source repairs run separately
+from receipt scheduling. Follow `pending_accounting` as well as enrichment and
+repricing queues; a small block gap does not prove those queues are complete.
+
+Metadata RPC fetches remain bounded and commit one batch.
 V3 balances use a batched pinned-state request and atomic snapshot commit.
 Identity replay commits canonical events and queue completion together.
 Price sample, reserve, mark, and state inserts use the same multi-row helper
 as event ingestion.
 
 Existing V3 NFT positions whose initial add precedes a verified mint in the
-same transaction are repaired by the normal projection lane. A default pass
+same transaction are repaired by the separate source-repair lane. A default pass
 examines at most 8,192 indexed add events newest-first, selects only affected
 positions within reviewed V3-manager ranges, and reprojects at most 32 positions.
 The event cursor stops at the last selected repair when the write limit is
@@ -133,6 +157,14 @@ repairs final collect-before-burn allocation. The
 the accounting schema version is unchanged, so startup does not replay the
 entire ledger. A read-only production probe admitted 16 repairs from 8,192
 events in 0.092 s.
+
+V4 source repair correlates already-traced manager positions with canonical NFT
+transfers from the same receipt, including receipts without an auxiliary
+PositionManager modification event. It preserves the owner at each action's
+log order and retains the stored trace, state, cash-flow, and fee evidence.
+The bounded `v4_owner_correlation_repair_v1` checkpoint resumes after restart.
+Fees before a transfer stay with the prior owner; receiving the NFT does not
+prove its acquisition basis.
 
 Wallet-only requests skip the unused custody aggregate. On a warm, read-only
 production snapshot of 10,540 wallets, this reduced owner-query time from

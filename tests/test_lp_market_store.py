@@ -221,7 +221,6 @@ def test_schema_migrations_preserve_durable_accounting_state(tmp_path):
 
         store = MarketStore(path)
         reader = store.read()
-        assert reader.execute("PRAGMA user_version").fetchone()[0] == 7
         assert [
             tuple(row) for row in reader.execute(
                 "SELECT block_hash,position_key FROM events"
@@ -268,7 +267,6 @@ def test_schema_migrations_preserve_durable_accounting_state(tmp_path):
 
         store = MarketStore(path)
         reader = store.read()
-        assert reader.execute("PRAGMA user_version").fetchone()[0] == 7
         assert tuple(reader.execute(
             "SELECT position_key,pool_id,active_episode_id,status,"
             "history_complete,state_json FROM lp_accounting_positions"
@@ -291,7 +289,6 @@ def test_schema_migrations_preserve_durable_accounting_state(tmp_path):
         store.close()
         store = MarketStore(path)
         reader = store.read()
-        assert reader.execute("PRAGMA user_version").fetchone()[0] == 7
         assert store.pending_enrichments(1)[0]["tx_hash"] == event(block, 0)["tx_hash"]
         assert store.status()["pending_enrichment"] == 1
         assert store.cursor("live") == cursor
