@@ -301,9 +301,11 @@ not for every unrelated episode correction. Cost-incomplete episodes stop at the
 first missing or inexact transaction; complete episodes still count each transaction
 once.
 Receipt-only pending work can publish gas and net results without replaying event
-history when existing projected events are included solely because their transaction
-record changed. Explicit event corrections, remaps, mixed generations and uncertain
-work invalidate that proof and retain full replay.
+history when existing projected events are unchanged, including byte-equivalent
+explicit receipt rows. Their normalized source is compared again after preceding
+price projections; repricing, explicit corrections, remaps, mixed generations and
+uncertain work invalidate that proof and retain full replay. The transient proof
+is not serialized into canonical event evidence.
 
 Core-position identities include protocol and pool. An EVM core hash alone is
 not globally unique: different pools can share owner, ticks, and salt. Bounded

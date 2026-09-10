@@ -929,6 +929,32 @@ def test_late_receipts_complete_deferred_gas_and_net_results(tmp_path):
         store.close()
 
 
+def test_receipt_completion_replays_changed_price_evidence(tmp_path):
+    blocks = [header(100 + index, 1_000 + index) for index in range(2)]
+    opened, closed, transactions = traced_v4_episode(blocks)
+    store, book = accounting_store(
+        tmp_path / "receipt-repricing.sqlite", deferred=True,
+    )
+    try:
+        store.ingest(blocks, [opened, closed])
+        drain_accounting(book)
+        before = book.closed({"window": "all"})["rows"][0]
+        assert before["gross_pnl_usd"] == pytest.approx(0.1)
+
+        # Corrected source units reach PriceProjection before accounting.
+        # Receiving only receipts does not prove event values stayed fixed.
+        with store.transaction() as connection:
+            connection.execute("UPDATE pools SET decimals1=5")
+        store.enrich([], transactions=transactions)
+        drain_accounting(book)
+        after = book.closed({"window": "all"})["rows"][0]
+        assert after["gross_pnl_usd"] == pytest.approx(1.0)
+        assert after["gas_usd"] == pytest.approx(0.02)
+        assert after["net_pnl_usd"] == pytest.approx(0.98)
+    finally:
+        store.close()
+
+
 def test_visible_wallet_recovers_missed_receipt_cost_without_new_activity(tmp_path):
     blocks = [header(100 + index, 1_000 + index) for index in range(2)]
     opened, closed, transactions = traced_v4_episode(blocks, key="late-cost")

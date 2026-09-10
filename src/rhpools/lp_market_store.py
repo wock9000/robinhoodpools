@@ -1797,7 +1797,7 @@ class MarketStore:
 
     @staticmethod
     def _event_data(event: Mapping[str, Any]) -> str | None:
-        known = set(EVENT_COLUMNS) | {"id", "pool"}
+        known = set(EVENT_COLUMNS) | {"id", "pool", "_transaction_source"}
         supplied = event.get("data")
         if isinstance(supplied, str):
             decoded = _decode_json(supplied, supplied)
@@ -2296,6 +2296,12 @@ class MarketStore:
                     result = connection.execute(insert_sql, tuple(row[column] for column in EVENT_COLUMNS))
                     merged["id"] = result.lastrowid
                     inserted += 1
+                if (
+                    current is not None
+                    and row["tx_hash"] in receipts
+                    and row == self._event_row(current, revision)
+                ):
+                    merged["_transaction_source"] = row
                 merged["revision"] = revision
                 enriched.append(merged)
             if inserted:
@@ -2320,9 +2326,11 @@ class MarketStore:
                         current.get("data"), current.get("data"),
                     )
                     current["revision"] = revision
-                    # Projection callbacks can refresh transaction-dependent
-                    # state without replaying an otherwise unchanged event.
-                    current["_transaction_only"] = True
+                    # Accounting must recheck this source after preceding
+                    # projections: receipt publication can also reprice it.
+                    current["_transaction_source"] = self._event_row(
+                        current, revision,
+                    )
                     enriched.append(current)
                     represented_ids.add(int(current["id"]))
             enriched.sort(key=lambda event: (

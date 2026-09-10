@@ -2168,7 +2168,13 @@ class AccountBook:
                 event_id = int(event["id"])
                 order = _order(event)[:3]
                 new_key = self._event_position_key(event)
-                transaction_only = bool(event.get("_transaction_only"))
+                transaction_source = event.get("_transaction_source")
+                transaction_only = (
+                    isinstance(transaction_source, Mapping)
+                    and transaction_source == self.store._event_row(
+                        event, int(event["revision"]),
+                    )
+                )
                 event_keys = {
                     key for key in (
                         old_mapping.get(event_id),
