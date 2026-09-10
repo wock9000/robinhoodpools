@@ -11,7 +11,9 @@ from rhpools.lp_market_protocols import (
     UNISWAP_V3_POSITION_MANAGER,
 )
 from rhpools.lp_market_index import V3_BIRTH_REPAIR_PREFIXES
-from rhpools.lp_market_service import LPMarketService
+from rhpools.lp_market_accounting import AccountBook
+from rhpools.lp_market_claims import PositionClaims
+from rhpools.lp_market_service import LPMarketService, PriceProjection
 from rhpools.lp_rpc import _WssRpc, build_rpc_factory
 from rhpools.lp_market_store import CanonicalConflict, MarketStore
 from rhpools.workbench_market import USDG, UNISWAP_V3_FACTORY
@@ -371,7 +373,10 @@ def test_protocol_input_signs_and_duplicate_delivery_survive_restart(tmp_path):
         events = [swap(blocks[0], V3, "v3"), swap(blocks[1], V4, "v4")]
         app.store.ingest(blocks, events)
         app.store.ingest(blocks, events)
-        app.store.save_v3_balance(V3, 99, blocks[0]["hash"], "100000000", "200000000")
+        app.store.queue_v3_balances([V3], 99, blocks[0]["hash"])
+        assert app.store.save_v3_balances([
+            (V3, 99, blocks[0]["hash"], "100000000", "200000000"),
+        ]) == [None]
         app.close()
         app = service(path)
         rows = {row["id"]: row for row in app.pools({"window": "1h"})["rows"]}
@@ -443,6 +448,41 @@ def test_backfill_insertion_order_does_not_reorder_live_tape(tmp_path):
     finally:
         app.close()
 
+def test_owner_tape_merges_owner_and_fallback_custody_in_canonical_order(
+        tmp_path):
+    app = service(tmp_path / "market.sqlite")
+    selected_owner = "0x" + "56" * 20
+    other_owner = "0x" + "78" * 20
+    try:
+        app.store.upsert_pools(pools())
+        now = int(time.time()) - 10
+        blocks = [header(100 + index, now + index) for index in range(3)]
+        custody = {
+            **swap(blocks[0], V3, "v3"), "kind": "add",
+            "custody": selected_owner,
+        }
+        shadowed_custody = {
+            **swap(blocks[1], V3, "v3"), "kind": "add",
+            "owner": other_owner, "custody": selected_owner,
+        }
+        owned = {
+            **swap(blocks[2], V3, "v3"), "kind": "add",
+            "owner": selected_owner,
+        }
+        app.store.ingest(blocks, [custody, shadowed_custody, owned])
+
+        rows = app.tape({
+            "window": "all", "owner": selected_owner,
+        })["rows"]
+
+        assert [row["block_number"] for row in rows] == [102, 100]
+        assert shadowed_custody["tx_hash"] not in {
+            row["tx_hash"] for row in rows
+        }
+    finally:
+        app.close()
+
+
 @pytest.mark.parametrize(
     ("recent_kind", "params", "expected_rows"),
     (
@@ -492,6 +532,42 @@ def test_underfilled_tape_stays_within_window(
     finally:
         connection.set_progress_handler(None, 0)
         app.close()
+
+def test_lp_tape_does_not_scan_dense_swap_history(tmp_path):
+    path = tmp_path / "market.sqlite"
+    seed = MarketStore(path)
+    now = int(time.time())
+    lp_block = header(100, now - 2)
+    swap_block = header(101, now - 1)
+    try:
+        seed.upsert_pools(pools())
+        lp_event = {
+            **swap(lp_block, V3, "v3"), "kind": "add",
+        }
+        seed.ingest(
+            [lp_block, swap_block],
+            [
+                lp_event,
+                *(swap(swap_block, V3, "v3", index=index)
+                  for index in range(4_000)),
+            ],
+        )
+    finally:
+        seed.close()
+
+    app = service(path)
+    status = app.status()
+    connection = app.store.read()
+    connection.set_progress_handler(lambda: 1, 2_000)
+    try:
+        result = app.tape({"window": "all", "limit": 1}, _status=status)
+        assert [row["tx_hash"] for row in result["rows"]] == [
+            lp_event["tx_hash"],
+        ]
+    finally:
+        connection.set_progress_handler(None, 0)
+        app.close()
+
 
 def test_backfilled_price_repairs_existing_flows_after_restart(tmp_path):
     path = tmp_path / "market.sqlite"
@@ -581,6 +657,986 @@ def ingest_effects(app, blocks, events):
                     for event in events]
     app.store.ingest(blocks, events, transactions=transactions)
     return transactions
+
+
+def accounting_store(path, *, deferred):
+    store = MarketStore(path)
+    PriceProjection(store)
+    book = AccountBook(store, deferred=deferred).install()
+    store.upsert_pools(pools())
+    return store, book
+
+
+def traced_v4_episode(blocks, *, owner=TOKEN, key="deferred"):
+    opened = lp_effect(
+        blocks[0], "v4", "add", 1_000, (1_000_000, 1_000_000),
+        position_state(0), position_state(1_000), key=key,
+    )
+    closed = lp_effect(
+        blocks[1], "v4", "remove", -1_000, (1_000_000, 1_000_000),
+        position_state(1_000), position_state(0), key=key,
+    )
+    for event, principal, cash, fees in (
+        (opened, (-1_000_000, -1_000_000), (-1_000_000, -1_000_000), (0, 0)),
+        (closed, (1_000_000, 1_000_000), (1_100_000, 1_000_000), (100_000, 0)),
+    ):
+        event.update(
+            owner=owner, custody=MANAGER,
+            cashflow0=str(cash[0]), cashflow1=str(cash[1]),
+            fee_amount0=str(fees[0]), fee_amount1=str(fees[1]),
+        )
+        event["data"].update(
+            trace_complete=True, fees_accrued_exact=True,
+            principal_delta_exact=True,
+            principal_delta={
+                "amount0": str(principal[0]), "amount1": str(principal[1]),
+            },
+        )
+    transactions = [
+        {
+            "tx_hash": event["tx_hash"],
+            "block_number": event["block_number"],
+            "block_hash": event["block_hash"],
+            "payer": owner,
+            "gas_usd": 0.01,
+        }
+        for event in (opened, closed)
+    ]
+    return opened, closed, transactions
+
+
+def drain_accounting(book):
+    while book.project_pending(limit=32):
+        pass
+
+
+def owner_open(block, owner, key):
+    event = lp_effect(
+        block, "v4", "add", 1_000, (1_000_000, 1_000_000),
+        position_state(0), position_state(1_000), key=key,
+    )
+    event.update(owner=owner, custody=MANAGER)
+    return event
+
+
+def test_backfill_preserves_published_episode_ids_and_returns(tmp_path):
+    path = tmp_path / "stable-episodes.sqlite"
+    store, book = accounting_store(path, deferred=True)
+    try:
+        recent_blocks = [header(200 + index, 2_000 + index) for index in range(2)]
+        recent_open, recent_close, recent_gas = traced_v4_episode(recent_blocks)
+        store.ingest(
+            recent_blocks, [recent_open, recent_close],
+            transactions=[{**row, "gas_usd": None} for row in recent_gas],
+        )
+        drain_accounting(book)
+        recent = book.closed({"window": "all"})["rows"][0]
+        assert recent["net_pnl_usd"] is None
+        store.enrich([recent_open, recent_close], transactions=recent_gas)
+        drain_accounting(book)
+        recent = book.closed({"window": "all"})["rows"][0]
+        assert recent["net_pnl_usd"] == pytest.approx(0.08)
+
+        older_blocks = [header(100 + index, 1_000 + index) for index in range(2)]
+        older_open, older_close, older_gas = traced_v4_episode(older_blocks)
+        store.ingest(
+            older_blocks, [older_open, older_close], transactions=older_gas, lane="backfill",
+        )
+        drain_accounting(book)
+        published = {
+            int(row["opened_at"]): row
+            for row in book.closed({"window": "all"})["rows"]
+        }
+        assert published[2000]["id"] == recent["id"]
+        assert published[2000]["net_pnl_usd"] == pytest.approx(
+            recent["net_pnl_usd"],
+        )
+        assert published[1000]["id"] != recent["id"]
+        assert published[1000]["net_pnl_usd"] == pytest.approx(0.08)
+        ids = {block: row["id"] for block, row in published.items()}
+
+        orphan_block = header(202, 2_002)
+        orphan = lp_effect(
+            orphan_block, "v4", "checkpoint", 0, (0, 0),
+            position_state(0), position_state(0), key="deferred",
+        )
+        store.ingest([orphan_block], [orphan], transactions=[{
+            "tx_hash": orphan["tx_hash"],
+            "block_number": orphan["block_number"],
+            "block_hash": orphan["block_hash"],
+            "payer": TOKEN,
+            "gas_usd": 0.01,
+        }])
+        store.rollback(201)
+        store.close()
+
+        store, book = accounting_store(path, deferred=True)
+        drain_accounting(book)
+        replayed = {
+            int(row["opened_at"]): row
+            for row in book.closed({"window": "all"})["rows"]
+        }
+        assert {block: row["id"] for block, row in replayed.items()} == ids
+        assert all(
+            row["net_pnl_usd"] == pytest.approx(0.08)
+            for row in replayed.values()
+        )
+        owner_episodes = {
+            int(row["opened_at"]): row
+            for position in book.owner(TOKEN, {"window": "all"})["positions"]
+            for row in position["episodes"]
+        }
+        assert {
+            block: row["id"] for block, row in owner_episodes.items()
+        } == ids
+        assert all(
+            row["net_pnl_usd"] == pytest.approx(0.08)
+            for row in owner_episodes.values()
+        )
+    finally:
+        store.close()
+
+
+def test_source_correction_removes_stale_episode_gas(tmp_path):
+    blocks = [header(100 + index, 1_000 + index) for index in range(3)]
+    opened, closed, transactions = traced_v4_episode(
+        [blocks[0], blocks[2]], key="gas-correction",
+    )
+    intermediate = lp_effect(
+        blocks[1], "v4", "checkpoint", 0, (0, 0),
+        position_state(1_000), position_state(1_000), key="gas-correction",
+    )
+    intermediate.update(
+        owner=TOKEN, custody=MANAGER,
+        cashflow0="0", cashflow1="0", fee_amount0="0", fee_amount1="0",
+    )
+    intermediate["data"].update(
+        trace_complete=True, fees_accrued_exact=True,
+        principal_delta_exact=True,
+        principal_delta={"amount0": "0", "amount1": "0"},
+    )
+    transactions.insert(1, {
+        "tx_hash": intermediate["tx_hash"],
+        "block_number": intermediate["block_number"],
+        "block_hash": intermediate["block_hash"],
+        "payer": TOKEN,
+        "gas_usd": 0.01,
+    })
+    store, book = accounting_store(
+        tmp_path / "gas-correction.sqlite", deferred=True,
+    )
+    try:
+        store.ingest(
+            blocks, [opened, intermediate, closed], transactions=transactions,
+        )
+        drain_accounting(book)
+        before = book.closed({"window": "all"})["rows"][0]
+        assert before["deposit_usd"] == pytest.approx(2)
+        assert before["withdrawal_usd"] == pytest.approx(2)
+        assert before["fees_usd"] == pytest.approx(0.1)
+        assert before["gross_pnl_usd"] == pytest.approx(0.1)
+        assert before["gas_usd"] == pytest.approx(0.03)
+        assert before["net_pnl_usd"] == pytest.approx(0.07)
+
+        store.enrich([{
+            **intermediate,
+            "position_key": None,
+            "owner": None,
+            "custody": None,
+            "identity_basis": "unresolved_position",
+        }])
+        drain_accounting(book)
+
+        after = book.closed({"window": "all"})["rows"][0]
+        assert after["id"] == before["id"]
+        assert after["deposit_usd"] == pytest.approx(before["deposit_usd"])
+        assert after["withdrawal_usd"] == pytest.approx(before["withdrawal_usd"])
+        assert after["fees_usd"] == pytest.approx(before["fees_usd"])
+        assert after["gross_pnl_usd"] == pytest.approx(before["gross_pnl_usd"])
+        assert after["gas_usd"] == pytest.approx(0.02)
+        assert after["net_pnl_usd"] == pytest.approx(0.08)
+
+        detail = book.owner(TOKEN, {"window": "all"})
+        owner_episode = next(
+            row
+            for position in detail["positions"]
+            if position["position_key"] == "v4:gas-correction"
+            for row in position["episodes"]
+            if row["id"] == before["id"]
+        )
+        assert owner_episode["gas_usd"] == pytest.approx(0.02)
+        assert owner_episode["net_pnl_usd"] == pytest.approx(0.08)
+        assert detail["summary"]["gas_usd"] == pytest.approx(0.02)
+        assert detail["summary"]["net_pnl_usd"] == pytest.approx(0.08)
+    finally:
+        store.close()
+
+def test_episode_basis_correction_preserves_financial_history(tmp_path):
+    blocks = [header(100 + index, 1_000 + index) for index in range(2)]
+    opened, closed, transactions = traced_v4_episode(
+        blocks, key="basis-only-replay",
+    )
+    store, book = accounting_store(
+        tmp_path / "basis-only-replay.sqlite", deferred=True,
+    )
+    try:
+        inserted = store.ingest(
+            blocks, [opened, closed], transactions=transactions,
+        )
+        drain_accounting(book)
+        before = book.closed({"window": "all"})["rows"][0]
+        assert before["gas_usd"] == pytest.approx(0.02)
+
+        store.enrich([{
+            "id": int(inserted[1]["id"]),
+            "data": {"cashflow_basis": "corrected-source-basis"},
+        }])
+        drain_accounting(book)
+
+        after = book.closed({"window": "all"})["rows"][0]
+        assert after["id"] == before["id"]
+        assert after["accounting_basis"] == "corrected-source-basis"
+        for field in (
+            "deposit_usd", "withdrawal_usd", "fees_usd", "gross_pnl_usd",
+            "gas_usd", "net_pnl_usd",
+        ):
+            assert after[field] == pytest.approx(before[field])
+    finally:
+        store.close()
+
+
+def test_late_receipts_complete_deferred_gas_and_net_results(tmp_path):
+    blocks = [header(100 + index, 1_000 + index) for index in range(2)]
+    opened, closed, transactions = traced_v4_episode(
+        blocks, key="receipt-only",
+    )
+    store, book = accounting_store(
+        tmp_path / "receipt-only.sqlite", deferred=True,
+    )
+    try:
+        store.ingest(blocks, [opened, closed])
+        drain_accounting(book)
+        assert book.closed({"window": "all"})["rows"][0]["gas_usd"] is None
+
+        store.enrich([], transactions=transactions)
+
+        drain_accounting(book)
+        after = book.closed({"window": "all"})["rows"][0]
+        assert after["gas_usd"] == pytest.approx(0.02)
+        assert after["net_pnl_usd"] == pytest.approx(0.08)
+        assert store.status()["pending_accounting"] == 0
+    finally:
+        store.close()
+
+
+def test_receipt_completion_replays_changed_price_evidence(tmp_path):
+    blocks = [header(100 + index, 1_000 + index) for index in range(2)]
+    opened, closed, transactions = traced_v4_episode(blocks)
+    store, book = accounting_store(
+        tmp_path / "receipt-repricing.sqlite", deferred=True,
+    )
+    try:
+        store.ingest(blocks, [opened, closed])
+        drain_accounting(book)
+        before = book.closed({"window": "all"})["rows"][0]
+        assert before["gross_pnl_usd"] == pytest.approx(0.1)
+
+        # Corrected source units reach PriceProjection before accounting.
+        # Receiving only receipts does not prove event values stayed fixed.
+        with store.transaction() as connection:
+            connection.execute("UPDATE pools SET decimals1=5")
+        store.enrich([], transactions=transactions)
+        drain_accounting(book)
+        after = book.closed({"window": "all"})["rows"][0]
+        assert after["gross_pnl_usd"] == pytest.approx(1.0)
+        assert after["gas_usd"] == pytest.approx(0.02)
+        assert after["net_pnl_usd"] == pytest.approx(0.98)
+    finally:
+        store.close()
+
+
+def test_visible_wallet_recovers_missed_receipt_cost_without_new_activity(tmp_path):
+    blocks = [header(100 + index, 1_000 + index) for index in range(2)]
+    opened, closed, transactions = traced_v4_episode(blocks, key="late-cost")
+    store, book = accounting_store(tmp_path / "late-cost.sqlite", deferred=True)
+    try:
+        store.ingest(blocks, [opened, closed])
+        drain_accounting(book)
+        # This reproduces persisted receipt evidence whose old accounting
+        # publication missed its cost dependency.
+        store.enrich([], transactions=transactions)
+        assert book.owner(TOKEN, {"window": "all"})["summary"]["net_pnl_usd"] is None
+        book.recover_receipt_costs(
+            [row["tx_hash"] for row in transactions], epoch=-1,
+        )
+        assert book.owner(TOKEN, {"window": "all"})["summary"]["net_pnl_usd"] is None
+
+        worker = PositionClaims(store, book, None, lambda: None)
+        worker.request([TOKEN])
+        worker._refresh(*worker._next())
+        summary = book.owner(TOKEN, {"window": "all"})["summary"]
+        assert summary["gas_usd"] == pytest.approx(0.02)
+        assert summary["net_pnl_usd"] == pytest.approx(0.08)
+        assert book.closed({"window": "all"})["rows"][0]["net_pnl_usd"] == pytest.approx(0.08)
+    finally:
+        store.close()
+
+
+
+def test_deferred_accounting_does_not_hold_writer_and_drains_same_branch_prefix(
+        tmp_path, monkeypatch):
+    blocks = [header(100 + index, 1_000 + index) for index in range(2)]
+    opened, closed, transactions = traced_v4_episode(blocks)
+    store, book = accounting_store(
+        tmp_path / "deferred.sqlite", deferred=True,
+    )
+    baseline, baseline_book = accounting_store(
+        tmp_path / "synchronous.sqlite", deferred=False,
+    )
+    derived = threading.Event()
+    release = threading.Event()
+    committed = threading.Event()
+    failures = []
+    original = book._derive
+
+    def paused(*args, **kwargs):
+        result = original(*args, **kwargs)
+        derived.set()
+        release.wait(5)
+        return result
+
+    monkeypatch.setattr(book, "_derive", paused)
+    try:
+        inserted = store.ingest(
+            blocks[:1], [opened], transactions=transactions[:1],
+        )
+        opened_id = int(inserted[0]["id"])
+        projector = threading.Thread(
+            target=lambda: book.project_pending(limit=1),
+        )
+        projector.start()
+        assert derived.wait(2)
+
+        def commit_arrival():
+            try:
+                store.ingest(
+                    blocks[1:], [closed], transactions=transactions[1:],
+                )
+                store.enrich([{
+                    "id": opened_id,
+                    "accounting_basis": "same-epoch trace enrichment",
+                }])
+            except BaseException as error:
+                failures.append(error)
+            finally:
+                committed.set()
+
+        writer = threading.Thread(target=commit_arrival)
+        writer.start()
+        assert committed.wait(2)
+        assert failures == []
+        assert store.status()["indexed_events"] == 2
+        assert store.status()["pending_accounting"] == 1
+        release.set()
+        writer.join(2)
+        projector.join(2)
+        assert not writer.is_alive()
+        assert not projector.is_alive()
+
+        prefix = book.positions({"owner": TOKEN})["rows"]
+        assert len(prefix) == 1
+        assert prefix[0]["status"] == "open"
+        assert store.status()["pending_accounting"] == 1
+        prefix_candidates = book.owner_candidates({"window": "all"})
+        assert prefix_candidates["accounting_as_of"] is None
+        prefix_owner = book.decorate_owner_activity(
+            prefix_candidates["rows"], {"window": "all"},
+        )[0]
+        assert prefix_owner["financial_pending"] is True
+        assert prefix_owner["financial_through_order"] is None
+
+        monkeypatch.setattr(book, "_derive", original)
+        drain_accounting(book)
+        baseline.ingest(blocks, [opened, closed], transactions=transactions)
+        deferred_row = book.closed({"window": "all"})["rows"][0]
+        synchronous_row = baseline_book.closed({"window": "all"})["rows"][0]
+        for field in (
+            "status", "deposit_usd", "withdrawal_usd", "fees_usd",
+            "gross_pnl_usd", "gas_usd", "net_pnl_usd",
+        ):
+            assert deferred_row[field] == synchronous_row[field]
+        assert deferred_row["net_pnl_usd"] == pytest.approx(0.08)
+        owner = book.decorate_owner_activity(
+            book.owner_candidates({"window": "all"})["rows"],
+            {"window": "all"},
+        )[0]
+        assert owner["financial_pending"] is False
+        assert owner["financial_through_order"] == {
+            "block_number": 101, "tx_index": 0, "log_index": 0,
+        }
+        assert owner["financial_through_as_of"] == 1_001
+    finally:
+        release.set()
+        baseline.close()
+        store.close()
+
+
+def test_owner_financial_boundary_uses_the_aggregate_snapshot(
+        tmp_path, monkeypatch):
+    blocks = [header(100 + index, 1_000 + index) for index in range(2)]
+    opened, closed, transactions = traced_v4_episode(
+        blocks, key="owner-snapshot",
+    )
+    store, book = accounting_store(tmp_path / "market.sqlite", deferred=True)
+    aggregate_read = threading.Event()
+    release = threading.Event()
+    failures = []
+    captured = []
+    original_gas = book._owner_gas_values
+
+    def paused_gas(*args, **kwargs):
+        result = original_gas(*args, **kwargs)
+        aggregate_read.set()
+        if not release.wait(5):
+            raise TimeoutError("test did not release owner aggregate snapshot")
+        return result
+
+    monkeypatch.setattr(book, "_owner_gas_values", paused_gas)
+    try:
+        store.ingest(
+            blocks[:1], [opened], transactions=transactions[:1],
+        )
+        drain_accounting(book)
+
+        def read_candidates():
+            try:
+                captured.append(book.owner_candidates({"window": "all"}))
+            except BaseException as error:
+                failures.append(error)
+
+        reader = threading.Thread(target=read_candidates)
+        reader.start()
+        assert aggregate_read.wait(2)
+        store.ingest(
+            blocks[1:], [closed], transactions=transactions[1:],
+        )
+        drain_accounting(book)
+        release.set()
+        reader.join(2)
+        assert not reader.is_alive()
+        assert failures == []
+
+        stale = captured[0]["rows"][0]
+        assert stale["closed_episodes"] == 0
+        assert stale["financial_pending"] is False
+        assert stale["financial_through_order"] == {
+            "block_number": 100, "tx_index": 0, "log_index": 0,
+        }
+        decorated = book.decorate_owner_activity(
+            captured[0]["rows"], {"window": "all"},
+        )[0]
+        assert decorated["closed_episodes"] == 0
+        assert decorated["financial_pending"] is True
+        assert decorated["financial_through_order"] is None
+        latest = book.owner_candidates({"window": "all"})["rows"][0]
+        assert latest["closed_episodes"] == 1
+        assert latest["financial_through_order"] == {
+            "block_number": 101, "tx_index": 0, "log_index": 0,
+        }
+    finally:
+        release.set()
+        store.close()
+
+
+def test_deferred_accounting_rejects_prepared_orphan_branch(
+        tmp_path, monkeypatch):
+    first_block = header(100, 1_000)
+    replacement_block = header(100, 1_001, branch=10_000)
+    old_event = lp_effect(
+        first_block, "v4", "add", 1_000, (1_000_000, 1_000_000),
+        position_state(0), position_state(1_000), key="reorg",
+    )
+    replacement_owner = "0x" + "78" * 20
+    replacement = lp_effect(
+        replacement_block, "v4", "add", 1_000, (1_000_000, 1_000_000),
+        position_state(0), position_state(1_000), key="reorg",
+    )
+    replacement.update(owner=replacement_owner, custody=MANAGER)
+    store, book = accounting_store(tmp_path / "market.sqlite", deferred=True)
+    derived = threading.Event()
+    release = threading.Event()
+    original = book._derive
+
+    def paused(*args, **kwargs):
+        result = original(*args, **kwargs)
+        derived.set()
+        release.wait(5)
+        return result
+
+    monkeypatch.setattr(book, "_derive", paused)
+    try:
+        store.ingest([first_block], [old_event])
+        projector = threading.Thread(
+            target=lambda: book.project_pending(limit=1),
+        )
+        projector.start()
+        assert derived.wait(2)
+        store.rollback(99)
+        store.ingest([replacement_block], [replacement])
+        release.set()
+        projector.join(2)
+        assert not projector.is_alive()
+        assert book.positions({"owner": TOKEN})["rows"] == []
+
+        monkeypatch.setattr(book, "_derive", original)
+        drain_accounting(book)
+        rows = book.positions({"owner": replacement_owner})["rows"]
+        assert len(rows) == 1
+        assert rows[0]["position_key"] == "v4:reorg"
+        assert book.positions({"owner": TOKEN})["rows"] == []
+    finally:
+        release.set()
+        store.close()
+
+
+def test_deferred_accounting_restart_resumes_queue_and_clears_reassigned_key(
+        tmp_path):
+    path = tmp_path / "market.sqlite"
+    block = header(100, 1_000)
+    event = lp_effect(
+        block, "v4", "add", 1_000, (1_000_000, 1_000_000),
+        position_state(0), position_state(1_000), key="before",
+    )
+    store, _book = accounting_store(path, deferred=True)
+    inserted = store.ingest([block], [event])
+    event_id = int(inserted[0]["id"])
+    assert store.status()["pending_accounting"] == 1
+    store.close()
+
+    store = MarketStore(path)
+    PriceProjection(store)
+    book = AccountBook(store, deferred=True)
+
+    try:
+        book.install()
+        assert store.status()["pending_accounting"] == 1
+        drain_accounting(book)
+        before = book.positions({"owner": TOKEN})["rows"]
+        assert [row["position_key"] for row in before] == ["v4:before"]
+
+        moved = {
+            **event, "id": event_id, "position_key": "v4:after",
+            "data": {**event["data"], "position_key": "v4:after"},
+        }
+        store.enrich([moved])
+        assert store.status()["pending_accounting"] == 2
+        drain_accounting(book)
+        after = book.positions({"owner": TOKEN})["rows"]
+        assert [row["position_key"] for row in after] == ["v4:after"]
+        assert after[0]["liquidity"] == "1000"
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("published_before_remap", [True, False])
+def test_prepared_remap_preserves_new_positions_gas(
+        tmp_path, monkeypatch, published_before_remap):
+    blocks = [header(100 + index, 1_000 + index) for index in range(2)]
+    opened, closed, costs = traced_v4_episode(blocks, key="before")
+    store, book = accounting_store(tmp_path / "remap.sqlite", deferred=True)
+    try:
+        inserted = store.ingest(blocks, [opened, closed], transactions=costs)
+        if published_before_remap:
+            drain_accounting(book)
+        else:
+            # An unpublished old-key insert waits across the source correction.
+            stale = book._prepare_pending("v4:before")
+        store.enrich([
+            {
+                **event, "id": row["id"], "position_key": "v4:after",
+                "data": {**event["data"], "position_key": "v4:after"},
+            }
+            for event, row in zip((opened, closed), inserted)
+        ])
+        if published_before_remap:
+            # Old-key cleanup waits across publication of the reassigned rows.
+            stale = book._prepare_pending("v4:before")
+        current = book._prepare_pending("v4:after")
+        assert current is not None and stale is not None
+        with monkeypatch.context() as publication:
+            publication.setattr(
+                book, "_prepared_pending", lambda _rows: iter((current, stale)),
+            )
+            book.project_pending()
+        drain_accounting(book)
+        rows = book.closed({"window": "all"})["rows"]
+        assert [row["position_key"] for row in rows] == ["v4:after"]
+        assert rows[0]["gross_pnl_usd"] == pytest.approx(0.1)
+        assert rows[0]["gas_usd"] == pytest.approx(0.02)
+        assert rows[0]["net_pnl_usd"] == pytest.approx(0.08)
+    finally:
+        store.close()
+
+
+def test_deferred_nft_transfer_hints_mark_both_wallets_pending(
+        tmp_path):
+    sender = "0x" + "56" * 20
+    recipient = "0x" + "78" * 20
+    bystander = "0x" + "9a" * 20
+    blocks = [header(100 + index, 1_000 + index) for index in range(4)]
+    seeds = [
+        owner_open(blocks[0], sender, "sender-seed"),
+        owner_open(blocks[1], recipient, "recipient-seed"),
+        owner_open(blocks[2], bystander, "bystander-seed"),
+    ]
+    store, book = accounting_store(tmp_path / "market.sqlite", deferred=True)
+    position_key = f"nft:{MANAGER}:42"
+    try:
+        store.ingest(blocks[:3], seeds)
+        drain_accounting(book)
+        transfer = swap(blocks[3], V4, "v4")
+        transfer.update(
+            protocol="nft", kind="transfer", position_key=position_key,
+            token_id="42", owner=recipient, custody=MANAGER,
+            liquidity=None, liquidity_delta=None, amount0=None, amount1=None,
+            cashflow0=None, cashflow1=None,
+            data={
+                "from": sender, "to": recipient,
+                "manager_protocol": "v4",
+            },
+        )
+        store.ingest(blocks[3:], [transfer])
+
+        rows = {
+            row["owner"]: row
+            for row in book.owner_candidates({
+                "window": "all", "protocol": "v4", "identity_scope": "wallets",
+            })["rows"]
+        }
+        assert all(rows[owner]["positions"] == 1 for owner in rows)
+        assert rows[sender]["financial_pending"] is True
+        assert rows[recipient]["financial_pending"] is True
+        assert rows[bystander]["financial_pending"] is False
+    finally:
+        store.close()
+
+
+def test_historical_owner_reassignment_survives_identity_cursor(tmp_path):
+    prior_owner = "0x" + "56" * 20
+    reassigned_owner = "0x" + "78" * 20
+    blocks = [header(100 + index, 1_000 + index) for index in range(2)]
+    original = owner_open(blocks[0], prior_owner, "reassigned")
+    other = owner_open(blocks[1], reassigned_owner, "existing")
+    store, book = accounting_store(tmp_path / "market.sqlite", deferred=True)
+    position_key = str(original["position_key"])
+    try:
+        inserted = store.ingest(blocks, [original, other])
+        event_id = int(inserted[0]["id"])
+        drain_accounting(book)
+        with store.transaction() as conn:
+            book._queue_position_keys(
+                conn, {position_key: (100, 0, 0)},
+            )
+            conn.execute(
+                "UPDATE lp_accounting_pending SET identity_cursor=? "
+                "WHERE position_key=?",
+                (event_id, position_key),
+            )
+            conn.execute(
+                "DELETE FROM lp_accounting_pending_identities "
+                "WHERE position_key=?",
+                (position_key,),
+            )
+
+        store.enrich([{
+            **original, "id": event_id, "owner": reassigned_owner,
+        }])
+        pending = store.read().execute(
+            "SELECT identities_ready,identity_cursor "
+            "FROM lp_accounting_pending WHERE position_key=?",
+            (position_key,),
+        ).fetchone()
+        hinted_owners = {
+            str(row[0])
+            for row in store.read().execute(
+                "SELECT identity "
+                "FROM lp_accounting_pending_identities "
+                "WHERE position_key=? AND kind='owner'",
+                (position_key,),
+            ).fetchall()
+        }
+        assert (
+            int(pending["identities_ready"]),
+            int(pending["identity_cursor"]),
+        ) == (0, event_id)
+        assert hinted_owners == {reassigned_owner}
+
+        assert book.recover_pending_identities() is True
+        ready = store.read().execute(
+            "SELECT identities_ready FROM lp_accounting_pending "
+            "WHERE position_key=?",
+            (position_key,),
+        ).fetchone()
+        rows = {
+            row["owner"]: row
+            for row in book.owner_candidates({"window": "all"})["rows"]
+        }
+        assert int(ready["identities_ready"]) == 1
+        assert rows[prior_owner]["financial_pending"] is True
+        assert rows[reassigned_owner]["financial_pending"] is True
+    finally:
+        store.close()
+
+
+def test_legacy_pending_identity_recovery_resumes_after_restart(
+        tmp_path, monkeypatch):
+    path = tmp_path / "market.sqlite"
+    queued_owner = "0x" + "56" * 20
+    unrelated_owner = "0x" + "78" * 20
+    blocks = [header(100 + index, 1_000 + index) for index in range(2)]
+    queued = owner_open(blocks[0], queued_owner, "legacy")
+    unrelated = owner_open(blocks[1], unrelated_owner, "unrelated")
+    store, book = accounting_store(path, deferred=True)
+    position_key = str(queued["position_key"])
+    store.ingest(blocks, [queued, unrelated])
+    drain_accounting(book)
+    with store.transaction() as conn:
+        book._queue_position_keys(conn, {position_key: (100, 0, 0)})
+        conn.execute(
+            "DELETE FROM lp_accounting_pending_identities "
+            "WHERE position_key=?",
+            (position_key,),
+        )
+    store.close()
+
+    store = MarketStore(path)
+    PriceProjection(store)
+    book = AccountBook(store, deferred=True)
+
+    def unexpected_replay(*_args, **_kwargs):
+        raise AssertionError("deferred restart replayed the ledger")
+
+    monkeypatch.setattr(book, "_map_existing_events", unexpected_replay)
+    monkeypatch.setattr(book, "_rebuild_position", unexpected_replay)
+    try:
+        book.install()
+        before = {
+            row["owner"]: row
+            for row in book.owner_candidates({"window": "all"})["rows"]
+        }
+        assert before[queued_owner]["positions"] == 1
+        assert before[unrelated_owner]["positions"] == 1
+        assert before[queued_owner]["financial_pending"] is True
+        assert before[unrelated_owner]["financial_pending"] is True
+
+        assert book.recover_pending_identities() is True
+        pending = store.read().execute(
+            "SELECT identities_ready FROM lp_accounting_pending "
+            "WHERE position_key=?",
+            (position_key,),
+        ).fetchone()
+        after = {
+            row["owner"]: row
+            for row in book.owner_candidates({"window": "all"})["rows"]
+        }
+        assert int(pending["identities_ready"]) == 1
+        assert after[queued_owner]["financial_pending"] is True
+        assert after[unrelated_owner]["financial_pending"] is False
+    finally:
+        store.close()
+
+
+def test_pending_identity_recovery_rejects_orphan_epoch(
+        tmp_path, monkeypatch):
+    old_owner = "0x" + "56" * 20
+    replacement_owner = "0x" + "78" * 20
+    old_block = header(100, 1_000)
+    replacement_block = header(100, 1_001, branch=10_000)
+    old_event = owner_open(old_block, old_owner, "identity-reorg")
+    replacement = owner_open(
+        replacement_block, replacement_owner, "identity-reorg",
+    )
+    store, book = accounting_store(tmp_path / "market.sqlite", deferred=True)
+    position_key = str(old_event["position_key"])
+    prepared = threading.Event()
+    release = threading.Event()
+    failures = []
+    original_prepare = book._prepare_pending_identity_hints
+
+    def paused_prepare():
+        result = original_prepare()
+        prepared.set()
+        if not release.wait(5):
+            raise TimeoutError("test did not release identity recovery")
+        return result
+
+    def recover():
+        try:
+            book.recover_pending_identities()
+        except BaseException as error:
+            failures.append(error)
+
+    monkeypatch.setattr(
+        book, "_prepare_pending_identity_hints", paused_prepare,
+    )
+    try:
+        store.ingest([old_block], [old_event])
+        with store.transaction() as conn:
+            conn.execute(
+                "UPDATE lp_accounting_pending SET identities_ready=0,"
+                "identity_cursor=0 WHERE position_key=?",
+                (position_key,),
+            )
+            conn.execute(
+                "DELETE FROM lp_accounting_pending_identities "
+                "WHERE position_key=?",
+                (position_key,),
+            )
+        projector = threading.Thread(target=recover)
+        projector.start()
+        assert prepared.wait(2)
+        store.rollback(99)
+        store.ingest([replacement_block], [replacement])
+        release.set()
+        projector.join(2)
+        assert not projector.is_alive()
+        assert failures == []
+
+        hinted_owners = {
+            str(row[0])
+            for row in store.read().execute(
+                "SELECT identity "
+                "FROM lp_accounting_pending_identities "
+                "WHERE position_key=? AND kind='owner'",
+                (position_key,),
+            ).fetchall()
+        }
+        pending = store.read().execute(
+            "SELECT identities_ready,identity_cursor "
+            "FROM lp_accounting_pending WHERE position_key=?",
+            (position_key,),
+        ).fetchone()
+        assert hinted_owners == {replacement_owner}
+        assert (
+            int(pending["identities_ready"]),
+            int(pending["identity_cursor"]),
+        ) == (0, 0)
+
+        monkeypatch.setattr(
+            book, "_prepare_pending_identity_hints", original_prepare,
+        )
+        assert book.recover_pending_identities() is True
+        final_owners = {
+            str(row[0])
+            for row in store.read().execute(
+                "SELECT identity "
+                "FROM lp_accounting_pending_identities "
+                "WHERE position_key=? AND kind='owner'",
+                (position_key,),
+            ).fetchall()
+        }
+        ready = store.read().execute(
+            "SELECT identities_ready FROM lp_accounting_pending "
+            "WHERE position_key=?",
+            (position_key,),
+        ).fetchone()
+        assert final_owners == {replacement_owner}
+        assert int(ready["identities_ready"]) == 1
+    finally:
+        release.set()
+        store.close()
+
+
+def test_v4_fee_action_before_same_tx_transfer_stays_with_prior_owner(
+        tmp_path):
+    app = service(tmp_path / "market.sqlite")
+    prior_owner = "0x" + "56" * 20
+    recipient = TOKEN
+    position_key = f"nft:{MANAGER}:42"
+    opened_block = header(99, 999)
+    transferred_block = header(100, 1_000)
+    opened = lp_effect(
+        opened_block, "v4", "add", 1_000, (1_000_000, 1_000_000),
+        position_state(0), position_state(1_000), key="unused",
+    )
+    opened.update(
+        log_index=1, position_key=position_key, token_id="42",
+        owner=prior_owner, custody=MANAGER,
+        cashflow0="-1000000", cashflow1="-1000000",
+        fee_amount0="0", fee_amount1="0",
+    )
+    opened["data"].update(
+        trace_complete=True, fees_accrued_exact=True,
+        principal_delta_exact=True,
+        principal_delta={"amount0": "-1000000", "amount1": "-1000000"},
+    )
+    collected = lp_effect(
+        transferred_block, "v4", "collect", 0, (100_000, 0),
+        position_state(1_000, 100_000, 0),
+        position_state(1_000), key="unused",
+    )
+    collected.update(
+        log_index=0, position_key=position_key, token_id="42",
+        owner=prior_owner, custody=MANAGER,
+        cashflow0="100000", cashflow1="0",
+        fee_amount0="100000", fee_amount1="0",
+    )
+    collected["data"].update(
+        trace_complete=True, fees_accrued_exact=True,
+        principal_delta_exact=True,
+        principal_delta={"amount0": "0", "amount1": "0"},
+    )
+
+    def transfer(block, tx_hash, log_index, source, target, *, mint=False):
+        event = swap(block, V4, "v4", index=log_index)
+        event.update(
+            tx_hash=tx_hash, log_index=log_index, protocol="nft",
+            kind="transfer", position_key=position_key, token_id="42",
+            owner=target, custody=MANAGER, liquidity_delta=None,
+            amount0=None, amount1=None, cashflow0=None, cashflow1=None,
+            data={
+                "from": source, "to": target, "mint": mint,
+                "manager_protocol": "v4",
+            },
+        )
+        return event
+
+    minted = transfer(
+        opened_block, opened["tx_hash"], 0, "0x" + "0" * 40,
+        prior_owner, mint=True,
+    )
+    delivered = transfer(
+        transferred_block, collected["tx_hash"], 1, prior_owner, recipient,
+    )
+    try:
+        app.store.upsert_pools(pools())
+        app.store.ingest(
+            [opened_block, transferred_block],
+            [minted, opened, collected, delivered],
+            transactions=[{
+                "tx_hash": event["tx_hash"],
+                "block_number": event["block_number"],
+                "block_hash": event["block_hash"],
+                "payer": prior_owner,
+                "gas_usd": 0.01,
+            } for event in (opened, collected)],
+        )
+        prior = app.book.owner(prior_owner, {"window": "all"})
+        prior_episode = prior["positions"][0]["episodes"][0]
+        assert prior_episode["observed_collected_fees_usd"] == pytest.approx(0.1)
+        assert prior_episode["status"] == "transferred_out"
+
+        received = app.book.owner(recipient, {"window": "all"})
+        position = received["positions"][0]
+        assert position["owner"] == recipient
+        assert position["liquidity"] == "1000"
+        recipient_episode = position["episodes"][0]
+        assert recipient_episode["net_pnl_usd"] is None
+        assert "transferred_basis_unknown" in (
+            recipient_episode["coverage"]["reasons"]
+        )
+    finally:
+        app.close()
 
 
 def test_receipt_enrichment_adds_missed_logs_once_and_never_revives_orphans(tmp_path):
@@ -840,6 +1896,82 @@ def test_v3_manager_log_order_recovers_complete_fees_without_overstating_wallet_
         app.close()
 
 
+def test_closed_pages_qualified_fees_and_unicode_pair_queries(tmp_path):
+    app = service(tmp_path / "market.sqlite")
+    try:
+        app.store.upsert_pools(pools())
+        keys = ("high", "unicode", "low", "incomplete")
+        blocks = [
+            header(100 + index, int(time.time()) - 120 + index)
+            for index in range(len(keys) * 2)
+        ]
+        events = []
+        transactions = []
+        for index, key in enumerate(keys):
+            opened, closed, episode_transactions = traced_v4_episode(
+                blocks[index * 2:index * 2 + 2], key=key,
+            )
+            events.extend((opened, closed))
+            transactions.extend(episode_transactions)
+        app.store.ingest(blocks, events, transactions=transactions)
+
+        with app.store.transaction() as connection:
+            for key, fees in zip(keys, (3.0, 2.0, 1.0, 99.0)):
+                connection.execute(
+                    "UPDATE lp_accounting_episodes SET fees_usd=? "
+                    "WHERE position_key=?",
+                    (fees, f"v4:{key}"),
+                )
+            connection.execute(
+                "UPDATE lp_accounting_episodes SET history_complete=0 "
+                "WHERE position_key=?",
+                ("v4:incomplete",),
+            )
+            connection.execute(
+                "UPDATE lp_accounting_episodes SET pool_id=? "
+                "WHERE position_key IN (?,?)",
+                (V3, "v4:high", "v4:low"),
+            )
+            connection.execute(
+                "UPDATE pools SET symbol0=NULL,token0=?,"
+                "symbol1=NULL,token1='' WHERE id=?",
+                ("CAFÉ%_TOKEN_LONG", V4),
+            )
+
+        page = app.book.closed({
+            "window": "all", "sort": "fees", "limit": 2, "offset": 1,
+        })
+        assert page["total"] == 4
+        assert [
+            row["position_key"] for row in page["rows"]
+        ] == ["v4:unicode", "v4:low"]
+        assert [row["fees_usd"] for row in page["rows"]] == [2.0, 1.0]
+
+        exhausted = app.book.closed({
+            "window": "all", "sort": "fees", "limit": 2, "offset": 99,
+        })
+        assert exhausted["rows"] == []
+        assert exhausted["total"] == 4
+
+        unicode_query = app.book.closed({
+            "window": "all", "sort": "fees", "q": "FÉ%_",
+        })
+        assert unicode_query["total"] == 2
+        assert [
+            row["position_key"] for row in unicode_query["rows"]
+        ] == ["v4:unicode", "v4:incomplete"]
+        assert unicode_query["rows"][0]["pair"] == "CAFÉ%_TO/?"
+        assert unicode_query["rows"][1]["fees_usd"] is None
+        assert unicode_query["rows"][1][
+            "observed_collected_fees_usd"
+        ] == 99.0
+        assert app.book.closed({
+            "window": "all", "q": "asset%_",
+        })["total"] == 0
+    finally:
+        app.close()
+
+
 def test_fully_traced_v4_close_separates_principal_fees_and_net_profit(tmp_path):
     app = service(tmp_path / "market.sqlite")
     try:
@@ -872,13 +2004,13 @@ def test_owner_summary_deduplicates_shared_transaction_costs_and_preserves_unkno
         owner2 = "0x" + "78" * 20
         blocks = [header(100 + i, int(time.time()) - 60 + i) for i in range(6)]
         opened_a = lp_effect(blocks[0], "v4", "add", 1000, (1_000_000, 1_000_000),
-                             position_state(0), position_state(1000), key="a")
+                             position_state(0), position_state(1000), key="gas-position-a")
         opened_b = lp_effect(blocks[1], "v4", "add", 1000, (1_000_000, 1_000_000),
-                             position_state(0), position_state(1000), key="b")
+                             position_state(0), position_state(1000), key="gas-position-b")
         closed_a = lp_effect(blocks[2], "v4", "remove", -1000, (1_000_000, 1_000_000),
-                             position_state(1000), position_state(0), key="a")
+                             position_state(1000), position_state(0), key="gas-position-a")
         closed_b = lp_effect(blocks[2], "v4", "remove", -1000, (1_000_000, 1_000_000),
-                             position_state(1000), position_state(0), key="b")
+                             position_state(1000), position_state(0), key="gas-position-b")
         closed_b.update(tx_hash=closed_a["tx_hash"], log_index=1)
         for event in (opened_a, opened_b, closed_a, closed_b):
             event["custody"] = MANAGER
@@ -931,6 +2063,11 @@ def test_owner_summary_deduplicates_shared_transaction_costs_and_preserves_unkno
         assert owner_rows[TOKEN]["gas_usd"] == pytest.approx(0.03)
         assert owner_rows[TOKEN]["net_pnl_usd"] == pytest.approx(0.17)
         assert owner_rows[TOKEN]["coverage"]["cost_qualified"] is True
+        scoped = app.book.owners({
+            "window": "all", "q": "gas-position-a", "identity_scope": "wallets",
+        })["rows"][0]
+        assert scoped["gas_usd"] == pytest.approx(0.02)
+        assert scoped["net_pnl_usd"] == pytest.approx(0.08)
         assert owner_rows[owner2]["fees_usd"] is None
         assert owner_rows[owner2]["gas_usd"] is None
         assert owner_rows[owner2]["net_pnl_usd"] is None
@@ -1142,8 +2279,61 @@ def test_owner_projection_is_shared_and_never_blocks_current_feed(
             "window": "all", "sort": "activity", "limit": 200,
         }) == envelope
         assert calls == 1
+
+        from types import SimpleNamespace
+        from rhpools import lp_market_claims
+        expired = time.monotonic() + 181
+        monkeypatch.setattr(
+            lp_market_claims, "time", SimpleNamespace(monotonic=lambda: expired),
+        )
+        assert app.claims._next() is None
+        assert app.poll_owners(params, after_revision=envelope["revision"]) is None
+        assert app.claims._next()[0] in {row["owner"] for row in envelope["rows"]}
+        assert calls == 1
     finally:
         release.set()
+        app.close()
+
+
+def test_wallet_read_does_not_queue_behind_unrelated_frames(tmp_path, monkeypatch):
+    app = service(tmp_path / "market.sqlite")
+    release = threading.Event()
+    entered = [threading.Event(), threading.Event()]
+    returned = threading.Event()
+    result = {}
+    reader = None
+    original = app.frame
+
+    def slow_frame(params, *args, **kwargs):
+        entered[int(params["q"])].set()
+        assert release.wait(3)
+        return original(params, *args, **kwargs)
+
+    monkeypatch.setattr(app, "frame", slow_frame)
+    try:
+        block = header(100, int(time.time()))
+        event = lp_effect(
+            block, "v4", "add", 1_000, (1_000_000, 1_000_000),
+            position_state(0), position_state(1_000),
+        )
+        app.observe_current_block(block)
+        app.observe_current_events(block, (event,))
+        for index in range(2):
+            assert app.poll_frame({"window": "all", "q": str(index)}, -1, 0) is None
+            assert entered[index].wait(1)
+
+        def read_wallet():
+            result.update(app.owners({"window": "all", "q": TOKEN}))
+            returned.set()
+
+        reader = threading.Thread(target=read_wallet)
+        reader.start()
+        assert returned.wait(1), "wallet read queued behind unrelated frame SQL"
+        assert TOKEN in {row["owner"] for row in result["rows"]}
+    finally:
+        release.set()
+        if reader is not None:
+            reader.join(3)
         app.close()
 
 
@@ -1199,6 +2389,20 @@ def test_completed_wallet_projection_is_deliverable_during_live_changes(
             assert result is not None, "completed wallets were starved by new activity"
             assert result["current_activity"]["head"] == 100
             assert TOKEN in {row["owner"] for row in result["rows"]}
+            assert app.poll_owners(params) == result, (
+                "another consumer lost the completed wallet snapshot"
+            )
+            updated = None
+            deadline = time.monotonic() + 3
+            while updated is None and time.monotonic() < deadline:
+                updated = app.poll_owners(params, result["revision"])
+                if updated is None:
+                    time.sleep(0.01)
+            assert updated is not None, "cached wallets stopped refreshing"
+            assert updated["current_activity"]["head"] == 101
+            assert "0x" + "78" * 20 in {
+                row["owner"] for row in updated["rows"]
+            }
     finally:
         release.set()
         app.close()
@@ -1411,6 +2615,46 @@ def test_pool_sort_keeps_unpriced_metrics_last_in_both_directions(tmp_path):
             ]
     finally:
         app.close()
+
+def test_shared_bucket_views_refresh_on_events_and_empty_window_advance(
+        tmp_path):
+    app = service(tmp_path / "market.sqlite")
+    try:
+        app.store.upsert_pools(pools())
+        first = header(100, 10_000)
+        app.store.ingest([first], [swap(first, V3, "v3")], cursor={
+            "from_block": 100, "to_block": 100, "block_number": 100,
+            "block_hash": first["hash"], "timestamp": 10_000,
+        })
+        assert app.overview({"window": "1h"})["swaps"] == 1
+        assert app.pools({
+            "window": "1h", "sort": "volume",
+        })["rows"][0]["id"] == V3
+
+        second = header(101, 10_001)
+        app.store.ingest([second], [swap(second, V4, "v4")], cursor={
+            "from_block": 101, "to_block": 101, "block_number": 101,
+            "block_hash": second["hash"], "timestamp": 10_001,
+        })
+        fee_rows = app.pools({"window": "1h", "sort": "fees"})["rows"]
+        assert [row["id"] for row in fee_rows] == [V4, V3]
+        assert app.overview({"window": "1h"})["swaps"] == 2
+
+        empty = header(102, 13_661)
+        before_empty = app.status()["events_revision"]
+        app.store.ingest([empty], [], cursor={
+            "from_block": 102, "to_block": 102, "block_number": 102,
+            "block_hash": empty["hash"], "timestamp": 13_661,
+        })
+        assert app.status()["events_revision"] == before_empty
+        assert app.overview({"window": "1h"})["swaps"] == 0
+        assert {
+            row["swaps"]
+            for row in app.pools({"window": "1h", "sort": "swaps"})["rows"]
+        } == {0}
+    finally:
+        app.close()
+
 
 
 def test_receipt_settlement_flows_are_not_v4_position_cashflows(tmp_path, monkeypatch):
@@ -1955,6 +3199,7 @@ def test_cold_v4_activity_resolves_only_a_complete_verified_pool_key(
     tmp_path, monkeypatch, matching_key, delivery,
 ):
     from eth_utils import keccak
+    from rhpools.lp_market_index import MarketIndexer
     from rhpools import workbench_market as market
 
     class OfflineRpc:
@@ -1963,6 +3208,14 @@ def test_cold_v4_activity_resolves_only_a_complete_verified_pool_key(
 
         def close(self):
             pass
+
+    original_init = MarketIndexer.__init__
+    monkeypatch.setattr(
+        MarketIndexer, "__init__",
+        lambda self, *args, **kwargs: original_init(
+            self, *args, rpc=OfflineRpc(), **kwargs,
+        ),
+    )
 
     universe = market._Universe((), {}, {"v2": 0, "v3": 0, "v4": 0}, (), (), {})
     monkeypatch.setattr(market, "_load_universe", lambda: universe)
@@ -1998,7 +3251,7 @@ def test_cold_v4_activity_resolves_only_a_complete_verified_pool_key(
     } for index, token in enumerate((token0, token1))]
     receipt = {
         "transactionHash": log["transactionHash"], "blockHash": block["hash"],
-        "logs": [log, *transfers],
+        "blockNumber": block["number"], "logs": [log, *transfers],
     }
     # A router supplies reversed currencies, two unrelated addresses, then
     # the fee/spacing/hook tuple. It does not embed a contiguous PoolKey.
@@ -2016,7 +3269,7 @@ def test_cold_v4_activity_resolves_only_a_complete_verified_pool_key(
         if method == "eth_getTransactionByHash":
             return transaction if from_input else None
         if method == "eth_getBlockByNumber":
-            return block
+            return {block["number"]: block, current["number"]: current}[params[0]]
         if method != "eth_call":
             raise AssertionError(method)
         if not release.wait(3):

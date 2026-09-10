@@ -7,6 +7,7 @@ def test_migrated_identity_queue_preserves_data_and_ready_order(tmp_path, monkey
     now = 1_700_000_000
     monkeypatch.setattr("rhpools.lp_market_index.time.time", lambda: now)
     path = tmp_path / "market.sqlite"
+    columns = "tx_hash,block_number,block_hash,attempts,next_attempt,last_error,created_at,updated_at"
     store = MarketStore(path)
     with store.transaction() as conn:
         store._set_metadata(conn, "epoch", 7)
@@ -25,7 +26,9 @@ def test_migrated_identity_queue_preserves_data_and_ready_order(tmp_path, monkey
                 (19, 0), (20, now), (21, -1), (22, now + 60), (23, now - 20),
             )
         )
-        conn.executemany("INSERT INTO pending_enrichment VALUES(?,?,?,?,?,?,?,?)", rows)
+        conn.executemany(
+            f"INSERT INTO pending_enrichment({columns}) VALUES(?,?,?,?,?,?,?,?)", rows,
+        )
         # Reconstruct the previous queue schema, then use the ordinary open path.
         conn.execute("DROP INDEX pending_enrichment_identity_immediate_idx")
         conn.execute("DROP INDEX pending_enrichment_identity_retry_ready_idx")
@@ -34,9 +37,10 @@ def test_migrated_identity_queue_preserves_data_and_ready_order(tmp_path, monkey
             "ON pending_enrichment(block_number,tx_hash,next_attempt) "
             "WHERE last_error GLOB 'pool_identity_pending:*'"
         )
+        conn.execute("ALTER TABLE pending_enrichment DROP COLUMN generation")
         conn.execute("PRAGMA user_version=3")
     before = [tuple(row) for row in store.read().execute(
-        "SELECT * FROM pending_enrichment ORDER BY block_number,tx_hash"
+        f"SELECT {columns} FROM pending_enrichment ORDER BY block_number,tx_hash"
     )]
     store.close()
 
@@ -45,7 +49,7 @@ def test_migrated_identity_queue_preserves_data_and_ready_order(tmp_path, monkey
     indexer.store = store
     try:
         assert [tuple(row) for row in store.read().execute(
-            "SELECT * FROM pending_enrichment ORDER BY block_number,tx_hash"
+            f"SELECT {columns} FROM pending_enrichment ORDER BY block_number,tx_hash"
         )] == before
         status = store.status()
         assert status["epoch"] == 7

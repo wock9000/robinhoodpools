@@ -772,8 +772,10 @@ def test_collections_and_burned_principal_do_not_manufacture_profit(
 
 
 def test_fee_claim_uses_uint256_wrapping_for_lazy_growth():
+    from rhpools.lp_math import fee_claim
+
     q128 = 1 << 128
-    claim0, claim1, lazy0, lazy1 = market._v3_fee_claim(
+    claim0, claim1, lazy0, lazy1 = fee_claim(
         3,
         (1 << 256) - q128,
         0,

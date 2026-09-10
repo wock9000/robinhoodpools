@@ -13,6 +13,8 @@ from itertools import chain, islice
 from pathlib import Path
 from typing import Any
 
+from .lp_market_protocols import core_position_key
+
 
 ProjectionApply = Callable[[sqlite3.Connection, list[dict[str, Any]]], None]
 ProjectionRollback = Callable[[sqlite3.Connection, int], None]
@@ -62,6 +64,9 @@ SEARCH_KINDS = frozenset({
     "pool", "token", "protocol", "owner", "custody", "transaction", "position",
 })
 _SEARCH_WORD_RE = re.compile(r"[a-z0-9]+")
+_CORE_POSITION_REPAIR_CHECKPOINT = "core_position_key_source_repair_v1"
+_CORE_POSITION_KEY_START = "0x"
+_CORE_POSITION_KEY_END = "0y"
 
 
 class MarketStoreError(RuntimeError):
@@ -191,6 +196,8 @@ class MarketStore:
         self._closed = False
         self._change_token = 0
         self._pool_metadata_token = 0
+        self._financial_interest_lock = threading.Lock()
+        self._financial_interest: dict[str, float] = {}
         self._checkpoint_on_commit = checkpoint_on_commit
         if str(path) == ":memory:":
             self._database = f"file:lp-market-{id(self):x}?mode=memory&cache=shared"
@@ -230,6 +237,55 @@ class MarketStore:
         else:
             connection.execute("PRAGMA query_only=ON")
         return connection
+
+    @staticmethod
+    def _install_accounting_pending_identities(
+        connection: sqlite3.Connection,
+    ) -> None:
+        pending_columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(lp_accounting_pending)"
+            ).fetchall()
+        }
+        if "append_only" not in pending_columns:
+            connection.execute(
+                "ALTER TABLE lp_accounting_pending ADD COLUMN "
+                "append_only INTEGER NOT NULL DEFAULT 0"
+            )
+        if "cost_only" not in pending_columns:
+            connection.execute(
+                "ALTER TABLE lp_accounting_pending ADD COLUMN "
+                "cost_only INTEGER NOT NULL DEFAULT 0"
+            )
+        if "identities_ready" not in pending_columns:
+            connection.execute(
+                "ALTER TABLE lp_accounting_pending ADD COLUMN "
+                "identities_ready INTEGER NOT NULL DEFAULT 0"
+            )
+        if "identity_cursor" not in pending_columns:
+            connection.execute(
+                "ALTER TABLE lp_accounting_pending ADD COLUMN "
+                "identity_cursor INTEGER NOT NULL DEFAULT 0"
+            )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS "
+            "lp_accounting_pending_identity_bootstrap "
+            "ON lp_accounting_pending(id) WHERE identities_ready=0"
+        )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS lp_accounting_pending_identities("
+            "position_key TEXT NOT NULL "
+            "REFERENCES lp_accounting_pending(position_key) ON DELETE CASCADE,"
+            "kind TEXT NOT NULL,"
+            "identity TEXT NOT NULL,"
+            "protocol TEXT NOT NULL,"
+            "pool_id TEXT NOT NULL,"
+            "timestamp INTEGER NOT NULL,"
+            "PRIMARY KEY(position_key,kind,identity,protocol,pool_id)"
+            ") WITHOUT ROWID"
+        )
+
 
     def _initialize(self) -> None:
         schema = """
@@ -278,8 +334,18 @@ class MarketStore:
             ON events(owner, timestamp DESC, id DESC) WHERE owner IS NOT NULL;
         CREATE INDEX IF NOT EXISTS events_custody_time_idx
             ON events(custody, timestamp DESC, id DESC) WHERE custody IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS events_owner_order_idx
+            ON events(owner,block_number DESC,tx_index DESC,log_index DESC)
+            WHERE owner IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS events_custody_order_idx
+            ON events(custody,block_number DESC,tx_index DESC,log_index DESC)
+            WHERE custody IS NOT NULL;
         CREATE INDEX IF NOT EXISTS events_block_idx
             ON events(block_number, tx_index, log_index);
+        CREATE INDEX IF NOT EXISTS events_lp_order_idx
+            ON events(block_number,tx_index,log_index)
+            WHERE kind IN ('add','remove','collect')
+            OR (kind='checkpoint' AND position_key IS NOT NULL);
         CREATE INDEX IF NOT EXISTS events_revision_id_idx ON events(revision, id);
         CREATE INDEX IF NOT EXISTS events_tx_log_idx ON events(tx_hash, log_index);
         CREATE TABLE IF NOT EXISTS transactions(
@@ -303,7 +369,8 @@ class MarketStore:
             tx_hash TEXT PRIMARY KEY, block_number INTEGER NOT NULL,
             block_hash TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
             next_attempt REAL NOT NULL DEFAULT 0, last_error TEXT,
-            created_at REAL NOT NULL, updated_at REAL NOT NULL
+            created_at REAL NOT NULL, updated_at REAL NOT NULL,
+            generation INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS pending_enrichment_ready_idx
             ON pending_enrichment(next_attempt, block_number, tx_hash);
@@ -491,6 +558,37 @@ class MarketStore:
                     "OR last_error NOT GLOB 'pool_identity_pending:*'"
                 )
                 self.connection.execute("PRAGMA user_version=7")
+            if int(self.connection.execute("PRAGMA user_version").fetchone()[0]) < 8:
+                enrichment_columns = {
+                    str(row["name"])
+                    for row in self.connection.execute(
+                        "PRAGMA table_info(pending_enrichment)"
+                    ).fetchall()
+                }
+                if "generation" not in enrichment_columns:
+                    self.connection.execute(
+                        "ALTER TABLE pending_enrichment ADD COLUMN "
+                        "generation INTEGER NOT NULL DEFAULT 0"
+                    )
+                self.connection.execute("PRAGMA user_version=8")
+            if int(self.connection.execute("PRAGMA user_version").fetchone()[0]) < 9:
+                accounting_pending_installed = self.connection.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type='table' AND name='lp_accounting_pending'"
+                ).fetchone() is not None
+                if accounting_pending_installed:
+                    self._install_accounting_pending_identities(self.connection)
+                self.connection.execute("PRAGMA user_version=9")
+            if int(self.connection.execute("PRAGMA user_version").fetchone()[0]) < 10:
+                self.connection.execute("PRAGMA user_version=10")
+            if int(self.connection.execute("PRAGMA user_version").fetchone()[0]) < 11:
+                accounting_pending_installed = self.connection.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type='table' AND name='lp_accounting_pending'"
+                ).fetchone() is not None
+                if accounting_pending_installed:
+                    self._install_accounting_pending_identities(self.connection)
+                self.connection.execute("PRAGMA user_version=11")
             self.connection.execute(
                 "CREATE INDEX IF NOT EXISTS pending_reprojection_order_idx "
                 "ON pending_reprojection(block_number,tx_index,log_index,event_id)"
@@ -551,7 +649,9 @@ class MarketStore:
                     "pending_pool_unpublish": "pending_pool_unpublish",
                     "pending_reprojection": "pending_reprojection",
                 }
-                default_keys = ("revision", "epoch", *count_tables)
+                default_keys = (
+                    "revision", "epoch", "pending_accounting", *count_tables,
+                )
                 marks = ",".join("?" for _ in default_keys)
                 existing = {
                     str(row[0]) for row in connection.execute(
@@ -560,7 +660,9 @@ class MarketStore:
                     ).fetchall()
                 }
                 defaults = {
-                    key: 0 for key in ("revision", "epoch")
+                    key: 0 for key in (
+                        "revision", "epoch", "pending_accounting",
+                    )
                     if key not in existing
                 }
                 for key, table in count_tables.items():
@@ -1695,7 +1797,7 @@ class MarketStore:
 
     @staticmethod
     def _event_data(event: Mapping[str, Any]) -> str | None:
-        known = set(EVENT_COLUMNS) | {"id", "pool"}
+        known = set(EVENT_COLUMNS) | {"id", "pool", "_transaction_source"}
         supplied = event.get("data")
         if isinstance(supplied, str):
             decoded = _decode_json(supplied, supplied)
@@ -2194,6 +2296,12 @@ class MarketStore:
                     result = connection.execute(insert_sql, tuple(row[column] for column in EVENT_COLUMNS))
                     merged["id"] = result.lastrowid
                     inserted += 1
+                if (
+                    current is not None
+                    and row["tx_hash"] in receipts
+                    and row == self._event_row(current, revision)
+                ):
+                    merged["_transaction_source"] = row
                 merged["revision"] = revision
                 enriched.append(merged)
             if inserted:
@@ -2218,6 +2326,11 @@ class MarketStore:
                         current.get("data"), current.get("data"),
                     )
                     current["revision"] = revision
+                    # Accounting must recheck this source after preceding
+                    # projections: receipt publication can also reprice it.
+                    current["_transaction_source"] = self._event_row(
+                        current, revision,
+                    )
                     enriched.append(current)
                     represented_ids.add(int(current["id"]))
             enriched.sort(key=lambda event: (
@@ -2257,35 +2370,180 @@ class MarketStore:
                 removed = connection.total_changes - before
                 if removed:
                     self._bump(connection, "pending_enrichment", -removed)
+            for event in enriched:
+                event.pop("_transaction_source", None)
             return enriched
 
+    def prioritize_enrichment(self, tx_hashes: Iterable[str]) -> None:
+        """Prefer requested financial evidence without writing from a reader."""
+        requested: dict[str, None] = {}
+        for value in islice(tx_hashes, 256):
+            tx_hash = str(value).strip().lower()
+            if not tx_hash:
+                continue
+            requested.pop(tx_hash, None)
+            requested[tx_hash] = None
+        if not requested:
+            return
+        expires = time.monotonic() + 180.0
+        with self._financial_interest_lock:
+            for tx_hash in requested:
+                self._financial_interest.pop(tx_hash, None)
+                self._financial_interest[tx_hash] = expires
+            while len(self._financial_interest) > 2048:
+                self._financial_interest.pop(next(iter(self._financial_interest)))
+
+    def requested_enrichments(
+        self,
+        limit: int,
+        *,
+        identity: bool = False,
+        now: float | None = None,
+        exclude: Iterable[str] = (),
+    ) -> list[dict[str, Any]]:
+        """Return the newest requested work eligible for one enrichment lane."""
+        limit = max(1, min(int(limit), 256))
+        due = time.time() if now is None else now
+        excluded = {
+            str(value).strip().lower() for value in exclude if str(value).strip()
+        }
+        with self._financial_interest_lock:
+            current = time.monotonic()
+            expired = [
+                key for key, expires_at in self._financial_interest.items()
+                if expires_at <= current
+            ]
+            for key in expired:
+                self._financial_interest.pop(key, None)
+            interests = dict(self._financial_interest)
+
+        selected: list[dict[str, Any]] = []
+        missing_interests: dict[str, float] = {}
+        for batch in _batches(tuple(reversed(interests)), size=32):
+            marks = ",".join("?" for _ in batch)
+            found = {
+                str(row["tx_hash"]).lower(): dict(row)
+                for row in self.read().execute(
+                    f"SELECT * FROM pending_enrichment WHERE tx_hash IN ({marks})",
+                    batch,
+                ).fetchall()
+            }
+            for tx_hash in batch:
+                if tx_hash not in found:
+                    missing_interests[tx_hash] = interests[tx_hash]
+            for tx_hash in batch:
+                row = found.get(tx_hash)
+                if row is None or tx_hash in excluded or row["next_attempt"] > due:
+                    continue
+                identity_pending = str(row["last_error"] or "").startswith(
+                    "pool_identity_pending:"
+                )
+                if identity_pending != identity:
+                    continue
+                selected.append(row)
+                if len(selected) == limit:
+                    break
+            if len(selected) == limit:
+                break
+        if missing_interests:
+            with self._financial_interest_lock:
+                for tx_hash, expires_at in missing_interests.items():
+                    if self._financial_interest.get(tx_hash) == expires_at:
+                        self._financial_interest.pop(tx_hash, None)
+        return selected
+
     def pending_enrichments(
-        self, limit: int = 16, *, now: float | None = None,
+        self,
+        limit: int = 16,
+        *,
+        now: float | None = None,
+        exclude: Iterable[str] = (),
+        prioritized: bool = False,
     ) -> list[dict[str, Any]]:
         # Reserve historical progress without making current financials wait
         # for the entire backfill. Identity discovery has its own worker.
         limit = max(1, min(int(limit), 256))
-        historical = max(1, limit // 4)
+        historical_capacity = max(1, limit // 4)
+        requested_capacity = min(
+            max(0, limit - historical_capacity), max(1, limit // 4),
+        )
         due = time.time() if now is None else now
-        rows = self.read().execute(
-            "WITH oldest AS ("
-            "SELECT block_number,tx_hash FROM pending_enrichment "
-            "INDEXED BY pending_enrichment_financial_order_idx "
-            "WHERE next_attempt<=? AND (last_error IS NULL "
-            "OR last_error NOT GLOB 'pool_identity_pending:*') "
-            "ORDER BY block_number,tx_hash LIMIT ?"
-            "),newest AS ("
-            "SELECT block_number,tx_hash FROM pending_enrichment "
-            "INDEXED BY pending_enrichment_financial_order_idx "
-            "WHERE next_attempt<=? AND (last_error IS NULL "
-            "OR last_error NOT GLOB 'pool_identity_pending:*') "
-            "ORDER BY block_number DESC,tx_hash DESC LIMIT ?"
-            "),selected AS (SELECT * FROM oldest UNION SELECT * FROM newest) "
-            "SELECT p.* FROM selected s JOIN pending_enrichment p "
-            "ON p.tx_hash=s.tx_hash ORDER BY s.block_number,s.tx_hash",
-            (due, historical, due, limit - historical),
-        ).fetchall()
-        return [dict(row) for row in rows]
+        excluded = tuple({
+            str(value).strip().lower() for value in exclude if str(value).strip()
+        })
+        excluded_set = set(excluded)
+        excluded_sql = ""
+        if excluded:
+            excluded_sql = (
+                f" AND tx_hash NOT IN ({','.join('?' for _ in excluded)})"
+            )
+        eligible_sql = (
+            "next_attempt<=? AND (last_error IS NULL "
+            "OR last_error NOT GLOB 'pool_identity_pending:*')"
+        )
+        connection = self.read()
+        historical_rows = [
+            dict(row) for row in connection.execute(
+                "SELECT * FROM pending_enrichment "
+                "INDEXED BY pending_enrichment_financial_order_idx "
+                f"WHERE {eligible_sql}{excluded_sql} "
+                "ORDER BY block_number,tx_hash LIMIT ?",
+                (due, *excluded, historical_capacity),
+            ).fetchall()
+        ]
+        selected_hashes = {
+            str(row["tx_hash"]).lower() for row in historical_rows
+        }
+
+        requested_rows = (
+            self.requested_enrichments(
+                requested_capacity,
+                now=due,
+                exclude=excluded_set | selected_hashes,
+            )
+            if requested_capacity
+            else []
+        )
+        selected_hashes.update(
+            str(row["tx_hash"]).lower() for row in requested_rows
+        )
+
+        recent_capacity = limit - len(historical_rows) - len(requested_rows)
+        recent_rows: list[dict[str, Any]] = []
+        if recent_capacity:
+            recent_excluded = tuple(excluded_set | selected_hashes)
+            recent_excluded_sql = ""
+            if recent_excluded:
+                recent_excluded_sql = (
+                    " AND tx_hash NOT IN "
+                    f"({','.join('?' for _ in recent_excluded)})"
+                )
+            recent_rows = [
+                dict(row) for row in connection.execute(
+                    "SELECT * FROM pending_enrichment "
+                    "INDEXED BY pending_enrichment_financial_order_idx "
+                    f"WHERE {eligible_sql}{recent_excluded_sql} "
+                    "ORDER BY block_number DESC,tx_hash DESC LIMIT ?",
+                    (due, *recent_excluded, recent_capacity),
+                ).fetchall()
+            ]
+
+        buckets = (
+            ("historical", historical_rows),
+            ("requested", requested_rows),
+            ("recent", recent_rows),
+        )
+        if prioritized:
+            selected: list[dict[str, Any]] = []
+            for priority, rows in buckets:
+                for row in rows:
+                    row["_enrichment_priority"] = priority
+                    selected.append(row)
+            return selected
+        return sorted(
+            (row for _priority, rows in buckets for row in rows),
+            key=lambda row: (row["block_number"], row["tx_hash"]),
+        )
 
     def pending_token_metadata(self, limit: int = 16) -> list[dict[str, Any]]:
         rows = self.read().execute(
@@ -2407,6 +2665,10 @@ class MarketStore:
                 "ORDER BY block_number,tx_index,log_index,id",
                 values,
             ).fetchall()
+            search_before = {
+                int(row["id"]): tuple(self._event_search_entities(dict(row)))
+                for row in rows
+            }
             revision = self._next_revision(connection)
             events = [dict(row) for row in rows]
             for event in events:
@@ -2414,8 +2676,12 @@ class MarketStore:
                 event["revision"] = revision
             search_rows: list[dict[str, Any]] = []
             if events:
-                search_rows = self._persist_projection_mutations(
-                    connection, events, revision,
+                # Repricing changes no canonical input before projections run.
+                # Rewriting the whole row here also rewrites every event index.
+                self._set_metadata(connection, "events_revision", revision)
+                connection.execute(
+                    f"UPDATE events SET revision=? WHERE id IN ({placeholders})",
+                    (revision, *values),
                 )
                 for apply, _rollback, _persists_events in self._projections:
                     apply(connection, events)
@@ -2425,7 +2691,11 @@ class MarketStore:
                     )
                 else:
                     search_rows = [self._event_row(event, revision) for event in events]
-            self._index_event_search_batch(connection, search_rows)
+            self._index_event_search_batch(connection, (
+                row for event, row in zip(events, search_rows)
+                if tuple(self._event_search_entities(row))
+                != search_before[int(event["id"])]
+            ))
             removed = connection.execute(
                 f"DELETE FROM pending_reprojection WHERE event_id IN ({placeholders})",
                 values,
@@ -2433,6 +2703,115 @@ class MarketStore:
             if removed:
                 self._bump(connection, "pending_reprojection", -removed)
             return events
+
+    def repair_legacy_core_position_keys(self, *, limit: int = 128) -> bool:
+        """Qualify one bounded chronological page of legacy V3/V4 core rows."""
+        repair_limit = max(1, min(int(limit), 512))
+        eligible = (
+            "position_key=? AND protocol IN ('v3','v4') "
+            "AND pool_id IS NOT NULL AND TRIM(pool_id)<>''"
+        )
+        with self.transaction() as connection:
+            checkpoint = self._metadata(
+                connection, _CORE_POSITION_REPAIR_CHECKPOINT, {},
+            )
+            after = str(
+                checkpoint.get("after_position_key", _CORE_POSITION_KEY_START)
+            ).lower()
+            if after < _CORE_POSITION_KEY_START or after >= _CORE_POSITION_KEY_END:
+                after = _CORE_POSITION_KEY_START
+            events_revision = int(self._metadata(connection, "events_revision", 0))
+            if (
+                checkpoint
+                and after == _CORE_POSITION_KEY_START
+                and int(checkpoint.get("exhausted_revision", -1)) == events_revision
+            ):
+                return False
+            selected = connection.execute(
+                "SELECT position_key FROM events "
+                "INDEXED BY events_position_order_idx "
+                "WHERE position_key>? AND position_key<? "
+                "AND LENGTH(position_key)=66 "
+                "AND SUBSTR(position_key,3) NOT GLOB '*[^0-9a-f]*' "
+                "AND protocol IN ('v3','v4') "
+                "AND pool_id IS NOT NULL AND TRIM(pool_id)<>'' "
+                "ORDER BY position_key,block_number,tx_index,log_index LIMIT 1",
+                (after, _CORE_POSITION_KEY_END),
+            ).fetchone()
+            if selected is None:
+                reset = after != _CORE_POSITION_KEY_START
+                self._set_metadata(connection, _CORE_POSITION_REPAIR_CHECKPOINT, {
+                    "after_position_key": _CORE_POSITION_KEY_START,
+                    "cycles": (
+                        int(checkpoint.get("cycles", 0))
+                        + int(reset or not checkpoint)
+                    ),
+                    "completed_keys": int(checkpoint.get("completed_keys", 0)),
+                    "repaired_events": int(checkpoint.get("repaired_events", 0)),
+                    "repaired_pages": int(checkpoint.get("repaired_pages", 0)),
+                    **({} if reset else {"exhausted_revision": events_revision}),
+                })
+                return reset
+
+            legacy_key = str(selected["position_key"])
+            rows = connection.execute(
+                "SELECT * FROM events INDEXED BY events_position_order_idx "
+                f"WHERE {eligible} "
+                "ORDER BY block_number,tx_index,log_index LIMIT ?",
+                (legacy_key, repair_limit),
+            ).fetchall()
+            events = [dict(row) for row in rows]
+            revision = self._next_revision(connection)
+            for event in events:
+                event["data"] = _decode_json(event.get("data"), event.get("data"))
+                event["position_key"] = core_position_key(
+                    str(event["protocol"]),
+                    str(event["pool_id"]),
+                    legacy_key,
+                )
+                event["revision"] = revision
+            self._set_metadata(connection, "events_revision", revision)
+            connection.executemany(
+                "UPDATE events SET position_key=?,revision=? WHERE id=?",
+                ((event["position_key"], revision, int(event["id"])) for event in events),
+            )
+            for apply, _rollback, _persists_events in self._projections:
+                apply(connection, events)
+            if any(not item[2] for item in self._projections):
+                search_rows = self._persist_projection_mutations(
+                    connection, events, revision,
+                )
+            else:
+                search_rows = [
+                    self._event_row(event, revision) for event in events
+                ]
+            self._index_event_search_batch(connection, search_rows)
+            if connection.execute(
+                "SELECT 1 FROM events INDEXED BY events_position_order_idx "
+                "WHERE position_key=? LIMIT 1",
+                (legacy_key,),
+            ).fetchone() is None:
+                connection.execute(
+                    "DELETE FROM lp_search_entities WHERE kind='position' AND id=?",
+                    (legacy_key,),
+                )
+            key_complete = connection.execute(
+                "SELECT 1 FROM events INDEXED BY events_position_order_idx "
+                f"WHERE {eligible} LIMIT 1",
+                (legacy_key,),
+            ).fetchone() is None
+            self._set_metadata(connection, _CORE_POSITION_REPAIR_CHECKPOINT, {
+                "after_position_key": legacy_key if key_complete else after,
+                "cycles": int(checkpoint.get("cycles", 0)),
+                "completed_keys": (
+                    int(checkpoint.get("completed_keys", 0)) + int(key_complete)
+                ),
+                "repaired_events": (
+                    int(checkpoint.get("repaired_events", 0)) + len(events)
+                ),
+                "repaired_pages": int(checkpoint.get("repaired_pages", 0)) + 1,
+            })
+            return True
 
     def repair_v3_birth_history(
         self, prefixes: Sequence[str], *, limit: int = 32,
@@ -2539,9 +2918,13 @@ class MarketStore:
     def mark_enrichment_error(self, tx_hash: str, error: str, *, delay: float) -> None:
         with self.transaction() as connection:
             connection.execute(
-                "UPDATE pending_enrichment SET attempts=attempts+1,next_attempt=?,last_error=?,updated_at=? "
-                "WHERE tx_hash=?",
-                (time.time() + max(0.0, delay), str(error)[:1000], time.time(), tx_hash.lower()),
+                "UPDATE pending_enrichment SET attempts=attempts+1,"
+                "next_attempt=?,last_error=?,updated_at=?,"
+                "generation=generation+1 WHERE tx_hash=?",
+                (
+                    time.time() + max(0.0, delay), str(error)[:1000],
+                    time.time(), tx_hash.lower(),
+                ),
             )
 
     def queue_v3_balances(
@@ -2588,64 +2971,178 @@ class MarketStore:
         ).fetchall()
         return [dict(row) for row in rows]
 
-    def save_v3_balance(
-        self, pool_id: str, block_number: int, block_hash: str, balance0: Any, balance1: Any,
-    ) -> None:
-        pool_id = pool_id.lower()
+    def save_v3_balances(
+        self, balances: Sequence[tuple[str, int, str, Any, Any]],
+    ) -> list[Exception | None]:
+        """Publish one fetched batch and return an outcome aligned to each input."""
+        outcomes: list[Exception | None] = [None] * len(balances)
+        normalized: list[tuple[int, str, int, str, str, str]] = []
+        identities: set[tuple[str, int]] = set()
+        for index, item in enumerate(balances):
+            try:
+                pool_value, number_value, hash_value, balance0_value, balance1_value = item
+                pool_id = str(pool_value).lower()
+                block_number = _integer(number_value, "block_number")
+                block_hash = str(hash_value).lower()
+                balance0 = _decimal_text(balance0_value, "balance0")
+                balance1 = _decimal_text(balance1_value, "balance1")
+                if len(pool_id) != 42:
+                    raise ValueError("pool_id must be a 20-byte address")
+                if len(block_hash) != 66:
+                    raise ValueError("block_hash must be a 32-byte hash")
+                if block_number is None or balance0 is None or balance1 is None:
+                    raise ValueError("balance snapshot fields must not be null")
+                identity = (pool_id, block_number)
+                if identity in identities:
+                    raise ValueError("balance batch contains a duplicate pool and block")
+                identities.add(identity)
+            except (TypeError, ValueError) as exc:
+                outcomes[index] = exc
+            else:
+                normalized.append((
+                    index, pool_id, block_number, block_hash, balance0, balance1,
+                ))
+        if not normalized:
+            return outcomes
+
         with self.transaction() as connection:
-            pool = connection.execute(
-                "SELECT protocol,metadata_json FROM pools WHERE id=?", (pool_id,),
-            ).fetchone()
-            block = connection.execute(
-                "SELECT hash,timestamp FROM blocks WHERE number=?", (int(block_number),),
-            ).fetchone()
-            if pool is None or pool["protocol"] != "v3":
-                raise ValueError("per-pool balance snapshots are only valid for V3 pools")
-            if block is None or block["hash"] != block_hash.lower():
-                raise CanonicalConflict("balance snapshot belongs to an orphaned block")
-            connection.execute(
-                "INSERT INTO pool_balances(pool_id,block_number,block_hash,balance0,balance1) "
-                "VALUES(?,?,?,?,?) ON CONFLICT(pool_id,block_number) DO UPDATE SET "
-                "block_hash=excluded.block_hash,balance0=excluded.balance0,balance1=excluded.balance1",
-                (
-                    pool_id, int(block_number), block_hash.lower(),
-                    _decimal_text(balance0, "balance0"), _decimal_text(balance1, "balance1"),
-                ),
-            )
-            metadata = _decode_json(pool["metadata_json"], {})
-            if not isinstance(metadata, dict):
-                metadata = {}
-            prior_block = metadata.get("balance_block")
-            if prior_block is None or int(prior_block) <= int(block_number):
-                metadata.update({
-                    "balance0": _decimal_text(balance0, "balance0"),
-                    "balance1": _decimal_text(balance1, "balance1"),
-                    "balance_block": int(block_number),
-                    "balance_timestamp": int(block["timestamp"]),
-                })
-                serialized = _json(metadata)
-                if serialized != pool["metadata_json"]:
-                    connection.execute(
+            pool_ids = tuple(dict.fromkeys(item[1] for item in normalized))
+            block_numbers = tuple(dict.fromkeys(item[2] for item in normalized))
+            pool_marks = ",".join("?" for _ in pool_ids)
+            block_marks = ",".join("?" for _ in block_numbers)
+            pools = {
+                str(row["id"]): row
+                for row in connection.execute(
+                    f"SELECT id,protocol,metadata_json FROM pools WHERE id IN ({pool_marks})",
+                    pool_ids,
+                )
+            }
+            blocks = {
+                int(row["number"]): row
+                for row in connection.execute(
+                    f"SELECT number,hash,timestamp FROM blocks WHERE number IN ({block_marks})",
+                    block_numbers,
+                )
+            }
+            pending = {
+                (str(row["pool_id"]), int(row["block_number"])): str(row["block_hash"])
+                for row in connection.execute(
+                    "SELECT pool_id,block_number,block_hash FROM pending_balances "
+                    f"WHERE pool_id IN ({pool_marks}) AND block_number IN ({block_marks})",
+                    (*pool_ids, *block_numbers),
+                )
+            }
+            publishable: list[tuple[int, str, int, str, str, str]] = []
+            for item in normalized:
+                index, pool_id, block_number, block_hash, _balance0, _balance1 = item
+                pool = pools.get(pool_id)
+                block = blocks.get(block_number)
+                if pool is None or pool["protocol"] != "v3":
+                    outcomes[index] = ValueError(
+                        "per-pool balance snapshots are only valid for V3 pools"
+                    )
+                elif block is None or str(block["hash"]) != block_hash:
+                    outcomes[index] = CanonicalConflict(
+                        "balance snapshot belongs to an orphaned block"
+                    )
+                elif pending.get((pool_id, block_number)) != block_hash:
+                    outcomes[index] = CanonicalConflict(
+                        "balance snapshot work is stale"
+                    )
+                else:
+                    publishable.append(item)
+
+            if publishable:
+                _insert_rows(
+                    connection,
+                    "INSERT INTO pool_balances"
+                    "(pool_id,block_number,block_hash,balance0,balance1)",
+                    (
+                        (pool_id, block_number, block_hash, balance0, balance1)
+                        for (
+                            _index, pool_id, block_number, block_hash,
+                            balance0, balance1,
+                        ) in publishable
+                    ),
+                    columns=5,
+                    suffix=(
+                        " ON CONFLICT(pool_id,block_number) DO UPDATE SET "
+                        "block_hash=excluded.block_hash,balance0=excluded.balance0,"
+                        "balance1=excluded.balance1"
+                    ),
+                )
+                latest: dict[str, tuple[int, str, str]] = {}
+                for (
+                    _index, pool_id, block_number, _block_hash, balance0, balance1,
+                ) in publishable:
+                    prior = latest.get(pool_id)
+                    if prior is None or prior[0] <= block_number:
+                        latest[pool_id] = (block_number, balance0, balance1)
+                metadata_updates: list[tuple[str, str]] = []
+                for pool_id, (block_number, balance0, balance1) in latest.items():
+                    pool = pools[pool_id]
+                    metadata = _decode_json(pool["metadata_json"], {})
+                    if not isinstance(metadata, dict):
+                        metadata = {}
+                    try:
+                        prior_block = int(metadata["balance_block"])
+                    except (KeyError, TypeError, ValueError):
+                        prior_block = None
+                    if prior_block is None or prior_block <= block_number:
+                        metadata.update({
+                            "balance0": balance0,
+                            "balance1": balance1,
+                            "balance_block": block_number,
+                            "balance_timestamp": int(blocks[block_number]["timestamp"]),
+                        })
+                        serialized = _json(metadata)
+                        if serialized != pool["metadata_json"]:
+                            metadata_updates.append((serialized, pool_id))
+                if metadata_updates:
+                    connection.executemany(
                         "UPDATE pools SET metadata_json=? WHERE id=?",
-                        (serialized, pool_id),
+                        metadata_updates,
                     )
                     self._mark_pool_metadata_changed()
-            removed = connection.execute(
-                "DELETE FROM pending_balances WHERE pool_id=? AND block_number=?",
-                (pool_id, int(block_number)),
-            ).rowcount
-            if removed:
+                before = connection.total_changes
+                connection.executemany(
+                    "DELETE FROM pending_balances "
+                    "WHERE pool_id=? AND block_number=? AND block_hash=?",
+                    (
+                        (pool_id, block_number, block_hash)
+                        for (
+                            _index, pool_id, block_number, block_hash,
+                            _balance0, _balance1,
+                        ) in publishable
+                    ),
+                )
+                removed = connection.total_changes - before
+                if removed != len(publishable):
+                    raise MarketStoreError(
+                        "pending balance set changed during atomic publication"
+                    )
                 self._bump(connection, "pending_balances", -removed)
-            self._next_revision(connection)
+                self._next_revision(connection)
+        return outcomes
 
-    def mark_v3_balance_error(
-        self, pool_id: str, block_number: int, error: str, *, delay: float,
+    def mark_v3_balance_errors(
+        self, errors: Sequence[tuple[str, int, str, str, float]],
     ) -> None:
+        if not errors:
+            return
+        now = time.time()
         with self.transaction() as connection:
-            connection.execute(
-                "UPDATE pending_balances SET attempts=attempts+1,next_attempt=?,last_error=? "
-                "WHERE pool_id=? AND block_number=?",
-                (time.time() + max(0.0, delay), str(error)[:1000], pool_id.lower(), int(block_number)),
+            connection.executemany(
+                "UPDATE pending_balances SET attempts=attempts+1,"
+                "next_attempt=?,last_error=? "
+                "WHERE pool_id=? AND block_number=? AND block_hash=?",
+                (
+                    (
+                        now + max(0.0, delay), str(error)[:1000],
+                        pool_id.lower(), int(block_number), block_hash.lower(),
+                    )
+                    for pool_id, block_number, block_hash, error, delay in errors
+                ),
             )
 
     def _rollback_search_index(
@@ -2941,6 +3438,7 @@ class MarketStore:
             "pending_metadata": int(metadata.get("pending_metadata", 0)),
             "pending_pool_unpublish": int(metadata.get("pending_pool_unpublish", 0)),
             "pending_reprojection": int(metadata.get("pending_reprojection", 0)),
+            "pending_accounting": int(metadata.get("pending_accounting", 0)),
             "history_from": history_from,
             "history_to": history_to,
             "history_target": history.get("target_timestamp") if isinstance(history, dict) else None,

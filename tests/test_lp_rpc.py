@@ -69,7 +69,7 @@ def test_missing_archive_state_does_not_poison_headers_or_bypass_cooldown(provid
     assert provider.status()["history_state"]["sources"][0]["state"] == "available"
 
 
-def test_slow_response_does_not_serialize_other_rpc_lanes(provider, monkeypatch):
+def test_slow_response_does_not_serialize_shared_rpc_client(provider, monkeypatch):
     slow_started = threading.Event()
     release_slow = threading.Event()
     monkeypatch.setattr(lp_rpc, "_minimum_interval", lambda _url: 0.0)
@@ -95,7 +95,7 @@ def test_slow_response_does_not_serialize_other_rpc_lanes(provider, monkeypatch)
 
     monkeypatch.setattr(provider._registry, "_session", lambda _source: SimpleNamespace(post=post))
     history = provider("history")
-    live = provider("live")
+    live = history
     with ThreadPoolExecutor(max_workers=2) as executor:
         blocked = executor.submit(history.call, "eth_getBlockByNumber", ["0x10", False])
         try:
@@ -106,6 +106,130 @@ def test_slow_response_does_not_serialize_other_rpc_lanes(provider, monkeypatch)
         finally:
             release_slow.set()
         assert blocked.result(timeout=2) == {"number": "0x10"}
+
+
+def test_concurrent_clients_share_one_chain_verification(provider, monkeypatch):
+    checks = threading.Barrier(2)
+    checked_threads = set()
+    checked_lock = threading.Lock()
+    chain_calls = 0
+    chain_calls_lock = threading.Lock()
+    verified = provider._registry.verified
+
+    def synchronized_verified(source):
+        identity = threading.get_ident()
+        with checked_lock:
+            first_check = identity not in checked_threads
+            checked_threads.add(identity)
+        if first_check:
+            checks.wait(timeout=2)
+        return verified(source)
+
+    def post(_client, _source, payload):
+        nonlocal chain_calls
+        if payload["method"] == "eth_chainId":
+            with chain_calls_lock:
+                chain_calls += 1
+            result = hex(CHAIN_ID)
+        else:
+            result = "0x200"
+        return {
+            "jsonrpc": "2.0", "id": payload["id"], "result": result,
+        }
+
+    monkeypatch.setattr(provider._registry, "verified", synchronized_verified)
+    monkeypatch.setattr(lp_rpc.RoutedRpc, "_post", post)
+    clients = (provider("live"), provider("live"))
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(
+            lambda client: client.call("eth_blockNumber"), clients,
+        ))
+    assert results == ["0x200", "0x200"]
+    assert chain_calls == 1
+
+
+def test_rate_wait_does_not_consume_response_capacity(provider, monkeypatch):
+    clock = SimpleNamespace(now=100.0)
+    gate = lp_rpc._SourceGate(next_at=101.0, started_at=100.0)
+    available_during_wait = []
+
+    def sleep(delay):
+        permits = []
+        for _index in range(lp_rpc.MAX_SOURCE_CONCURRENCY):
+            if gate.slots.acquire(blocking=False):
+                permits.append(True)
+        available_during_wait.append(len(permits))
+        for _permit in permits:
+            gate.slots.release()
+        clock.now += delay
+
+    monkeypatch.setattr(lp_rpc, "time", SimpleNamespace(
+        monotonic=lambda: clock.now, time=lambda: clock.now, sleep=sleep,
+    ))
+    monkeypatch.setattr(lp_rpc, "_gate", lambda _url: gate)
+    monkeypatch.setattr(lp_rpc, "_minimum_interval", lambda _url: 0.0)
+    response = json.dumps({
+        "jsonrpc": "2.0", "id": 1, "result": "0x200",
+    }).encode()
+    session = SimpleNamespace(post=lambda *_args, **_kwargs: SimpleNamespace(
+        raise_for_status=lambda: None,
+        raw=SimpleNamespace(read=lambda *_args, **_kwargs: response),
+        close=lambda: None,
+    ))
+    monkeypatch.setattr(provider._registry, "_session", lambda _source: session)
+
+    client = provider("live")
+    source = provider._registry.sources["head"][0]
+    assert client._post(source, {
+        "jsonrpc": "2.0", "id": 1,
+        "method": "eth_blockNumber", "params": [],
+    })["result"] == "0x200"
+    assert available_during_wait == [lp_rpc.MAX_SOURCE_CONCURRENCY]
+
+
+def test_close_waits_for_admitted_http_request(provider, monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+    close_started = threading.Event()
+    session_closed = threading.Event()
+    source = provider._registry.sources["head"][0]
+
+    def post(_url, *, data, **_kwargs):
+        payload = json.loads(data)
+        started.set()
+        if not release.wait(5):
+            raise TimeoutError("request was not released")
+        encoded = json.dumps({
+            "jsonrpc": "2.0", "id": payload["id"], "result": "0x200",
+        }).encode()
+        return SimpleNamespace(
+            raise_for_status=lambda: None,
+            raw=SimpleNamespace(read=lambda *_args, **_kwargs: encoded),
+            close=lambda: None,
+        )
+
+    session = SimpleNamespace(post=post, close=session_closed.set)
+    provider._registry._clients[(source.url, source.headers)] = session
+    monkeypatch.setattr(provider._registry, "_session", lambda _source: session)
+    monkeypatch.setattr(lp_rpc, "_minimum_interval", lambda _url: 0.0)
+    provider._registry.mark_verified(source)
+    client = provider("live")
+
+    def close_factory():
+        close_started.set()
+        provider.close()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        request = executor.submit(client.call, "eth_blockNumber")
+        assert started.wait(2)
+        closing = executor.submit(close_factory)
+        assert close_started.wait(2)
+        assert not closing.done()
+        assert not session_closed.is_set()
+        release.set()
+        assert request.result(timeout=2) == "0x200"
+        closing.result(timeout=2)
+    assert session_closed.is_set()
 
 
 def test_rpc_credentials_reject_public_files_and_bad_urls_without_leaking(tmp_path, monkeypatch):
@@ -193,8 +317,11 @@ def test_execution_revert_in_batch_is_not_replaced_by_another_provider(monkeypat
     )
     monkeypatch.setattr(lp_rpc, "_source_list", lambda *_args: sources)
     monkeypatch.setattr(lp_rpc, "head_subscription_urls", lambda: ())
+    posts = []
+
 
     def post(_client, source, payload):
+        posts.append((source.name, payload))
         def response(item):
             result = {"jsonrpc": "2.0", "id": item["id"]}
             if item["method"] == "eth_chainId":
@@ -214,19 +341,453 @@ def test_execution_revert_in_batch_is_not_replaced_by_another_provider(monkeypat
         bad = ("eth_call", [{"to": "0x" + "1" * 40, "data": "0xbad0"}, "latest"])
         with pytest.raises(RuntimeError, match="execution reverted"):
             client.batch([good, bad])
+        output = client.batch([good, bad], allow_reverts=True)
+        assert output == [
+            "0x01",
+            {"error": {"code": -32000, "message": "execution reverted: unknown selector"}},
+        ]
+        assert [
+            source for source, payload in posts
+            if isinstance(payload, list) and any(
+                item["method"] == "eth_call" for item in payload
+            )
+        ] == ["primary", "primary"]
         assert client.batch([good]) == ["0x01"]
+        assert factory.status()["state"]["sources"][0]["state"] == "available"
     finally:
         factory.close()
 
 
+def test_allow_reverts_preserves_abi_error_but_not_provider_credentials(
+        monkeypatch):
+    credential = "secret-provider-key"
+    source = lp_rpc._Source(
+        "private", f"https://rpc.example.test/v2/{credential}",
+        (("Authorization", f"Bearer {credential}"),),
+    )
+    monkeypatch.setattr(lp_rpc, "_source_list", lambda *_args: (source,))
+    monkeypatch.setattr(lp_rpc, "head_subscription_urls", lambda: ())
+    revert_data = "0x08c379a0" + "00" * 64
+
+    def post(_client, _source, payload):
+        def response(item):
+            result = {"jsonrpc": "2.0", "id": item["id"]}
+            if item["method"] == "eth_chainId":
+                result["result"] = hex(CHAIN_ID)
+            else:
+                result["error"] = {
+                    "code": 3,
+                    "message": f"execution reverted at {source.url}?token={credential}",
+                    "data": revert_data,
+                    "details": {"authorization": f"Bearer {credential}"},
+                }
+            return result
+        return [response(item) for item in payload] if isinstance(payload, list) else response(payload)
+
+    monkeypatch.setattr(lp_rpc.RoutedRpc, "_post", post)
+    factory = lp_rpc.build_rpc_factory("", RuntimeError)
+    try:
+        result = factory("state").batch([
+            ("eth_call", [{"to": "0x" + "1" * 40, "data": "0xbad0"}, "latest"]),
+        ], allow_reverts=True)
+        assert result[0]["error"]["code"] == 3
+        assert result[0]["error"]["data"] == revert_data
+        encoded = json.dumps(result)
+        assert credential not in encoded
+        assert "<redacted>" in encoded
+    finally:
+        factory.close()
+
+
+def test_allow_reverts_fails_over_and_propagates_non_revert_failures(monkeypatch):
+    sources = (
+        lp_rpc._Source("primary", "https://primary.test/rpc"),
+        lp_rpc._Source("fallback", "https://fallback.test/rpc"),
+    )
+    monkeypatch.setattr(lp_rpc, "_source_list", lambda *_args: sources)
+    monkeypatch.setattr(lp_rpc, "head_subscription_urls", lambda: ())
+    attempted = []
+
+    def post(_client, source, payload):
+        if isinstance(payload, list):
+            attempted.append(source.name)
+
+        def response(item):
+            result = {"jsonrpc": "2.0", "id": item["id"]}
+            if item["method"] == "eth_chainId":
+                result["result"] = hex(CHAIN_ID)
+            else:
+                result["error"] = {"code": -32000, "message": "missing trie node"}
+            return result
+        return [response(item) for item in payload] if isinstance(payload, list) else response(payload)
+
+    monkeypatch.setattr(lp_rpc.RoutedRpc, "_post", post)
+    factory = lp_rpc.build_rpc_factory("", RuntimeError)
+    try:
+        with pytest.raises(RuntimeError, match="missing trie node"):
+            factory("enrichment").batch([
+                ("eth_call", [{"to": "0x" + "1" * 40, "data": "0x"}, "0x10"]),
+            ], allow_reverts=True)
+        assert attempted == ["primary", "fallback"]
+        assert [
+            source["state"]
+            for source in factory.status()["history_state"]["sources"]
+        ] == ["failed", "failed"]
+    finally:
+        factory.close()
+
+
+def test_batch_failover_does_not_repeat_healthy_siblings(monkeypatch):
+    sources = (
+        lp_rpc._Source("primary", "https://partial-primary.test/rpc"),
+        lp_rpc._Source("fallback", "https://partial-fallback.test/rpc"),
+    )
+    monkeypatch.setattr(lp_rpc, "_source_list", lambda *_args: sources)
+    monkeypatch.setattr(lp_rpc, "head_subscription_urls", lambda: ())
+    batches = []
+
+    def post(_client, source, payload):
+        def response(item):
+            result = {"jsonrpc": "2.0", "id": item["id"]}
+            if item["method"] == "eth_chainId":
+                result["result"] = hex(CHAIN_ID)
+            elif (
+                source.name == "primary"
+                and item["params"][0]["data"] == "0xbad0"
+            ):
+                result["error"] = {
+                    "code": -32000, "message": "missing trie node",
+                }
+            else:
+                result["result"] = (
+                    "0x01" if source.name == "primary" else "0x99"
+                )
+            return result
+
+        if isinstance(payload, list):
+            batches.append((
+                source.name,
+                [item["params"][0]["data"] for item in payload],
+            ))
+            return [response(item) for item in payload]
+        return response(payload)
+
+    monkeypatch.setattr(lp_rpc.RoutedRpc, "_post", post)
+    factory = lp_rpc.build_rpc_factory("", RuntimeError)
+    good = (
+        "eth_call",
+        [{"to": "0x" + "1" * 40, "data": "0x600d"}, "latest"],
+    )
+    bad = (
+        "eth_call",
+        [{"to": "0x" + "1" * 40, "data": "0xbad0"}, "latest"],
+    )
+    try:
+        assert factory("state").batch([good, bad]) == ["0x01", "0x99"]
+        assert batches == [
+            ("primary", ["0x600d", "0xbad0"]),
+            ("fallback", ["0xbad0"]),
+        ]
+    finally:
+        factory.close()
+
+
+def test_batch_results_isolates_errors_without_replaying_siblings(monkeypatch):
+    class RpcFailure(RuntimeError):
+        def __init__(self, message, *, code=None):
+            self.code = code
+            super().__init__(message)
+
+    primary_key = "primary-secret"
+    fallback_key = "fallback-secret"
+    sources = (
+        lp_rpc._Source(
+            "primary", f"https://primary.test/v2/{primary_key}",
+        ),
+        lp_rpc._Source(
+            "fallback", f"https://fallback.test/v2/{fallback_key}",
+        ),
+    )
+    monkeypatch.setattr(lp_rpc, "_source_list", lambda *_args: sources)
+    monkeypatch.setattr(lp_rpc, "head_subscription_urls", lambda: ())
+    batches = []
+
+    def post(_client, source, payload):
+        def response(item):
+            result = {"jsonrpc": "2.0", "id": item["id"]}
+            if item["method"] == "eth_chainId":
+                result["result"] = hex(CHAIN_ID)
+                return result
+            selector = item["params"][0]["data"]
+            if source.name == "primary" and selector == "0x600d":
+                result["result"] = "0x01"
+            elif source.name == "primary" and selector == "0xdead":
+                result["error"] = {
+                    "code": 3, "message": f"execution reverted {source.url}",
+                    "data": "0xdeadbeef",
+                }
+            elif source.name == "fallback" and selector == "0xfade":
+                result["result"] = "0x99"
+            else:
+                result["error"] = {
+                    "code": -32000 if source.name == "primary" else -32001,
+                    "message": f"missing state at {source.url}",
+                    "data": (
+                        "0xaaaaaaaa"
+                        if source.name == "primary"
+                        else "0xbbbbbbbb"
+                    ),
+                }
+            return result
+
+        if isinstance(payload, list):
+            batches.append((
+                source.name,
+                [item["params"][0]["data"] for item in payload],
+            ))
+            return [response(item) for item in payload]
+        return response(payload)
+
+    monkeypatch.setattr(lp_rpc.RoutedRpc, "_post", post)
+    factory = lp_rpc.build_rpc_factory("", RpcFailure)
+    calls = [
+        (
+            "eth_call",
+            [{"to": "0x" + "1" * 40, "data": selector}, "latest"],
+        )
+        for selector in ("0x600d", "0xdead", "0xfade", "0xbad0")
+    ]
+    try:
+        results = factory("state").batch_results(calls)
+        assert results[0] == "0x01"
+        assert isinstance(results[1], RpcFailure)
+        assert results[1].code == 3
+        assert "0xdeadbeef" in str(results[1])
+        assert results[2] == "0x99"
+        assert isinstance(results[3], RpcFailure)
+        assert results[3].code == -32001
+        assert "0xaaaaaaaa" in str(results[3])
+        assert "0xbbbbbbbb" in str(results[3])
+        assert primary_key not in " ".join(map(str, results))
+        assert fallback_key not in " ".join(map(str, results))
+        assert batches == [
+            ("primary", ["0x600d", "0xdead", "0xfade", "0xbad0"]),
+            ("fallback", ["0xfade", "0xbad0"]),
+        ]
+    finally:
+        factory.close()
+
+
+def test_balance_lane_routes_pinned_state_to_history_provider(monkeypatch):
+    live = lp_rpc._Source("live", "https://live-state.test/rpc")
+    historical = lp_rpc._Source(
+        "historical", "https://historical-state.test/rpc",
+    )
+    monkeypatch.setattr(
+        lp_rpc, "_source_list",
+        lambda _url, capability: (
+            (historical,) if capability == "history_state" else (live,)
+        ),
+    )
+    monkeypatch.setattr(lp_rpc, "head_subscription_urls", lambda: ())
+    attempted = []
+
+    def post(_client, source, payload):
+        attempted.append(source.name)
+        result = {
+            "jsonrpc": "2.0", "id": payload["id"],
+            "result": (
+                hex(CHAIN_ID)
+                if payload["method"] == "eth_chainId"
+                else "0x01"
+            ),
+        }
+        return result
+
+    monkeypatch.setattr(lp_rpc.RoutedRpc, "_post", post)
+    factory = lp_rpc.build_rpc_factory("", RuntimeError)
+    try:
+        assert factory("balance").call("eth_call", [
+            {"to": "0x" + "1" * 40, "data": "0x600d"},
+            {"blockHash": "0x" + "a" * 64, "requireCanonical": True},
+        ]) == "0x01"
+        assert attempted == ["historical", "historical"]
+    finally:
+        factory.close()
+
+
+def test_v4_manager_owner_correlation_does_not_require_optional_aux_event():
+    from eth_abi import encode
+    from rhpools.lp_market_protocols import (
+        POOL_MANAGER, TRANSFER_TOPIC, V4_MODIFY_LIQUIDITY_TOPIC,
+        V4_POSITION_MANAGER, decode_logs, decode_position_state_results,
+        nft_position_key, position_state_requests,
+    )
+
+    block_hash = "0x" + "a" * 64
+    tx_hash = "0x" + "b" * 64
+    pool_id = "0x" + "c" * 64
+    owner = "0x" + "1" * 40
+    token_id = 42
+
+    def topic(value):
+        return "0x" + f"{value:064x}"
+
+    common = {
+        "blockNumber": "0xa", "blockHash": block_hash,
+        "transactionHash": tx_hash, "transactionIndex": "0x0",
+    }
+    logs = [
+        {
+            **common,
+            "address": V4_POSITION_MANAGER,
+            "logIndex": "0x0",
+            "topics": [
+                TRANSFER_TOPIC, topic(0), topic(int(owner, 16)), topic(token_id),
+            ],
+            "data": "0x",
+        },
+        {
+            **common,
+            "address": POOL_MANAGER,
+            "logIndex": "0x1",
+            "topics": [
+                V4_MODIFY_LIQUIDITY_TOPIC, pool_id,
+                topic(int(V4_POSITION_MANAGER, 16)),
+            ],
+            "data": "0x" + encode(
+                ["int24", "int24", "int256", "bytes32"],
+                [-60, 60, 100, token_id.to_bytes(32, "big")],
+            ).hex(),
+        },
+    ]
+    rows = decode_logs(
+        logs,
+        {pool_id: {"id": pool_id, "protocol": "v4", "address": POOL_MANAGER}},
+        {10: {"hash": block_hash, "timestamp": 1_000}},
+    )
+    action = next(row for row in rows if row["protocol"] == "v4")
+    assert action["owner"] == owner
+    assert action["position_key"] == nft_position_key(V4_POSITION_MANAGER, token_id)
+    position_requests = [
+        request for request in position_state_requests(rows)
+        if request["correlation"]["decoder"] == "v4_state_view_position"
+    ]
+    assert {
+        request["correlation"]["field"] for request in position_requests
+    } == {"position_after"}
+    assert {
+        request["correlation"]["position_before_absence_basis"]
+        for request in position_requests
+    } == {"same_receipt_verified_v4_manager_mint"}
+    state = "0x" + encode(["uint128", "uint256", "uint256"], [100, 1, 2]).hex()
+    position_updates = decode_position_state_results(
+        position_requests, [state] * len(position_requests)
+    )
+    for update in position_updates:
+        assert update["data"]["position_before"] == {
+            "exists": False,
+            "liquidity": "0",
+            "fee_growth_inside0_last_x128": "0",
+            "fee_growth_inside1_last_x128": "0",
+            "tokens_owed0": None,
+            "tokens_owed1": None,
+            "claims_empty": True,
+            "claim_model": "fees_settled_on_modify_no_tokens_owed_storage",
+            "source": "verified_v4_manager_mint_absence",
+            "pinned_block": 9,
+            "absence_basis": "same_receipt_verified_v4_manager_mint",
+        }
+        assert update["data"]["position_after"]["liquidity"] == "100"
+    assert action["identity_basis"] == "manager_transfer_same_tx"
+
+def test_repair_v4_owners_preserves_enriched_canonical_data():
+    from rhpools.lp_market_protocols import (
+        V4_POSITION_MANAGER, nft_position_key, repair_v4_owners,
+    )
+
+    owner = "0x" + "1" * 40
+    recipient = "0x" + "2" * 40
+    tx_hash = "0x" + "b" * 64
+    token_id = 42
+    position_key = nft_position_key(V4_POSITION_MANAGER, token_id)
+    core = {
+        "protocol": "v4",
+        "kind": "add",
+        "block_number": 10,
+        "block_hash": "0x" + "a" * 64,
+        "tx_hash": tx_hash,
+        "tx_index": 2,
+        "log_index": 11,
+        "owner": None,
+        "custody": V4_POSITION_MANAGER,
+        "position_key": position_key,
+        "token_id": str(token_id),
+        "liquidity_delta": "100",
+        "cashflow0": "-25",
+        "cashflow1": "-50",
+        "fee_amount0": "3",
+        "fee_amount1": "7",
+        "accounting_basis": "v4_modifyLiquidity_return",
+        "identity_basis": "verified_v4_nft_salt",
+        "data": {
+            "identity_basis": "verified_v4_nft_salt",
+            "trace_complete": True,
+            "cashflow_basis": "v4_modifyLiquidity_return",
+            "position_before": {
+                "exists": False, "liquidity": "0", "pinned_block": 9,
+            },
+            "position_after": {
+                "exists": True, "liquidity": "100", "pinned_block": 10,
+            },
+            "nested_evidence": {"paths": [[0, 1]], "return": "0x1234"},
+        },
+    }
+    transfer = {
+        "protocol": "nft",
+        "kind": "transfer",
+        "block_number": 10,
+        "block_hash": core["block_hash"],
+        "tx_hash": tx_hash,
+        "tx_index": 2,
+        "log_index": 12,
+        "owner": recipient,
+        "custody": V4_POSITION_MANAGER,
+        "position_key": position_key,
+        "token_id": str(token_id),
+        "data": {
+            "manager_protocol": "v4",
+            "prior_owner": owner,
+            "new_owner": recipient,
+            "mint": False,
+            "burn": False,
+        },
+    }
+    original = json.loads(json.dumps([core, transfer]))
+    expected = json.loads(json.dumps(core))
+    expected.update(
+        owner=owner,
+        identity_basis="manager_transfer_same_tx_prestate",
+    )
+    expected["data"]["identity_basis"] = "manager_transfer_same_tx_prestate"
+
+    repaired = repair_v4_owners([core, transfer])
+
+    assert [core, transfer] == original
+    assert repaired == [expected]
+    assert repair_v4_owners([repaired[0], transfer]) == []
+
+
+
 @pytest.mark.parametrize("lifecycle", ["mint", "burn"])
-def test_nfpm_lifecycle_absence_survives_routed_batch_fallback(
+def test_nfpm_lifecycle_absence_uses_verified_mint_and_batched_burn(
         provider, monkeypatch, tmp_path, lifecycle):
     from eth_abi import encode
     from rhpools.lp_market_index import MarketIndexer, RpcError
     from rhpools.lp_market_protocols import (
         ProtocolDecodeError, UNISWAP_V3_POSITION_MANAGER,
-        decode_position_state_results, position_state_requests,
+        decode_position_state_results, nft_position_key,
+        position_state_requests,
     )
     from rhpools.lp_market_store import MarketStore
 
@@ -241,7 +802,10 @@ def test_nfpm_lifecycle_absence_survives_routed_batch_fallback(
         [0, zero, owner, "0x" + "2" * 40, 500, -60, 60, liquidity, 0, 0, 0, 0],
     ).hex()
 
+    posts = []
+
     def post(_client, _source, payload):
+        posts.append(payload)
         def response(item):
             result = {"jsonrpc": "2.0", "id": item["id"]}
             if item["method"] == "eth_chainId":
@@ -263,6 +827,7 @@ def test_nfpm_lifecycle_absence_survives_routed_batch_fallback(
         "block_hash": "0x" + "a" * 64, "tx_hash": "0x" + "b" * 64,
         "tx_index": 0, "log_index": 1, "token_id": "42",
         "custody": UNISWAP_V3_POSITION_MANAGER,
+        "position_key": nft_position_key(UNISWAP_V3_POSITION_MANAGER, 42),
         "data": {
             "manager_protocol": "v3", "mint": lifecycle == "mint",
             "burn": lifecycle == "burn",
@@ -282,9 +847,30 @@ def test_nfpm_lifecycle_absence_survives_routed_batch_fallback(
             assert update[missing]["claims_empty"] is True
             assert update[present]["exists"] is True
             assert update[present]["liquidity"] == str(liquidity)
+            if lifecycle == "mint":
+                assert update[missing]["absence_basis"] == "same_receipt_verified_nfpm_mint"
+            eth_call_batches = [
+                payload for payload in posts
+                if isinstance(payload, list) and any(
+                    item["method"] == "eth_call" for item in payload
+                )
+            ]
+            eth_call_singles = [
+                payload for payload in posts
+                if isinstance(payload, dict) and payload["method"] == "eth_call"
+            ]
+            assert len(eth_call_batches) == 1
+            assert len(eth_call_batches[0]) == (1 if lifecycle == "mint" else 2)
+            assert eth_call_singles == []
+            assert provider.status()["history_state"]["sources"][0]["state"] == "available"
 
             event["data"].update(mint=False, burn=False)
-            with pytest.raises(ProtocolDecodeError, match="pinned eth_call failed"):
+            expected = (
+                "request/result count mismatch"
+                if lifecycle == "mint"
+                else "pinned eth_call failed"
+            )
+            with pytest.raises(ProtocolDecodeError, match=expected):
                 decode_position_state_results(position_state_requests([event]), results)
         finally:
             scanner.close()

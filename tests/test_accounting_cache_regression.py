@@ -165,3 +165,184 @@ def test_pool_stats_respects_an_existing_reader_snapshot(inventory):
     assert book.pool_stats([POOL_ID])[POOL_ID]["observed_principal_usd"] == pytest.approx(
         before["observed_principal_usd"] * 2
     )
+
+
+APPEND_POSITION = "v4:deferred-append"
+
+
+def accounting_header(number):
+    return {
+        "number": hex(number),
+        "hash": "0x" + f"{number:064x}",
+        "parentHash": "0x" + f"{number - 1:064x}",
+        "timestamp": hex(1_700_000_000 + number),
+    }
+
+
+def accounting_state(liquidity):
+    return {
+        "liquidity": str(liquidity),
+        "tokens_owed0": "0",
+        "tokens_owed1": "0",
+        "claims_empty": True,
+    }
+
+
+def accounting_event(block, kind, liquidity_delta, before, after, usd):
+    adding = kind == "add"
+    cashflow = -100 if adding else 100
+    return {
+        "block_number": int(block["number"], 16),
+        "block_hash": block["hash"],
+        "tx_hash": "0x" + f"{int(block['number'], 16):064x}",
+        "tx_index": 0,
+        "log_index": 0,
+        "timestamp": int(block["timestamp"], 16),
+        "pool_id": None,
+        "protocol": "v4",
+        "kind": kind,
+        "owner": OWNER,
+        "custody": OWNER,
+        "position_key": APPEND_POSITION,
+        "token_id": "42",
+        "tick_lower": -10,
+        "tick_upper": 10,
+        "liquidity": str(after),
+        "liquidity_delta": str(liquidity_delta),
+        "amount0": "0",
+        "amount1": "0",
+        "cashflow0": str(cashflow),
+        "cashflow1": "0",
+        "fee_amount0": "0",
+        "fee_amount1": "0",
+        "deposit_usd": usd if adding else 0.0,
+        "withdrawal_usd": 0.0 if adding else usd,
+        "fees_usd": 0.0,
+        "accounting_basis": "complete v4 trace",
+        "identity_basis": "verified_owner",
+        "data": {
+            "position_before": accounting_state(before),
+            "position_after": accounting_state(after),
+            "trace_complete": True,
+            "fees_accrued_exact": True,
+            "principal_delta_exact": True,
+            "principal_delta": {
+                "amount0": str(cashflow),
+                "amount1": "0",
+            },
+        },
+    }
+
+
+def accounting_history():
+    blocks = [accounting_header(number) for number in range(100, 104)]
+    events = [
+        accounting_event(blocks[0], "add", 100, 0, 100, 1.0),
+        accounting_event(blocks[1], "remove", -100, 100, 0, 2.0),
+        accounting_event(blocks[2], "add", 200, 0, 200, 3.0),
+        accounting_event(blocks[3], "remove", -200, 200, 0, 4.0),
+    ]
+    return blocks, events
+
+
+def drain_accounting(book):
+    while book.project_pending(limit=32):
+        pass
+
+
+def accounting_projection(store):
+    reader = store.read()
+    return {
+        "positions": [
+            tuple(row) for row in reader.execute(
+                "SELECT * FROM lp_accounting_positions ORDER BY position_key"
+            )
+        ],
+        "episodes": [
+            tuple(row) for row in reader.execute(
+                "SELECT * FROM lp_accounting_episodes ORDER BY id"
+            )
+        ],
+        "effects": [
+            tuple(row) for row in reader.execute(
+                "SELECT * FROM lp_accounting_effects ORDER BY event_id"
+            )
+        ],
+        "ownership": [
+            tuple(row) for row in reader.execute(
+                "SELECT * FROM lp_ownership_intervals "
+                "ORDER BY position_key,ordinal"
+            )
+        ],
+    }
+
+
+def test_deferred_later_block_append_matches_full_synchronous_replay(tmp_path):
+    deferred = MarketStore(tmp_path / "deferred-append.sqlite")
+    full = MarketStore(tmp_path / "full-replay.sqlite")
+    deferred_book = AccountBook(deferred, deferred=True).install()
+    AccountBook(full).install()
+    try:
+        blocks, events = accounting_history()
+        deferred.ingest(blocks[:2], events[:2])
+        drain_accounting(deferred_book)
+        deferred.ingest(blocks[2:3], events[2:3])
+
+        drain_accounting(deferred_book)
+
+        full_blocks, full_events = accounting_history()
+        full.ingest(full_blocks[:3], full_events[:3])
+        assert accounting_projection(deferred) == accounting_projection(full)
+        assert deferred.read().execute(
+            "SELECT COUNT(*) FROM lp_accounting_effects"
+        ).fetchone()[0] == 3
+        assert deferred.read().execute(
+            "SELECT COUNT(*) FROM lp_accounting_episodes"
+        ).fetchone()[0] == 2
+    finally:
+        full.close()
+        deferred.close()
+
+
+def test_older_enrichment_mixed_with_new_events_forces_full_replay(tmp_path):
+    deferred = MarketStore(tmp_path / "mixed-deferred.sqlite")
+    synchronous = MarketStore(tmp_path / "mixed-synchronous.sqlite")
+    deferred_book = AccountBook(deferred, deferred=True).install()
+    AccountBook(synchronous).install()
+    try:
+        blocks, events = accounting_history()
+        inserted = deferred.ingest(blocks[:2], events[:2])
+        first_event_id = int(inserted[0]["id"])
+        drain_accounting(deferred_book)
+        deferred.ingest(blocks[2:3], events[2:3])
+
+        deferred.enrich([{
+            "id": first_event_id,
+            "deposit_usd": 9.0,
+            "accounting_basis": "same-order financial enrichment",
+        }])
+        deferred.ingest(blocks[3:], events[3:])
+        drain_accounting(deferred_book)
+
+        sync_blocks, sync_events = accounting_history()
+        sync_inserted = synchronous.ingest(sync_blocks[:2], sync_events[:2])
+        synchronous.ingest(sync_blocks[2:3], sync_events[2:3])
+        synchronous.enrich([{
+            "id": int(sync_inserted[0]["id"]),
+            "deposit_usd": 9.0,
+            "accounting_basis": "same-order financial enrichment",
+        }])
+        synchronous.ingest(sync_blocks[3:], sync_events[3:])
+
+        assert accounting_projection(deferred) == accounting_projection(
+            synchronous
+        )
+        first_episode = deferred.read().execute(
+            "SELECT deposit_usd FROM lp_accounting_episodes "
+            "WHERE position_key=? AND ordinal=1",
+            (APPEND_POSITION,),
+        ).fetchone()
+        assert first_episode["deposit_usd"] == pytest.approx(9.0)
+    finally:
+        synchronous.close()
+        deferred.close()

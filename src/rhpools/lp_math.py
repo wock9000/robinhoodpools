@@ -121,6 +121,39 @@ def principal_raw(liquidity: int, sqrt: int, lo: int, hi: int) -> tuple[int, int
     return amount0, amount1
 
 
+def fee_growth_amount(liquidity: int, current: int, previous: int) -> int:
+    """Convert wrapped Q128 fee growth into floor-rounded token units."""
+    return liquidity * ((current - previous) & _MAX_UINT256) // (1 << 128)
+
+
+def fee_claim(
+    liquidity: int,
+    fee_growth0_last: int,
+    fee_growth1_last: int,
+    owed0: int,
+    owed1: int,
+    global0: int,
+    global1: int,
+    lower_outside0: int,
+    lower_outside1: int,
+    upper_outside0: int,
+    upper_outside1: int,
+    tick: int,
+    lower: int,
+    upper: int,
+) -> tuple[int, int, int, int]:
+    """Return total claim and still-lazy fees using V3 uint256 wrapping."""
+    below0 = lower_outside0 if tick >= lower else (global0 - lower_outside0) & _MAX_UINT256
+    below1 = lower_outside1 if tick >= lower else (global1 - lower_outside1) & _MAX_UINT256
+    above0 = upper_outside0 if tick < upper else (global0 - upper_outside0) & _MAX_UINT256
+    above1 = upper_outside1 if tick < upper else (global1 - upper_outside1) & _MAX_UINT256
+    inside0 = (global0 - below0 - above0) & _MAX_UINT256
+    inside1 = (global1 - below1 - above1) & _MAX_UINT256
+    lazy0 = fee_growth_amount(liquidity, inside0, fee_growth0_last)
+    lazy1 = fee_growth_amount(liquidity, inside1, fee_growth1_last)
+    return owed0 + lazy0, owed1 + lazy1, lazy0, lazy1
+
+
 __all__ = [
     "MAX_SQRT_RATIO",
     "MAX_TICK",
@@ -129,6 +162,8 @@ __all__ = [
     "Q96",
     "amount0_delta",
     "amount1_delta",
+    "fee_claim",
+    "fee_growth_amount",
     "principal_raw",
     "sqrt_ratio_at_tick",
     "tick_at_sqrt_price_x96",

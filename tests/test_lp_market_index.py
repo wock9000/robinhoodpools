@@ -10,10 +10,14 @@ import pytest
 
 from rhpools.lp_market_index import (
     FACTORY_SELECTOR,
+    FEE_SELECTOR,
     GET_PAIR_SELECTOR,
+    TICK_SPACING_SELECTOR,
     TOKEN0_SELECTOR,
     TOKEN1_SELECTOR,
+    V4_POOL_KEYS_SELECTOR,
     MarketIndexer,
+    RpcError,
 )
 from rhpools.lp_market_store import CanonicalConflict, MarketStore
 from rhpools.lp_market_protocols import (
@@ -22,6 +26,7 @@ from rhpools.lp_market_protocols import (
     POOL_MANAGER,
     TRANSFER_TOPIC,
     V4_MODIFY_LIQUIDITY_TOPIC,
+    V4_POSITION_MANAGER,
 )
 
 
@@ -69,8 +74,19 @@ class StaticRpc:
             return []
         raise AssertionError(method)
 
-    def batch(self, calls):
-        return [self.call(method, params) for method, params in calls]
+    def batch(self, calls, *, allow_reverts=False):
+        results = []
+        for method, params in calls:
+            try:
+                results.append(self.call(method, params))
+            except RpcError as exc:
+                if allow_reverts and method == "eth_call" and (
+                    exc.code == 3 or "execution reverted" in str(exc).lower()
+                ):
+                    results.append({"error": str(exc)})
+                else:
+                    raise
+        return results
 
 
 class Market:
@@ -484,46 +500,226 @@ def test_live_parent_mismatch_rolls_back_to_canonical_ancestor():
         store.close()
 
 
-def test_missing_trace_capability_defers_lane_without_rewriting_jobs():
-    class NoTraceRpc(StaticRpc):
+@pytest.mark.parametrize("blocked_trace", [False, True], ids=["unavailable-trace", "slow-trace"])
+def test_live_gap_and_v4_trace_cannot_block_v3_position_accounting(
+    tmp_path, blocked_trace,
+):
+    from eth_abi import encode
+    from rhpools.lp_market_protocols import (
+        LIQUIDITY_SELECTOR, POSITIONS_SELECTOR, SLOT0_SELECTOR, V3_MINT_TOPIC,
+    )
+    from rhpools.lp_market_service import LPMarketService
+    from rhpools.workbench_market import USDG, UNISWAP_V3_FACTORY
+
+    owner, pool, token = ("0x" + byte * 20 for byte in ("11", "22", "33"))
+    v4_tx, v3_tx = ("0x" + byte * 32 for byte in ("ab", "cd"))
+    trace_started, release_trace = threading.Event(), threading.Event()
+    blocks = {tx: header(n) for tx, n in ((v4_tx, 20), (v3_tx, 21))}
+    raw_logs = {}
+    for tx_hash, block in blocks.items():
+        raw_logs[tx_hash] = {
+            "blockNumber": block["number"], "blockHash": block["hash"],
+            "transactionHash": tx_hash, "transactionIndex": "0x0", "logIndex": "0x0",
+            "address": POOL_MANAGER if tx_hash == v4_tx else pool,
+            "topics": (
+                [V4_MODIFY_LIQUIDITY_TOPIC, "0x" + "44" * 32, "0x" + owner[2:].zfill(64)]
+                if tx_hash == v4_tx else [
+                    V3_MINT_TOPIC, "0x" + owner[2:].zfill(64),
+                    "0x" + "00" * 32, "0x" + f"{10:064x}",
+                ]
+            ),
+            "data": "0x" + encode(
+                ["address", "uint128", "uint256", "uint256"],
+                [owner, 10, 1_000_000, 2_000_000],
+            ).hex(),
+        }
+
+    class ReceiptRpc(StaticRpc):
         @staticmethod
         def status():
-            return {
-                "trace": {
-                    "active": None,
-                    "configured": False,
-                    "sources": [],
-                },
-            }
+            return {"trace": {"active": None, "configured": False, "sources": []}}
 
-    store = MarketStore(":memory:")
-    scanner = indexer(store, NoTraceRpc())
-    block = header(10)
-    pending_event = {
-        "block_number": 10,
-        "block_hash": block["hash"],
-        "tx_hash": "0x" + "ab" * 32,
-        "tx_index": 0,
-        "log_index": 0,
-        "timestamp": int(block["timestamp"], 16),
-        "pool_id": None,
-        "protocol": "v3",
-        "kind": "add",
-        "owner": "0x" + "11" * 20,
-        "data": {},
-    }
-    store.ingest([block], [pending_event])
+        def call(self, method, params):
+            if method == "eth_getTransactionReceipt":
+                tx_hash = params[0]
+                block = blocks[tx_hash]
+                return {
+                    "transactionHash": tx_hash, "blockNumber": block["number"],
+                    "blockHash": block["hash"], "transactionIndex": "0x0",
+                    "status": "0x1", "from": owner, "gasUsed": hex(21_000),
+                    "effectiveGasPrice": hex(1_000_000_000),
+                    "logs": [raw_logs[tx_hash]],
+                }
+            if method == "eth_getTransactionByHash":
+                return {"hash": params[0], "from": owner, "gasPrice": hex(1_000_000_000)}
+            if method == "debug_traceTransaction":
+                assert params[0] == v4_tx
+                trace_started.set()
+                if blocked_trace:
+                    assert release_trace.wait(5)
+                raise RpcError("trace RPC unavailable")
+            if method == "eth_call":
+                selector = params[0]["data"][:10]
+                if selector == POSITIONS_SELECTOR:
+                    values = [10, 0, 0, 3, 5] if params[1] == "0x15" else [0] * 5
+                elif selector == SLOT0_SELECTOR:
+                    values = [1 << 96, 0, 0, 1, 1, 0, 1]
+                elif selector == LIQUIDITY_SELECTOR:
+                    values = [1_000]
+                else:
+                    raise AssertionError(selector)
+                return "0x" + encode(["uint256"] * len(values), values).hex()
+            return super().call(method, params)
+
+    app = LPMarketService(Market(), "http://unused.invalid", tmp_path / "receipts.sqlite", start=False)
+    scanner = indexer(app.store, ReceiptRpc())
     try:
-        assert scanner._enrich_once() is False
-        row = store.read().execute(
-            "SELECT attempts,last_error FROM pending_enrichment",
-        ).fetchone()
-        assert (row["attempts"], row["last_error"]) == (0, None)
-        status = scanner.runtime_status()
-        assert status["enrichment_deferred"] is True
+        app.store.upsert_pools([{
+            "id": pool, "address": pool, "protocol": "v3",
+            "token0": token, "token1": USDG, "decimals0": 6, "decimals1": 6,
+            "symbol0": "ASSET", "symbol1": "USDG", "fee_ppm": 3_000,
+            "tick_spacing": 1, "factory": UNISWAP_V3_FACTORY,
+            "created_block": 1, "source": "factory-live",
+            "metadata_json": {"discovery_basis": "factory_creation_event"},
+        }])
+        events = scanner._decode("live", [raw_logs[v3_tx]], {21: blocks[v3_tx]}, resolve_unknown=False)
+        app.store.ingest(list(blocks.values()), [
+            {**indexed_event(20, "ab"), "protocol": "v4"}, *events,
+        ], cursor={"block_number": 21, "block_hash": blocks[v3_tx]["hash"]})
+        assert app.book.positions({"pool": pool})["rows"][0]["liquidity"] is None
+        scanner._publish_current_block(header(2_000), (), source="test")
+        scanner._initialized.set()
+        worker = threading.Thread(target=scanner._enrichment_run)
+        scanner._threads.append(worker)
+        worker.start()
+        assert trace_started.wait(2)
+        deadline = time.monotonic() + 3
+        while True:
+            position = app.book.positions({"pool": pool})["rows"][0]
+            if position["liquidity"] == "10" or time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)
+        assert (
+            position["liquidity"], position["tokens_owed0"], position["tokens_owed1"],
+        ) == ("10", "3", "5")
+        assert position["coverage"]["history"] == "full"
+        assert [row["tx_hash"] for row in app.store.read().execute(
+            "SELECT tx_hash FROM pending_enrichment"
+        )] == [v4_tx]
+    finally:
+        release_trace.set()
+        scanner.close()
+        app.close()
+
+
+def test_small_trace_refills_rotate_history_requested_and_recent(monkeypatch):
+    from concurrent.futures import Future
+
+    monkeypatch.setattr("rhpools.lp_market_index.ENRICH_TRACE_INFLIGHT_LIMIT", 8)
+    store = MarketStore(":memory:")
+    scanner = indexer(store)
+    numbers = [*range(1, 257), 500, 699, 700, 701]
+    store.ingest([header(number) for number in numbers], [
+        {
+            **indexed_event(number, "11"),
+            "tx_hash": header(number)["hash"],
+            "protocol": "v3" if number == 701 else "v4",
+        }
+        for number in numbers
+    ])
+    store.prioritize_enrichment([header(500)["hash"]])
+    submitted = {False: [], True: []}
+
+    def capture(lane):
+        def submit(_function, rows):
+            submitted[lane].append(tuple(rows))
+            return Future()
+
+        return submit
+
+    monkeypatch.setattr(scanner._enrichment_executor, "submit", capture(False))
+    monkeypatch.setattr(scanner._trace_enrichment_executor, "submit", capture(True))
+    occupied = tuple(dict(row) for row in store.read().execute(
+        "SELECT * FROM pending_enrichment WHERE block_number<=6 ORDER BY block_number",
+    ))
+    scanner._enrichment_jobs[tuple(row["tx_hash"] for row in occupied)] = (
+        occupied, Future(), time.monotonic(), True,
+    )
+    try:
+        scanner._fill_enrichment_jobs()
+        first_trace = tuple(row for batch in submitted[True] for row in batch)
+        first_regular = tuple(row for batch in submitted[False] for row in batch)
+        assert [row["block_number"] for row in first_trace] == [7, 500]
+        assert [row["block_number"] for row in first_regular] == [701]
+
+        first_trace_hashes = tuple(row["tx_hash"] for row in first_trace)
+        scanner._enrichment_jobs.pop(first_trace_hashes)
+        submitted[True].clear()
+        scanner._fill_enrichment_jobs(first_trace_hashes)
+        second_trace = tuple(row for batch in submitted[True] for row in batch)
+        assert [row["block_number"] for row in second_trace] == [700, 699]
     finally:
         scanner.close()
         store.close()
+
+
+def test_identity_recovery_waits_for_initialization_and_outlives_blocked_accounting(
+    tmp_path, monkeypatch,
+):
+    store = MarketStore(tmp_path / "market.sqlite")
+    bootstrap_started = threading.Event()
+    release_bootstrap = threading.Event()
+    accounting_started = threading.Event()
+    release_accounting = threading.Event()
+    accounting_finished = threading.Event()
+    recovery_called = threading.Event()
+    recovery_initialization = []
+
+    def project_accounting():
+        accounting_started.set()
+        release_accounting.wait()
+        accounting_finished.set()
+        return False
+
+    def recover_identities():
+        recovery_initialization.append(scanner._initialized.is_set())
+        recovery_called.set()
+        return False
+
+    scanner = indexer(
+        store,
+        accounting_projector=project_accounting,
+        accounting_recovery=recover_identities,
+    )
+    bootstrap = scanner._bootstrap
+
+    def blocked_bootstrap():
+        bootstrap_started.set()
+        release_bootstrap.wait()
+        return bootstrap()
+
+    monkeypatch.setattr(scanner, "_bootstrap", blocked_bootstrap)
+    workers = ()
+    try:
+        scanner.start(deferred=True)
+        workers = tuple(scanner._threads)
+        assert bootstrap_started.wait(2)
+        assert accounting_started.wait(2)
+        assert not recovery_called.wait(0.1)
+
+        release_bootstrap.set()
+        assert recovery_called.wait(2)
+        assert recovery_initialization
+        assert all(recovery_initialization)
+        assert not accounting_finished.is_set()
+    finally:
+        release_bootstrap.set()
+        release_accounting.set()
+        scanner.close()
+        store.close()
+
+    assert workers
+    assert all(not worker.is_alive() for worker in workers)
 
 
 def test_history_progress_is_independent_of_unrunnable_enrichment(monkeypatch):
@@ -566,20 +762,24 @@ def test_history_progress_is_independent_of_unrunnable_enrichment(monkeypatch):
     )
     monkeypatch.setattr(scanner, "_decode", lambda *_args, **_kwargs: [])
     try:
-        assert scanner._scan_history_once() is True
         cursor = store.cursor("history")
+        while not cursor["complete"]:
+            previous_next = cursor["next_to"]
+            assert scanner._scan_history_once() is True
+            cursor = store.cursor("history")
+            assert previous_next > cursor["next_to"] >= 399
         assert cursor["next_to"] == 399
         assert cursor["complete"] is True
-        status = scanner.runtime_status()["history_scan"]
-        assert status["blocks"] == 100
+        assert store.status()["pending_enrichment"] == 5_000
     finally:
         scanner.close()
         store.close()
 
 
-def test_recent_ledger_gap_yields_history_until_live_progresses():
+def test_history_prioritizes_large_live_gaps_without_starving_at_tip():
+    live_head = 1_100
     store = MarketStore(":memory:")
-    scanner = indexer(store, StaticRpc(1_100))
+    scanner = indexer(store, StaticRpc(live_head))
     scanner._history_verified = True
     anchor = header(500)
     store.ingest([anchor], [], lane="history", cursor={
@@ -592,15 +792,26 @@ def test_recent_ledger_gap_yields_history_until_live_progresses():
         "block_number": 500, "block_hash": anchor["hash"],
         "timestamp": int(anchor["timestamp"], 16),
     })
-    scanner._set_runtime("head", head=1_100)
+    scanner._set_runtime("head", head=live_head)
     try:
         assert scanner._scan_history_once() is False
         assert store.cursor("history")["next_to"] == 499
         assert scanner._scan_live_once() is True
         assert store.cursor("live")["block_number"] > 500
-        assert scanner._scan_history_once() is True
-        assert store.cursor("history")["next_to"] == 399
-        assert store.cursor("history")["complete"] is True
+        while store.cursor("live")["block_number"] < live_head:
+            assert scanner._scan_live_once() is True
+        for number in range(live_head + 1, live_head + 4):
+            # A continuously advancing head is never exactly equal to the
+            # durable cursor when the history worker gets scheduled.
+            scanner._set_runtime("head", head=number)
+            previous = store.cursor("history")["next_to"]
+            assert scanner._scan_history_once() is True
+            assert store.cursor("history")["next_to"] < previous
+            tip = header(number)
+            store.ingest([tip], [], lane="live", cursor={
+                "block_number": number, "block_hash": tip["hash"],
+                "timestamp": int(tip["timestamp"], 16),
+            })
     finally:
         scanner.close()
         store.close()
@@ -640,6 +851,84 @@ def test_live_health_publishes_while_another_lane_holds_writer():
         store.close()
 
 
+def test_requested_identity_replay_keeps_regular_enrichment_interest(monkeypatch):
+    store = MarketStore(":memory:")
+    scanner = indexer(store)
+    def identity_marker(number):
+        block = header(number)
+        return scanner._encode_pool_identity_marker({
+            "addresses": ["0x" + "12" * 20],
+            "logs": [{
+                "address": "0x" + "12" * 20,
+                "topics": [V2_SYNC_TOPIC],
+                "data": "0x" + f"{123:064x}{456:064x}",
+                "blockNumber": block["number"], "blockHash": block["hash"],
+                "transactionHash": "0x" + f"{number:064x}",
+                "transactionIndex": "0x0", "logIndex": "0x0",
+            }],
+        })
+    target_tx = "0x" + f"{50:064x}"
+    regular_tx = "0x" + f"{51:064x}"
+    identity_numbers = [*range(1, 33), 50, *range(68, 100)]
+    store.ingest([header(number) for number in sorted([*identity_numbers, 51])], [])
+    now = time.time()
+    with store.transaction() as connection:
+        connection.executemany(
+            "INSERT INTO pending_enrichment"
+            "(tx_hash,block_number,block_hash,attempts,next_attempt,last_error,"
+            "created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+            [
+                (
+                    "0x" + f"{number:064x}",
+                    number,
+                    header(number)["hash"],
+                    0,
+                    0,
+                    identity_marker(number),
+                    now,
+                    now,
+                )
+                for number in identity_numbers
+            ] + [
+                (
+                    regular_tx,
+                    51,
+                    header(51)["hash"],
+                    0,
+                    0,
+                    None,
+                    now,
+                    now,
+                ),
+            ],
+        )
+        store._set_metadata(
+            connection, "pending_enrichment", len(identity_numbers) + 1,
+        )
+    store.prioritize_enrichment([target_tx, regular_tx])
+
+    def unavailable(_method, _params):
+        raise RpcError("identity RPC unavailable")
+
+    monkeypatch.setattr(scanner, "_seed_deferred_v4_pool_identities", lambda: 0)
+    monkeypatch.setattr(scanner._clients["pool"], "call", unavailable)
+    scanner._pool_identity_replay_turn = 1
+    try:
+        assert scanner._resolve_deferred_pool_identities_once() is True
+        assert [
+            row["tx_hash"] for row in store.read().execute(
+                "SELECT tx_hash FROM pending_enrichment WHERE next_attempt>0",
+            )
+        ] == [target_tx]
+        assert [
+            row["tx_hash"]
+            for row in store.requested_enrichments(8, identity=False)
+        ] == [regular_tx]
+    finally:
+        scanner.close()
+        store.close()
+
+
 def test_history_defers_cold_pool_identity_to_current_canonical_state(monkeypatch):
     valid_pool = "0x" + "12" * 20
     spoof_pool = "0x" + "13" * 20
@@ -675,6 +964,8 @@ def test_history_defers_cold_pool_identity_to_current_canonical_state(monkeypatc
                 if target == spoof_pool:
                     return word("0x" + "00" * 20)
                 if target == valid_pool:
+                    if selector in {FEE_SELECTOR, TICK_SPACING_SELECTOR}:
+                        raise RpcError("execution reverted", code=3)
                     return {
                         FACTORY_SELECTOR: word(factory),
                         TOKEN0_SELECTOR: word(token0),
@@ -742,10 +1033,6 @@ def test_history_defers_cold_pool_identity_to_current_canonical_state(monkeypatc
         )
 
         assert scanner._resolve_deferred_pool_identities_once() is True
-        assert scanner._resolve_deferred_pool_identities_once() is True
-        assert rpc.call_tags
-        assert set(rpc.call_tags) == {hex(current_block)}
-        assert rpc.current_header_reads >= 2
 
         event = store.read().execute(
             "SELECT pool_id,protocol,kind FROM events WHERE tx_hash=?",
@@ -778,6 +1065,375 @@ def test_history_defers_cold_pool_identity_to_current_canonical_state(monkeypatc
     finally:
         scanner.close()
         store.close()
+
+
+def test_deferred_identity_batch_preserves_transient_part_of_mixed_row(
+    monkeypatch,
+):
+    valid_pool = "0x" + "12" * 20
+    invalid_pool = "0x" + "13" * 20
+    transient_v4 = "0x" + "14" * 32
+    token0 = "0x" + "21" * 20
+    token1 = "0x" + "23" * 20
+    factory = sorted(V2_FACTORIES)[0]
+    tx_hash = "0x" + "31" * 32
+    block = header(9)
+
+    def address_word(address):
+        return "0x" + address[2:].rjust(64, "0")
+
+    def sync_log(address, index):
+        return {
+            "address": address,
+            "topics": [V2_SYNC_TOPIC],
+            "data": "0x" + f"{123:064x}{456:064x}",
+            "blockNumber": block["number"],
+            "blockHash": block["hash"],
+            "transactionHash": tx_hash,
+            "transactionIndex": "0x0",
+            "logIndex": hex(index),
+            "removed": False,
+        }
+
+    v4_log = {
+        "address": POOL_MANAGER,
+        "topics": [
+            V4_MODIFY_LIQUIDITY_TOPIC,
+            transient_v4,
+            "0x" + f"{int('0x' + '45' * 20, 16):064x}",
+        ],
+        "data": "0x" + "".join(
+            f"{value & ((1 << 256) - 1):064x}"
+            for value in (-10, 10, 100, 7)
+        ),
+        "blockNumber": block["number"],
+        "blockHash": block["hash"],
+        "transactionHash": tx_hash,
+        "transactionIndex": "0x0",
+        "logIndex": "0x2",
+        "removed": False,
+    }
+
+    class MixedIdentityRpc(StaticRpc):
+        def __init__(self):
+            super().__init__(100)
+
+        def call(self, method, params):
+            if method == "eth_call":
+                request, tag = params
+                assert tag == hex(self.head)
+                target = request["to"].lower()
+                selector = request["data"][:10]
+                if target == V4_POSITION_MANAGER:
+                    return "0x" + "00" * 160
+                if target == invalid_pool:
+                    return address_word("0x" + "00" * 20)
+                if target == valid_pool:
+                    if selector in {FEE_SELECTOR, TICK_SPACING_SELECTOR}:
+                        raise RpcError("execution reverted", code=3)
+                    return {
+                        FACTORY_SELECTOR: address_word(factory),
+                        TOKEN0_SELECTOR: address_word(token0),
+                        TOKEN1_SELECTOR: address_word(token1),
+                    }[selector]
+                if target == factory and selector == GET_PAIR_SELECTOR:
+                    return address_word(valid_pool)
+                raise AssertionError((target, selector))
+            if method in {
+                "eth_getTransactionByHash", "eth_getTransactionReceipt",
+            }:
+                raise RpcError("transaction transport unavailable")
+            return super().call(method, params)
+
+    store = MarketStore(":memory:")
+    scanner = indexer(store, MixedIdentityRpc())
+    monkeypatch.setattr(scanner, "_seed_deferred_v4_pool_identities", lambda: 0)
+    logs = [sync_log(valid_pool, 0), sync_log(invalid_pool, 1), v4_log]
+    try:
+        store.ingest([block], [])
+        with store.transaction() as connection:
+            assert scanner._queue_deferred_pool_identities(
+                connection, logs, (),
+            ) == 1
+
+        assert scanner._resolve_deferred_pool_identities_once() is True
+
+        event = store.read().execute(
+            "SELECT pool_id,protocol FROM events WHERE tx_hash=?",
+            (tx_hash,),
+        ).fetchone()
+        assert tuple(event) == (valid_pool, "v2")
+        assert store.pool(valid_pool) is not None
+        assert store.pool(invalid_pool) is None
+        assert store.pool(transient_v4) is None
+        pending = store.read().execute(
+            "SELECT next_attempt,last_error FROM pending_enrichment "
+            "WHERE tx_hash=?",
+            (tx_hash,),
+        ).fetchone()
+        marker = scanner._pool_identity_marker(pending["last_error"])
+        assert marker["addresses"] == [transient_v4]
+        assert len(marker["logs"]) == 1
+        assert pending["next_attempt"] > time.time()
+    finally:
+        scanner.close()
+        store.close()
+
+
+def test_deferred_identity_batch_keeps_all_rows_when_anchor_changes(monkeypatch):
+    pools = ("0x" + "31" * 20, "0x" + "32" * 20)
+    tokens = {
+        pools[0]: ("0x" + "41" * 20, "0x" + "42" * 20),
+        pools[1]: ("0x" + "43" * 20, "0x" + "44" * 20),
+    }
+    factory = sorted(V2_FACTORIES)[0]
+    transactions = ("0x" + "51" * 32, "0x" + "52" * 32)
+    current_number = 100
+
+    def address_word(address):
+        return "0x" + address[2:].rjust(64, "0")
+
+    def sync_log(pool_id, tx_hash, number):
+        block = header(number)
+        return {
+            "address": pool_id,
+            "topics": [V2_SYNC_TOPIC],
+            "data": "0x" + f"{123:064x}{456:064x}",
+            "blockNumber": block["number"],
+            "blockHash": block["hash"],
+            "transactionHash": tx_hash,
+            "transactionIndex": "0x0",
+            "logIndex": "0x0",
+            "removed": False,
+        }
+
+    membership = {
+        GET_PAIR_SELECTOR
+        + token0[2:].rjust(64, "0")
+        + token1[2:].rjust(64, "0"): pool_id
+        for pool_id, (token0, token1) in tokens.items()
+    }
+
+    class ReorgingIdentityRpc(StaticRpc):
+        def __init__(self):
+            super().__init__(current_number)
+            self.current_reads = 0
+
+        def call(self, method, params):
+            if method == "eth_getBlockByNumber":
+                number = int(params[0], 16)
+                block = header(number)
+                if number == current_number:
+                    self.current_reads += 1
+                    if self.current_reads > 1:
+                        block["hash"] = "0x" + "aa" * 32
+                return block
+            if method == "eth_call":
+                request, tag = params
+                assert tag == hex(current_number)
+                target = request["to"].lower()
+                selector = request["data"][:10]
+                if target in tokens:
+                    if selector in {FEE_SELECTOR, TICK_SPACING_SELECTOR}:
+                        raise RpcError("execution reverted", code=3)
+                    token0, token1 = tokens[target]
+                    return {
+                        FACTORY_SELECTOR: address_word(factory),
+                        TOKEN0_SELECTOR: address_word(token0),
+                        TOKEN1_SELECTOR: address_word(token1),
+                    }[selector]
+                if target == factory:
+                    return address_word(membership[request["data"]])
+                raise AssertionError((target, selector))
+            return super().call(method, params)
+
+    store = MarketStore(":memory:")
+    scanner = indexer(store, ReorgingIdentityRpc())
+    monkeypatch.setattr(scanner, "_seed_deferred_v4_pool_identities", lambda: 0)
+    logs = [
+        sync_log(pool_id, tx_hash, number)
+        for pool_id, tx_hash, number in zip(pools, transactions, (9, 10))
+    ]
+    try:
+        store.ingest([header(9), header(10)], [])
+        with store.transaction() as connection:
+            assert scanner._queue_deferred_pool_identities(
+                connection, logs, (),
+            ) == 2
+
+        assert scanner._resolve_deferred_pool_identities_once() is True
+
+        assert store.read().execute(
+            "SELECT COUNT(*) FROM events WHERE tx_hash IN (?,?)",
+            transactions,
+        ).fetchone()[0] == 0
+        assert all(store.pool(pool_id) is None for pool_id in pools)
+        queued = store.read().execute(
+            "SELECT next_attempt,last_error FROM pending_enrichment "
+            "WHERE tx_hash IN (?,?) ORDER BY tx_hash",
+            transactions,
+        ).fetchall()
+        assert len(queued) == 2
+        assert all(row["next_attempt"] > time.time() for row in queued)
+        assert all(
+            scanner._pool_identity_marker(row["last_error"]) is not None
+            for row in queued
+        )
+    finally:
+        scanner.close()
+        store.close()
+
+
+def test_v4_identity_batch_replays_duplicates_and_yields_to_current_lane(
+    monkeypatch,
+):
+    from eth_utils import keccak
+
+    token0 = "0x" + "11" * 20
+    token1 = "0x" + "22" * 20
+    hook = "0x" + "33" * 20
+    current_token1 = "0x" + "44" * 20
+
+    def pool_key(second_token):
+        values = (token0, second_token, 3000, 8, hook)
+        raw = b"".join(
+            (value if isinstance(value, int) else int(value, 16)).to_bytes(
+                32, "big",
+            )
+            for value in values
+        )
+        return "0x" + keccak(raw).hex(), raw
+
+    duplicate_pool, duplicate_key = pool_key(token1)
+    current_pool, current_key = pool_key(current_token1)
+    invalid_pool = "0x" + "99" * 32
+    transactions = {
+        duplicate_pool: ("0x" + "61" * 32, "0x" + "62" * 32),
+        invalid_pool: ("0x" + "63" * 32,),
+        current_pool: ("0x" + "64" * 32,),
+    }
+
+    def v4_log(pool_id, tx_hash, number):
+        block = header(number)
+
+        def word(value):
+            return f"{value & ((1 << 256) - 1):064x}"
+
+        return {
+            "address": POOL_MANAGER,
+            "topics": [
+                V4_MODIFY_LIQUIDITY_TOPIC,
+                pool_id,
+                "0x" + word(int("0x" + "55" * 20, 16)),
+            ],
+            "data": "0x" + "".join(
+                word(value) for value in (-10, 10, 100, 7)
+            ),
+            "blockNumber": block["number"],
+            "blockHash": block["hash"],
+            "transactionHash": tx_hash,
+            "transactionIndex": "0x0",
+            "logIndex": "0x0",
+            "removed": False,
+        }
+
+    logs = [
+        v4_log(duplicate_pool, transactions[duplicate_pool][0], 9),
+        v4_log(duplicate_pool, transactions[duplicate_pool][1], 10),
+        v4_log(invalid_pool, transactions[invalid_pool][0], 11),
+        v4_log(current_pool, transactions[current_pool][0], 12),
+    ]
+    getter_results = {
+        V4_POOL_KEYS_SELECTOR + duplicate_pool[2:52] + "00" * 7:
+            duplicate_key,
+        V4_POOL_KEYS_SELECTOR + invalid_pool[2:52] + "00" * 7:
+            duplicate_key,
+        V4_POOL_KEYS_SELECTOR + current_pool[2:52] + "00" * 7:
+            current_key,
+    }
+    invalid_tx = {
+        "hash": transactions[invalid_pool][0],
+        "blockHash": header(11)["hash"],
+        "blockNumber": header(11)["number"],
+        "input": "0x",
+    }
+    invalid_receipt = {
+        "transactionHash": transactions[invalid_pool][0],
+        "blockHash": header(11)["hash"],
+        "logs": [logs[2]],
+    }
+
+    class V4IdentityRpc(StaticRpc):
+        def __init__(self):
+            super().__init__(100)
+
+        def call(self, method, params):
+            if method == "eth_call":
+                request, tag = params
+                assert tag == hex(self.head)
+                if request["to"].lower() != V4_POSITION_MANAGER:
+                    raise AssertionError(request["to"])
+                return "0x" + getter_results[request["data"]].hex()
+            if method == "eth_getTransactionByHash":
+                assert params == [transactions[invalid_pool][0]]
+                return invalid_tx
+            if method == "eth_getTransactionReceipt":
+                assert params == [transactions[invalid_pool][0]]
+                return invalid_receipt
+            return super().call(method, params)
+
+    store = MarketStore(":memory:")
+    scanner = indexer(store, V4IdentityRpc())
+    monkeypatch.setattr(scanner, "_seed_deferred_v4_pool_identities", lambda: 0)
+    try:
+        store.ingest([header(number) for number in range(9, 13)], [])
+        with store.transaction() as connection:
+            assert scanner._queue_deferred_pool_identities(
+                connection, logs, (),
+            ) == 4
+        with scanner._current_receipt_lock:
+            scanner._current_pool_pending.add(current_pool)
+
+        assert scanner._resolve_deferred_pool_identities_once() is True
+
+        replayed = store.read().execute(
+            "SELECT tx_hash,pool_id FROM events WHERE tx_hash IN (?,?,?,?) "
+            "ORDER BY tx_hash",
+            tuple(
+                tx_hash
+                for pool_transactions in transactions.values()
+                for tx_hash in pool_transactions
+            ),
+        ).fetchall()
+        assert [tuple(row) for row in replayed] == [
+            (transactions[duplicate_pool][0], duplicate_pool),
+            (transactions[duplicate_pool][1], duplicate_pool),
+            (transactions[invalid_pool][0], invalid_pool),
+        ]
+        assert store.pool(duplicate_pool)["source"] == "PositionManager.poolKeys"
+        assert store.pool(invalid_pool) is None
+        waiting = store.read().execute(
+            "SELECT tx_hash,last_error FROM pending_enrichment "
+            "WHERE last_error GLOB 'pool_identity_pending:*'"
+        ).fetchall()
+        assert [row["tx_hash"] for row in waiting] == [
+            transactions[current_pool][0]
+        ]
+        marker = scanner._pool_identity_marker(waiting[0]["last_error"])
+        assert marker["addresses"] == [current_pool]
+
+        with scanner._current_receipt_lock:
+            scanner._current_pool_pending.remove(current_pool)
+        assert scanner._resolve_deferred_pool_identities_once() is True
+        assert store.read().execute(
+            "SELECT pool_id FROM events WHERE tx_hash=?",
+            (transactions[current_pool][0],),
+        ).fetchone()["pool_id"] == current_pool
+        assert store.pool(current_pool)["source"] == "PositionManager.poolKeys"
+    finally:
+        scanner.close()
+        store.close()
+
 
 
 @pytest.mark.parametrize("lane", ["live", "history"])
@@ -915,6 +1571,14 @@ def test_scans_durably_replay_unregistered_v4_pool_keys(
         marker = scanner._pool_identity_marker(queued["last_error"])
         assert marker["addresses"] == [pool_id]
         assert store.pool(pool_id) is None
+        store.mark_enrichment_error(tx_hash, queued["last_error"], delay=60)
+        waiting = dict(store.read().execute(
+            "SELECT * FROM pending_enrichment WHERE tx_hash=?", (tx_hash,),
+        ).fetchone())
+        assert scanner._resolve_deferred_pool_identities_once() is False
+        assert dict(store.read().execute(
+            "SELECT * FROM pending_enrichment WHERE tx_hash=?", (tx_hash,),
+        ).fetchone()) == waiting
         # Simulate a database populated by an older indexer, before durable
         # V4 identity markers existed. Restart seeding must recover it too.
         with store.transaction() as connection:
@@ -924,6 +1588,11 @@ def test_scans_durably_replay_unregistered_v4_pool_keys(
             ).rowcount
             store._bump(connection, "pending_enrichment", -removed)
         assert scanner._pending_pool_identity_replays() == []
+        scanner.close()
+        scanner = MarketIndexer(
+            store, market, "http://unused.invalid", rpc=IdentityRpc(),
+            history_disk_reserve_bytes=0,
+        )
 
         assert scanner._resolve_deferred_pool_identities_once() is True
         pool = store.pool(pool_id)
@@ -974,7 +1643,7 @@ def test_interval_headers_and_logs_use_overlapping_bounded_lanes():
                 return hex(4663)
             raise AssertionError(method)
 
-        def batch(self, calls):
+        def batch(self, calls, *, allow_reverts=False):
             if self.lane == "live" and self.ordinal == 1:
                 header_started.set()
                 assert log_started.wait(1)
@@ -1010,7 +1679,7 @@ def test_interval_end_is_rechecked_after_logs_before_commit():
                 return block
             return super().call(method, params)
 
-        def batch(self, calls):
+        def batch(self, calls, *, allow_reverts=False):
             return [
                 header(int(params[0], 16))
                 if method == "eth_getBlockByNumber"
@@ -1096,6 +1765,417 @@ def test_metadata_and_balance_batches_isolate_invalid_tokens(tmp_path):
     finally:
         scanner.close()
         store.close()
+
+
+def test_balance_multicall_keeps_pins_failures_and_zero_distinct(tmp_path):
+    from eth_abi import decode as abi_decode, encode as abi_encode
+
+    token, quote, invalid = ("0x" + byte * 20 for byte in ("11", "22", "33"))
+    healthy_pool, reverting_pool = ("0x" + byte * 20 for byte in ("44", "55"))
+    blocks = {header(number)["hash"]: number for number in (9, 10)}
+
+    class SnapshotRpc(StaticRpc):
+        def batch(self, calls, *, allow_reverts=False):
+            return [self.call(method, params) for method, params in calls]
+
+        def call(self, method, params):
+            if method != "eth_call":
+                return super().call(method, params)
+            request, pin = params
+            assert pin["requireCanonical"] is True
+            number = blocks[pin["blockHash"]]
+            packed = abi_decode(
+                ["(address,bool,bytes)[]"], bytes.fromhex(request["data"][10:]),
+            )[0]
+            values = []
+            for target, _allow_failure, _data in packed:
+                if target == invalid and number == 9:
+                    values.append((False, b""))
+                else:
+                    value = 0 if number == 10 and target == token else number * 100
+                    values.append((True, value.to_bytes(32, "big")))
+            return "0x" + abi_encode(["(bool,bytes)[]"], [values]).hex()
+
+    store = MarketStore(tmp_path / "pinned-balances.sqlite")
+    scanner = indexer(store, SnapshotRpc(), v3_balances=True)
+    try:
+        store.upsert_pools([
+            {
+                "id": pool_id, "protocol": "v3", "address": pool_id,
+                "token0": asset, "token1": quote,
+            }
+            for pool_id, asset in (
+                (healthy_pool, token), (reverting_pool, invalid),
+            )
+        ])
+        store.ingest([header(9), header(10)], [])
+        for number in (9, 10):
+            store.queue_v3_balances(
+                [healthy_pool, reverting_pool], number, header(number)["hash"],
+            )
+        scanner._balances_once()
+        assert [
+            tuple(row) for row in store.read().execute(
+                "SELECT pool_id,block_number,balance0,balance1 FROM pool_balances "
+                "ORDER BY pool_id,block_number"
+            )
+        ] == [
+            (healthy_pool, 9, "900", "900"),
+            (healthy_pool, 10, "0", "1000"),
+            (reverting_pool, 10, "1000", "1000"),
+        ]
+        assert [
+            tuple(row) for row in store.read().execute(
+                "SELECT pool_id,block_number FROM pending_balances"
+            )
+        ] == [(reverting_pool, 9)]
+        metadata = json.loads(store.pool(healthy_pool)["metadata_json"])
+        assert (metadata["balance_block"], metadata["balance0"]) == (10, "0")
+    finally:
+        scanner.close()
+        store.close()
+
+def test_balance_lane_ignores_projection_checkpoint_and_isolates_reorg(
+    tmp_path, monkeypatch,
+):
+    token0, token1 = ("0x" + byte * 20 for byte in ("11", "22"))
+    healthy_pool, orphaned_pool = ("0x" + byte * 20 for byte in ("33", "44"))
+    checkpoint_started = threading.Event()
+    release_checkpoint = threading.Event()
+    balance_started = threading.Event()
+    release_balance = threading.Event()
+    created = {}
+
+    class LaneRpc:
+        def __init__(self, lane):
+            self.lane = lane
+
+        def call(self, method, params):
+            if method == "eth_chainId":
+                return hex(4663)
+            if method == "eth_call":
+                return hex(1_000_000)
+            raise AssertionError((self.lane, method))
+
+        def batch(self, calls, *, allow_reverts=False):
+            if self.lane == "balance":
+                balance_started.set()
+                assert release_balance.wait(2)
+            return [self.call(method, params) for method, params in calls]
+
+        def close(self):
+            pass
+
+    def factory(lane):
+        client = LaneRpc(lane)
+        created.setdefault(lane, []).append(client)
+        return client
+
+    def blocked_checkpoint():
+        checkpoint_started.set()
+        assert release_checkpoint.wait(2)
+
+    store = MarketStore(tmp_path / "balance-reorg.sqlite")
+    scanner = indexer(store, factory, v3_balances=True)
+    healthy_block = header(10)
+    orphaned_block = header(11, parent=healthy_block["hash"])
+    store.upsert_pools([
+        {
+            "id": pool_id, "protocol": "v3", "address": pool_id,
+            "token0": token0, "token1": token1,
+        }
+        for pool_id in (healthy_pool, orphaned_pool)
+    ])
+    store.ingest([healthy_block, orphaned_block], [])
+    store.queue_v3_balances([healthy_pool], 10, healthy_block["hash"])
+    store.queue_v3_balances([orphaned_pool], 11, orphaned_block["hash"])
+    monkeypatch.setattr(store, "checkpoint", blocked_checkpoint)
+    scanner._initialized.set()
+    workers = [
+        threading.Thread(target=scanner._projection_run),
+        threading.Thread(target=scanner._balance_run),
+    ]
+    scanner._threads.extend(workers)
+    for worker in workers:
+        worker.start()
+    try:
+        assert checkpoint_started.wait(1)
+        assert balance_started.wait(1), (
+            "balance RPC waited for the projection checkpoint"
+        )
+        store.rollback(10)
+        release_balance.set()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and store.status()["pending_balances"]:
+            time.sleep(0.01)
+        assert [
+            tuple(row) for row in store.read().execute(
+                "SELECT pool_id,block_number FROM pool_balances "
+                "ORDER BY pool_id,block_number"
+            )
+        ] == [(healthy_pool, 10)]
+        assert store.status()["pending_balances"] == 0
+    finally:
+        release_balance.set()
+        release_checkpoint.set()
+        scanner.close()
+        store.close()
+
+
+def test_v4_receipt_trace_and_pinned_state_produce_exact_financial_evidence():
+    from eth_abi import encode
+    from eth_utils import keccak
+    from rhpools.lp_market_protocols import (
+        MODIFY_LIQUIDITY_SELECTOR,
+        STATE_VIEW_LIQUIDITY_SELECTOR,
+        STATE_VIEW_POSITION_SELECTOR,
+        STATE_VIEW_SLOT0_SELECTOR,
+        V4_POSITION_MANAGER,
+    )
+
+    token0, token1 = ("0x" + byte * 20 for byte in ("11", "22"))
+    owner = "0x" + "33" * 20
+    hook = "0x" + "00" * 20
+    fee, spacing, token_id = 3_000, 8, 42
+    observed = header(10)
+    tx_hash = "0x" + "44" * 32
+    pool_id = "0x" + keccak(encode(
+        ["address", "address", "uint24", "int24", "address"],
+        [token0, token1, fee, spacing, hook],
+    )).hex()
+
+    def topic(value):
+        return "0x" + f"{value:064x}"
+
+    common = {
+        "blockNumber": observed["number"],
+        "blockHash": observed["hash"],
+        "transactionHash": tx_hash,
+        "transactionIndex": "0x0",
+    }
+    core = {
+        **common,
+        "address": POOL_MANAGER,
+        "logIndex": "0x0",
+        "topics": [
+            V4_MODIFY_LIQUIDITY_TOPIC,
+            pool_id,
+            topic(int(V4_POSITION_MANAGER, 16)),
+        ],
+        "data": "0x" + encode(
+            ["int24", "int24", "int256", "bytes32"],
+            [-60, 60, 100, token_id.to_bytes(32, "big")],
+        ).hex(),
+    }
+    transfer = {
+        **common,
+        "address": V4_POSITION_MANAGER,
+        "logIndex": "0x1",
+        "topics": [
+            TRANSFER_TOPIC,
+            topic(0),
+            topic(int(owner, 16)),
+            topic(token_id),
+        ],
+        "data": "0x",
+    }
+    calldata = MODIFY_LIQUIDITY_SELECTOR + encode(
+        [
+            "(address,address,uint24,int24,address)",
+            "(int24,int24,int256,bytes32)",
+            "bytes",
+        ],
+        [
+            (token0, token1, fee, spacing, hook),
+            (-60, 60, 100, token_id.to_bytes(32, "big")),
+            b"",
+        ],
+    ).hex()
+    mask = (1 << 128) - 1
+
+    def balance_delta(amount0, amount1):
+        return (
+            ((amount0 & mask) << 128) | (amount1 & mask)
+        ).to_bytes(32, "big").hex()
+
+    trace = {
+        "type": "CALL",
+        "from": V4_POSITION_MANAGER,
+        "to": POOL_MANAGER,
+        "input": calldata,
+        "output": "0x" + balance_delta(-1_000, -2_000) + balance_delta(3, 5),
+        "logs": [core],
+    }
+    receipt = {
+        "transactionHash": tx_hash,
+        "blockNumber": observed["number"],
+        "blockHash": observed["hash"],
+        "transactionIndex": "0x0",
+        "status": "0x1",
+        "from": owner,
+        "gasUsed": hex(21_000),
+        "effectiveGasPrice": hex(1_000_000_000),
+        "logs": [core, transfer],
+    }
+
+    class EnrichmentRpc(StaticRpc):
+        def call(self, method, params):
+            if method == "eth_getTransactionReceipt":
+                return receipt
+            if method == "eth_getTransactionByHash":
+                raise AssertionError("complete receipt must not fetch a body")
+            if method == "debug_traceTransaction":
+                return trace
+            if method == "eth_getBlockByNumber":
+                return observed
+            if method == "eth_call":
+                calldata_ = params[0]["data"]
+                if calldata_.startswith(STATE_VIEW_POSITION_SELECTOR):
+                    values = [100, 1, 2]
+                elif calldata_.startswith(STATE_VIEW_SLOT0_SELECTOR):
+                    values = [1 << 96, 0, 0, fee]
+                elif calldata_.startswith(STATE_VIEW_LIQUIDITY_SELECTOR):
+                    values = [1_000]
+                else:
+                    raise AssertionError(calldata_)
+                return "0x" + encode(
+                    ["uint256"] * len(values), values,
+                ).hex()
+            return super().call(method, params)
+
+    store = MarketStore(":memory:")
+    rpc = EnrichmentRpc()
+    scanner = indexer(store, rpc)
+    try:
+        store.upsert_pools([{
+            "id": pool_id,
+            "protocol": "v4",
+            "address": POOL_MANAGER,
+            "token0": token0,
+            "token1": token1,
+            "fee_ppm": fee,
+            "tick_spacing": spacing,
+            "hook": hook,
+            "factory": POOL_MANAGER,
+            "source": "test",
+        }])
+        pending = {
+            "tx_hash": tx_hash,
+            "block_number": 10,
+            "block_hash": observed["hash"],
+            "attempts": 0,
+            "generation": 0,
+        }
+        _row, events, gas, error = scanner._enrich_transactions([pending])[0]
+        assert error is None
+        action = next(row for row in events if row["protocol"] == "v4")
+        assert (
+            action["cashflow0"],
+            action["cashflow1"],
+            action["fee_amount0"],
+            action["fee_amount1"],
+        ) == ("-1000", "-2000", "3", "5")
+        assert action["data"]["trace_complete"] is True
+        assert action["data"]["position_before"]["absence_basis"] == (
+            "same_receipt_verified_v4_manager_mint"
+        )
+        assert action["data"]["position_after"]["liquidity"] == "100"
+        assert action["data"]["pool_state_before"]["liquidity"] == "1000"
+        assert gas["payer"] == owner
+        assert gas["gas_native"] == str(21_000 * 1_000_000_000)
+    finally:
+        scanner.close()
+        store.close()
+
+
+def test_v4_zero_state_requires_same_receipt_burn_proof():
+    from eth_abi import encode
+    from rhpools.lp_market_protocols import (
+        V4_POSITION_MANAGER,
+        decode_position_state_results,
+        nft_position_key,
+        position_state_requests,
+    )
+
+    owner = "0x" + "11" * 20
+    block_hash = "0x" + "22" * 32
+    tx_hash = "0x" + "33" * 32
+    pool_id = "0x" + "44" * 32
+    core_key = "0x" + "55" * 32
+    token_id = 42
+    position_key = nft_position_key(V4_POSITION_MANAGER, token_id)
+    common = {
+        "block_number": 10,
+        "block_hash": block_hash,
+        "tx_hash": tx_hash,
+        "tx_index": 0,
+        "timestamp": 1_000,
+        "pool_id": pool_id,
+        "owner": owner,
+        "custody": V4_POSITION_MANAGER,
+        "position_key": position_key,
+        "token_id": str(token_id),
+        "tick_lower": -60,
+        "tick_upper": 60,
+    }
+    action = {
+        **common,
+        "protocol": "v4",
+        "kind": "remove",
+        "log_index": 0,
+        "liquidity_delta": "-100",
+        "data": {"core_position_key": core_key},
+    }
+    burn = {
+        **common,
+        "protocol": "nft",
+        "kind": "transfer",
+        "log_index": 1,
+        "liquidity_delta": None,
+        "data": {
+            "manager_protocol": "v4",
+            "prior_owner": owner,
+            "new_owner": "0x" + "00" * 20,
+            "burn": True,
+            "core_position_key": core_key,
+        },
+    }
+    requests = [
+        request
+        for request in position_state_requests([action, burn])
+        if request["correlation"]["decoder"] == "v4_state_view_position"
+    ]
+    results = [
+        "0x" + encode(
+            ["uint128", "uint256", "uint256"],
+            [100, 1, 2]
+            if request["correlation"]["field"] == "position_before"
+            else [0, 0, 0],
+        ).hex()
+        for request in requests
+    ]
+    updates = decode_position_state_results(requests, results)
+    assert updates
+    for update in updates:
+        assert update["data"]["position_after"]["exists"] is None
+        assert update["data"]["position_after"]["nft_exists"] is False
+        assert update["data"]["position_after"]["nft_absence_basis"] == (
+            "same_receipt_verified_v4_manager_burn"
+        )
+
+    unproven_requests = [
+        request
+        for request in position_state_requests([action])
+        if request["correlation"]["decoder"] == "v4_state_view_position"
+    ]
+    unproven = decode_position_state_results(
+        unproven_requests,
+        ["0x" + encode(
+            ["uint128", "uint256", "uint256"], [0, 0, 0],
+        ).hex()] * len(unproven_requests),
+    )
+    assert unproven[0]["data"]["position_after"]["exists"] is None
+    assert "nft_exists" not in unproven[0]["data"]["position_after"]
 
 
 
