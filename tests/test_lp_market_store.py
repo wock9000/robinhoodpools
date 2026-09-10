@@ -792,7 +792,7 @@ def test_reopen_preserves_durable_counts_and_initializes_only_missing_counts(tmp
         store.close()
 
 
-def test_pending_append_proof_upgrade_preserves_existing_queue(tmp_path):
+def test_pending_work_mode_upgrade_preserves_existing_queue(tmp_path):
     path = tmp_path / "pending-append-upgrade.sqlite"
     connection = sqlite3.connect(path)
     connection.executescript("""
@@ -820,13 +820,13 @@ def test_pending_append_proof_upgrade_preserves_existing_queue(tmp_path):
     with MarketStore(path) as store:
         assert store.read().execute("PRAGMA user_version").fetchone()[0] == 11
         assert tuple(store.read().execute(
-            "SELECT id,position_key,generation,append_only,"
+            "SELECT id,position_key,generation,append_only,cost_only,"
             "requested_revision,requested_epoch,priority_block,"
             "priority_tx_index,priority_log_index,"
             "identities_ready,identity_cursor "
             "FROM lp_accounting_pending"
         ).fetchone()) == (
-            41, "existing-position", 7, 0, 19, 3, 10, 2, 5, 1, 123,
+            41, "existing-position", 7, 0, 0, 19, 3, 10, 2, 5, 1, 123,
         )
 
 

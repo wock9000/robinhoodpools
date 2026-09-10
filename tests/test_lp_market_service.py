@@ -871,6 +871,64 @@ def test_source_correction_removes_stale_episode_gas(tmp_path):
     finally:
         store.close()
 
+def test_episode_basis_correction_preserves_financial_history(tmp_path):
+    blocks = [header(100 + index, 1_000 + index) for index in range(2)]
+    opened, closed, transactions = traced_v4_episode(
+        blocks, key="basis-only-replay",
+    )
+    store, book = accounting_store(
+        tmp_path / "basis-only-replay.sqlite", deferred=True,
+    )
+    try:
+        inserted = store.ingest(
+            blocks, [opened, closed], transactions=transactions,
+        )
+        drain_accounting(book)
+        before = book.closed({"window": "all"})["rows"][0]
+        assert before["gas_usd"] == pytest.approx(0.02)
+
+        store.enrich([{
+            "id": int(inserted[1]["id"]),
+            "data": {"cashflow_basis": "corrected-source-basis"},
+        }])
+        drain_accounting(book)
+
+        after = book.closed({"window": "all"})["rows"][0]
+        assert after["id"] == before["id"]
+        assert after["accounting_basis"] == "corrected-source-basis"
+        for field in (
+            "deposit_usd", "withdrawal_usd", "fees_usd", "gross_pnl_usd",
+            "gas_usd", "net_pnl_usd",
+        ):
+            assert after[field] == pytest.approx(before[field])
+    finally:
+        store.close()
+
+
+def test_late_receipts_complete_deferred_gas_and_net_results(tmp_path):
+    blocks = [header(100 + index, 1_000 + index) for index in range(2)]
+    opened, closed, transactions = traced_v4_episode(
+        blocks, key="receipt-only",
+    )
+    store, book = accounting_store(
+        tmp_path / "receipt-only.sqlite", deferred=True,
+    )
+    try:
+        store.ingest(blocks, [opened, closed])
+        drain_accounting(book)
+        assert book.closed({"window": "all"})["rows"][0]["gas_usd"] is None
+
+        store.enrich([], transactions=transactions)
+
+        drain_accounting(book)
+        after = book.closed({"window": "all"})["rows"][0]
+        assert after["gas_usd"] == pytest.approx(0.02)
+        assert after["net_pnl_usd"] == pytest.approx(0.08)
+        assert store.status()["pending_accounting"] == 0
+    finally:
+        store.close()
+
+
 def test_visible_wallet_recovers_missed_receipt_cost_without_new_activity(tmp_path):
     blocks = [header(100 + index, 1_000 + index) for index in range(2)]
     opened, closed, transactions = traced_v4_episode(blocks, key="late-cost")

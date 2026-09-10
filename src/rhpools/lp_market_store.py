@@ -253,6 +253,11 @@ class MarketStore:
                 "ALTER TABLE lp_accounting_pending ADD COLUMN "
                 "append_only INTEGER NOT NULL DEFAULT 0"
             )
+        if "cost_only" not in pending_columns:
+            connection.execute(
+                "ALTER TABLE lp_accounting_pending ADD COLUMN "
+                "cost_only INTEGER NOT NULL DEFAULT 0"
+            )
         if "identities_ready" not in pending_columns:
             connection.execute(
                 "ALTER TABLE lp_accounting_pending ADD COLUMN "
@@ -2315,6 +2320,9 @@ class MarketStore:
                         current.get("data"), current.get("data"),
                     )
                     current["revision"] = revision
+                    # Projection callbacks can refresh transaction-dependent
+                    # state without replaying an otherwise unchanged event.
+                    current["_transaction_only"] = True
                     enriched.append(current)
                     represented_ids.add(int(current["id"]))
             enriched.sort(key=lambda event: (

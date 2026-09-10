@@ -295,6 +295,15 @@ Deferred rollback preserves opening identities separately from financial rows,
 including across a restart before replay.
 Replay compares source fields separately from derived valuation and costs,
 while receipt changes still refresh dependent gas and net P/L.
+Financial-only replay retains derived episode values until revaluation. Gas is
+refreshed when transaction-cost evidence or episode/transaction membership changes,
+not for every unrelated episode correction. Cost-incomplete episodes stop at the
+first missing or inexact transaction; complete episodes still count each transaction
+once.
+Receipt-only pending work can publish gas and net results without replaying event
+history when existing projected events are included solely because their transaction
+record changed. Explicit event corrections, remaps, mixed generations and uncertain
+work invalidate that proof and retain full replay.
 
 Core-position identities include protocol and pool. An EVM core hash alone is
 not globally unique: different pools can share owner, ticks, and salt. Bounded
