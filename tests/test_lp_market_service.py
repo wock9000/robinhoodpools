@@ -373,7 +373,10 @@ def test_protocol_input_signs_and_duplicate_delivery_survive_restart(tmp_path):
         events = [swap(blocks[0], V3, "v3"), swap(blocks[1], V4, "v4")]
         app.store.ingest(blocks, events)
         app.store.ingest(blocks, events)
-        app.store.save_v3_balance(V3, 99, blocks[0]["hash"], "100000000", "200000000")
+        app.store.queue_v3_balances([V3], 99, blocks[0]["hash"])
+        assert app.store.save_v3_balances([
+            (V3, 99, blocks[0]["hash"], "100000000", "200000000"),
+        ]) == [None]
         app.close()
         app = service(path)
         rows = {row["id"]: row for row in app.pools({"window": "1h"})["rows"]}
@@ -445,6 +448,41 @@ def test_backfill_insertion_order_does_not_reorder_live_tape(tmp_path):
     finally:
         app.close()
 
+def test_owner_tape_merges_owner_and_fallback_custody_in_canonical_order(
+        tmp_path):
+    app = service(tmp_path / "market.sqlite")
+    selected_owner = "0x" + "56" * 20
+    other_owner = "0x" + "78" * 20
+    try:
+        app.store.upsert_pools(pools())
+        now = int(time.time()) - 10
+        blocks = [header(100 + index, now + index) for index in range(3)]
+        custody = {
+            **swap(blocks[0], V3, "v3"), "kind": "add",
+            "custody": selected_owner,
+        }
+        shadowed_custody = {
+            **swap(blocks[1], V3, "v3"), "kind": "add",
+            "owner": other_owner, "custody": selected_owner,
+        }
+        owned = {
+            **swap(blocks[2], V3, "v3"), "kind": "add",
+            "owner": selected_owner,
+        }
+        app.store.ingest(blocks, [custody, shadowed_custody, owned])
+
+        rows = app.tape({
+            "window": "all", "owner": selected_owner,
+        })["rows"]
+
+        assert [row["block_number"] for row in rows] == [102, 100]
+        assert shadowed_custody["tx_hash"] not in {
+            row["tx_hash"] for row in rows
+        }
+    finally:
+        app.close()
+
+
 @pytest.mark.parametrize(
     ("recent_kind", "params", "expected_rows"),
     (
@@ -494,6 +532,42 @@ def test_underfilled_tape_stays_within_window(
     finally:
         connection.set_progress_handler(None, 0)
         app.close()
+
+def test_lp_tape_does_not_scan_dense_swap_history(tmp_path):
+    path = tmp_path / "market.sqlite"
+    seed = MarketStore(path)
+    now = int(time.time())
+    lp_block = header(100, now - 2)
+    swap_block = header(101, now - 1)
+    try:
+        seed.upsert_pools(pools())
+        lp_event = {
+            **swap(lp_block, V3, "v3"), "kind": "add",
+        }
+        seed.ingest(
+            [lp_block, swap_block],
+            [
+                lp_event,
+                *(swap(swap_block, V3, "v3", index=index)
+                  for index in range(4_000)),
+            ],
+        )
+    finally:
+        seed.close()
+
+    app = service(path)
+    status = app.status()
+    connection = app.store.read()
+    connection.set_progress_handler(lambda: 1, 2_000)
+    try:
+        result = app.tape({"window": "all", "limit": 1}, _status=status)
+        assert [row["tx_hash"] for row in result["rows"]] == [
+            lp_event["tx_hash"],
+        ]
+    finally:
+        connection.set_progress_handler(None, 0)
+        app.close()
+
 
 def test_backfilled_price_repairs_existing_flows_after_restart(tmp_path):
     path = tmp_path / "market.sqlite"
@@ -2417,6 +2491,46 @@ def test_pool_sort_keeps_unpriced_metrics_last_in_both_directions(tmp_path):
             ]
     finally:
         app.close()
+
+def test_shared_bucket_views_refresh_on_events_and_empty_window_advance(
+        tmp_path):
+    app = service(tmp_path / "market.sqlite")
+    try:
+        app.store.upsert_pools(pools())
+        first = header(100, 10_000)
+        app.store.ingest([first], [swap(first, V3, "v3")], cursor={
+            "from_block": 100, "to_block": 100, "block_number": 100,
+            "block_hash": first["hash"], "timestamp": 10_000,
+        })
+        assert app.overview({"window": "1h"})["swaps"] == 1
+        assert app.pools({
+            "window": "1h", "sort": "volume",
+        })["rows"][0]["id"] == V3
+
+        second = header(101, 10_001)
+        app.store.ingest([second], [swap(second, V4, "v4")], cursor={
+            "from_block": 101, "to_block": 101, "block_number": 101,
+            "block_hash": second["hash"], "timestamp": 10_001,
+        })
+        fee_rows = app.pools({"window": "1h", "sort": "fees"})["rows"]
+        assert [row["id"] for row in fee_rows] == [V4, V3]
+        assert app.overview({"window": "1h"})["swaps"] == 2
+
+        empty = header(102, 13_661)
+        before_empty = app.status()["events_revision"]
+        app.store.ingest([empty], [], cursor={
+            "from_block": 102, "to_block": 102, "block_number": 102,
+            "block_hash": empty["hash"], "timestamp": 13_661,
+        })
+        assert app.status()["events_revision"] == before_empty
+        assert app.overview({"window": "1h"})["swaps"] == 0
+        assert {
+            row["swaps"]
+            for row in app.pools({"window": "1h", "sort": "swaps"})["rows"]
+        } == {0}
+    finally:
+        app.close()
+
 
 
 def test_receipt_settlement_flows_are_not_v4_position_cashflows(tmp_path, monkeypatch):

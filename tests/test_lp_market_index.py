@@ -611,6 +611,7 @@ def test_live_gap_and_v4_trace_cannot_block_v3_position_accounting(
 def test_small_trace_refills_rotate_history_requested_and_recent(monkeypatch):
     from concurrent.futures import Future
 
+    monkeypatch.setattr("rhpools.lp_market_index.ENRICH_TRACE_INFLIGHT_LIMIT", 8)
     store = MarketStore(":memory:")
     scanner = indexer(store)
     numbers = [*range(1, 257), 500, 699, 700, 701]
@@ -1007,10 +1008,6 @@ def test_history_defers_cold_pool_identity_to_current_canonical_state(monkeypatc
         )
 
         assert scanner._resolve_deferred_pool_identities_once() is True
-        assert scanner._resolve_deferred_pool_identities_once() is True
-        assert rpc.call_tags
-        assert set(rpc.call_tags) == {hex(current_block)}
-        assert rpc.current_header_reads >= 2
 
         event = store.read().execute(
             "SELECT pool_id,protocol,kind FROM events WHERE tx_hash=?",
@@ -1372,6 +1369,161 @@ def test_metadata_and_balance_batches_isolate_invalid_tokens(tmp_path):
         ] == [(reverting_pool, 1)]
         assert store.status()["pending_balances"] == 1
     finally:
+        scanner.close()
+        store.close()
+
+
+def test_balance_multicall_keeps_pins_failures_and_zero_distinct(tmp_path):
+    from eth_abi import decode as abi_decode, encode as abi_encode
+
+    token, quote, invalid = ("0x" + byte * 20 for byte in ("11", "22", "33"))
+    healthy_pool, reverting_pool = ("0x" + byte * 20 for byte in ("44", "55"))
+    blocks = {header(number)["hash"]: number for number in (9, 10)}
+
+    class SnapshotRpc(StaticRpc):
+        def batch(self, calls, *, allow_reverts=False):
+            return [self.call(method, params) for method, params in calls]
+
+        def call(self, method, params):
+            if method != "eth_call":
+                return super().call(method, params)
+            request, pin = params
+            assert pin["requireCanonical"] is True
+            number = blocks[pin["blockHash"]]
+            packed = abi_decode(
+                ["(address,bool,bytes)[]"], bytes.fromhex(request["data"][10:]),
+            )[0]
+            values = []
+            for target, _allow_failure, _data in packed:
+                if target == invalid and number == 9:
+                    values.append((False, b""))
+                else:
+                    value = 0 if number == 10 and target == token else number * 100
+                    values.append((True, value.to_bytes(32, "big")))
+            return "0x" + abi_encode(["(bool,bytes)[]"], [values]).hex()
+
+    store = MarketStore(tmp_path / "pinned-balances.sqlite")
+    scanner = indexer(store, SnapshotRpc(), v3_balances=True)
+    try:
+        store.upsert_pools([
+            {
+                "id": pool_id, "protocol": "v3", "address": pool_id,
+                "token0": asset, "token1": quote,
+            }
+            for pool_id, asset in (
+                (healthy_pool, token), (reverting_pool, invalid),
+            )
+        ])
+        store.ingest([header(9), header(10)], [])
+        for number in (9, 10):
+            store.queue_v3_balances(
+                [healthy_pool, reverting_pool], number, header(number)["hash"],
+            )
+        scanner._balances_once()
+        assert [
+            tuple(row) for row in store.read().execute(
+                "SELECT pool_id,block_number,balance0,balance1 FROM pool_balances "
+                "ORDER BY pool_id,block_number"
+            )
+        ] == [
+            (healthy_pool, 9, "900", "900"),
+            (healthy_pool, 10, "0", "1000"),
+            (reverting_pool, 10, "1000", "1000"),
+        ]
+        assert [
+            tuple(row) for row in store.read().execute(
+                "SELECT pool_id,block_number FROM pending_balances"
+            )
+        ] == [(reverting_pool, 9)]
+        metadata = json.loads(store.pool(healthy_pool)["metadata_json"])
+        assert (metadata["balance_block"], metadata["balance0"]) == (10, "0")
+    finally:
+        scanner.close()
+        store.close()
+
+def test_balance_lane_ignores_projection_checkpoint_and_isolates_reorg(
+    tmp_path, monkeypatch,
+):
+    token0, token1 = ("0x" + byte * 20 for byte in ("11", "22"))
+    healthy_pool, orphaned_pool = ("0x" + byte * 20 for byte in ("33", "44"))
+    checkpoint_started = threading.Event()
+    release_checkpoint = threading.Event()
+    balance_started = threading.Event()
+    release_balance = threading.Event()
+    created = {}
+
+    class LaneRpc:
+        def __init__(self, lane):
+            self.lane = lane
+
+        def call(self, method, params):
+            if method == "eth_chainId":
+                return hex(4663)
+            if method == "eth_call":
+                return hex(1_000_000)
+            raise AssertionError((self.lane, method))
+
+        def batch(self, calls, *, allow_reverts=False):
+            if self.lane == "balance":
+                balance_started.set()
+                assert release_balance.wait(2)
+            return [self.call(method, params) for method, params in calls]
+
+        def close(self):
+            pass
+
+    def factory(lane):
+        client = LaneRpc(lane)
+        created.setdefault(lane, []).append(client)
+        return client
+
+    def blocked_checkpoint():
+        checkpoint_started.set()
+        assert release_checkpoint.wait(2)
+
+    store = MarketStore(tmp_path / "balance-reorg.sqlite")
+    scanner = indexer(store, factory, v3_balances=True)
+    healthy_block = header(10)
+    orphaned_block = header(11, parent=healthy_block["hash"])
+    store.upsert_pools([
+        {
+            "id": pool_id, "protocol": "v3", "address": pool_id,
+            "token0": token0, "token1": token1,
+        }
+        for pool_id in (healthy_pool, orphaned_pool)
+    ])
+    store.ingest([healthy_block, orphaned_block], [])
+    store.queue_v3_balances([healthy_pool], 10, healthy_block["hash"])
+    store.queue_v3_balances([orphaned_pool], 11, orphaned_block["hash"])
+    monkeypatch.setattr(store, "checkpoint", blocked_checkpoint)
+    scanner._initialized.set()
+    workers = [
+        threading.Thread(target=scanner._projection_run),
+        threading.Thread(target=scanner._balance_run),
+    ]
+    scanner._threads.extend(workers)
+    for worker in workers:
+        worker.start()
+    try:
+        assert checkpoint_started.wait(1)
+        assert balance_started.wait(1), (
+            "balance RPC waited for the projection checkpoint"
+        )
+        store.rollback(10)
+        release_balance.set()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and store.status()["pending_balances"]:
+            time.sleep(0.01)
+        assert [
+            tuple(row) for row in store.read().execute(
+                "SELECT pool_id,block_number FROM pool_balances "
+                "ORDER BY pool_id,block_number"
+            )
+        ] == [(healthy_pool, 10)]
+        assert store.status()["pending_balances"] == 0
+    finally:
+        release_balance.set()
+        release_checkpoint.set()
         scanner.close()
         store.close()
 

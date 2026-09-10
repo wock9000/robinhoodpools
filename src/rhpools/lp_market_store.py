@@ -324,8 +324,18 @@ class MarketStore:
             ON events(owner, timestamp DESC, id DESC) WHERE owner IS NOT NULL;
         CREATE INDEX IF NOT EXISTS events_custody_time_idx
             ON events(custody, timestamp DESC, id DESC) WHERE custody IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS events_owner_order_idx
+            ON events(owner,block_number DESC,tx_index DESC,log_index DESC)
+            WHERE owner IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS events_custody_order_idx
+            ON events(custody,block_number DESC,tx_index DESC,log_index DESC)
+            WHERE custody IS NOT NULL;
         CREATE INDEX IF NOT EXISTS events_block_idx
             ON events(block_number, tx_index, log_index);
+        CREATE INDEX IF NOT EXISTS events_lp_order_idx
+            ON events(block_number,tx_index,log_index)
+            WHERE kind IN ('add','remove','collect')
+            OR (kind='checkpoint' AND position_key IS NOT NULL);
         CREATE INDEX IF NOT EXISTS events_revision_id_idx ON events(revision, id);
         CREATE INDEX IF NOT EXISTS events_tx_log_idx ON events(tx_hash, log_index);
         CREATE TABLE IF NOT EXISTS transactions(
@@ -559,6 +569,8 @@ class MarketStore:
                 if accounting_pending_installed:
                     self._install_accounting_pending_identities(self.connection)
                 self.connection.execute("PRAGMA user_version=9")
+            if int(self.connection.execute("PRAGMA user_version").fetchone()[0]) < 10:
+                self.connection.execute("PRAGMA user_version=10")
             self.connection.execute(
                 "CREATE INDEX IF NOT EXISTS pending_reprojection_order_idx "
                 "ON pending_reprojection(block_number,tx_index,log_index,event_id)"
@@ -2928,64 +2940,178 @@ class MarketStore:
         ).fetchall()
         return [dict(row) for row in rows]
 
-    def save_v3_balance(
-        self, pool_id: str, block_number: int, block_hash: str, balance0: Any, balance1: Any,
-    ) -> None:
-        pool_id = pool_id.lower()
+    def save_v3_balances(
+        self, balances: Sequence[tuple[str, int, str, Any, Any]],
+    ) -> list[Exception | None]:
+        """Publish one fetched batch and return an outcome aligned to each input."""
+        outcomes: list[Exception | None] = [None] * len(balances)
+        normalized: list[tuple[int, str, int, str, str, str]] = []
+        identities: set[tuple[str, int]] = set()
+        for index, item in enumerate(balances):
+            try:
+                pool_value, number_value, hash_value, balance0_value, balance1_value = item
+                pool_id = str(pool_value).lower()
+                block_number = _integer(number_value, "block_number")
+                block_hash = str(hash_value).lower()
+                balance0 = _decimal_text(balance0_value, "balance0")
+                balance1 = _decimal_text(balance1_value, "balance1")
+                if len(pool_id) != 42:
+                    raise ValueError("pool_id must be a 20-byte address")
+                if len(block_hash) != 66:
+                    raise ValueError("block_hash must be a 32-byte hash")
+                if block_number is None or balance0 is None or balance1 is None:
+                    raise ValueError("balance snapshot fields must not be null")
+                identity = (pool_id, block_number)
+                if identity in identities:
+                    raise ValueError("balance batch contains a duplicate pool and block")
+                identities.add(identity)
+            except (TypeError, ValueError) as exc:
+                outcomes[index] = exc
+            else:
+                normalized.append((
+                    index, pool_id, block_number, block_hash, balance0, balance1,
+                ))
+        if not normalized:
+            return outcomes
+
         with self.transaction() as connection:
-            pool = connection.execute(
-                "SELECT protocol,metadata_json FROM pools WHERE id=?", (pool_id,),
-            ).fetchone()
-            block = connection.execute(
-                "SELECT hash,timestamp FROM blocks WHERE number=?", (int(block_number),),
-            ).fetchone()
-            if pool is None or pool["protocol"] != "v3":
-                raise ValueError("per-pool balance snapshots are only valid for V3 pools")
-            if block is None or block["hash"] != block_hash.lower():
-                raise CanonicalConflict("balance snapshot belongs to an orphaned block")
-            connection.execute(
-                "INSERT INTO pool_balances(pool_id,block_number,block_hash,balance0,balance1) "
-                "VALUES(?,?,?,?,?) ON CONFLICT(pool_id,block_number) DO UPDATE SET "
-                "block_hash=excluded.block_hash,balance0=excluded.balance0,balance1=excluded.balance1",
-                (
-                    pool_id, int(block_number), block_hash.lower(),
-                    _decimal_text(balance0, "balance0"), _decimal_text(balance1, "balance1"),
-                ),
-            )
-            metadata = _decode_json(pool["metadata_json"], {})
-            if not isinstance(metadata, dict):
-                metadata = {}
-            prior_block = metadata.get("balance_block")
-            if prior_block is None or int(prior_block) <= int(block_number):
-                metadata.update({
-                    "balance0": _decimal_text(balance0, "balance0"),
-                    "balance1": _decimal_text(balance1, "balance1"),
-                    "balance_block": int(block_number),
-                    "balance_timestamp": int(block["timestamp"]),
-                })
-                serialized = _json(metadata)
-                if serialized != pool["metadata_json"]:
-                    connection.execute(
+            pool_ids = tuple(dict.fromkeys(item[1] for item in normalized))
+            block_numbers = tuple(dict.fromkeys(item[2] for item in normalized))
+            pool_marks = ",".join("?" for _ in pool_ids)
+            block_marks = ",".join("?" for _ in block_numbers)
+            pools = {
+                str(row["id"]): row
+                for row in connection.execute(
+                    f"SELECT id,protocol,metadata_json FROM pools WHERE id IN ({pool_marks})",
+                    pool_ids,
+                )
+            }
+            blocks = {
+                int(row["number"]): row
+                for row in connection.execute(
+                    f"SELECT number,hash,timestamp FROM blocks WHERE number IN ({block_marks})",
+                    block_numbers,
+                )
+            }
+            pending = {
+                (str(row["pool_id"]), int(row["block_number"])): str(row["block_hash"])
+                for row in connection.execute(
+                    "SELECT pool_id,block_number,block_hash FROM pending_balances "
+                    f"WHERE pool_id IN ({pool_marks}) AND block_number IN ({block_marks})",
+                    (*pool_ids, *block_numbers),
+                )
+            }
+            publishable: list[tuple[int, str, int, str, str, str]] = []
+            for item in normalized:
+                index, pool_id, block_number, block_hash, _balance0, _balance1 = item
+                pool = pools.get(pool_id)
+                block = blocks.get(block_number)
+                if pool is None or pool["protocol"] != "v3":
+                    outcomes[index] = ValueError(
+                        "per-pool balance snapshots are only valid for V3 pools"
+                    )
+                elif block is None or str(block["hash"]) != block_hash:
+                    outcomes[index] = CanonicalConflict(
+                        "balance snapshot belongs to an orphaned block"
+                    )
+                elif pending.get((pool_id, block_number)) != block_hash:
+                    outcomes[index] = CanonicalConflict(
+                        "balance snapshot work is stale"
+                    )
+                else:
+                    publishable.append(item)
+
+            if publishable:
+                _insert_rows(
+                    connection,
+                    "INSERT INTO pool_balances"
+                    "(pool_id,block_number,block_hash,balance0,balance1)",
+                    (
+                        (pool_id, block_number, block_hash, balance0, balance1)
+                        for (
+                            _index, pool_id, block_number, block_hash,
+                            balance0, balance1,
+                        ) in publishable
+                    ),
+                    columns=5,
+                    suffix=(
+                        " ON CONFLICT(pool_id,block_number) DO UPDATE SET "
+                        "block_hash=excluded.block_hash,balance0=excluded.balance0,"
+                        "balance1=excluded.balance1"
+                    ),
+                )
+                latest: dict[str, tuple[int, str, str]] = {}
+                for (
+                    _index, pool_id, block_number, _block_hash, balance0, balance1,
+                ) in publishable:
+                    prior = latest.get(pool_id)
+                    if prior is None or prior[0] <= block_number:
+                        latest[pool_id] = (block_number, balance0, balance1)
+                metadata_updates: list[tuple[str, str]] = []
+                for pool_id, (block_number, balance0, balance1) in latest.items():
+                    pool = pools[pool_id]
+                    metadata = _decode_json(pool["metadata_json"], {})
+                    if not isinstance(metadata, dict):
+                        metadata = {}
+                    try:
+                        prior_block = int(metadata["balance_block"])
+                    except (KeyError, TypeError, ValueError):
+                        prior_block = None
+                    if prior_block is None or prior_block <= block_number:
+                        metadata.update({
+                            "balance0": balance0,
+                            "balance1": balance1,
+                            "balance_block": block_number,
+                            "balance_timestamp": int(blocks[block_number]["timestamp"]),
+                        })
+                        serialized = _json(metadata)
+                        if serialized != pool["metadata_json"]:
+                            metadata_updates.append((serialized, pool_id))
+                if metadata_updates:
+                    connection.executemany(
                         "UPDATE pools SET metadata_json=? WHERE id=?",
-                        (serialized, pool_id),
+                        metadata_updates,
                     )
                     self._mark_pool_metadata_changed()
-            removed = connection.execute(
-                "DELETE FROM pending_balances WHERE pool_id=? AND block_number=?",
-                (pool_id, int(block_number)),
-            ).rowcount
-            if removed:
+                before = connection.total_changes
+                connection.executemany(
+                    "DELETE FROM pending_balances "
+                    "WHERE pool_id=? AND block_number=? AND block_hash=?",
+                    (
+                        (pool_id, block_number, block_hash)
+                        for (
+                            _index, pool_id, block_number, block_hash,
+                            _balance0, _balance1,
+                        ) in publishable
+                    ),
+                )
+                removed = connection.total_changes - before
+                if removed != len(publishable):
+                    raise MarketStoreError(
+                        "pending balance set changed during atomic publication"
+                    )
                 self._bump(connection, "pending_balances", -removed)
-            self._next_revision(connection)
+                self._next_revision(connection)
+        return outcomes
 
-    def mark_v3_balance_error(
-        self, pool_id: str, block_number: int, error: str, *, delay: float,
+    def mark_v3_balance_errors(
+        self, errors: Sequence[tuple[str, int, str, str, float]],
     ) -> None:
+        if not errors:
+            return
+        now = time.time()
         with self.transaction() as connection:
-            connection.execute(
-                "UPDATE pending_balances SET attempts=attempts+1,next_attempt=?,last_error=? "
-                "WHERE pool_id=? AND block_number=?",
-                (time.time() + max(0.0, delay), str(error)[:1000], pool_id.lower(), int(block_number)),
+            connection.executemany(
+                "UPDATE pending_balances SET attempts=attempts+1,"
+                "next_attempt=?,last_error=? "
+                "WHERE pool_id=? AND block_number=? AND block_hash=?",
+                (
+                    (
+                        now + max(0.0, delay), str(error)[:1000],
+                        pool_id.lower(), int(block_number), block_hash.lower(),
+                    )
+                    for pool_id, block_number, block_hash, error, delay in errors
+                ),
             )
 
     def _rollback_search_index(

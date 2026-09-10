@@ -63,6 +63,19 @@ class _SourceGate:
     seconds: list[int] = field(default_factory=lambda: [-1] * 60)
     http_window: list[int] = field(default_factory=lambda: [0] * 60)
     calls_window: list[int] = field(default_factory=lambda: [0] * 60)
+    def acquire(self, interval: float, cost: int) -> None:
+        """Acquire response capacity only when this request may start."""
+        while True:
+            self.slots.acquire()
+            with self.lock:
+                now = time.monotonic()
+                delay = self.next_at - now
+                if delay <= 0:
+                    self.next_at = now + interval * cost
+                    return
+            self.slots.release()
+            time.sleep(delay)
+
 
     def record(self, calls: int) -> None:
         """Count attempted HTTP requests and batch items, including failures."""
@@ -280,7 +293,7 @@ def _capability(method: str, params: Sequence[Any], lane: str) -> str:
     if (
         state_method
         and tag not in (None, "latest", "pending", "safe", "finalized")
-        and lane in {"history", "backfill", "maintenance", "enrichment"}
+        and lane in {"history", "backfill", "maintenance", "enrichment", "balance"}
     ):
         return "history_state"
     if state_method:
@@ -301,16 +314,22 @@ class _Registry:
         }
         self._states[("logs", _EXPLORER_SOURCE.name)] = _SourceState()
         self._verified_sources: set[str] = set()
-        self._clients: dict[str, requests.Session] = {}
+        self._verification_locks: dict[str, threading.Lock] = {}
+        self._clients: dict[
+            tuple[str, tuple[tuple[str, str], ...]], requests.Session
+        ] = {}
         self._active: dict[str, str] = {}
         self._lock = threading.RLock()
+        self._requests_drained = threading.Condition(self._lock)
+        self._active_requests = 0
         self._closed = False
 
     def _session(self, source: _Source) -> requests.Session:
         with self._lock:
             if self._closed:
                 raise self.error_type("RPC provider registry is closed")
-            session = self._clients.get(source.name)
+            key = (source.url, source.headers)
+            session = self._clients.get(key)
             if session is None:
                 session = requests.Session()
                 session.headers.update({
@@ -319,12 +338,33 @@ class _Registry:
                     **dict(source.headers),
                 })
                 adapter = HTTPAdapter(
-                    pool_connections=2, pool_maxsize=MAX_SOURCE_CONCURRENCY, max_retries=0, pool_block=True,
+                    pool_connections=2, pool_maxsize=MAX_SOURCE_CONCURRENCY,
+                    max_retries=0, pool_block=True,
                 )
                 session.mount("http://", adapter)
                 session.mount("https://", adapter)
-                self._clients[source.name] = session
+                self._clients[key] = session
             return session
+
+    def _acquire_session(self, source: _Source) -> requests.Session:
+        with self._lock:
+            session = self._session(source)
+            self._active_requests += 1
+            return session
+
+    def _release_session(self) -> None:
+        with self._requests_drained:
+            self._active_requests -= 1
+            if self._active_requests == 0:
+                self._requests_drained.notify_all()
+
+    def _verification_lock(self, source: _Source) -> threading.Lock:
+        with self._lock:
+            lock = self._verification_locks.get(source.url)
+            if lock is None:
+                lock = threading.Lock()
+                self._verification_locks[source.url] = lock
+            return lock
 
     def candidates(self, capability: str) -> tuple[_Source, ...]:
         sources = self.sources[capability]
@@ -452,10 +492,12 @@ class _Registry:
         return result
 
     def close(self) -> None:
-        with self._lock:
+        with self._requests_drained:
             if self._closed:
                 return
             self._closed = True
+            while self._active_requests:
+                self._requests_drained.wait()
             sessions = list(self._clients.values())
             self._clients.clear()
         for session in sessions:
@@ -608,6 +650,11 @@ class _WssPreferredRpc:
         # socket that is optimized for individual latency-sensitive calls.
         return self._fallback.batch(calls, allow_reverts=allow_reverts)
 
+    def batch_results(
+        self, calls: Iterable[tuple[str, Sequence[Any]]],
+    ) -> list[Any | Exception]:
+        return self._fallback.batch_results(calls)
+
     def status(self) -> dict[str, Any]:
         return self._fallback.status()
 
@@ -642,6 +689,20 @@ class RoutedRpc:
         except TypeError:
             return self._registry.error_type(message)
 
+    def _check_open(self) -> None:
+        with self._lock:
+            if self._closed:
+                raise self._error("RPC lane is closed")
+
+    def _reserve_ids(self, count: int) -> range:
+        with self._lock:
+            if self._closed:
+                raise self._error("RPC lane is closed")
+            first = self._request_id + 1
+            self._request_id += count
+            return range(first, first + count)
+
+
     @staticmethod
     def _is_execution_revert(method: str, error: Any) -> bool:
         if method not in {"eth_call", "eth_estimateGas"} or not isinstance(error, Mapping):
@@ -658,24 +719,26 @@ class RoutedRpc:
 
 
     def _post(self, source: _Source, payload: Any) -> Any:
-        response: requests.Response | None = None
+        body = json.dumps(payload, separators=(",", ":"))
+        calls = len(payload) if isinstance(payload, list) else 1
+        hostname = (urlsplit(source.url).hostname or "").lower()
+        cost = calls if hostname == "edge.goldsky.com" else 1
         gate = _gate(source.url)
-        with gate.slots:
-            with gate.lock:
-                delay = gate.next_at - time.monotonic()
-                if delay > 0:
-                    time.sleep(delay)
-                calls = len(payload) if isinstance(payload, list) else 1
-                cost = calls if (urlsplit(source.url).hostname or "").lower() == "edge.goldsky.com" else 1
-                gate.next_at = time.monotonic() + _minimum_interval(source.url) * cost
-                gate.record(calls)
+        gate.acquire(_minimum_interval(source.url), cost)
+        response: requests.Response | None = None
+        session: requests.Session | None = None
+        try:
+            session = self._registry._acquire_session(source)
+            gate.record(calls)
             try:
-                response = self._registry._session(source).post(
-                    source.url, data=json.dumps(payload, separators=(",", ":")),
-                    timeout=(2.0, self._timeout), stream=True,
+                response = session.post(
+                    source.url, data=body, timeout=(2.0, self._timeout),
+                    stream=True,
                 )
                 response.raise_for_status()
-                raw = response.raw.read(MAX_RPC_RESPONSE_BYTES + 1, decode_content=True)
+                raw = response.raw.read(
+                    MAX_RPC_RESPONSE_BYTES + 1, decode_content=True,
+                )
             except requests.RequestException as exc:
                 raise self._error(
                     f"{source.name} transport: {type(exc).__name__}"
@@ -683,11 +746,17 @@ class RoutedRpc:
             finally:
                 if response is not None:
                     response.close()
+        finally:
+            if session is not None:
+                self._registry._release_session()
+            gate.slots.release()
         if len(raw) > MAX_RPC_RESPONSE_BYTES:
-            raise self._error(f"{source.name} response exceeds {MAX_RPC_RESPONSE_BYTES} bytes")
+            raise self._error(
+                f"{source.name} response exceeds {MAX_RPC_RESPONSE_BYTES} bytes"
+            )
         try:
             return json.loads(raw)
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        except (UnicodeDecodeError, json.JSONDecodeError):
             raise self._error(f"{source.name} returned invalid JSON") from None
 
     def _validate_item(
@@ -717,19 +786,28 @@ class RoutedRpc:
     def _ensure_chain(self, source: _Source) -> None:
         if self._registry.verified(source):
             return
-        self._request_id += 1
-        request_id = self._request_id
-        raw = self._post(source, {
-            "jsonrpc": "2.0", "id": request_id, "method": "eth_chainId", "params": [],
-        })
-        result = self._validate_item(source, raw, request_id, "eth_chainId")
-        try:
-            chain_id = int(str(result), 16)
-        except (TypeError, ValueError) as exc:
-            raise self._error(f"{source.name} returned malformed chain id") from None
-        if chain_id != CHAIN_ID:
-            raise self._error(f"{source.name} is chain {chain_id}, expected {CHAIN_ID}")
-        self._registry.mark_verified(source)
+        with self._registry._verification_lock(source):
+            if self._registry.verified(source):
+                return
+            request_id = self._reserve_ids(1).start
+            raw = self._post(source, {
+                "jsonrpc": "2.0", "id": request_id,
+                "method": "eth_chainId", "params": [],
+            })
+            result = self._validate_item(
+                source, raw, request_id, "eth_chainId",
+            )
+            try:
+                chain_id = int(str(result), 16)
+            except (TypeError, ValueError):
+                raise self._error(
+                    f"{source.name} returned malformed chain id"
+                ) from None
+            if chain_id != CHAIN_ID:
+                raise self._error(
+                    f"{source.name} is chain {chain_id}, expected {CHAIN_ID}"
+                )
+            self._registry.mark_verified(source)
 
     @staticmethod
     def _log_matches(query: Mapping[str, Any], row: Mapping[str, Any]) -> bool:
@@ -778,7 +856,6 @@ class RoutedRpc:
         if len(addresses) * len(topics) > 16:
             raise self._error("blockscout explorer log filter exceeds 16 bounded queries")
         result: dict[tuple[str, str, str], dict[str, Any]] = {}
-        session = self._registry._session(_EXPLORER_SOURCE)
         gate = _gate(_EXPLORER)
         for address in addresses:
             for topic in topics:
@@ -793,24 +870,28 @@ class RoutedRpc:
                 for index, expected in enumerate((query.get("topics") or ())[1:], 1):
                     if isinstance(expected, str):
                         params[f"topic{index}"] = expected
+                gate.acquire(0.20, 1)
                 response: requests.Response | None = None
-                with gate.lock:
-                    delay = gate.next_at - time.monotonic()
-                    if delay > 0:
-                        time.sleep(delay)
-                    try:
-                        response = session.get(
-                            _EXPLORER, params=params,
-                            timeout=(2.0, self._timeout), stream=True,
-                        )
-                        response.raise_for_status()
-                        raw = response.raw.read(
-                            MAX_RPC_RESPONSE_BYTES + 1, decode_content=True,
-                        )
-                    finally:
-                        gate.next_at = time.monotonic() + 0.20
-                        if response is not None:
-                            response.close()
+                session: requests.Session | None = None
+                try:
+                    session = self._registry._acquire_session(
+                        _EXPLORER_SOURCE
+                    )
+                    gate.record(0)
+                    response = session.get(
+                        _EXPLORER, params=params,
+                        timeout=(2.0, self._timeout), stream=True,
+                    )
+                    response.raise_for_status()
+                    raw = response.raw.read(
+                        MAX_RPC_RESPONSE_BYTES + 1, decode_content=True,
+                    )
+                finally:
+                    if response is not None:
+                        response.close()
+                    if session is not None:
+                        self._registry._release_session()
+                    gate.slots.release()
                 if len(raw) > MAX_RPC_RESPONSE_BYTES:
                     raise self._error("blockscout explorer response is oversized")
                 payload = json.loads(raw)
@@ -868,8 +949,7 @@ class RoutedRpc:
             targets.append(number)
         if not targets:
             return False
-        self._request_id += 1
-        request_id = self._request_id
+        request_id = self._reserve_ids(1).start
         raw = self._post(source, {
             "jsonrpc": "2.0", "id": request_id,
             "method": "eth_blockNumber", "params": [],
@@ -884,67 +964,85 @@ class RoutedRpc:
         return max(targets) <= head_number
 
     def call(self, method: str, params: Sequence[Any] | None = None) -> Any:
+        self._check_open()
         values = list(params or ())
         capability = _capability(method, values, self._lane)
         sources = self._registry.candidates(capability)
         if not sources and not self._registry.sources[capability]:
             raise self._error(
-                f"{capability} RPC unavailable; configure LP_RPC_{capability.upper()}_URLS"
+                f"{capability} RPC unavailable; "
+                f"configure LP_RPC_{capability.upper()}_URLS"
             )
         failures: list[str] = []
-        with self._lock:
-            if self._closed:
-                raise self._error("RPC lane is closed")
-            for source in sources:
-                if not self._registry.can_try(source, capability):
-                    continue
-                started = time.monotonic()
-                try:
-                    self._ensure_chain(source)
-                    if capability == "logs" and not self._local_log_range_eligible(
+        for source in sources:
+            if not self._registry.can_try(source, capability):
+                continue
+            started = time.monotonic()
+            try:
+                self._ensure_chain(source)
+                if (
+                    capability == "logs"
+                    and not self._local_log_range_eligible(
                         source, [(method, values)],
-                    ):
-                        continue
-                    self._request_id += 1
-                    request_id = self._request_id
-                    raw = self._post(source, {
-                        "jsonrpc": "2.0", "id": request_id,
-                        "method": method, "params": values,
-                    })
-                    result = self._validate_item(source, raw, request_id, method)
-                    if method == "eth_chainId" and int(str(result), 16) != CHAIN_ID:
-                        raise self._error(f"{source.name} changed chain identity")
-                except _ExecutionReverted as exc:
-                    self._registry.success(
-                        source, capability, exc.method, time.monotonic() - started,
                     )
-                    raise exc.error from None
-                except Exception as exc:
-                    self._registry.failure(source, capability, exc)
-                    failures.append(self._registry._safe_error(source, exc))
+                ):
                     continue
+                request_id = self._reserve_ids(1).start
+                raw = self._post(source, {
+                    "jsonrpc": "2.0", "id": request_id,
+                    "method": method, "params": values,
+                })
+                result = self._validate_item(
+                    source, raw, request_id, method,
+                )
+                if (
+                    method == "eth_chainId"
+                    and int(str(result), 16) != CHAIN_ID
+                ):
+                    raise self._error(
+                        f"{source.name} changed chain identity"
+                    )
+            except _ExecutionReverted as exc:
                 self._registry.success(
-                    source, capability, method, time.monotonic() - started,
+                    source, capability, exc.method,
+                    time.monotonic() - started,
+                )
+                raise exc.error from None
+            except Exception as exc:
+                self._registry.failure(source, capability, exc)
+                failures.append(self._registry._safe_error(source, exc))
+                continue
+            self._registry.success(
+                source, capability, method, time.monotonic() - started,
+            )
+            return result
+        if (
+            capability == "logs"
+            and self._registry.can_try(_EXPLORER_SOURCE, capability)
+        ):
+            started = time.monotonic()
+            try:
+                result = self._explorer_logs(values)
+            except Exception as exc:
+                self._registry.failure(
+                    _EXPLORER_SOURCE, capability, exc,
+                )
+                failures.append(
+                    self._registry._safe_error(_EXPLORER_SOURCE, exc)
+                )
+            else:
+                self._registry.success(
+                    _EXPLORER_SOURCE, capability, method,
+                    time.monotonic() - started,
                 )
                 return result
-            if capability == "logs" and self._registry.can_try(_EXPLORER_SOURCE, capability):
-                started = time.monotonic()
-                try:
-                    result = self._explorer_logs(values)
-                except Exception as exc:
-                    self._registry.failure(_EXPLORER_SOURCE, capability, exc)
-                    failures.append(
-                        self._registry._safe_error(_EXPLORER_SOURCE, exc)
-                    )
-                else:
-                    self._registry.success(
-                        _EXPLORER_SOURCE, capability, method,
-                        time.monotonic() - started,
-                    )
-                    return result
         if not failures:
-            raise self._error(f"{capability} RPC deferred during provider cooldown")
-        raise self._error(f"{capability} RPC exhausted: " + "; ".join(failures))
+            raise self._error(
+                f"{capability} RPC deferred during provider cooldown"
+            )
+        raise self._error(
+            f"{capability} RPC exhausted: " + "; ".join(failures)
+        )
 
     def batch(
         self, calls: Iterable[tuple[str, Sequence[Any]]], *,
@@ -955,83 +1053,182 @@ class RoutedRpc:
             return []
         if len(specifications) > MAX_BATCH_CALLS:
             raise ValueError(f"RPC batch exceeds {MAX_BATCH_CALLS} calls")
+        results = self._run_batch(
+            specifications, allow_reverts=allow_reverts,
+            stop_on_error=True,
+        )
+        for result in results:
+            if isinstance(result, Exception):
+                raise result
+        return results
+
+    def batch_results(
+        self, calls: Iterable[tuple[str, Sequence[Any]]],
+    ) -> list[Any | Exception]:
+        specifications = [(method, list(params)) for method, params in calls]
+        if not specifications:
+            return []
+        if len(specifications) > MAX_BATCH_CALLS:
+            raise ValueError(f"RPC batch exceeds {MAX_BATCH_CALLS} calls")
+        return self._run_batch(
+            specifications, allow_reverts=False, stop_on_error=False,
+        )
+
+    def _run_batch(
+        self, specifications: list[tuple[str, list[Any]]], *,
+        allow_reverts: bool,
+        stop_on_error: bool,
+    ) -> list[Any | Exception]:
+        self._check_open()
         capabilities = {
             _capability(method, params, self._lane)
             for method, params in specifications
         }
         if len(capabilities) != 1:
-            grouped: dict[str, list[tuple[int, tuple[str, list[Any]]]]] = {}
+            grouped: dict[
+                str, list[tuple[int, tuple[str, list[Any]]]]
+            ] = {}
             for index, specification in enumerate(specifications):
                 capability = _capability(
                     specification[0], specification[1], self._lane,
                 )
-                grouped.setdefault(capability, []).append((index, specification))
-            output: list[Any] = [None] * len(specifications)
-            for group in grouped.values():
-                results = self.batch(
-                    (specification for _index, specification in group),
-                    allow_reverts=allow_reverts,
+                grouped.setdefault(capability, []).append(
+                    (index, specification)
                 )
+            output: list[Any | Exception] = [None] * len(specifications)
+            for group in grouped.values():
+                results = self._run_batch(
+                    [specification for _index, specification in group],
+                    allow_reverts=allow_reverts,
+                    stop_on_error=stop_on_error,
+                )
+                if stop_on_error:
+                    for result in results:
+                        if isinstance(result, Exception):
+                            raise result
                 for (index, _specification), result in zip(group, results):
                     output[index] = result
             return output
+
         capability = capabilities.pop()
         sources = self._registry.candidates(capability)
         if not sources and not self._registry.sources[capability]:
-            raise self._error(
-                f"{capability} RPC unavailable; configure LP_RPC_{capability.upper()}_URLS"
+            failure = self._error(
+                f"{capability} RPC unavailable; "
+                f"configure LP_RPC_{capability.upper()}_URLS"
             )
-        failures: list[str] = []
-        with self._lock:
-            if self._closed:
-                raise self._error("RPC lane is closed")
-            for source in sources:
-                if not self._registry.can_try(source, capability):
+            return [
+                self._error(str(failure)) for _item in specifications
+            ]
+        output = [None] * len(specifications)
+        pending = list(enumerate(specifications))
+        failure_messages: dict[int, list[str]] = {
+            index: [] for index in range(len(specifications))
+        }
+        failure_codes: dict[int, int] = {}
+
+        def remember(
+            attempted: Iterable[
+                tuple[int, tuple[str, list[Any]]]
+            ],
+            source: _Source,
+            exc: Exception,
+        ) -> None:
+            message = self._registry._safe_error(source, exc)
+            code = getattr(exc, "code", None)
+            for index, _specification in attempted:
+                failure_messages[index].append(message)
+                if isinstance(code, int):
+                    failure_codes[index] = code
+
+        for source in sources:
+            if not pending:
+                break
+            if not self._registry.can_try(source, capability):
+                continue
+            started = time.monotonic()
+            attempted = pending
+            attempted_specs = [
+                specification for _index, specification in attempted
+            ]
+            try:
+                self._ensure_chain(source)
+                if (
+                    capability == "logs"
+                    and not self._local_log_range_eligible(
+                        source, attempted_specs,
+                    )
+                ):
                     continue
-                started = time.monotonic()
+                request_ids = self._reserve_ids(len(attempted))
+                payload = [
+                    {
+                        "jsonrpc": "2.0", "id": request_id,
+                        "method": method, "params": params,
+                    }
+                    for request_id, (
+                        _index, (method, params)
+                    ) in zip(request_ids, attempted)
+                ]
+                raw = self._post(source, payload)
+                if not isinstance(raw, list):
+                    raise self._error(
+                        f"{source.name} returned non-list batch response"
+                    )
+                by_id = {
+                    item.get("id"): item
+                    for item in raw if isinstance(item, Mapping)
+                }
+            except Exception as exc:
+                self._registry.failure(source, capability, exc)
+                remember(attempted, source, exc)
+                continue
+
+            unresolved: list[
+                tuple[int, tuple[str, list[Any]]]
+            ] = []
+            first_failure: Exception | None = None
+            for request_id, (
+                index, (method, params)
+            ) in zip(request_ids, attempted):
                 try:
-                    self._ensure_chain(source)
-                    if capability == "logs" and not self._local_log_range_eligible(
-                        source, specifications,
-                    ):
-                        continue
-                    payload = []
-                    ids = []
-                    for method, params in specifications:
-                        self._request_id += 1
-                        ids.append(self._request_id)
-                        payload.append({
-                            "jsonrpc": "2.0", "id": self._request_id,
-                            "method": method, "params": params,
-                        })
-                    raw = self._post(source, payload)
-                    if not isinstance(raw, list):
-                        raise self._error(f"{source.name} returned non-list batch response")
-                    by_id = {item.get("id"): item for item in raw if isinstance(item, Mapping)}
-                    output = [
-                        self._validate_item(
-                            source, by_id.get(request_id), request_id, method,
-                            allow_revert=allow_reverts,
-                        )
-                        for request_id, (method, _params) in zip(ids, specifications)
-                    ]
+                    output[index] = self._validate_item(
+                        source, by_id.get(request_id), request_id, method,
+                        allow_revert=allow_reverts,
+                    )
                 except _ExecutionReverted as exc:
-                    self._registry.success(
-                        source, capability, exc.method, time.monotonic() - started,
-                    )
-                    raise exc.error from None
+                    output[index] = exc.error
                 except Exception as exc:
-                    self._registry.failure(source, capability, exc)
-                    failures.append(self._registry._safe_error(source, exc))
-                    continue
-                for method, _params in specifications:
-                    self._registry.success(
-                        source, capability, method, time.monotonic() - started,
-                    )
-                return output
-        if not failures:
-            raise self._error(f"{capability} RPC deferred during provider cooldown")
-        raise self._error(f"{capability} RPC exhausted: " + "; ".join(failures))
+                    unresolved.append((index, (method, params)))
+                    remember(((index, (method, params)),), source, exc)
+                    if first_failure is None:
+                        first_failure = exc
+            if unresolved:
+                assert first_failure is not None
+                self._registry.failure(
+                    source, capability, first_failure,
+                )
+                pending = unresolved
+                continue
+            for _index, (method, _params) in attempted:
+                self._registry.success(
+                    source, capability, method,
+                    time.monotonic() - started,
+                )
+            pending = []
+
+        for index, _specification in pending:
+            messages = failure_messages[index]
+            if messages:
+                output[index] = self._error(
+                    f"{capability} RPC exhausted: " + "; ".join(messages),
+                    code=failure_codes.get(index),
+                )
+            else:
+                output[index] = self._error(
+                    f"{capability} RPC deferred during provider cooldown"
+                )
+        return output
 
     def status(self) -> dict[str, Any]:
         return self._registry.status()

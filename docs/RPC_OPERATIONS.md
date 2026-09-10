@@ -40,11 +40,18 @@ containing V4 PoolManager liquidity modifications still require `callTracer`.
 
 A small anonymous-output probe from the production host verified the donated provider privately: chain 4663; exact matching block/header and log digests against the local node; old block headers; USDG `decimals()` at blocks 30,000,000 and 56,400,000; receipts; `debug_traceTransaction` with `callTracer`; and a four-item JSON-RPC batch. The local pruned node could not answer those archive-state calls. Individual successful Goldsky requests in this probe took roughly 76–352 ms; these are samples, not percentile/SLA claims.
 
-Goldsky supports HTTPS JSON-RPC, not WSS subscriptions. Keep the existing independent WSS head/activity source. Route cheap local headers/logs locally and use Goldsky for archive state, receipts/traces, current state, and fallback. Enrichment remains bounded; enabling archive access does not instantly complete historical ownership or P/L.
+Goldsky supports HTTPS JSON-RPC, not WSS subscriptions. Keep the independent WSS head/activity source. Route cheap local headers/logs locally. An explicit `LP_RPC_RECEIPT_URLS` can also put the local node ahead of the archive fallback: a production probe returned 12 historical/current receipts with matching canonical hashes, plus three complete block-receipt results, in 32 ms. This does not establish archive-state or trace availability; those capabilities remain separately routed to Goldsky.
 
 The donated allowance is 6,000 requests/minute. This process paces Goldsky at at most 80 JSON-RPC items/second on average per endpoint, counting batch elements conservatively, with four concurrent HTTP requests. Bursts are bounded by the batch size (100). This leaves nominal headroom under 100/s but does not account for other applications sharing the key. Provider billing/rate accounting remains authoritative.
 
 `/api/lp/status` includes per-source `traffic`: total HTTP attempts, total JSON-RPC items, and rolling approximately 60-second rates. Failed attempts and chain verification count. Traffic is endpoint-wide and repeated under capabilities using that endpoint: **do not sum repeated capability rows**. WSS messages and explorer fallback GETs are not included in these HTTP JSON-RPC counters.
+
+Shared RPC clients no longer serialize complete network requests. Chain
+verification is single-flight, and rate waiting does not occupy an HTTP
+response slot. Shutdown waits for admitted requests before closing pooled
+sessions. Batch failover retains successful siblings and retries only failed
+items. `batch_results` exposes failures by input position for trace waves;
+ordinary `batch` still raises on non-revert failures.
 
 Goldsky primary references:
 
@@ -187,14 +194,26 @@ pages recover their hints on an independent worker, without waiting behind
 full position replays or discarding existing financial rows. Recovery checks
 the canonical epoch and per-key cursor before publication.
 
+Schema version 10 adds sparse LP-tape and owner/custody canonical-order indexes.
+It does not rebuild accounting or change canonical rows. Tape selects bounded
+event IDs before materializing event payloads; owner selection preserves
+`COALESCE(owner,custody)` rather than treating custody as a second owner.
+Historical owner activity uses the same block/transaction/log ordering.
+Allow temporary-sort disk space when installing these indexes on a large ledger.
+
+Overview and bucket-sorted pool pages share one per-pool interval aggregation,
+keyed by event revision, canonical epoch, and the exact bucket boundaries.
+An advancing empty block still changes the window boundary. Pool metadata
+changes invalidate pool candidates and responses without rescanning buckets.
+
 Legacy V4 identity seeding checks each canonical candidate transaction's queue
 entry by transaction hash. It no longer searches every serialized error
 payload for a pool ID, and it preserves existing candidate retry schedules.
 
 Receipt enrichment, repricing, and accounting continue during live catch-up.
 Receipt fetches run in eight-transaction waves, with up to 64 transactions in
-flight. V4 trace work has its own eight-transaction capacity, four-worker pool,
-and two-transaction waves, so slow traces cannot consume receipt-worker capacity.
+flight. V4 trace work has its own 32-transaction capacity, four-worker pool,
+and eight-transaction batches with independent per-transaction outcomes.
 Each lane rotates historical, requested, recent, and recent admissions across
 refills. Even a one- or two-slot refill must serve requested and current evidence;
 sorting a mixed candidate page oldest-first before truncating a trace lane
@@ -211,8 +230,27 @@ scheduling. Follow `pending_accounting` as well as enrichment and repricing queu
 a small block gap does not prove those queues are complete.
 
 Metadata RPC fetches remain bounded and commit one batch.
-V3 balances use a batched pinned-state request and atomic snapshot commit.
-Identity replay commits canonical events and queue completion together.
+V3 balances have an independent worker rather than waiting behind repricing or
+WAL checkpoints. Each wave selects at most 64 exact `(pool,block)` obligations,
+reserving a quarter for old history. Multicall3 groups caller-independent reads
+by their block pin; balance calls use `blockHash` and `requireCanonical`.
+Failed subcalls remain unknown, retain their revert data, and do not discard
+successful siblings. Missing or unsupported aggregate responses fall back to
+the original pinned calls.
+Bulk publication verifies each canonical hash and pending obligation under
+the writer, updates latest metadata once per pool, and advances one revision.
+No historical snapshots are coalesced or discarded; no fixed per-lane rate
+ceiling prevents balances from borrowing unused provider capacity.
+
+A pre-change 122-second production sample created 10.33 balance snapshots/s
+and completed only 5.30/s. The new worker completed 128 real-provider snapshots
+in 0.775 seconds against an isolated temporary store, with direct canonical
+controls matching. This is a smoke measurement, not loaded production capacity.
+
+Identity replay admits up to 64 queue records per pass. Already-known or
+rejected identities need no current-state RPC and do not wait for unrelated
+live pool discoveries. New identity work remains bounded to eight addresses.
+Canonical events and queue completion commit together.
 Price sample, reserve, mark, and state inserts use the same multi-row helper
 as event ingestion.
 
@@ -293,6 +331,12 @@ production snapshot of 10,540 wallets, this reduced owner-query time from
 1.34 s to 0.78 s; the reported single-wallet query fell from 1.65 s to 0.63 s.
 Existing financial fields had identical digests. Retain the short-circuit
 missing-gas query: a grouped replacement was slower for the full wallet table.
+Complete episode-gas coverage now permits owner costs to qualify their scope
+through the attributed episode instead of probing effects per transaction.
+Owners with incomplete or shared episode attribution retain the missing-cost
+short circuit. A read-only comparison across 48 real wallets returned identical
+values and NULLs: all-time gas lookup fell from 21.5 ms to 2.6 ms; the finite
+window changed from 67.7 ms to 62.8 ms. These samples are not full-table timings.
 
 For 32 production pools containing 52,393 active positions, selecting the
 covering index reduced inventory reads from 0.524 s to 0.093 s and LP-count

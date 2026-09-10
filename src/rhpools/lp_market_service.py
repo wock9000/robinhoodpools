@@ -27,6 +27,7 @@ BUCKET_FIELDS = (
     "deposit_usd", "withdrawal_usd", "priced_swaps", "priced_fees", "priced_flows", "flows",
 )
 _SUM_FIELDS = ",".join(f"SUM({name}) AS {name}" for name in BUCKET_FIELDS)
+_BUCKET_INDEX = {name: index for index, name in enumerate(BUCKET_FIELDS)}
 
 _MISSING = object()
 
@@ -1790,6 +1791,63 @@ class LPMarketService:
                 "(resolution=60 AND ((bucket>=? AND bucket<?) OR (bucket>=? AND bucket<=?))))",
                 [low_hour, high_hour, low_minute, low_hour, high_hour, high_minute])
 
+    def _bucket_aggregates(self, status, start, end):
+        """Share one canonical interval scan across overview and pool metrics."""
+        clause, args = self._bucket_clause(start, end)
+        events_revision = int(status.get("events_revision") or 0)
+
+        def load():
+            rows = self.store.read().execute(
+                f"SELECT pool_id,{_SUM_FIELDS} FROM lp_pool_buckets "
+                f"WHERE {clause} GROUP BY pool_id",
+                args,
+            ).fetchall()
+            return {
+                str(row["pool_id"]): tuple(
+                    row[field] or 0 for field in BUCKET_FIELDS
+                )
+                for row in rows
+            }
+
+        epoch = int(status.get("epoch") or 0)
+        cache_key = ("bucket-aggregates", events_revision, clause, *args)
+        aggregates = self._cached(
+            cache_key, load, ttl=float("inf"), epoch=epoch,
+        )
+        # These values are much larger than ordinary response-cache entries.
+        # Keep enough for every public window without retaining 64 revisions.
+        with self._cache_lock:
+            keys = [
+                key for key in self._cache
+                if len(key) > 1 and key[1] == "bucket-aggregates"
+            ]
+            for key in keys[:-8]:
+                self._cache.pop(key, None)
+        return aggregates
+
+    @staticmethod
+    def _bucket_sort_value(sort, values):
+        if values is None:
+            return 0 if sort in {"swaps", "adds", "removes", "activity"} else None
+        if sort == "volume":
+            return (
+                values[_BUCKET_INDEX["volume_usd"]]
+                if values[_BUCKET_INDEX["priced_swaps"]] > 0 else None
+            )
+        if sort == "fees":
+            return (
+                values[_BUCKET_INDEX["fees_usd"]]
+                if values[_BUCKET_INDEX["priced_fees"]] > 0 else None
+            )
+        if sort == "flow":
+            return (
+                values[_BUCKET_INDEX["deposit_usd"]]
+                - values[_BUCKET_INDEX["withdrawal_usd"]]
+                if values[_BUCKET_INDEX["priced_flows"]] > 0 else None
+            )
+        field = "events" if sort == "activity" else sort
+        return values[_BUCKET_INDEX[field]]
+
     @staticmethod
     def _filters(params, prefix="p"):
         conditions, values = [], []
@@ -1818,24 +1876,27 @@ class LPMarketService:
         status = self.status()
         name, start, end, coverage = self._window(params, status)
         def load():
-            clause, args = self._bucket_clause(start, end)
-            conn = self.store.read()
-            row = conn.execute(f"SELECT {_SUM_FIELDS},COUNT(DISTINCT pool_id) AS active_pools "
-                               f"FROM lp_pool_buckets WHERE {clause}", args).fetchone()
-            totals = {field: row[field] or 0 for field in BUCKET_FIELDS}
-            priced_swaps = int(totals["priced_swaps"])
-            priced_fees = int(totals["priced_fees"])
-            priced_flows = int(totals["priced_flows"])
+            aggregates = self._bucket_aggregates(status, start, end)
+            totals = [0] * len(BUCKET_FIELDS)
+            for values in aggregates.values():
+                for index, value in enumerate(values):
+                    totals[index] += value
+            total = lambda field: totals[_BUCKET_INDEX[field]]
+            priced_swaps = int(total("priced_swaps"))
+            priced_fees = int(total("priced_fees"))
+            priced_flows = int(total("priced_flows"))
             return {
-                "window": name, "volume_usd": totals["volume_usd"] if priced_swaps else None,
-                "fees_usd": totals["fees_usd"] if priced_fees else None,
-                "swaps": int(totals["swaps"]), "adds": int(totals["adds"]),
-                "removes": int(totals["removes"]), "collects": int(totals["collects"]),
-                "active_pools": row["active_pools"],
+                "window": name, "volume_usd": total("volume_usd") if priced_swaps else None,
+                "fees_usd": total("fees_usd") if priced_fees else None,
+                "swaps": int(total("swaps")), "adds": int(total("adds")),
+                "removes": int(total("removes")), "collects": int(total("collects")),
+                "active_pools": len(aggregates),
                 "active_owners": self.book.owner_count(name),
-                "net_deposits_usd": totals["deposit_usd"] - totals["withdrawal_usd"] if priced_flows else None,
-                "coverage": {**coverage, "priced_swaps": priced_swaps, "unpriced_swaps": int(totals["swaps"]) - priced_swaps,
-                             "priced_flows": priced_flows, "unpriced_flows": int(totals["flows"]) - priced_flows},
+                "net_deposits_usd": total("deposit_usd") - total("withdrawal_usd") if priced_flows else None,
+                "coverage": {**coverage, "priced_swaps": priced_swaps,
+                             "unpriced_swaps": int(total("swaps")) - priced_swaps,
+                             "priced_flows": priced_flows,
+                             "unpriced_flows": int(total("flows")) - priced_flows},
             }
         revision = int(status.get("revision") or 0)
         aggregate = self._cached(
@@ -1918,30 +1979,29 @@ class LPMarketService:
                 "sort must be fee, tvl, active_tvl, observed_active_tvl, volume, "
                 "fees, flow, swaps, adds, removes, lps, price, change or created"
             )
+        aggregate_fields = bucket_sort_fields.get(sort)
+        clause, bucket_args = self._bucket_clause(start, end)
         capital_sort = sort in {"active_tvl", "observed_active_tvl", "lps"}
         snapshot_revision = int(status.get("revision") or 0)
+        snapshot_events_revision = int(status.get("events_revision") or 0)
+        snapshot_pool_metadata_token = self.store.pool_metadata_token
         owner_revision = self.book.owners_revision
         metric_revision = (
-            snapshot_revision,
+            (
+                snapshot_events_revision, clause, *bucket_args
+            ) if aggregate_fields is not None else (
+                snapshot_revision, start, end
+            ),
             owner_revision if capital_sort else None,
-            start,
-            end,
+            snapshot_pool_metadata_token,
         )
         def load():
-            clause, args = self._bucket_clause(start, end)
             conn = self.store.read()
+            bucket_aggregates = (
+                self._bucket_aggregates(status, start, end)
+                if aggregate_fields is not None else None
+            )
             metric_ctes = []
-            metric_args: list[Any] = []
-            aggregate_fields = bucket_sort_fields.get(sort)
-            if aggregate_fields is not None:
-                sums = ",".join(
-                    f"SUM({field}) AS {field}" for field in aggregate_fields
-                )
-                metric_ctes.append(
-                    f"t AS (SELECT pool_id,{sums} FROM lp_pool_buckets "
-                    f"WHERE {clause} GROUP BY pool_id)"
-                )
-                metric_args.extend(args)
             if sort == "lps":
                 metric_ctes.append(
                     "a AS (SELECT pool_id,"
@@ -1971,24 +2031,55 @@ class LPMarketService:
                 "WITH " + ",".join(metric_ctes) + " " if metric_ctes else ""
             )
             metric_joins = (
-                "FROM pools p "
-                + ("LEFT JOIN t ON t.pool_id=p.id " if aggregate_fields is not None else "")
-                + "LEFT JOIN lp_pool_state s ON s.pool_id=p.id "
+                "FROM pools p LEFT JOIN lp_pool_state s ON s.pool_id=p.id "
                 + ("LEFT JOIN a ON a.pool_id=p.id " if capital_sort else "")
             )
             def metric_rows():
+                if bucket_aggregates is not None:
+                    def load_pool_ids():
+                        return tuple(sorted(
+                            str(row["id"])
+                            for row in conn.execute(
+                                f"SELECT p.id FROM pools p WHERE {where}", filters,
+                            ).fetchall()
+                        ))
+                    pool_ids = self._cached(
+                        (
+                            "pool-filter-base", snapshot_pool_metadata_token,
+                            where, *filters,
+                        ),
+                        load_pool_ids,
+                        ttl=float("inf"),
+                        epoch=int(status.get("epoch") or 0),
+                    )
+                    return [
+                        (
+                            pool_id,
+                            self._bucket_sort_value(
+                                sort, bucket_aggregates.get(pool_id),
+                            ),
+                        )
+                        for pool_id in pool_ids
+                    ]
                 return [
                     (str(row["id"]), row["sort_value"])
                     for row in conn.execute(
                         metric_prefix + f"SELECT p.id,{ordering_value} AS sort_value "
                         + metric_joins + f"WHERE {where}",
-                        [*metric_args, *ordering_args, *filters],
+                        [*ordering_args, *filters],
                     ).fetchall()
                 ]
-            metrics = self._cached(
-                ("pool-sort-base", metric_revision, name, where, *filters, sort),
-                metric_rows, ttl=float("inf"),
-                epoch=int(status.get("epoch") or 0),
+            metrics = (
+                metric_rows()
+                if bucket_aggregates is not None
+                else self._cached(
+                    (
+                        "pool-sort-base", metric_revision, name, where, *filters,
+                        sort,
+                    ),
+                    metric_rows, ttl=float("inf"),
+                    epoch=int(status.get("epoch") or 0),
+                )
             )
             valued = sorted(
                 ((pool_id, value) for pool_id, value in metrics if value is not None),
@@ -2001,26 +2092,36 @@ class LPMarketService:
             page_ids = ordered_ids[offset:offset + limit]
             if page_ids:
                 marks = ",".join("?" for _ in page_ids)
-                row_sums = ",".join(
-                    f"SUM({field}) AS {field}" for field in row_bucket_fields
-                )
-                page_totals = (
-                    f"WITH t AS (SELECT pool_id,{row_sums} FROM lp_pool_buckets "
-                    f"WHERE {clause} AND pool_id IN ({marks}) GROUP BY pool_id) "
-                )
-                page_joins = (
-                    "FROM pools p LEFT JOIN t ON t.pool_id=p.id "
-                    "LEFT JOIN lp_pool_state s ON s.pool_id=p.id "
-                )
-                raw_rows = conn.execute(
-                    page_totals
-                    + "SELECT p.*,s.price,s.price0_usd,s.price1_usd,"
-                    "s.timestamp AS last_event_at,s.liquidity AS active_liquidity,"
-                    "s.fee_ppm AS current_fee,"
-                    + ",".join(f"t.{field}" for field in row_bucket_fields)
-                    + " " + page_joins + f"WHERE p.id IN ({marks})",
-                    [*args, *page_ids, *page_ids],
-                ).fetchall()
+                if bucket_aggregates is not None:
+                    raw_rows = conn.execute(
+                        "SELECT p.*,s.price,s.price0_usd,s.price1_usd,"
+                        "s.timestamp AS last_event_at,"
+                        "s.liquidity AS active_liquidity,"
+                        "s.fee_ppm AS current_fee "
+                        "FROM pools p LEFT JOIN lp_pool_state s ON s.pool_id=p.id "
+                        f"WHERE p.id IN ({marks})",
+                        page_ids,
+                    ).fetchall()
+                else:
+                    row_sums = ",".join(
+                        f"SUM({field}) AS {field}" for field in row_bucket_fields
+                    )
+                    page_totals = (
+                        f"WITH t AS (SELECT pool_id,{row_sums} FROM lp_pool_buckets "
+                        f"WHERE {clause} AND pool_id IN ({marks}) GROUP BY pool_id) "
+                    )
+                    raw_rows = conn.execute(
+                        page_totals
+                        + "SELECT p.*,s.price,s.price0_usd,s.price1_usd,"
+                        "s.timestamp AS last_event_at,"
+                        "s.liquidity AS active_liquidity,"
+                        "s.fee_ppm AS current_fee,"
+                        + ",".join(f"t.{field}" for field in row_bucket_fields)
+                        + " FROM pools p LEFT JOIN t ON t.pool_id=p.id "
+                        "LEFT JOIN lp_pool_state s ON s.pool_id=p.id "
+                        f"WHERE p.id IN ({marks})",
+                        [*bucket_args, *page_ids, *page_ids],
+                    ).fetchall()
                 by_id = {str(row["id"]): row for row in raw_rows}
                 rows = [by_id[pool_id] for pool_id in page_ids if pool_id in by_id]
             else:
@@ -2035,8 +2136,16 @@ class LPMarketService:
             result = []
             for row in rows:
                 row = dict(row)
-                for field in row_bucket_fields:
-                    row[field] = row.get(field) or 0
+                if bucket_aggregates is not None:
+                    aggregate = bucket_aggregates.get(row["id"])
+                    for field in row_bucket_fields:
+                        row[field] = (
+                            aggregate[_BUCKET_INDEX[field]]
+                            if aggregate is not None else 0
+                        )
+                else:
+                    for field in row_bucket_fields:
+                        row[field] = row.get(field) or 0
                 stats = capital.get(row["id"], {})
                 risks = []
                 if not coverage["complete"]:
@@ -2134,8 +2243,8 @@ class LPMarketService:
             }
         return self._cached(
             (
-                "pools", snapshot_revision, owner_revision, name, where,
-                *filters, sort, order, limit, offset,
+                "pools", snapshot_revision, snapshot_pool_metadata_token,
+                owner_revision, name, where, *filters, sort, order, limit, offset,
             ),
             load, ttl=3.0, epoch=int(status.get("epoch") or 0),
         )
@@ -2408,10 +2517,11 @@ class LPMarketService:
                               "(e.kind='checkpoint' AND e.position_key IS NOT NULL))")
         elif kind != "all":
             raise ValueError("kind must be lp or all")
-        for key, column in (("pool", "e.pool_id"), ("owner", "COALESCE(e.owner,e.custody)")):
-            if params.get(key):
-                conditions.append(f"{column}=?")
-                args.append(str(params[key]).lower()[:66])
+        pool = str(params.get("pool") or "").lower()[:66]
+        if pool:
+            conditions.append("e.pool_id=?")
+            args.append(pool)
+        owner = str(params.get("owner") or "").lower()[:66]
         before = params.get("before")
         if before:
             # Cursor identifies a row, but chronological order is block/tx/log.
@@ -2425,14 +2535,17 @@ class LPMarketService:
         snapshot_events_revision = int(status.get("events_revision") or 0)
         snapshot_pool_metadata_token = self.store.pool_metadata_token
         snapshot_epoch = int(status.get("epoch") or 0)
-        # Only an exact pool predicate has an index that also satisfies the
-        # canonical feed order. Leading-wildcard search, protocol, and
-        # COALESCE(owner,custody) predicates do not. Letting SQLite choose an
-        # index for those predicates can sort every match before LIMIT.
+        # Canonical-order indexes let LIMIT stop before unrelated history.
+        # Owner/custody are separate because COALESCE(owner,custody) means
+        # custody participates only when owner is NULL.
         event_source = "events e INDEXED BY events_block_idx"
-        if params.get("pool"):
+        if owner:
+            event_source = None
+        elif pool:
             event_source = "events e INDEXED BY lp_events_pool_order"
-        cache_args = tuple(args)
+        elif kind == "lp":
+            event_source = "events e INDEXED BY events_lp_order_idx"
+        cache_args = (owner, *args)
         window_floor = None
         if start:
             # Event timestamps come from canonical block headers and increase
@@ -2455,13 +2568,42 @@ class LPMarketService:
                 args.append(window_floor)
 
         def load():
+            selected_columns = (
+                "e.id,e.block_number,e.tx_index,e.log_index "
+            )
+            selected_where = " AND ".join(conditions)
+            if owner:
+                selection = (
+                    "SELECT " + selected_columns
+                    + "FROM events e INDEXED BY events_owner_order_idx "
+                    "LEFT JOIN pools p ON p.id=e.pool_id WHERE "
+                    + selected_where + " AND e.owner=? UNION ALL "
+                    "SELECT " + selected_columns
+                    + "FROM events e INDEXED BY events_custody_order_idx "
+                    "LEFT JOIN pools p ON p.id=e.pool_id WHERE "
+                    + selected_where
+                    + " AND e.owner IS NULL AND e.custody=? "
+                    "ORDER BY block_number DESC,tx_index DESC,log_index DESC LIMIT ?"
+                )
+                query_args = [*args, owner, *args, owner, limit]
+            else:
+                selection = (
+                    "SELECT " + selected_columns + f"FROM {event_source} "
+                    "LEFT JOIN pools p ON p.id=e.pool_id WHERE "
+                    + selected_where
+                    + " ORDER BY e.block_number DESC,e.tx_index DESC,"
+                    "e.log_index DESC LIMIT ?"
+                )
+                query_args = [*args, limit]
             rows = self.store.read().execute(
-                "SELECT e.*,p.token0,p.token1,p.symbol0,p.symbol1,p.decimals0,p.decimals1,"
-                "p.protocol AS pool_protocol,p.fee_ppm AS pool_fee_raw "
-                f"FROM {event_source} LEFT JOIN pools p ON p.id=e.pool_id WHERE "
-                + " AND ".join(conditions)
-                + " ORDER BY e.block_number DESC,e.tx_index DESC,e.log_index DESC LIMIT ?",
-                [*args, limit],
+                "WITH selected AS MATERIALIZED (" + selection + ") "
+                "SELECT e.*,p.token0,p.token1,p.symbol0,p.symbol1,"
+                "p.decimals0,p.decimals1,p.protocol AS pool_protocol,"
+                "p.fee_ppm AS pool_fee_raw FROM selected s "
+                "JOIN events e ON e.id=s.id "
+                "LEFT JOIN pools p ON p.id=e.pool_id "
+                "ORDER BY s.block_number DESC,s.tx_index DESC,s.log_index DESC",
+                query_args,
             ).fetchall()
             output = []
             for raw in rows:

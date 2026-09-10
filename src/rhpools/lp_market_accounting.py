@@ -339,7 +339,7 @@ _EFFECT_WRITE_SQL = (
 
 def _dict_rows(cursor: sqlite3.Cursor) -> list[dict[str, Any]]:
     names = [item[0] for item in cursor.description or ()]
-    return [dict(zip(names, row)) for row in cursor.fetchall()]
+    return [dict(zip(names, row)) for row in cursor]
 
 
 class _ReplayWrites:
@@ -601,8 +601,11 @@ def _batches(values: Sequence[Any], size: int = 500) -> Iterable[Sequence[Any]]:
 
 
 def _one(cursor: sqlite3.Cursor) -> dict[str, Any] | None:
-    rows = _dict_rows(cursor)
-    return rows[0] if rows else None
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    names = [item[0] for item in cursor.description or ()]
+    return dict(zip(names, row))
 
 
 def _json(value: Any) -> dict[str, Any]:
@@ -3883,21 +3886,21 @@ class AccountBook:
             if identity is not None:
                 owner_clause = " AND ep.owner=?"
                 args.append(identity)
-            rows = _dict_rows(conn.execute(
+            rows = conn.execute(
                 "SELECT DISTINCT ep.owner,e.tx_hash,c.owner AS cost_owner,c.gas_usd "
                 "FROM lp_accounting_effects e "
                 "JOIN lp_accounting_episodes ep ON ep.id=e.episode_id "
                 "LEFT JOIN lp_accounting_tx_costs c ON c.tx_hash=e.tx_hash "
                 f"WHERE e.episode_id IN ({marks}){owner_clause}", args,
-            ))
+            )
             for row in rows:
-                owner = _address(row.get("owner"))
-                tx_hash = str(row.get("tx_hash") or "")
+                owner = _address(row[0])
+                tx_hash = str(row[1] or "")
                 if owner is None or not tx_hash:
                     continue
-                exact_owner = _address(row.get("cost_owner")) == owner
+                exact_owner = _address(row[2]) == owner
                 costs[(owner, tx_hash)] = (
-                    _finite_float(row.get("gas_usd")) if exact_owner else None
+                    _finite_float(row[3]) if exact_owner else None
                 )
         result: dict[str, list[float | None]] = defaultdict(list)
         for (owner, _), value in costs.items():
@@ -3908,15 +3911,46 @@ class AccountBook:
     def _owner_gas_values(
             conn: sqlite3.Connection, identities: Iterable[Any],
             owner_clauses: Sequence[str], args: Sequence[Any],
+            complete_identities: Iterable[Any] = (),
     ) -> dict[str, float | None]:
         selected = sorted({
             str(identity) for identity in identities if identity is not None
         })
         if not selected:
             return {}
+        complete = {
+            str(identity) for identity in complete_identities
+            if identity is not None
+        }
         predicate = " AND ".join(owner_clauses)
         result: dict[str, float | None] = {}
-        for batch in _batches(selected, 400):
+        # A non-NULL episode gas aggregate proves every selected transaction
+        # has an exact episode attribution. Sum those costs in the same owner
+        # index order as before, but resolve scope through c.episode_id instead
+        # of probing the effects table once per transaction.
+        known = [owner for owner in selected if owner in complete]
+        for batch in _batches(known, 400):
+            values = ",".join("(?)" for _ in batch)
+            rows = conn.execute(
+                "WITH selected(owner) AS (VALUES " + values + ") "
+                "SELECT selected.owner,(SELECT SUM(c.gas_usd) "
+                "FROM lp_accounting_tx_costs c "
+                "INDEXED BY lp_accounting_tx_costs_owner "
+                "WHERE c.owner=selected.owner AND EXISTS ("
+                "SELECT 1 FROM lp_accounting_episodes ep "
+                "LEFT JOIN pools p ON p.id=ep.pool_id "
+                "WHERE ep.id=c.episode_id AND ep.owner=selected.owner AND "
+                + predicate + ")) AS gas_usd FROM selected",
+                [*batch, *args],
+            )
+            for row in rows:
+                result[str(row["owner"])] = row["gas_usd"]
+        # Episode NULLs can still be owner-qualified when one transaction
+        # spans several episodes belonging to that owner. Retain the existing
+        # per-owner missing-cost short circuit for exactly those uncertain
+        # owners; only owners which pass it pay for the de-duplicated sum.
+        uncertain = [owner for owner in selected if owner not in complete]
+        for batch in _batches(uncertain, 400):
             values = ",".join("(?)" for _ in batch)
             rows = conn.execute(
                 "WITH selected(owner) AS (VALUES " + values + ") "
@@ -3941,7 +3975,7 @@ class AccountBook:
                 "WHERE fx.tx_hash=c.tx_hash AND ep.owner=selected.owner AND "
                 + predicate + ")) END AS gas_usd FROM selected",
                 [*batch, *args, *args],
-            ).fetchall()
+            )
             for row in rows:
                 result[str(row["owner"])] = row["gas_usd"]
         return result
@@ -4258,9 +4292,7 @@ class AccountBook:
             else:
                 rows = []
         if cached is None:
-            clauses: list[str] = [
-                "(e.owner IS NOT NULL OR e.custody IS NOT NULL)"
-            ]
+            clauses: list[str] = []
             args: list[Any] = []
             if cutoff_seconds is not None:
                 clauses.append("e.last_timestamp>=?")
@@ -4294,7 +4326,6 @@ class AccountBook:
                     "LOWER(fxq.tx_hash) LIKE ? ESCAPE '\\'))"
                 )
                 args.extend([term] * 13)
-            where = " WHERE " + " AND ".join(clauses) if clauses else ""
             aggregate = (
                 "COUNT(DISTINCT e.position_key) AS positions,"
                 "COUNT(DISTINCT CASE WHEN e.closed_at IS NULL THEN e.position_key END) "
@@ -4302,8 +4333,6 @@ class AccountBook:
                 "SUM(e.status='complete') AS closed_episodes,"
                 "CASE WHEN COUNT(e.gross_pnl_usd)=COUNT(*) "
                 "THEN SUM(e.gross_pnl_usd) END AS gross_pnl_usd,"
-                "CASE WHEN COUNT(e.net_pnl_usd)=COUNT(*) "
-                "THEN SUM(e.net_pnl_usd) END AS net_pnl_usd,"
                 "CASE WHEN COUNT(e.gas_usd)=COUNT(*) "
                 "THEN SUM(e.gas_usd) END AS gas_usd,"
                 "CASE WHEN MIN(e.history_complete AND e.fees_complete "
@@ -4325,8 +4354,26 @@ class AccountBook:
                 "100.0*SUM(e.status='complete' AND e.gross_pnl_usd>0)"
                 "/SUM(e.status='complete') END AS win_rate,"
                 "SUM(e.gross_pnl_usd IS NOT NULL) AS complete_episodes,"
-                "COUNT(*) AS episodes,MAX(e.last_timestamp) AS _activity_at,"
-                "MIN(e.last_timestamp) AS _retention_timestamp "
+                "COUNT(*) AS episodes,MAX(e.last_timestamp) AS _activity_at"
+                + (
+                    ",MIN(e.last_timestamp) AS _retention_timestamp"
+                    if cutoff_seconds is not None else ""
+                )
+            )
+            custody_aggregate = (
+                "COUNT(DISTINCT e.position_key) AS positions,"
+                "COUNT(DISTINCT CASE WHEN e.closed_at IS NULL "
+                "THEN e.position_key END) AS open_positions,"
+                "SUM(e.status='complete') AS closed_episodes,"
+                "CASE WHEN MIN(e.history_complete AND e.pricing_complete)=1 "
+                "AND COUNT(e.deposit_usd)=COUNT(*) "
+                "AND COUNT(e.proceeds_usd)=COUNT(*) "
+                "THEN SUM(e.deposit_usd+e.proceeds_usd) END AS volume_usd,"
+                "COUNT(*) AS episodes,MAX(e.last_timestamp) AS _activity_at"
+                + (
+                    ",MIN(e.last_timestamp) AS _retention_timestamp"
+                    if cutoff_seconds is not None else ""
+                )
             )
             source = " FROM lp_accounting_episodes e "
             if cutoff_seconds is not None and not pool_id:
@@ -4350,12 +4397,16 @@ class AccountBook:
                     "financial_scope": "lifetime_of_selected_episodes",
                     "fee_value_unit": "USDG_quote",
                 })
+                beneficial_clauses = [*clauses, "e.owner IS NOT NULL"]
+                beneficial_where = (
+                    " WHERE " + " AND ".join(beneficial_clauses)
+                )
                 beneficial = (
                     _dict_rows(conn.execute(
                         "SELECT e.owner,NULL AS custody,"
                         "'verified_owner' AS identity_basis,"
-                        + aggregate + source + where
-                        + " AND e.owner IS NOT NULL GROUP BY e.owner",
+                        + aggregate + source + beneficial_where
+                        + " GROUP BY e.owner",
                         args,
                     ))
                     if identity_scope != "custody" else []
@@ -4369,7 +4420,7 @@ class AccountBook:
                         "CASE WHEN SUM(e.owner IS NOT NULL)>0 "
                         "THEN 'custody_aggregate' ELSE 'custody_only' END "
                         "AS identity_basis,"
-                        + aggregate + source + custody_where
+                        + custody_aggregate + source + custody_where
                         + " GROUP BY e.custody",
                         args,
                     ))
@@ -4380,6 +4431,10 @@ class AccountBook:
                 gas_by_owner = self._owner_gas_values(
                     conn, (row.get("owner") for row in beneficial),
                     gas_clauses, args,
+                    (
+                        row.get("owner") for row in beneficial
+                        if row.get("gas_usd") is not None
+                    ),
                 )
                 financial_state = self._scoped_owner_financial_state(
                     conn, params,
@@ -4391,22 +4446,23 @@ class AccountBook:
                 through_order, through_as_of, pending_owners,
                 pending_custodies, mapping_complete,
             ) = financial_state
-            for row in (*beneficial, *custody_rows):
-                owner = _address(row.get("owner"))
-                custody = _address(row.get("custody"))
-                pending = (
-                    not mapping_complete
-                    or owner is not None and owner in pending_owners
-                    or custody is not None and custody in pending_custodies
-                )
-                row["financial_pending"] = pending
-                row["financial_through_order"] = (
-                    None if pending or through_order is None
-                    else dict(through_order)
-                )
-                row["financial_through_as_of"] = (
-                    None if pending else through_as_of
-                )
+            for group in (beneficial, custody_rows):
+                for row in group:
+                    owner = _address(row.get("owner"))
+                    custody = _address(row.get("custody"))
+                    pending = (
+                        not mapping_complete
+                        or owner is not None and owner in pending_owners
+                        or custody is not None and custody in pending_custodies
+                    )
+                    row["financial_pending"] = pending
+                    row["financial_through_order"] = (
+                        None if pending or through_order is None
+                        else dict(through_order)
+                    )
+                    row["financial_through_as_of"] = (
+                        None if pending else through_as_of
+                    )
             for row in rows:
                 timestamp = row.pop("_retention_timestamp", None)
                 if cutoff_seconds is not None and timestamp is not None:
@@ -4548,87 +4604,180 @@ class AccountBook:
             row["financial_through_as_of"] = None
 
     def _historical_owner_activity(
-            self, conn: sqlite3.Connection, owner_row: Mapping[str, Any],
+            self, conn: sqlite3.Connection,
+            owner_rows: Sequence[Mapping[str, Any]],
             params: Mapping[str, Any],
-    ) -> dict[str, Any] | None:
-        identity = _address(owner_row.get("owner") or owner_row.get("custody"))
-        if identity is None:
-            return None
-        owner_match = owner_row.get("owner") is not None
-        clauses = [
-            "e.kind IN ('add','remove','collect','checkpoint','donate','fee','transfer')"
+    ) -> list[dict[str, Any] | None]:
+        identities = [
+            (
+                row.get("owner") is not None,
+                _address(row.get("owner") or row.get("custody")),
+            )
+            for row in owner_rows
         ]
-        args: list[Any] = []
-        cutoff = _cutoff(params)
-        if cutoff is not None:
-            clauses.append("e.timestamp>=CAST(strftime('%s','now') AS INTEGER)-?")
-            args.append(cutoff)
-        protocol = str(params.get("protocol") or "").lower()
-        if protocol:
-            clauses.append(
-                "(e.protocol=? OR (e.protocol='nft' AND "
-                "json_extract(e.data,'$.manager_protocol')=?))"
-            )
-            args.extend((protocol, protocol))
-        pool_id = str(params.get("pool") or params.get("pool_id") or "").lower()
-        if pool_id:
-            clauses.append("e.pool_id=?")
-            args.append(pool_id)
         query = str(params.get("q") or "").strip().lower()[:128]
-        if query and query not in identity:
-            escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-            term = f"%{escaped}%"
-            clauses.append(
-                "(LOWER(COALESCE(e.pool_id,'')) LIKE ? ESCAPE '\\' OR "
-                "LOWER(COALESCE(e.protocol,'')) LIKE ? ESCAPE '\\' OR "
-                "LOWER(COALESCE(p.symbol0,'')) LIKE ? ESCAPE '\\' OR "
-                "LOWER(COALESCE(p.symbol1,'')) LIKE ? ESCAPE '\\' OR "
-                "LOWER(COALESCE(p.token0,'')) LIKE ? ESCAPE '\\' OR "
-                "LOWER(COALESCE(p.token1,'')) LIKE ? ESCAPE '\\' OR "
-                "LOWER(COALESCE(p.symbol0,'')||'/'||"
-                "COALESCE(p.symbol1,'')) LIKE ? ESCAPE '\\' OR "
-                "LOWER(COALESCE(p.symbol0,'')||' / '||"
-                "COALESCE(p.symbol1,'')) LIKE ? ESCAPE '\\' OR "
-                "LOWER(COALESCE(e.tx_hash,'')) LIKE ? ESCAPE '\\' OR "
-                "LOWER(COALESCE(e.position_key,'')) LIKE ? ESCAPE '\\' OR "
-                "LOWER(COALESCE(e.token_id,'')) LIKE ? ESCAPE '\\' OR "
-                "LOWER(COALESCE(e.owner,'')) LIKE ? ESCAPE '\\' OR "
-                "LOWER(COALESCE(e.custody,'')) LIKE ? ESCAPE '\\')"
-            )
-            args.extend([term] * 13)
+        escaped = (
+            query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        )
+        term = f"%{escaped}%"
+        cutoff_seconds = _cutoff(params)
+        cutoff_timestamp = (
+            int(time.time()) - cutoff_seconds
+            if cutoff_seconds is not None else None
+        )
+        protocol = str(params.get("protocol") or "").lower()
+        pool_id = str(
+            params.get("pool") or params.get("pool_id") or ""
+        ).lower()
+        latest: dict[tuple[bool, str], dict[str, Any]] = {}
         columns = (
             "e.block_number,e.timestamp,e.pool_id,e.kind,e.tx_hash,e.tx_index,"
             "e.log_index,p.symbol0,p.symbol1,p.token0,p.token1"
         )
-        identity_column = "e.owner" if owner_match else "e.custody"
-        direct = _one(conn.execute(
-            "SELECT " + columns + " FROM events e "
-            "LEFT JOIN pools p ON p.id=e.pool_id WHERE "
-            + identity_column + "=? AND " + " AND ".join(clauses)
-            + " ORDER BY e.block_number DESC,e.tx_index DESC,e.log_index DESC LIMIT 1",
-            [identity, *args],
-        ))
-        ended = None
-        if owner_match:
-            ended = _one(conn.execute(
-                "SELECT " + columns + " FROM lp_ownership_intervals i "
-                "JOIN lp_accounting_event_keys k ON k.position_key=i.position_key "
-                "JOIN events e ON e.id=k.event_id AND e.block_number=i.end_block "
-                "AND e.tx_index=i.end_tx_index AND e.log_index=i.end_log_index "
-                "LEFT JOIN pools p ON p.id=e.pool_id WHERE i.owner=? "
-                "AND i.end_block IS NOT NULL AND " + " AND ".join(clauses)
-                + " ORDER BY e.block_number DESC,e.tx_index DESC,e.log_index DESC LIMIT 1",
-                [identity, *args],
-            ))
-        latest = max(
-            (row for row in (direct, ended) if row is not None),
-            key=lambda row: (
-                int(row.get("block_number") or 0), int(row.get("tx_index") or 0),
-                int(row.get("log_index") or 0),
-            ),
-            default=None,
-        )
-        return self._activity_view(latest)
+
+        def scope(include_query: bool) -> tuple[list[str], list[Any]]:
+            clauses = [
+                "a.kind IN "
+                "('add','remove','collect','checkpoint','donate','fee','transfer')"
+            ]
+            scope_args: list[Any] = []
+            if cutoff_timestamp is not None:
+                clauses.append("a.timestamp>=?")
+                scope_args.append(cutoff_timestamp)
+            if protocol:
+                clauses.append(
+                    "(a.protocol=? OR (a.protocol='nft' AND "
+                    "json_extract(a.data,'$.manager_protocol')=?))"
+                )
+                scope_args.extend((protocol, protocol))
+            if pool_id:
+                clauses.append("a.pool_id=?")
+                scope_args.append(pool_id)
+            if include_query:
+                clauses.append(
+                    "(LOWER(COALESCE(a.pool_id,'')) LIKE ? ESCAPE '\\' OR "
+                    "LOWER(COALESCE(a.protocol,'')) LIKE ? ESCAPE '\\' OR "
+                    "LOWER(COALESCE(ap.symbol0,'')) LIKE ? ESCAPE '\\' OR "
+                    "LOWER(COALESCE(ap.symbol1,'')) LIKE ? ESCAPE '\\' OR "
+                    "LOWER(COALESCE(ap.token0,'')) LIKE ? ESCAPE '\\' OR "
+                    "LOWER(COALESCE(ap.token1,'')) LIKE ? ESCAPE '\\' OR "
+                    "LOWER(COALESCE(ap.symbol0,'')||'/'||"
+                    "COALESCE(ap.symbol1,'')) LIKE ? ESCAPE '\\' OR "
+                    "LOWER(COALESCE(ap.symbol0,'')||' / '||"
+                    "COALESCE(ap.symbol1,'')) LIKE ? ESCAPE '\\' OR "
+                    "LOWER(COALESCE(a.tx_hash,'')) LIKE ? ESCAPE '\\' OR "
+                    "LOWER(COALESCE(a.position_key,'')) LIKE ? ESCAPE '\\' OR "
+                    "LOWER(COALESCE(a.token_id,'')) LIKE ? ESCAPE '\\' OR "
+                    "LOWER(COALESCE(a.owner,'')) LIKE ? ESCAPE '\\' OR "
+                    "LOWER(COALESCE(a.custody,'')) LIKE ? ESCAPE '\\')"
+                )
+                scope_args.extend([term] * 13)
+            return clauses, scope_args
+
+        def retain(
+                owner_match: bool, rows: Iterable[sqlite3.Row],
+        ) -> None:
+            for source in rows:
+                row = dict(source)
+                identity = str(row.pop("_identity"))
+                key = (owner_match, identity)
+                prior = latest.get(key)
+                order = (
+                    int(row.get("block_number") or 0),
+                    int(row.get("tx_index") or 0),
+                    int(row.get("log_index") or 0),
+                )
+                if prior is None or order > (
+                    int(prior.get("block_number") or 0),
+                    int(prior.get("tx_index") or 0),
+                    int(prior.get("log_index") or 0),
+                ):
+                    latest[key] = row
+
+        def direct(
+                owner_match: bool, selected: Sequence[str],
+                include_query: bool,
+        ) -> None:
+            clauses, scope_args = scope(include_query)
+            identity_column = "a.owner" if owner_match else "a.custody"
+            index_name = (
+                "events_owner_order_idx"
+                if owner_match else "events_custody_order_idx"
+            )
+            for batch in _batches(selected, 400):
+                values = ",".join("(?)" for _ in batch)
+                pool_join = (
+                    "LEFT JOIN pools ap ON ap.id=a.pool_id "
+                    if include_query else ""
+                )
+                retain(owner_match, conn.execute(
+                    "WITH selected(identity) AS (VALUES " + values + ") "
+                    "SELECT s.identity AS _identity," + columns
+                    + " FROM selected s JOIN events e ON e.id=("
+                    "SELECT a.id FROM events a INDEXED BY " + index_name + " "
+                    + pool_join + "WHERE " + identity_column + "=s.identity AND "
+                    + " AND ".join(clauses)
+                    + " ORDER BY a.block_number DESC,a.tx_index DESC,"
+                    "a.log_index DESC LIMIT 1) "
+                    "LEFT JOIN pools p ON p.id=e.pool_id",
+                    [*batch, *scope_args],
+                ))
+
+        def ended(selected: Sequence[str], include_query: bool) -> None:
+            clauses, scope_args = scope(include_query)
+            for batch in _batches(selected, 400):
+                values = ",".join("(?)" for _ in batch)
+                pool_join = (
+                    "LEFT JOIN pools ap ON ap.id=a.pool_id "
+                    if include_query else ""
+                )
+                retain(True, conn.execute(
+                    "WITH selected(identity) AS (VALUES " + values + ") "
+                    "SELECT s.identity AS _identity," + columns
+                    + " FROM selected s JOIN events e ON e.id=("
+                    "SELECT a.id FROM lp_ownership_intervals i "
+                    "INDEXED BY lp_ownership_intervals_owner "
+                    "JOIN lp_accounting_event_keys k "
+                    "ON k.position_key=i.position_key "
+                    "JOIN events a ON a.id=k.event_id "
+                    + pool_join + "WHERE i.owner=s.identity "
+                    "AND i.end_block IS NOT NULL "
+                    "AND a.block_number=i.end_block "
+                    "AND a.tx_index=i.end_tx_index "
+                    "AND a.log_index=i.end_log_index AND "
+                    + " AND ".join(clauses)
+                    + " ORDER BY i.end_block DESC,i.end_tx_index DESC,"
+                    "i.end_log_index DESC LIMIT 1) "
+                    "LEFT JOIN pools p ON p.id=e.pool_id",
+                    [*batch, *scope_args],
+                ))
+
+        for owner_match in (True, False):
+            matches = sorted({
+                identity for match, identity in identities
+                if match is owner_match and identity is not None
+                and (not query or query in identity)
+            })
+            searches = sorted({
+                identity for match, identity in identities
+                if match is owner_match and identity is not None
+                and query and query not in identity
+            })
+            if matches:
+                direct(owner_match, matches, False)
+                if owner_match:
+                    ended(matches, False)
+            if searches:
+                direct(owner_match, searches, True)
+                if owner_match:
+                    ended(searches, True)
+        return [
+            self._activity_view(
+                latest.get((owner_match, identity))
+                if identity is not None else None
+            )
+            for owner_match, identity in identities
+        ]
 
     def _scoped_owner_financial_state(
             self, conn: sqlite3.Connection, params: Mapping[str, Any],
@@ -4792,23 +4941,23 @@ class AccountBook:
                 )
         if missing:
             with self._reader() as conn:
-                for index, key in missing:
-                    activity = self._historical_owner_activity(
-                        conn, output[index], params,
-                    )
-                    self._attach_owner_activity(
-                        output[index],
-                        activity if isinstance(activity, Mapping) else None,
-                    )
-                    with self._cache_lock:
-                        if generation == self._owners_generation:
-                            self._owner_activity_cache[key] = (
-                                dict(activity)
-                                if isinstance(activity, Mapping) else None
-                            )
-                            self._owner_activity_cache.move_to_end(key)
-                            while len(self._owner_activity_cache) > 2048:
-                                self._owner_activity_cache.popitem(last=False)
+                activities = self._historical_owner_activity(
+                    conn, [output[index] for index, _ in missing], params,
+                )
+            for (index, _), activity in zip(missing, activities):
+                self._attach_owner_activity(
+                    output[index],
+                    activity if isinstance(activity, Mapping) else None,
+                )
+            with self._cache_lock:
+                if generation == self._owners_generation:
+                    for (_, key), activity in zip(missing, activities):
+                        self._owner_activity_cache[key] = (
+                            activity if isinstance(activity, Mapping) else None
+                        )
+                        self._owner_activity_cache.move_to_end(key)
+                    while len(self._owner_activity_cache) > 2048:
+                        self._owner_activity_cache.popitem(last=False)
         return output
 
     def owners(self, params: Mapping[str, Any] | None = None) -> dict[str, Any]:

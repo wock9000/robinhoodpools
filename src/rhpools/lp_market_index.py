@@ -21,6 +21,7 @@ import requests
 from eth_utils import keccak
 from requests.adapters import HTTPAdapter
 
+from . import _mc
 from .lp_chain import CHAIN_ID
 from .lp_market_protocols import (
     EVENT_TOPICS,
@@ -66,7 +67,7 @@ MAX_INTERVAL_STORE_SECONDS = 2.0
 HISTORY_MAX_INTERVAL_STORE_SECONDS = 0.2
 ENRICH_BATCH = 8
 ENRICHMENT_CAPABILITY_RECHECK_S = 300.0
-ENRICH_TRACE_BATCH = 2
+ENRICH_TRACE_BATCH = 8
 ENRICH_WORKERS = 8
 ENRICH_TRACE_WORKERS = 4
 ENRICH_REGULAR_INFLIGHT_LIMIT = ENRICH_BATCH * ENRICH_WORKERS
@@ -78,12 +79,15 @@ V4_OWNER_REPAIR_SCAN = 8192
 V3_BIRTH_REPAIR_PREFIXES = tuple(
     sorted(f"nft:{address}:" for address in V3_NFT_MANAGER_ADDRESSES)
 )
-DEFERRED_POOL_IDENTITY_BATCH = 8
+DEFERRED_POOL_IDENTITY_BATCH = 64
+DEFERRED_POOL_IDENTITY_RPC_BATCH = 8
 DEFERRED_POOL_IDENTITY_CANDIDATES_PER_POOL = 4
 DEFERRED_POOL_IDENTITY_SEED_BUSY_S = 1.0
 LEGACY_V4_IDENTITY_BATCH = 4
 DEFERRED_POOL_IDENTITY_PREFIX = "pool_identity_pending:"
-BALANCE_BATCH = 8
+# A bounded snapshot wave shares exact-block state roots through Multicall3.
+# The shared endpoint gate, not a fixed lane quota, limits archive traffic.
+BALANCE_BATCH = 64
 BALANCE_OF_SELECTOR = "0x70a08231"
 SYMBOL_SELECTOR = "0x95d89b41"
 DECIMALS_SELECTOR = "0x313ce567"
@@ -301,11 +305,11 @@ def _timestamp(header: Mapping[str, Any]) -> int:
 
 
 class MarketIndexer:
-    """Canonical LP event index with independent live/history/enrichment lanes.
+    """Canonical LP event index with independent live/history/enrichment/balance lanes.
 
     ``rpc`` is an optional deterministic injected client (or ``lane -> client``
     factory) implementing ``call`` and optionally ``batch``.  Production uses
-    dedicated live/history sessions and a bounded worker-local enrichment pool.
+    dedicated live/history/balance sessions and bounded enrichment worker pools.
     """
 
     def __init__(
@@ -371,6 +375,12 @@ class MarketIndexer:
             self._clients["live_header"] = self._clients["live"]
             self._clients["history_header"] = self._clients["history"]
             self._head_wss_urls = ()
+        if self.v3_balances:
+            self._clients["balance"] = (
+                self._rpc_factory("balance")
+                if self._rpc_factory is not None
+                else self._clients["enrichment"]
+            )
         for lane, client in self._clients.items():
             if not callable(getattr(client, "call", None)):
                 raise TypeError(f"injected {lane} RPC must implement call(method, params)")
@@ -398,7 +408,7 @@ class MarketIndexer:
         self._process_lock_fd: int | None = None
         self._history_verified = False
         self._enrichment_verified = False
-        self._projection_verified = False
+        self._balance_verified = False
         self._publish_after_id = ""
         self._market_epoch = int(self.store.status().get("epoch", 0))
         self._enrichment_local = threading.local()
@@ -1730,6 +1740,32 @@ class MarketIndexer:
                     raise
         return results
 
+
+    def _batch_results_on(
+        self, client: Any, calls: list[tuple[str, Sequence[Any]]],
+    ) -> list[Any]:
+        if not calls:
+            return []
+        batch_results = getattr(client, "batch_results", None)
+        if callable(batch_results):
+            output: list[Any] = []
+            for offset in range(0, len(calls), MAX_BATCH_CALLS):
+                chunk = calls[offset:offset + MAX_BATCH_CALLS]
+                results = list(batch_results(chunk))
+                if len(results) != len(chunk):
+                    raise RpcError("batch RPC returned an incomplete result set")
+                output.extend(results)
+            return output
+        # Injected clients without per-item results cannot safely share a
+        # failure-prone wave: a failed trace must not discard its siblings.
+        output = []
+        for method, params in calls:
+            try:
+                output.append(client.call(method, list(params)))
+            except Exception as exc:
+                output.append(exc)
+        return output
+
     def _rpc_batch(self, lane: str, calls: list[tuple[str, Sequence[Any]]]) -> list[Any]:
         return self._batch_on(self._clients[lane], calls)
 
@@ -1903,6 +1939,12 @@ class MarketIndexer:
                         daemon=True,
                     ),
                 ]
+                if self.v3_balances:
+                    self._threads.append(threading.Thread(
+                        target=self._balance_run,
+                        name="lp-market-balances",
+                        daemon=True,
+                    ))
                 if self._accounting_projector is not None:
                     self._threads.append(threading.Thread(
                         target=self._accounting_run,
@@ -2508,20 +2550,19 @@ class MarketIndexer:
     def _optional_identity_batch(
         self, lane: str, calls: list[tuple[str, Sequence[Any]]],
     ) -> list[Any]:
-        try:
-            return self._rpc_batch(lane, calls)
-        except RpcError:
-            results: list[Any] = []
-            client = self._clients[lane]
-            for method, params in calls:
-                try:
-                    results.append(client.call(method, list(params)))
-                except RpcError as exc:
-                    if "revert" in str(exc).lower():
-                        results.append(None)
-                    else:
-                        raise
-            return results
+        results = self._rpc_state_batch(calls, self._clients[lane])
+        for index, result in enumerate(results):
+            if not isinstance(result, Mapping) or "error" not in result:
+                continue
+            error = result["error"]
+            code = error.get("code") if isinstance(error, Mapping) else None
+            if code == 3 or "execution reverted" in str(error).lower():
+                results[index] = None
+            else:
+                # A missing identity method is a contract outcome. Missing
+                # archive state or transport failure cannot reject an emitter.
+                raise RpcError(str(error), code=code)
+        return results
 
     def _resolve_unknown_pools(
         self, lane: str, logs: list[dict[str, Any]],
@@ -2967,7 +3008,7 @@ class MarketIndexer:
             "ORDER BY pool_id LIMIT ?",
             (
                 self._deferred_identity_seed_after_id,
-                DEFERRED_POOL_IDENTITY_BATCH,
+                DEFERRED_POOL_IDENTITY_RPC_BATCH,
             ),
         ).fetchall()
         if not pool_rows:
@@ -3150,45 +3191,53 @@ class MarketIndexer:
         if not rows:
             return False
         with self._current_receipt_lock:
-            if self._current_pool_pending:
-                return False
+            current_pending = set(self._current_pool_pending)
         self._pool_identity_replay_turn = (self._pool_identity_replay_turn + 1) % 4
         started = time.monotonic()
-        try:
-            identity_block = _hex_int(
-                self._clients["pool"].call("eth_blockNumber", []),
-                "current pool identity block",
-            )
-            identity_header = self._block("pool", identity_block)
-        except Exception as exc:
-            for row in rows:
-                marker = str(row.get("last_error") or "")
-                payload = self._pool_identity_marker(marker)
-                if payload is not None:
-                    self._mark_pool_identity_replay_error(
-                        row, marker, payload, exc,
-                    )
-            self._set_runtime("pool_identity", error=exc)
-            return True
-
-        address_budget = 1
+        identity_block: int | None = None
+        identity_header: dict[str, Any] | None = None
+        address_budget = DEFERRED_POOL_IDENTITY_RPC_BATCH
+        worked = False
         replayed = 0
         rejected = 0
         inserted_count = 0
         batch_error: Exception | None = None
         for row in rows:
-            if address_budget <= 0 or self._stop.is_set():
+            if self._stop.is_set():
                 break
             marker = str(row.get("last_error") or "")
             payload = self._pool_identity_marker(marker)
             if payload is None:
                 continue
-            addresses = set(payload["addresses"][:address_budget])
-            if not addresses:
+            addresses: set[str] = set()
+            needs_state = False
+            for address in payload["addresses"]:
+                known = (
+                    self._verified_pool(address) is not None
+                    or address in self._identity_checked
+                )
+                if known:
+                    addresses.add(address)
+                elif address_budget > 0 and address not in current_pending:
+                    addresses.add(address)
+                    address_budget -= 1
+                    needs_state = True
+            if not payload["addresses"]:
                 self._finish_pool_identity_replay(row, marker, payload, set())
+                worked = True
                 continue
-            address_budget -= len(addresses)
+            if not addresses:
+                continue
+            worked = True
             try:
+                # Known identities and already-rejected emitters need no RPC.
+                # They must not wait behind either a new identity or the live feed.
+                if needs_state and identity_header is None:
+                    identity_block = _hex_int(
+                        self._clients["pool"].call("eth_blockNumber", []),
+                        "current pool identity block",
+                    )
+                    identity_header = self._block("pool", identity_block)
                 stored = self.store.read().execute(
                     "SELECT hash,parent_hash,timestamp FROM blocks WHERE number=?",
                     (int(row["block_number"]),),
@@ -3238,8 +3287,11 @@ class MarketIndexer:
                 if legacy_addresses:
                     self._resolve_unknown_pools(
                         "pool", logs, pools,
-                        identity_block=identity_block,
-                        identity_hash=identity_header["hash"],
+                        identity_block=identity_block if needs_state else None,
+                        identity_hash=(
+                            identity_header["hash"]
+                            if needs_state and identity_header is not None else None
+                        ),
                     )
                 resolved_v4: list[dict[str, Any]] = []
                 for pool_id in sorted(
@@ -3250,6 +3302,7 @@ class MarketIndexer:
                         pools[pool_id] = pool
                         resolved_v4.append(pool)
                         continue
+                    assert identity_block is not None and identity_header is not None
                     pool = self._resolve_current_v4_pool(
                         pool_id, identity_block, identity_header["hash"],
                     )
@@ -3260,11 +3313,13 @@ class MarketIndexer:
                     if pool is not None:
                         pools[pool_id] = pool
                         resolved_v4.append(pool)
-                canonical = self._block("pool", identity_block)
-                if canonical["hash"] != identity_header["hash"]:
-                    raise CanonicalConflict(
-                        "current V4 pool identity anchor changed during resolution"
-                    )
+                if needs_state:
+                    assert identity_block is not None and identity_header is not None
+                    canonical = self._block("pool", identity_block)
+                    if canonical["hash"] != identity_header["hash"]:
+                        raise CanonicalConflict(
+                            "current pool identity anchor changed during resolution"
+                        )
                 events = self._decode(
                     "pool", logs, {int(row["block_number"]): header},
                     resolve_unknown=False,
@@ -3307,7 +3362,7 @@ class MarketIndexer:
             pool_identity_rejected=rejected,
             pool_identity_inserted_events=inserted_count,
         )
-        return True
+        return worked
 
     def _decode_current(
         self, logs: list[dict[str, Any]], headers: dict[int, dict[str, Any]],
@@ -4131,6 +4186,7 @@ class MarketIndexer:
     def _rpc_state_batch(
         self, calls: list[tuple[str, Sequence[Any]]], client: Any | None = None,
     ) -> list[Any]:
+        """Deduplicate caller-independent reads and share each pinned state root."""
         selected = client or self._clients["enrichment"]
         unique: list[tuple[str, Sequence[Any]]] = []
         indexes: dict[tuple[str, str], int] = {}
@@ -4143,7 +4199,74 @@ class MarketIndexer:
                 indexes[key] = index
                 unique.append((method, params))
             order.append(index)
-        results = self._batch_on(selected, unique, allow_reverts=True)
+        groups: dict[str, list[int]] = {}
+        for index, (method, params) in enumerate(unique):
+            if (
+                method == "eth_call" and len(params) == 2
+                and isinstance(params[0], Mapping)
+                and set(params[0]) == {"to", "data"}
+            ):
+                pin = json.dumps(params[1], sort_keys=True, separators=(",", ":"))
+            else:
+                pin = f"direct:{index}"
+            groups.setdefault(pin, []).append(index)
+        specifications: list[tuple[str, Sequence[Any]]] = []
+        members: list[list[int]] = []
+        for group in groups.values():
+            for offset in range(0, len(group), _mc.MAX_PER_BATCH):
+                chunk = group[offset:offset + _mc.MAX_PER_BATCH]
+                members.append(chunk)
+                if len(chunk) == 1:
+                    specifications.append(unique[chunk[0]])
+                else:
+                    packed = [
+                        (str(unique[index][1][0]["to"]), str(unique[index][1][0]["data"]))
+                        for index in chunk
+                    ]
+                    specifications.append(("eth_call", [{
+                        "to": _mc.MULTICALL3, "data": _mc.encode(packed),
+                    }, unique[chunk[0]][1][1]]))
+
+        def fetch(specs: list[tuple[str, Sequence[Any]]]) -> list[Any]:
+            if callable(getattr(selected, "batch_results", None)):
+                return [
+                    {"error": str(value)} if isinstance(value, Exception) else value
+                    for value in self._batch_results_on(selected, specs)
+                ]
+            return self._batch_on(selected, specs, allow_reverts=True)
+
+        try:
+            aggregated = fetch(specifications)
+        except Exception:
+            # Older injected transports can reject Multicall3 before returning
+            # any result. The original pinned calls remain the fallback.
+            direct = fetch(unique)
+            return [direct[index] for index in order]
+        results: list[Any] = [None] * len(unique)
+        fallback: list[int] = []
+        for chunk, raw in zip(members, aggregated):
+            if len(chunk) == 1:
+                results[chunk[0]] = raw
+                continue
+            try:
+                decoded = _mc.decode(raw)
+                if len(decoded) != len(chunk):
+                    raise ValueError("Multicall3 response arity mismatch")
+            except Exception:
+                fallback.extend(chunk)
+                continue
+            for index, (ok, data) in zip(chunk, decoded):
+                results[index] = (
+                    "0x" + data.hex() if ok else {
+                        "error": {
+                            "code": 3, "message": "execution reverted",
+                            "data": "0x" + data.hex(),
+                        },
+                    }
+                )
+        if fallback:
+            for index, value in zip(fallback, fetch([unique[index] for index in fallback])):
+                results[index] = value
         return [results[index] for index in order]
 
     @staticmethod
@@ -4291,28 +4414,32 @@ class MarketIndexer:
                     errors[tx_hash] = exc
                     prepared.pop(tx_hash)
 
-        # Trace calls stay independent. One pruned or malformed trace must not
-        # discard successful siblings from the receipt wave.
-        for tx_hash, context in tuple(prepared.items()):
-            if not self._requires_v4_trace(context["receipt"]):
-                continue
+        trace_hashes = [
+            tx_hash for tx_hash, context in prepared.items()
+            if self._requires_v4_trace(context["receipt"])
+        ]
+        traces = self._batch_results_on(client, [
+            ("debug_traceTransaction", [
+                tx_hash, {
+                    "tracer": "callTracer",
+                    "tracerConfig": {"withLog": True},
+                    # Missing archive state stays pending, never reexecutes
+                    # on the authoritative live node.
+                    "reexec": 0,
+                    "timeout": "5s",
+                },
+            ])
+            for tx_hash in trace_hashes
+        ])
+        for tx_hash, trace in zip(trace_hashes, traces):
             try:
-                trace = client.call("debug_traceTransaction", [
-                    tx_hash,
-                    {
-                        "tracer": "callTracer",
-                        "tracerConfig": {"withLog": True},
-                        # Missing historical state stays pending; never rebuild
-                        # it on the authoritative live node.
-                        "reexec": 0,
-                        "timeout": "5s",
-                    },
-                ])
+                if isinstance(trace, Exception):
+                    raise trace
                 if not isinstance(trace, Mapping):
                     raise RpcError(
                         f"transaction {tx_hash} returned a malformed call trace"
                     )
-                context["trace"] = dict(trace)
+                prepared[tx_hash]["trace"] = dict(trace)
             except Exception as exc:
                 errors[tx_hash] = exc
                 prepared.pop(tx_hash)
@@ -4831,11 +4958,14 @@ class MarketIndexer:
         return True
 
     @staticmethod
-    def _balance_call(token: str, pool_address: str, block: int) -> tuple[str, list[Any]]:
+    def _balance_call(token: str, pool_address: str, block_hash: str) -> tuple[str, list[Any]]:
         if len(token) != 42 or len(pool_address) != 42:
             raise ValueError("V3 balance request requires token and pool addresses")
         data = BALANCE_OF_SELECTOR + pool_address[2:].rjust(64, "0")
-        return "eth_call", [{"to": token, "data": data}, hex(block)]
+        return "eth_call", [
+            {"to": token, "data": data},
+            {"blockHash": block_hash, "requireCanonical": True},
+        ]
 
     def _balances_once(self) -> bool:
         if not self.v3_balances or self._stop.is_set():
@@ -4847,11 +4977,12 @@ class MarketIndexer:
         requested = []
         calls = []
         errors = []
+        canonical_rejections = []
         for row in pending:
             try:
                 pair = [
                     self._balance_call(
-                        str(row[token]), str(row["pool_id"]), int(row["block_number"]),
+                        str(row[token]), str(row["pool_id"]), str(row["block_hash"]),
                     )
                     for token in ("token0", "token1")
                 ]
@@ -4862,7 +4993,10 @@ class MarketIndexer:
                 calls.extend(pair)
         completed = []
         try:
-            results = self._rpc_state_batch(calls) if calls else []
+            results = (
+                self._rpc_state_batch(calls, self._clients["balance"])
+                if calls else []
+            )
         except Exception as exc:
             errors.extend((row, exc) for row in requested)
         else:
@@ -4875,30 +5009,59 @@ class MarketIndexer:
                 else:
                     completed.append((row, balance0, balance1))
         saved = 0
-        try:
-            with self.store.transaction():
-                for row, balance0, balance1 in completed:
-                    self.store.save_v3_balance(
-                        str(row["pool_id"]), int(row["block_number"]),
-                        str(row["block_hash"]), balance0, balance1,
-                    )
-        except (CanonicalConflict, ValueError) as exc:
-            errors.extend((row, exc) for row, _balance0, _balance1 in completed)
-        else:
-            saved = len(completed)
-        if errors:
-            with self.store.transaction():
-                for row, exc in errors:
-                    attempts = int(row.get("attempts", 0)) + 1
-                    self.store.mark_v3_balance_error(
-                        str(row["pool_id"]), int(row["block_number"]), str(exc),
-                        delay=min(300.0, 2.0 ** min(attempts, 8)),
-                    )
+        if completed:
+            outcomes = self.store.save_v3_balances([
+                (
+                    str(row["pool_id"]), int(row["block_number"]),
+                    str(row["block_hash"]), balance0, balance1,
+                )
+                for row, balance0, balance1 in completed
+            ])
+            for (row, _balance0, _balance1), outcome in zip(completed, outcomes):
+                if outcome is None:
+                    saved += 1
+                elif isinstance(outcome, CanonicalConflict):
+                    canonical_rejections.append((row, outcome))
+                else:
+                    errors.append((row, outcome))
+        rejected = errors + canonical_rejections
+        if rejected:
+            self.store.mark_v3_balance_errors([
+                (
+                    str(row["pool_id"]), int(row["block_number"]),
+                    str(row["block_hash"]), str(exc),
+                    min(
+                        300.0,
+                        2.0 ** min(int(row.get("attempts", 0)) + 1, 8),
+                    ),
+                )
+                for row, exc in rejected
+            ])
         self._set_runtime(
             "balances", error=errors[-1][1] if errors else None,
             latency=time.monotonic() - started, balances_batch=saved,
+            balances_rejected=len(canonical_rejections),
+            balances_state_reads=len(calls),
         )
         return True
+
+    def _balance_run(self) -> None:
+        backoff = 0.5
+        while not self._stop.is_set():
+            if not self._initialized.wait(0.5):
+                continue
+            try:
+                if not self._balance_verified:
+                    self._verify_chain("balance")
+                    self._balance_verified = True
+                worked = self._balances_once()
+            except Exception as exc:
+                self._set_runtime("balances", error=exc)
+                self._stop.wait(backoff)
+                backoff = min(30.0, backoff * 2.0)
+            else:
+                backoff = 0.5
+                self._stop.wait(0.01 if worked else 0.5)
 
     def _live_run(self) -> None:
         backoff = 0.25
@@ -5109,11 +5272,7 @@ class MarketIndexer:
                 continue
             try:
                 self.store.checkpoint()
-                if not self._projection_verified:
-                    self._verify_chain("enrichment")
-                    self._projection_verified = True
                 worked = self._reproject_once()
-                worked = self._balances_once() or worked
             except Exception as exc:
                 self._set_runtime("projection", error=exc)
                 self._stop.wait(backoff)

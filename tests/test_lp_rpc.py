@@ -69,7 +69,7 @@ def test_missing_archive_state_does_not_poison_headers_or_bypass_cooldown(provid
     assert provider.status()["history_state"]["sources"][0]["state"] == "available"
 
 
-def test_slow_response_does_not_serialize_other_rpc_lanes(provider, monkeypatch):
+def test_slow_response_does_not_serialize_shared_rpc_client(provider, monkeypatch):
     slow_started = threading.Event()
     release_slow = threading.Event()
     monkeypatch.setattr(lp_rpc, "_minimum_interval", lambda _url: 0.0)
@@ -95,7 +95,7 @@ def test_slow_response_does_not_serialize_other_rpc_lanes(provider, monkeypatch)
 
     monkeypatch.setattr(provider._registry, "_session", lambda _source: SimpleNamespace(post=post))
     history = provider("history")
-    live = provider("live")
+    live = history
     with ThreadPoolExecutor(max_workers=2) as executor:
         blocked = executor.submit(history.call, "eth_getBlockByNumber", ["0x10", False])
         try:
@@ -106,6 +106,130 @@ def test_slow_response_does_not_serialize_other_rpc_lanes(provider, monkeypatch)
         finally:
             release_slow.set()
         assert blocked.result(timeout=2) == {"number": "0x10"}
+
+
+def test_concurrent_clients_share_one_chain_verification(provider, monkeypatch):
+    checks = threading.Barrier(2)
+    checked_threads = set()
+    checked_lock = threading.Lock()
+    chain_calls = 0
+    chain_calls_lock = threading.Lock()
+    verified = provider._registry.verified
+
+    def synchronized_verified(source):
+        identity = threading.get_ident()
+        with checked_lock:
+            first_check = identity not in checked_threads
+            checked_threads.add(identity)
+        if first_check:
+            checks.wait(timeout=2)
+        return verified(source)
+
+    def post(_client, _source, payload):
+        nonlocal chain_calls
+        if payload["method"] == "eth_chainId":
+            with chain_calls_lock:
+                chain_calls += 1
+            result = hex(CHAIN_ID)
+        else:
+            result = "0x200"
+        return {
+            "jsonrpc": "2.0", "id": payload["id"], "result": result,
+        }
+
+    monkeypatch.setattr(provider._registry, "verified", synchronized_verified)
+    monkeypatch.setattr(lp_rpc.RoutedRpc, "_post", post)
+    clients = (provider("live"), provider("live"))
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(
+            lambda client: client.call("eth_blockNumber"), clients,
+        ))
+    assert results == ["0x200", "0x200"]
+    assert chain_calls == 1
+
+
+def test_rate_wait_does_not_consume_response_capacity(provider, monkeypatch):
+    clock = SimpleNamespace(now=100.0)
+    gate = lp_rpc._SourceGate(next_at=101.0, started_at=100.0)
+    available_during_wait = []
+
+    def sleep(delay):
+        permits = []
+        for _index in range(lp_rpc.MAX_SOURCE_CONCURRENCY):
+            if gate.slots.acquire(blocking=False):
+                permits.append(True)
+        available_during_wait.append(len(permits))
+        for _permit in permits:
+            gate.slots.release()
+        clock.now += delay
+
+    monkeypatch.setattr(lp_rpc, "time", SimpleNamespace(
+        monotonic=lambda: clock.now, time=lambda: clock.now, sleep=sleep,
+    ))
+    monkeypatch.setattr(lp_rpc, "_gate", lambda _url: gate)
+    monkeypatch.setattr(lp_rpc, "_minimum_interval", lambda _url: 0.0)
+    response = json.dumps({
+        "jsonrpc": "2.0", "id": 1, "result": "0x200",
+    }).encode()
+    session = SimpleNamespace(post=lambda *_args, **_kwargs: SimpleNamespace(
+        raise_for_status=lambda: None,
+        raw=SimpleNamespace(read=lambda *_args, **_kwargs: response),
+        close=lambda: None,
+    ))
+    monkeypatch.setattr(provider._registry, "_session", lambda _source: session)
+
+    client = provider("live")
+    source = provider._registry.sources["head"][0]
+    assert client._post(source, {
+        "jsonrpc": "2.0", "id": 1,
+        "method": "eth_blockNumber", "params": [],
+    })["result"] == "0x200"
+    assert available_during_wait == [lp_rpc.MAX_SOURCE_CONCURRENCY]
+
+
+def test_close_waits_for_admitted_http_request(provider, monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+    close_started = threading.Event()
+    session_closed = threading.Event()
+    source = provider._registry.sources["head"][0]
+
+    def post(_url, *, data, **_kwargs):
+        payload = json.loads(data)
+        started.set()
+        if not release.wait(5):
+            raise TimeoutError("request was not released")
+        encoded = json.dumps({
+            "jsonrpc": "2.0", "id": payload["id"], "result": "0x200",
+        }).encode()
+        return SimpleNamespace(
+            raise_for_status=lambda: None,
+            raw=SimpleNamespace(read=lambda *_args, **_kwargs: encoded),
+            close=lambda: None,
+        )
+
+    session = SimpleNamespace(post=post, close=session_closed.set)
+    provider._registry._clients[(source.url, source.headers)] = session
+    monkeypatch.setattr(provider._registry, "_session", lambda _source: session)
+    monkeypatch.setattr(lp_rpc, "_minimum_interval", lambda _url: 0.0)
+    provider._registry.mark_verified(source)
+    client = provider("live")
+
+    def close_factory():
+        close_started.set()
+        provider.close()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        request = executor.submit(client.call, "eth_blockNumber")
+        assert started.wait(2)
+        closing = executor.submit(close_factory)
+        assert close_started.wait(2)
+        assert not closing.done()
+        assert not session_closed.is_set()
+        release.set()
+        assert request.result(timeout=2) == "0x200"
+        closing.result(timeout=2)
+    assert session_closed.is_set()
 
 
 def test_rpc_credentials_reject_public_files_and_bad_urls_without_leaking(tmp_path, monkeypatch):
@@ -309,6 +433,185 @@ def test_allow_reverts_fails_over_and_propagates_non_revert_failures(monkeypatch
             source["state"]
             for source in factory.status()["history_state"]["sources"]
         ] == ["failed", "failed"]
+    finally:
+        factory.close()
+
+
+def test_batch_failover_does_not_repeat_healthy_siblings(monkeypatch):
+    sources = (
+        lp_rpc._Source("primary", "https://partial-primary.test/rpc"),
+        lp_rpc._Source("fallback", "https://partial-fallback.test/rpc"),
+    )
+    monkeypatch.setattr(lp_rpc, "_source_list", lambda *_args: sources)
+    monkeypatch.setattr(lp_rpc, "head_subscription_urls", lambda: ())
+    batches = []
+
+    def post(_client, source, payload):
+        def response(item):
+            result = {"jsonrpc": "2.0", "id": item["id"]}
+            if item["method"] == "eth_chainId":
+                result["result"] = hex(CHAIN_ID)
+            elif (
+                source.name == "primary"
+                and item["params"][0]["data"] == "0xbad0"
+            ):
+                result["error"] = {
+                    "code": -32000, "message": "missing trie node",
+                }
+            else:
+                result["result"] = (
+                    "0x01" if source.name == "primary" else "0x99"
+                )
+            return result
+
+        if isinstance(payload, list):
+            batches.append((
+                source.name,
+                [item["params"][0]["data"] for item in payload],
+            ))
+            return [response(item) for item in payload]
+        return response(payload)
+
+    monkeypatch.setattr(lp_rpc.RoutedRpc, "_post", post)
+    factory = lp_rpc.build_rpc_factory("", RuntimeError)
+    good = (
+        "eth_call",
+        [{"to": "0x" + "1" * 40, "data": "0x600d"}, "latest"],
+    )
+    bad = (
+        "eth_call",
+        [{"to": "0x" + "1" * 40, "data": "0xbad0"}, "latest"],
+    )
+    try:
+        assert factory("state").batch([good, bad]) == ["0x01", "0x99"]
+        assert batches == [
+            ("primary", ["0x600d", "0xbad0"]),
+            ("fallback", ["0xbad0"]),
+        ]
+    finally:
+        factory.close()
+
+
+def test_batch_results_isolates_errors_without_replaying_siblings(monkeypatch):
+    class RpcFailure(RuntimeError):
+        def __init__(self, message, *, code=None):
+            self.code = code
+            super().__init__(message)
+
+    primary_key = "primary-secret"
+    fallback_key = "fallback-secret"
+    sources = (
+        lp_rpc._Source(
+            "primary", f"https://primary.test/v2/{primary_key}",
+        ),
+        lp_rpc._Source(
+            "fallback", f"https://fallback.test/v2/{fallback_key}",
+        ),
+    )
+    monkeypatch.setattr(lp_rpc, "_source_list", lambda *_args: sources)
+    monkeypatch.setattr(lp_rpc, "head_subscription_urls", lambda: ())
+    batches = []
+
+    def post(_client, source, payload):
+        def response(item):
+            result = {"jsonrpc": "2.0", "id": item["id"]}
+            if item["method"] == "eth_chainId":
+                result["result"] = hex(CHAIN_ID)
+                return result
+            selector = item["params"][0]["data"]
+            if source.name == "primary" and selector == "0x600d":
+                result["result"] = "0x01"
+            elif source.name == "primary" and selector == "0xdead":
+                result["error"] = {
+                    "code": 3, "message": f"execution reverted {source.url}",
+                    "data": "0xdeadbeef",
+                }
+            elif source.name == "fallback" and selector == "0xfade":
+                result["result"] = "0x99"
+            else:
+                result["error"] = {
+                    "code": -32000 if source.name == "primary" else -32001,
+                    "message": f"missing state at {source.url}",
+                    "data": (
+                        "0xaaaaaaaa"
+                        if source.name == "primary"
+                        else "0xbbbbbbbb"
+                    ),
+                }
+            return result
+
+        if isinstance(payload, list):
+            batches.append((
+                source.name,
+                [item["params"][0]["data"] for item in payload],
+            ))
+            return [response(item) for item in payload]
+        return response(payload)
+
+    monkeypatch.setattr(lp_rpc.RoutedRpc, "_post", post)
+    factory = lp_rpc.build_rpc_factory("", RpcFailure)
+    calls = [
+        (
+            "eth_call",
+            [{"to": "0x" + "1" * 40, "data": selector}, "latest"],
+        )
+        for selector in ("0x600d", "0xdead", "0xfade", "0xbad0")
+    ]
+    try:
+        results = factory("state").batch_results(calls)
+        assert results[0] == "0x01"
+        assert isinstance(results[1], RpcFailure)
+        assert results[1].code == 3
+        assert "0xdeadbeef" in str(results[1])
+        assert results[2] == "0x99"
+        assert isinstance(results[3], RpcFailure)
+        assert results[3].code == -32001
+        assert "0xaaaaaaaa" in str(results[3])
+        assert "0xbbbbbbbb" in str(results[3])
+        assert primary_key not in " ".join(map(str, results))
+        assert fallback_key not in " ".join(map(str, results))
+        assert batches == [
+            ("primary", ["0x600d", "0xdead", "0xfade", "0xbad0"]),
+            ("fallback", ["0xfade", "0xbad0"]),
+        ]
+    finally:
+        factory.close()
+
+
+def test_balance_lane_routes_pinned_state_to_history_provider(monkeypatch):
+    live = lp_rpc._Source("live", "https://live-state.test/rpc")
+    historical = lp_rpc._Source(
+        "historical", "https://historical-state.test/rpc",
+    )
+    monkeypatch.setattr(
+        lp_rpc, "_source_list",
+        lambda _url, capability: (
+            (historical,) if capability == "history_state" else (live,)
+        ),
+    )
+    monkeypatch.setattr(lp_rpc, "head_subscription_urls", lambda: ())
+    attempted = []
+
+    def post(_client, source, payload):
+        attempted.append(source.name)
+        result = {
+            "jsonrpc": "2.0", "id": payload["id"],
+            "result": (
+                hex(CHAIN_ID)
+                if payload["method"] == "eth_chainId"
+                else "0x01"
+            ),
+        }
+        return result
+
+    monkeypatch.setattr(lp_rpc.RoutedRpc, "_post", post)
+    factory = lp_rpc.build_rpc_factory("", RuntimeError)
+    try:
+        assert factory("balance").call("eth_call", [
+            {"to": "0x" + "1" * 40, "data": "0x600d"},
+            {"blockHash": "0x" + "a" * 64, "requireCanonical": True},
+        ]) == "0x01"
+        assert attempted == ["historical", "historical"]
     finally:
         factory.close()
 
