@@ -102,8 +102,11 @@ preserves the raw event/cursor/job boundary.
 Adaptive scan sizing uses separate writer targets: two seconds for live
 catch-up and 200 ms for background history. Growth is capped by measured store
 throughput and log density; history starts with eight blocks before adapting.
-History starts a scan only when the live cursor has caught up to the observed
-head, rather than competing with live catch-up below a 512-block threshold.
+History yields when the recent gap exceeds one adaptive live batch, rather than
+requiring the durable cursor to equal a continuously advancing head. Exact-tip
+admission starved history even while live ingestion stayed only a few blocks
+behind. The adaptive batch is the amount the live worker can commit next, not
+an unrelated fixed lag allowance.
 A new block can arrive during an in-flight transaction; the reported gap
 remains the actual head-minus-cursor difference, without rounding it to zero.
 These are feedback targets, not hard transaction deadlines; indivisible block
@@ -201,10 +204,22 @@ event IDs before materializing event payloads; owner selection preserves
 Historical owner activity uses the same block/transaction/log ordering.
 Allow temporary-sort disk space when installing these indexes on a large ledger.
 
+Schema version 11 adds an `append_only` proof to pending accounting jobs.
+Existing jobs default to full replay; accounting state schema remains 3, with
+no bootstrap or ledger rebuild. Before rolling back to a pre-11 writer, reset
+pending `append_only` values to 0 so that writer cannot leave stale proofs.
+
 Overview and bucket-sorted pool pages share one per-pool interval aggregation,
 keyed by event revision, canonical epoch, and the exact bucket boundaries.
 An advancing empty block still changes the window boundary. Pool metadata
 changes invalidate pool candidates and responses without rescanning buckets.
+
+Owner gas totals resolve exactly attributed transactions through their episode,
+even when other transactions require shared-cost qualification. Shared costs
+still use the effects relation and are counted once. A production read-only
+comparison preserved every value across all-history, 24-hour, protocol and pool
+scopes: all-history took 0.43 seconds versus 0.78 for 24,169 owners; a 1,207-owner
+pool scope took 0.12 versus 0.41 seconds. The 24-hour query remained about 0.54 seconds.
 
 Legacy V4 identity seeding checks each canonical candidate transaction's queue
 entry by transaction hash. It no longer searches every serialized error
@@ -249,8 +264,14 @@ controls matching. This is a smoke measurement, not loaded production capacity.
 
 Identity replay admits up to 64 queue records per pass. Already-known or
 rejected identities need no current-state RPC and do not wait for unrelated
-live pool discoveries. New identity work remains bounded to eight addresses.
-Canonical events and queue completion commit together.
+live pool discoveries. Each pass admits at most 64 distinct fresh identities,
+without taking identities reserved by the current lane. Independent factory
+probes share a state wave; membership checks follow in a dependent wave.
+V4 PoolKey reads and transaction/receipt/header fallbacks are likewise batched.
+Canonical anchor checks precede publication; per-row generation, marker and
+stored-hash checks remain inside bounded shared writer transactions. Network
+work stays outside the writer. Transient failures retain their obligations;
+canonical events and queue completion commit together.
 Price sample, reserve, mark, and state inserts use the same multi-row helper
 as event ingestion.
 
@@ -261,6 +282,12 @@ indivisible position can exceed the target. Epoch checks reject reorged work,
 and generation-guarded completion preserves same-epoch input that arrived during
 preparation. Repricing updates the source revision before projections without
 rewriting every event index; search terms refresh only when identity changes.
+New, previously unprojected events can use the existing incremental append path.
+Persisted state must be compatible and the events must start in a later block.
+An existing-event correction, remap, uncertain trigger or mixed queue generation
+requires full replay; a newer maximum priority does not prove append safety.
+Incremental publication preserves untouched historical episodes, effects and
+ownership intervals.
 
 Episode IDs remain tied to their opening event when older history arrives;
 backfill no longer renumbers every later episode and rewrites its effects.

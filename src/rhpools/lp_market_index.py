@@ -80,9 +80,10 @@ V3_BIRTH_REPAIR_PREFIXES = tuple(
     sorted(f"nft:{address}:" for address in V3_NFT_MANAGER_ADDRESSES)
 )
 DEFERRED_POOL_IDENTITY_BATCH = 64
-DEFERRED_POOL_IDENTITY_RPC_BATCH = 8
+DEFERRED_POOL_IDENTITY_RPC_BATCH = DEFERRED_POOL_IDENTITY_BATCH
 DEFERRED_POOL_IDENTITY_CANDIDATES_PER_POOL = 4
 DEFERRED_POOL_IDENTITY_SEED_BUSY_S = 1.0
+DEFERRED_POOL_IDENTITY_PUBLICATION_SECONDS = 0.2
 LEGACY_V4_IDENTITY_BATCH = 4
 DEFERRED_POOL_IDENTITY_PREFIX = "pool_identity_pending:"
 # A bounded snapshot wave shares exact-block state roots through Multicall3.
@@ -945,21 +946,47 @@ class MarketIndexer:
                 pool_id, header, [], "inspector", transaction_hash,
             )
 
-    def _resolve_current_v4_pool(
-        self, pool_id: str, number: int, block_hash: str,
-    ) -> dict[str, Any] | None:
+    def _resolve_current_v4_pools(
+        self, pool_ids: Iterable[str], number: int, block_hash: str,
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, Exception]]:
         # PosM stores a bytes25 prefix; only the complete PoolKey hash proves
         # identity. A zero/mismatched getter result is not a discovered pool.
-        result = self._clients["pool"].call("eth_call", [{
-            "to": V4_POSITION_MANAGER,
-            "data": V4_POOL_KEYS_SELECTOR + pool_id[2:52] + "00" * 7,
-        }, hex(number)])
-        if not isinstance(result, str) or len(result) != 322 or not result.startswith("0x"):
-            return None
-        return self._current_v4_pool_key(
-            pool_id, bytes.fromhex(result[2:]), number, block_hash,
-            source="PositionManager.poolKeys",
-        )
+        ordered = sorted(set(pool_ids))
+        results = self._optional_identity_batch("pool", [
+            (
+                "eth_call",
+                [{
+                    "to": V4_POSITION_MANAGER,
+                    "data": V4_POOL_KEYS_SELECTOR + pool_id[2:52] + "00" * 7,
+                }, hex(number)],
+            )
+            for pool_id in ordered
+        ])
+        resolved: dict[str, dict[str, Any]] = {}
+        failures: dict[str, Exception] = {}
+        for pool_id, result in zip(ordered, results):
+            if isinstance(result, Exception):
+                failures[pool_id] = result
+                continue
+            if (
+                not isinstance(result, str) or not result.startswith("0x")
+                or len(result) != 322
+            ):
+                continue
+            try:
+                raw = bytes.fromhex(result[2:])
+            except ValueError:
+                failures[pool_id] = RpcError(
+                    "PositionManager.poolKeys returned malformed data"
+                )
+                continue
+            pool = self._current_v4_pool_key(
+                pool_id, raw, number, block_hash,
+                source="PositionManager.poolKeys",
+            )
+            if pool is not None:
+                resolved[pool_id] = pool
+        return resolved, failures
 
     def _current_v4_pool_key(
         self, pool_id: str, raw: bytes, number: int, block_hash: str, *, source: str,
@@ -1059,63 +1086,167 @@ class MarketIndexer:
                         return pool
         return None
 
-    def _resolve_current_v4_input(
-        self, pool_id: str, logs: Sequence[Mapping[str, Any]], transaction_hash: str = "",
-    ) -> dict[str, Any] | None:
-        tx_hash = transaction_hash or next(
-            (_lower(log.get("transactionHash")) for log in logs if log.get("transactionHash")),
-            "",
-        )
-        if not tx_hash:
+    def _resolve_current_v4_inputs(
+        self,
+        candidates: Mapping[
+            str, tuple[Sequence[Mapping[str, Any]], str]
+        ],
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, Exception]]:
+        tx_hashes: dict[str, str] = {}
+        missing: set[str] = set()
+        for pool_id, (logs, transaction_hash) in candidates.items():
+            tx_hash = _lower(transaction_hash) or next(
+                (
+                    _lower(log.get("transactionHash"))
+                    for log in logs if log.get("transactionHash")
+                ),
+                "",
+            )
+            if tx_hash:
+                tx_hashes[pool_id] = tx_hash
+            else:
+                missing.add(pool_id)
+        if missing:
             with self._feed_condition:
-                for header, events in reversed(self._observed_blocks.values()):
-                    event = next((row for row in events if row.get("pool_id") == pool_id), None)
-                    if event is not None:
-                        tx_hash = _lower(event["tx_hash"])
+                for _header_, events in reversed(self._observed_blocks.values()):
+                    for event in events:
+                        pool_id = _lower(event.get("pool_id"))
+                        if pool_id in missing:
+                            tx_hashes[pool_id] = _lower(event["tx_hash"])
+                            missing.remove(pool_id)
+                    if not missing:
                         break
-        if not tx_hash:
-            return None
+
+        ordered = [
+            (pool_id, tx_hashes[pool_id])
+            for pool_id in sorted(tx_hashes)
+        ]
         client = self._clients["pool"]
-        transaction = client.call("eth_getTransactionByHash", [tx_hash])
-        if not isinstance(transaction, Mapping):
-            raise RpcError("PoolKey transaction is temporarily unavailable")
-        receipt = client.call("eth_getTransactionReceipt", [tx_hash])
-        if not isinstance(receipt, Mapping):
-            raise RpcError("PoolKey transaction receipt is temporarily unavailable")
-        number = _hex_int(transaction.get("blockNumber"), "PoolKey transaction block")
-        block_hash = _lower(transaction.get("blockHash"))
+        fetched = self._rpc_state_batch([
+            (method, [tx_hash])
+            for _pool_id, tx_hash in ordered
+            for method in (
+                "eth_getTransactionByHash", "eth_getTransactionReceipt",
+            )
+        ], client)
+        errors: dict[str, Exception] = {}
+        prepared: dict[str, dict[str, Any]] = {}
+        for offset, (pool_id, tx_hash) in enumerate(ordered):
+            transaction, receipt = fetched[offset * 2:(offset + 1) * 2]
+            if not isinstance(transaction, Mapping) or "error" in transaction:
+                errors[pool_id] = RpcError(
+                    "PoolKey transaction is temporarily unavailable"
+                )
+                continue
+            if not isinstance(receipt, Mapping) or "error" in receipt:
+                errors[pool_id] = RpcError(
+                    "PoolKey transaction receipt is temporarily unavailable"
+                )
+                continue
+            try:
+                number = _hex_int(
+                    transaction.get("blockNumber"), "PoolKey transaction block",
+                )
+            except RpcError as exc:
+                errors[pool_id] = exc
+                continue
+            block_hash = _lower(transaction.get("blockHash"))
+            prepared[pool_id] = {
+                "tx_hash": tx_hash,
+                "transaction": transaction,
+                "receipt": receipt,
+                "number": number,
+                "block_hash": block_hash,
+            }
+
+        header_ids: list[str] = []
         with self._feed_condition:
-            cached = self._observed_blocks.get(number)
-        if cached is not None and cached[0]["hash"] == block_hash:
-            header = cached[0]
-        else:
-            header = client.call("eth_getBlockByNumber", [hex(number), False])
-            if not isinstance(header, Mapping):
-                raise RpcError("PoolKey transaction header is temporarily unavailable")
-            if (
-                _number(header) != number
-                or _lower(header.get("hash")) != block_hash
-            ):
-                raise CanonicalConflict("PoolKey transaction is no longer canonical")
-        pool = self._current_v4_input_key(
-            pool_id, transaction, receipt, header, tx_hash,
-        )
-        if cached is not None:
-            with self._feed_condition:
-                current = self._observed_blocks.get(number)
-                if current is None or current[0]["hash"] != block_hash:
-                    return None
-        else:
-            canonical = client.call("eth_getBlockByNumber", [hex(number), False])
-            if (
-                not isinstance(canonical, Mapping)
-                or _number(canonical) != number
-                or _lower(canonical.get("hash")) != block_hash
-            ):
-                raise CanonicalConflict(
+            for pool_id, entry in prepared.items():
+                cached = self._observed_blocks.get(entry["number"])
+                if cached is not None and cached[0]["hash"] == entry["block_hash"]:
+                    entry["header"] = cached[0]
+                    entry["cached"] = True
+                else:
+                    header_ids.append(pool_id)
+        headers = self._rpc_state_batch([
+            ("eth_getBlockByNumber", [hex(prepared[pool_id]["number"]), False])
+            for pool_id in header_ids
+        ], client)
+        for pool_id, raw_header in zip(header_ids, headers):
+            entry = prepared[pool_id]
+            if not isinstance(raw_header, Mapping) or "error" in raw_header:
+                errors[pool_id] = RpcError(
+                    "PoolKey transaction header is temporarily unavailable"
+                )
+                continue
+            try:
+                matches = (
+                    _number(raw_header) == entry["number"]
+                    and _lower(raw_header.get("hash")) == entry["block_hash"]
+                )
+            except RpcError as exc:
+                errors[pool_id] = exc
+                continue
+            if not matches:
+                errors[pool_id] = CanonicalConflict(
+                    "PoolKey transaction is no longer canonical"
+                )
+                continue
+            entry["header"] = raw_header
+            entry["cached"] = False
+
+        decoded: dict[str, dict[str, Any] | None] = {}
+        recheck_ids: list[str] = []
+        for pool_id, entry in prepared.items():
+            if pool_id in errors or "header" not in entry:
+                continue
+            try:
+                decoded[pool_id] = self._current_v4_input_key(
+                    pool_id, entry["transaction"], entry["receipt"],
+                    entry["header"], entry["tx_hash"],
+                )
+            except Exception as exc:
+                errors[pool_id] = exc
+                continue
+            if entry["cached"]:
+                with self._feed_condition:
+                    current = self._observed_blocks.get(entry["number"])
+                    if (
+                        current is None
+                        or current[0]["hash"] != entry["block_hash"]
+                    ):
+                        errors[pool_id] = CanonicalConflict(
+                            "PoolKey transaction changed during identity recovery"
+                        )
+            else:
+                recheck_ids.append(pool_id)
+
+        canonical = self._rpc_state_batch([
+            ("eth_getBlockByNumber", [hex(prepared[pool_id]["number"]), False])
+            for pool_id in recheck_ids
+        ], client)
+        for pool_id, raw_header in zip(recheck_ids, canonical):
+            entry = prepared[pool_id]
+            try:
+                matches = (
+                    isinstance(raw_header, Mapping)
+                    and "error" not in raw_header
+                    and _number(raw_header) == entry["number"]
+                    and _lower(raw_header.get("hash")) == entry["block_hash"]
+                )
+            except RpcError:
+                matches = False
+            if not matches:
+                errors[pool_id] = CanonicalConflict(
                     "PoolKey transaction changed during identity recovery"
                 )
-        return pool
+
+        resolved = {
+            pool_id: pool
+            for pool_id, pool in decoded.items()
+            if pool is not None and pool_id not in errors
+        }
+        return resolved, errors
 
     def _resolve_current_pool(
         self, address: str, number: int, block_hash: str,
@@ -1126,9 +1257,19 @@ class MarketIndexer:
             if self._stop.is_set():
                 return
             if len(address) == 66:
-                pool = self._resolve_current_v4_pool(address, number, block_hash)
+                getter_pools, getter_failures = self._resolve_current_v4_pools(
+                    [address], number, block_hash,
+                )
+                if address in getter_failures:
+                    raise getter_failures[address]
+                pool = getter_pools.get(address)
                 if pool is None:
-                    pool = self._resolve_current_v4_input(address, logs, transaction_hash)
+                    recovered, failures = self._resolve_current_v4_inputs({
+                        address: (logs, transaction_hash),
+                    })
+                    if address in failures:
+                        raise failures[address]
+                    pool = recovered.get(address)
             else:
                 pools = self._pools_for_logs(logs)
                 self._resolve_unknown_pools("pool", logs, pools)
@@ -2559,9 +2700,9 @@ class MarketIndexer:
             if code == 3 or "execution reverted" in str(error).lower():
                 results[index] = None
             else:
-                # A missing identity method is a contract outcome. Missing
-                # archive state or transport failure cannot reject an emitter.
-                raise RpcError(str(error), code=code)
+                # Preserve non-EVM failures per identity when the transport
+                # exposes them without failing the complete batch.
+                results[index] = RpcError(str(error), code=code)
         return results
 
     def _resolve_unknown_pools(
@@ -2569,10 +2710,17 @@ class MarketIndexer:
         pools: dict[str, dict[str, Any]], *,
         identity_block: int | None = None,
         identity_hash: str | None = None,
-    ) -> None:
+        addresses: Iterable[str] | None = None,
+    ) -> tuple[bool, dict[str, Exception]]:
         if (identity_block is None) != (identity_hash is None):
             raise ValueError("current identity resolution requires a block and hash")
         unknown = set(unknown_pool_candidates(logs, pools))
+        requested = (
+            {_lower(address) for address in addresses}
+            if addresses is not None else None
+        )
+        if requested is not None:
+            unknown.intersection_update(requested)
         unresolved: dict[str, dict[str, Any] | None] = {
             address: None for address in unknown
         }
@@ -2601,12 +2749,14 @@ class MarketIndexer:
                 ):
                     continue
                 address = _lower(pool["address"])
+                if requested is not None and address not in requested:
+                    continue
                 unresolved[address] = pool
                 first_blocks[address] = min(first_blocks.get(address, number), number)
                 if first_blocks[address] == number:
                     first_hashes[address] = block_hash
         if not unresolved:
-            return
+            return False, {}
 
         unresolved_addresses = set(unresolved)
         for key, pool in tuple(pools.items()):
@@ -2615,7 +2765,9 @@ class MarketIndexer:
 
         with self._identity_resolve_lock:
             available: list[dict[str, Any]] = []
+            pending: list[dict[str, Any]] = []
             resolved: list[dict[str, Any]] = []
+            failures: dict[str, Exception] = {}
             checked: set[str] = set()
             for address in sorted(unresolved):
                 current = self._pool(address)
@@ -2625,25 +2777,50 @@ class MarketIndexer:
                     continue
                 if address in self._identity_checked:
                     continue
-                prior = current or unresolved[address]
                 observed_block = first_blocks.get(address)
                 if observed_block is None:
                     continue
-                observed_hash = first_hashes.get(address)
-                verification_block = (
-                    int(identity_block)
-                    if identity_block is not None else observed_block
+                pending.append({
+                    "address": address,
+                    "prior": current or unresolved[address],
+                    "observed_block": observed_block,
+                    "observed_hash": first_hashes.get(address),
+                    "verification_block": (
+                        int(identity_block)
+                        if identity_block is not None else observed_block
+                    ),
+                    "verification_hash": (
+                        _lower(identity_hash)
+                        if identity_hash is not None else first_hashes.get(address)
+                    ),
+                })
+
+            probes = self._optional_identity_batch(lane, [
+                (
+                    "eth_call",
+                    [{"to": entry["address"], "data": selector},
+                     hex(entry["verification_block"])],
                 )
-                verification_hash = (
-                    _lower(identity_hash)
-                    if identity_hash is not None else observed_hash
+                for entry in pending
+                for selector in (
+                    FACTORY_SELECTOR, TOKEN0_SELECTOR, TOKEN1_SELECTOR,
+                    FEE_SELECTOR, TICK_SPACING_SELECTOR,
                 )
-                tag = hex(verification_block)
-                identity = self._optional_identity_batch(lane, [
-                    ("eth_call", [{"to": address, "data": FACTORY_SELECTOR}, tag]),
-                    ("eth_call", [{"to": address, "data": TOKEN0_SELECTOR}, tag]),
-                    ("eth_call", [{"to": address, "data": TOKEN1_SELECTOR}, tag]),
-                ])
+            ])
+            membership_candidates: list[dict[str, Any]] = []
+            for offset, entry in enumerate(pending):
+                identity = probes[offset * 5:(offset + 1) * 5]
+                failure = next(
+                    (
+                        value for value in identity[:3]
+                        if isinstance(value, Exception)
+                    ),
+                    None,
+                )
+                if failure is not None:
+                    failures[entry["address"]] = failure
+                    continue
+                address = entry["address"]
                 factory = self._abi_address(identity[0])
                 token0 = self._abi_address(identity[1])
                 token1 = self._abi_address(identity[2])
@@ -2655,6 +2832,7 @@ class MarketIndexer:
                     checked.add(address)
                     continue
                 protocol = "v2" if factory in V2_FACTORIES else "v3"
+                prior = entry["prior"]
                 if prior is not None and (
                     prior.get("protocol") != protocol
                     or _lower(prior.get("token0")) != token0
@@ -2669,13 +2847,19 @@ class MarketIndexer:
                     membership_data = GET_PAIR_SELECTOR + token_args
                     discovery_basis = "pinned_factory_getPair_membership"
                 else:
-                    details = self._optional_identity_batch(lane, [
-                        ("eth_call", [{"to": address, "data": FEE_SELECTOR}, tag]),
-                        ("eth_call", [{"to": address, "data": TICK_SPACING_SELECTOR}, tag]),
-                    ])
+                    failure = next(
+                        (
+                            value for value in identity[3:]
+                            if isinstance(value, Exception)
+                        ),
+                        None,
+                    )
+                    if failure is not None:
+                        failures[address] = failure
+                        continue
                     try:
-                        fee = _hex_int(details[0], "pool fee")
-                        spacing_word = _hex_int(details[1], "pool tick spacing")
+                        fee = _hex_int(identity[3], "pool fee")
+                        spacing_word = _hex_int(identity[4], "pool tick spacing")
                     except RpcError:
                         checked.add(address)
                         continue
@@ -2694,14 +2878,35 @@ class MarketIndexer:
                         else GET_POOL_SELECTOR + token_args + f"{fee:064x}"
                     )
                     discovery_basis = "pinned_factory_getPool_membership"
-                membership = self._optional_identity_batch(lane, [
-                    ("eth_call", [{"to": factory, "data": membership_data}, tag]),
-                ])
-                if self._abi_address(membership[0]) != address:
+                membership_candidates.append({
+                    **entry,
+                    "factory": factory,
+                    "token0": token0,
+                    "token1": token1,
+                    "protocol": protocol,
+                    "fee": fee,
+                    "spacing": spacing,
+                    "membership_data": membership_data,
+                    "discovery_basis": discovery_basis,
+                })
+
+            memberships = self._optional_identity_batch(lane, [
+                (
+                    "eth_call",
+                    [{"to": entry["factory"], "data": entry["membership_data"]},
+                     hex(entry["verification_block"])],
+                )
+                for entry in membership_candidates
+            ])
+            for entry, membership in zip(membership_candidates, memberships):
+                if isinstance(membership, Exception):
+                    failures[entry["address"]] = membership
+                    continue
+                address = entry["address"]
+                if self._abi_address(membership) != address:
                     checked.add(address)
                     continue
-
-                payload = dict(prior or {})
+                payload = dict(entry["prior"] or {})
                 metadata = payload.get("metadata_json")
                 if isinstance(metadata, str):
                     try:
@@ -2713,9 +2918,9 @@ class MarketIndexer:
                     "creation_block_known", payload.get("created_block") is not None,
                 )
                 verified_metadata.update({
-                    "discovery_basis": discovery_basis,
-                    "identity_verified_block": verification_block,
-                    "identity_verified_hash": verification_hash,
+                    "discovery_basis": entry["discovery_basis"],
+                    "identity_verified_block": entry["verification_block"],
+                    "identity_verified_hash": entry["verification_hash"],
                     "identity_state_basis": (
                         "current_canonical_factory_membership"
                         if identity_block is not None
@@ -2724,20 +2929,21 @@ class MarketIndexer:
                 })
                 if identity_block is not None:
                     verified_metadata.update({
-                        "identity_observed_block": observed_block,
-                        "identity_observed_hash": observed_hash,
+                        "identity_observed_block": entry["observed_block"],
+                        "identity_observed_hash": entry["observed_hash"],
                     })
-                if protocol == "v3":
+                if entry["protocol"] == "v3":
                     verified_metadata["pool_family"] = (
-                        "slipstream" if factory == SLIPSTREAM_FACTORY else "v3"
+                        "slipstream"
+                        if entry["factory"] == SLIPSTREAM_FACTORY else "v3"
                     )
                 payload.update({
                     "id": address,
-                    "protocol": protocol,
+                    "protocol": entry["protocol"],
                     "address": address,
-                    "token0": token0,
-                    "token1": token1,
-                    "factory": factory,
+                    "token0": entry["token0"],
+                    "token1": entry["token1"],
+                    "factory": entry["factory"],
                     "source": payload.get("source") or (
                         "historical_event_with_current_factory_membership"
                         if identity_block is not None
@@ -2745,28 +2951,29 @@ class MarketIndexer:
                     ),
                     "metadata_json": verified_metadata,
                 })
-                if protocol == "v3":
-                    payload["fee_ppm"] = fee
-                    payload["tick_spacing"] = spacing
+                if entry["protocol"] == "v3":
+                    payload["fee_ppm"] = entry["fee"]
+                    payload["tick_spacing"] = entry["spacing"]
                 pool = self._normalize_pool(payload)
-                if pool is None:
-                    checked.add(address)
-                    continue
-                resolved.append(pool)
+                if pool is not None:
+                    resolved.append(pool)
                 checked.add(address)
 
+            guarded = False
             if identity_block is not None and checked:
                 canonical = self._block(lane, int(identity_block))
                 if canonical["hash"] != _lower(identity_hash):
                     raise CanonicalConflict(
                         "current pool identity anchor changed during resolution"
                     )
+                guarded = True
             for pool in (*available, *resolved):
                 pools[_lower(pool["id"])] = pool
                 pools[_lower(pool["address"])] = pool
             for pool in resolved:
                 self._remember_pool(pool)
             self._identity_checked.update(checked)
+            return guarded, failures
 
     @staticmethod
     def _pool_identity_marker(value: Any) -> dict[str, Any] | None:
@@ -3126,7 +3333,8 @@ class MarketIndexer:
 
     def _finish_pool_identity_replay(
         self, row: Mapping[str, Any], marker: str,
-        payload: Mapping[str, Any], processed: set[str],
+        payload: Mapping[str, Any], processed: set[str], *,
+        pending_error: BaseException | str | None = None,
     ) -> None:
         remaining = set(payload["addresses"]).difference(processed)
         with self.store.transaction() as connection:
@@ -3138,15 +3346,24 @@ class MarketIndexer:
                         log for log in payload["logs"]
                         if self._pool_identity_candidates(log).intersection(remaining)
                     ],
-                    "identity_attempts": 0,
                 })
-                updated.pop("identity_error", None)
+                next_attempt = 0.0
+                if pending_error is None:
+                    updated["identity_attempts"] = 0
+                    updated.pop("identity_error", None)
+                else:
+                    attempts = int(payload.get("identity_attempts", 0)) + 1
+                    updated["identity_attempts"] = attempts
+                    updated["identity_error"] = str(pending_error)[:1000]
+                    next_attempt = time.time() + min(
+                        300.0, 2.0 ** min(attempts, 8),
+                    )
                 connection.execute(
-                    "UPDATE pending_enrichment SET next_attempt=0,last_error=?,"
+                    "UPDATE pending_enrichment SET next_attempt=?,last_error=?,"
                     "updated_at=?,generation=generation+1 WHERE tx_hash=? AND last_error=?",
                     (
-                        self._encode_pool_identity_marker(updated), time.time(),
-                        _lower(row["tx_hash"]), marker,
+                        next_attempt, self._encode_pool_identity_marker(updated),
+                        time.time(), _lower(row["tx_hash"]), marker,
                     ),
                 )
                 return
@@ -3194,14 +3411,18 @@ class MarketIndexer:
             current_pending = set(self._current_pool_pending)
         self._pool_identity_replay_turn = (self._pool_identity_replay_turn + 1) % 4
         started = time.monotonic()
-        identity_block: int | None = None
-        identity_header: dict[str, Any] | None = None
-        address_budget = DEFERRED_POOL_IDENTITY_RPC_BATCH
         worked = False
         replayed = 0
         rejected = 0
         inserted_count = 0
         batch_error: Exception | None = None
+        selected_network: set[str] = set()
+        known_pools: dict[str, dict[str, Any] | None] = {}
+        prepared: list[dict[str, Any]] = []
+        combined_logs: dict[tuple[str, str, int], dict[str, Any]] = {}
+
+        # Preserve the row selector's oldest/newest/requested ordering while
+        # charging the RPC budget once for each distinct fresh identity.
         for row in rows:
             if self._stop.is_set():
                 break
@@ -3209,65 +3430,65 @@ class MarketIndexer:
             payload = self._pool_identity_marker(marker)
             if payload is None:
                 continue
-            addresses: set[str] = set()
-            needs_state = False
-            for address in payload["addresses"]:
-                known = (
-                    self._verified_pool(address) is not None
-                    or address in self._identity_checked
-                )
-                if known:
-                    addresses.add(address)
-                elif address_budget > 0 and address not in current_pending:
-                    addresses.add(address)
-                    address_budget -= 1
-                    needs_state = True
-            if not payload["addresses"]:
+            payload_addresses = set(payload["addresses"])
+            if not payload_addresses:
                 self._finish_pool_identity_replay(row, marker, payload, set())
                 worked = True
                 continue
-            if not addresses:
+            stored = self.store.read().execute(
+                "SELECT hash,parent_hash,timestamp FROM blocks WHERE number=?",
+                (int(row["block_number"]),),
+            ).fetchone()
+            if stored is None or _lower(stored["hash"]) != _lower(
+                row["block_hash"]
+            ):
+                self._finish_pool_identity_replay(
+                    row, marker, payload, payload_addresses,
+                )
+                rejected += len(payload_addresses)
+                worked = True
                 continue
-            worked = True
+            header = {
+                "number": hex(int(row["block_number"])),
+                "hash": _lower(stored["hash"]),
+                "parentHash": _lower(stored["parent_hash"]),
+                "timestamp": hex(int(stored["timestamp"])),
+            }
+            newly_selected: set[str] = set()
             try:
-                # Known identities and already-rejected emitters need no RPC.
-                # They must not wait behind either a new identity or the live feed.
-                if needs_state and identity_header is None:
-                    identity_block = _hex_int(
-                        self._clients["pool"].call("eth_blockNumber", []),
-                        "current pool identity block",
-                    )
-                    identity_header = self._block("pool", identity_block)
-                stored = self.store.read().execute(
-                    "SELECT hash,parent_hash,timestamp FROM blocks WHERE number=?",
-                    (int(row["block_number"]),),
-                ).fetchone()
-                if stored is None or _lower(stored["hash"]) != _lower(
-                    row["block_hash"]
-                ):
-                    self._finish_pool_identity_replay(
-                        row, marker, payload, set(payload["addresses"]),
-                    )
-                    rejected += len(addresses)
+                addresses: set[str] = set()
+                for address in payload["addresses"]:
+                    if address not in known_pools:
+                        known_pools[address] = self._verified_pool(address)
+                    if (
+                        known_pools[address] is not None
+                        or address in self._identity_checked
+                    ):
+                        addresses.add(address)
+                    elif address in selected_network:
+                        addresses.add(address)
+                    elif (
+                        address not in current_pending
+                        and len(selected_network)
+                        < DEFERRED_POOL_IDENTITY_RPC_BATCH
+                    ):
+                        selected_network.add(address)
+                        newly_selected.add(address)
+                        addresses.add(address)
+                if not addresses:
                     continue
-                header = {
-                    "number": hex(int(row["block_number"])),
-                    "hash": _lower(stored["hash"]),
-                    "parentHash": _lower(stored["parent_hash"]),
-                    "timestamp": hex(int(stored["timestamp"])),
-                }
-                logs = [
-                    dict(log) for log in payload["logs"]
-                    if self._pool_identity_candidates(log).intersection(addresses)
-                ]
+
+                raw_logs: list[dict[str, Any]] = []
                 observed_addresses: set[str] = set()
-                for log in logs:
+                for raw_log in payload["logs"]:
+                    log = dict(raw_log)
                     identities = self._pool_identity_candidates(log).intersection(
                         addresses
                     )
+                    if not identities:
+                        continue
                     if (
-                        not identities
-                        or _lower(log.get("transactionHash"))
+                        _lower(log.get("transactionHash"))
                         != _lower(row["tx_hash"])
                         or _hex_int(log.get("blockNumber"), "replay block")
                         != int(row["block_number"])
@@ -3277,84 +3498,321 @@ class MarketIndexer:
                         raise CanonicalConflict(
                             "deferred pool log no longer matches its canonical queue"
                         )
+                    self._log_key(log)
+                    raw_logs.append(log)
                     observed_addresses.update(identities)
                 if observed_addresses != addresses:
                     raise RpcError("deferred pool identity queue omitted raw logs")
-                pools = self._verified_pools_for_deferred_logs(logs)
-                legacy_addresses = {
-                    address for address in addresses if len(address) == 42
+
+                logs = raw_logs
+                entry = {
+                    "row": row,
+                    "marker": marker,
+                    "payload": payload,
+                    "addresses": addresses,
+                    "header": header,
+                    "logs": logs,
                 }
-                if legacy_addresses:
-                    self._resolve_unknown_pools(
-                        "pool", logs, pools,
-                        identity_block=identity_block if needs_state else None,
-                        identity_hash=(
-                            identity_header["hash"]
-                            if needs_state and identity_header is not None else None
-                        ),
-                    )
-                resolved_v4: list[dict[str, Any]] = []
-                for pool_id in sorted(
-                    address for address in addresses if len(address) == 66
-                ):
-                    pool = self._verified_pool(pool_id)
-                    if pool is not None:
-                        pools[pool_id] = pool
-                        resolved_v4.append(pool)
-                        continue
-                    assert identity_block is not None and identity_header is not None
-                    pool = self._resolve_current_v4_pool(
-                        pool_id, identity_block, identity_header["hash"],
-                    )
-                    if pool is None:
-                        pool = self._resolve_current_v4_input(
-                            pool_id, logs, _lower(row["tx_hash"]),
+                prepared.append(entry)
+                for log in logs:
+                    combined_logs.setdefault(self._log_key(log), log)
+                worked = True
+            except Exception as exc:
+                selected_network.difference_update(newly_selected)
+                batch_error = exc
+                worked = True
+                self._mark_pool_identity_replay_error(
+                    row, marker, payload, exc,
+                )
+
+        if not prepared:
+            self._set_runtime(
+                "pool_identity", error=batch_error,
+                latency=time.monotonic() - started,
+                pool_identity_replayed=replayed,
+                pool_identity_rejected=rejected,
+                pool_identity_inserted_events=inserted_count,
+            )
+            return worked
+
+        active_addresses = set().union(*(
+            entry["addresses"] for entry in prepared
+        ))
+        selected_network.intersection_update(active_addresses)
+        identity_block: int | None = None
+        identity_header: dict[str, Any] | None = None
+        anchor_error: Exception | None = None
+        transient: dict[str, Exception] = {}
+        processed_network: set[str] = set()
+        resolved_v4: dict[str, dict[str, Any]] = {}
+        guarded = False
+        if selected_network:
+            try:
+                identity_block = _hex_int(
+                    self._clients["pool"].call("eth_blockNumber", []),
+                    "current pool identity block",
+                )
+                identity_header = self._block("pool", identity_block)
+            except Exception as exc:
+                anchor_error = exc
+                batch_error = exc
+                transient.update({
+                    address: exc for address in selected_network
+                })
+
+        if identity_header is not None:
+            assert identity_block is not None
+            v4_ids = {
+                address for address in selected_network if len(address) == 66
+            }
+            if v4_ids:
+                try:
+                    getter_pools, getter_failures = (
+                        self._resolve_current_v4_pools(
+                            v4_ids, identity_block, identity_header["hash"],
                         )
-                    if pool is not None:
-                        pools[pool_id] = pool
-                        resolved_v4.append(pool)
-                if needs_state:
-                    assert identity_block is not None and identity_header is not None
+                    )
+                    resolved_v4.update(getter_pools)
+                    transient.update(getter_failures)
+                    if getter_failures:
+                        batch_error = getter_failures[
+                            sorted(getter_failures)[0]
+                        ]
+                except Exception as exc:
+                    batch_error = exc
+                    transient.update({pool_id: exc for pool_id in v4_ids})
+                else:
+                    fallback_ids = (
+                        v4_ids.difference(resolved_v4).difference(transient)
+                    )
+                    fallback_candidates = {
+                        pool_id: (
+                            tuple(
+                                log for log in combined_logs.values()
+                                if pool_id in self._pool_identity_candidates(log)
+                            ),
+                            "",
+                        )
+                        for pool_id in fallback_ids
+                    }
+                    try:
+                        recovered, failures = self._resolve_current_v4_inputs(
+                            fallback_candidates,
+                        )
+                    except Exception as exc:
+                        batch_error = exc
+                        transient.update({
+                            pool_id: exc for pool_id in fallback_ids
+                        })
+                    else:
+                        resolved_v4.update(recovered)
+                        transient.update(failures)
+                        if failures:
+                            batch_error = failures[sorted(failures)[0]]
+                        processed_network.update(
+                            fallback_ids.difference(failures)
+                        )
+                    processed_network.update(resolved_v4)
+
+            legacy_ids = {
+                address for address in selected_network if len(address) == 42
+            }
+            if legacy_ids:
+                pools = self._verified_pools_for_deferred_logs(
+                    list(combined_logs.values())
+                )
+                try:
+                    guarded, legacy_failures = self._resolve_unknown_pools(
+                        "pool", list(combined_logs.values()), pools,
+                        identity_block=identity_block,
+                        identity_hash=identity_header["hash"],
+                        addresses=legacy_ids,
+                    )
+                    transient.update(legacy_failures)
+                    if legacy_failures:
+                        batch_error = legacy_failures[
+                            sorted(legacy_failures)[0]
+                        ]
+                except CanonicalConflict as exc:
+                    anchor_error = exc
+                    batch_error = exc
+                except Exception as exc:
+                    batch_error = exc
+                    transient.update({
+                        address: exc for address in legacy_ids
+                    })
+                else:
+                    processed_network.update(legacy_ids.difference(transient))
+
+            if anchor_error is None and processed_network and not guarded:
+                try:
                     canonical = self._block("pool", identity_block)
                     if canonical["hash"] != identity_header["hash"]:
                         raise CanonicalConflict(
                             "current pool identity anchor changed during resolution"
                         )
+                except Exception as exc:
+                    anchor_error = exc
+                    batch_error = exc
+
+        # No network work follows the anchor guard. Decode outside the writer,
+        # then publish prepared rows in short transactions with per-row guards.
+        publication: list[dict[str, Any]] = []
+        for entry in prepared:
+            row = entry["row"]
+            addresses = entry["addresses"]
+            network_addresses = addresses.intersection(selected_network)
+            if anchor_error is not None and network_addresses:
+                publication.append({**entry, "error": anchor_error})
+                continue
+            failed = addresses.intersection(transient)
+            processed = addresses.difference(failed)
+            if not processed:
+                publication.append({
+                    **entry,
+                    "error": transient[sorted(failed)[0]],
+                })
+                continue
+            pending_error = (
+                transient[sorted(failed)[0]] if failed else None
+            )
+            row_v4 = [
+                resolved_v4[pool_id]
+                for pool_id in sorted(processed)
+                if pool_id in resolved_v4
+            ]
+            processed_logs = [
+                log for log in entry["logs"]
+                if self._pool_identity_candidates(log).intersection(processed)
+            ]
+            try:
                 events = self._decode(
-                    "pool", logs, {int(row["block_number"]): header},
+                    "pool", processed_logs,
+                    {int(row["block_number"]): entry["header"]},
                     resolve_unknown=False,
-                    known_pools=resolved_v4,
+                    known_pools=row_v4,
                 )
-                with self.store.transaction():
-                    inserted = self.store.ingest(
-                        [header], events, lane="history",
-                    )
-                    self._finish_pool_identity_replay(
-                        row, marker, payload, addresses,
-                    )
+            except Exception as exc:
+                batch_error = exc
+                publication.append({**entry, "error": exc})
+                continue
+            publication.append({
+                **entry,
+                "processed": processed,
+                "pending_error": pending_error,
+                "row_v4": row_v4,
+                "events": events,
+            })
+
+        published = 0
+        while published < len(publication):
+            completed: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
+            try:
+                with self.store.transaction() as connection:
+                    acquired_at = time.monotonic()
+                    first = published
+                    while (
+                        published < len(publication)
+                        and (
+                            published == first
+                            or time.monotonic() - acquired_at
+                            < DEFERRED_POOL_IDENTITY_PUBLICATION_SECONDS
+                        )
+                    ):
+                        item = publication[published]
+                        published += 1
+                        row = item["row"]
+                        marker = item["marker"]
+                        payload = item["payload"]
+                        pending = connection.execute(
+                            "SELECT generation,last_error,block_hash "
+                            "FROM pending_enrichment WHERE tx_hash=?",
+                            (_lower(row["tx_hash"]),),
+                        ).fetchone()
+                        if (
+                            pending is None
+                            or int(pending["generation"])
+                            != int(row["generation"])
+                            or str(pending["last_error"] or "") != marker
+                            or _lower(pending["block_hash"])
+                            != _lower(row["block_hash"])
+                        ):
+                            continue
+                        stored = connection.execute(
+                            "SELECT hash FROM blocks WHERE number=?",
+                            (int(row["block_number"]),),
+                        ).fetchone()
+                        if (
+                            stored is None
+                            or _lower(stored["hash"]) != item["header"]["hash"]
+                        ):
+                            error = CanonicalConflict(
+                                "deferred pool log changed before publication"
+                            )
+                            batch_error = error
+                            self._mark_pool_identity_replay_error(
+                                row, marker, payload, error,
+                            )
+                            continue
+                        error = item.get("error")
+                        if isinstance(error, BaseException):
+                            self._mark_pool_identity_replay_error(
+                                row, marker, payload, error,
+                            )
+                            continue
+
+                        connection.execute("SAVEPOINT pool_identity_row")
+                        try:
+                            inserted = self.store.ingest(
+                                [item["header"]], item["events"], lane="history",
+                            )
+                            self._finish_pool_identity_replay(
+                                row, marker, payload, item["processed"],
+                                pending_error=item["pending_error"],
+                            )
+                        except Exception as exc:
+                            connection.execute(
+                                "ROLLBACK TO SAVEPOINT pool_identity_row"
+                            )
+                            connection.execute(
+                                "RELEASE SAVEPOINT pool_identity_row"
+                            )
+                            batch_error = exc
+                            self._mark_pool_identity_replay_error(
+                                row, marker, payload, exc,
+                            )
+                        else:
+                            connection.execute(
+                                "RELEASE SAVEPOINT pool_identity_row"
+                            )
+                            completed.append((item, list(inserted)))
+            except Exception as exc:
+                batch_error = exc
+                completed.clear()
+
+            for item, inserted in completed:
+                processed = item["processed"]
                 inserted_count += len(inserted)
                 resolved_pools = {
                     address: self._verified_pool(address)
-                    for address in addresses
+                    for address in processed
                 }
                 resolved_count = sum(
                     pool is not None for pool in resolved_pools.values()
                 )
                 replayed += resolved_count
-                rejected += len(addresses) - resolved_count
+                rejected += len(processed) - resolved_count
                 publish = list(inserted)
                 publish.extend(
                     {"pool": self._stored_pool(stored)}
-                    for pool in resolved_v4
+                    for pool in item["row_v4"]
                     if (stored := self.store.pool(str(pool["id"]))) is not None
                 )
                 if publish:
-                    self._publish_event_pools(publish)
-            except Exception as exc:
-                batch_error = exc
-                self._mark_pool_identity_replay_error(
-                    row, marker, payload, exc,
-                )
+                    try:
+                        self._publish_event_pools(publish)
+                    except Exception as exc:
+                        batch_error = exc
         self._set_runtime(
             "pool_identity", error=batch_error,
             latency=time.monotonic() - started,
@@ -3995,7 +4453,10 @@ class MarketIndexer:
         with self._status_lock:
             head = max(observed_number, int(self._runtime_status.get("head") or 0))
             lag = max(0, head - int(cursor["block_number"]))
-            pending = lag > 0
+            # The live worker normally trails a continuously advancing tip.
+            # Reserve recent-gap priority for debt larger than one adaptive
+            # live batch; exact-tip admission can starve history indefinitely.
+            pending = lag > self._live_chunk
             self._runtime_status.update({
                 "recent_catchup_priority": pending,
                 "recent_catchup_lag_blocks": lag,

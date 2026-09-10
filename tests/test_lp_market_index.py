@@ -10,9 +10,12 @@ import pytest
 
 from rhpools.lp_market_index import (
     FACTORY_SELECTOR,
+    FEE_SELECTOR,
     GET_PAIR_SELECTOR,
+    TICK_SPACING_SELECTOR,
     TOKEN0_SELECTOR,
     TOKEN1_SELECTOR,
+    V4_POOL_KEYS_SELECTOR,
     MarketIndexer,
     RpcError,
 )
@@ -23,6 +26,7 @@ from rhpools.lp_market_protocols import (
     POOL_MANAGER,
     TRANSFER_TOPIC,
     V4_MODIFY_LIQUIDITY_TOPIC,
+    V4_POSITION_MANAGER,
 )
 
 
@@ -772,8 +776,8 @@ def test_history_progress_is_independent_of_unrunnable_enrichment(monkeypatch):
         store.close()
 
 
-@pytest.mark.parametrize("live_head", [501, 1_100])
-def test_recent_ledger_gap_yields_history_until_live_progresses(live_head):
+def test_history_prioritizes_large_live_gaps_without_starving_at_tip():
+    live_head = 1_100
     store = MarketStore(":memory:")
     scanner = indexer(store, StaticRpc(live_head))
     scanner._history_verified = True
@@ -795,10 +799,19 @@ def test_recent_ledger_gap_yields_history_until_live_progresses(live_head):
         assert scanner._scan_live_once() is True
         assert store.cursor("live")["block_number"] > 500
         while store.cursor("live")["block_number"] < live_head:
-            assert scanner._scan_history_once() is False
             assert scanner._scan_live_once() is True
-        assert scanner._scan_history_once() is True
-        assert store.cursor("history")["next_to"] < 499
+        for number in range(live_head + 1, live_head + 4):
+            # A continuously advancing head is never exactly equal to the
+            # durable cursor when the history worker gets scheduled.
+            scanner._set_runtime("head", head=number)
+            previous = store.cursor("history")["next_to"]
+            assert scanner._scan_history_once() is True
+            assert store.cursor("history")["next_to"] < previous
+            tip = header(number)
+            store.ingest([tip], [], lane="live", cursor={
+                "block_number": number, "block_hash": tip["hash"],
+                "timestamp": int(tip["timestamp"], 16),
+            })
     finally:
         scanner.close()
         store.close()
@@ -841,13 +854,23 @@ def test_live_health_publishes_while_another_lane_holds_writer():
 def test_requested_identity_replay_keeps_regular_enrichment_interest(monkeypatch):
     store = MarketStore(":memory:")
     scanner = indexer(store)
-    identity_marker = scanner._encode_pool_identity_marker({
-        "addresses": ["0x" + "12" * 20],
-        "logs": [],
-    })
+    def identity_marker(number):
+        block = header(number)
+        return scanner._encode_pool_identity_marker({
+            "addresses": ["0x" + "12" * 20],
+            "logs": [{
+                "address": "0x" + "12" * 20,
+                "topics": [V2_SYNC_TOPIC],
+                "data": "0x" + f"{123:064x}{456:064x}",
+                "blockNumber": block["number"], "blockHash": block["hash"],
+                "transactionHash": "0x" + f"{number:064x}",
+                "transactionIndex": "0x0", "logIndex": "0x0",
+            }],
+        })
     target_tx = "0x" + f"{50:064x}"
     regular_tx = "0x" + f"{51:064x}"
     identity_numbers = [*range(1, 33), 50, *range(68, 100)]
+    store.ingest([header(number) for number in sorted([*identity_numbers, 51])], [])
     now = time.time()
     with store.transaction() as connection:
         connection.executemany(
@@ -861,7 +884,7 @@ def test_requested_identity_replay_keeps_regular_enrichment_interest(monkeypatch
                     header(number)["hash"],
                     0,
                     0,
-                    identity_marker,
+                    identity_marker(number),
                     now,
                     now,
                 )
@@ -941,6 +964,8 @@ def test_history_defers_cold_pool_identity_to_current_canonical_state(monkeypatc
                 if target == spoof_pool:
                     return word("0x" + "00" * 20)
                 if target == valid_pool:
+                    if selector in {FEE_SELECTOR, TICK_SPACING_SELECTOR}:
+                        raise RpcError("execution reverted", code=3)
                     return {
                         FACTORY_SELECTOR: word(factory),
                         TOKEN0_SELECTOR: word(token0),
@@ -1040,6 +1065,375 @@ def test_history_defers_cold_pool_identity_to_current_canonical_state(monkeypatc
     finally:
         scanner.close()
         store.close()
+
+
+def test_deferred_identity_batch_preserves_transient_part_of_mixed_row(
+    monkeypatch,
+):
+    valid_pool = "0x" + "12" * 20
+    invalid_pool = "0x" + "13" * 20
+    transient_v4 = "0x" + "14" * 32
+    token0 = "0x" + "21" * 20
+    token1 = "0x" + "23" * 20
+    factory = sorted(V2_FACTORIES)[0]
+    tx_hash = "0x" + "31" * 32
+    block = header(9)
+
+    def address_word(address):
+        return "0x" + address[2:].rjust(64, "0")
+
+    def sync_log(address, index):
+        return {
+            "address": address,
+            "topics": [V2_SYNC_TOPIC],
+            "data": "0x" + f"{123:064x}{456:064x}",
+            "blockNumber": block["number"],
+            "blockHash": block["hash"],
+            "transactionHash": tx_hash,
+            "transactionIndex": "0x0",
+            "logIndex": hex(index),
+            "removed": False,
+        }
+
+    v4_log = {
+        "address": POOL_MANAGER,
+        "topics": [
+            V4_MODIFY_LIQUIDITY_TOPIC,
+            transient_v4,
+            "0x" + f"{int('0x' + '45' * 20, 16):064x}",
+        ],
+        "data": "0x" + "".join(
+            f"{value & ((1 << 256) - 1):064x}"
+            for value in (-10, 10, 100, 7)
+        ),
+        "blockNumber": block["number"],
+        "blockHash": block["hash"],
+        "transactionHash": tx_hash,
+        "transactionIndex": "0x0",
+        "logIndex": "0x2",
+        "removed": False,
+    }
+
+    class MixedIdentityRpc(StaticRpc):
+        def __init__(self):
+            super().__init__(100)
+
+        def call(self, method, params):
+            if method == "eth_call":
+                request, tag = params
+                assert tag == hex(self.head)
+                target = request["to"].lower()
+                selector = request["data"][:10]
+                if target == V4_POSITION_MANAGER:
+                    return "0x" + "00" * 160
+                if target == invalid_pool:
+                    return address_word("0x" + "00" * 20)
+                if target == valid_pool:
+                    if selector in {FEE_SELECTOR, TICK_SPACING_SELECTOR}:
+                        raise RpcError("execution reverted", code=3)
+                    return {
+                        FACTORY_SELECTOR: address_word(factory),
+                        TOKEN0_SELECTOR: address_word(token0),
+                        TOKEN1_SELECTOR: address_word(token1),
+                    }[selector]
+                if target == factory and selector == GET_PAIR_SELECTOR:
+                    return address_word(valid_pool)
+                raise AssertionError((target, selector))
+            if method in {
+                "eth_getTransactionByHash", "eth_getTransactionReceipt",
+            }:
+                raise RpcError("transaction transport unavailable")
+            return super().call(method, params)
+
+    store = MarketStore(":memory:")
+    scanner = indexer(store, MixedIdentityRpc())
+    monkeypatch.setattr(scanner, "_seed_deferred_v4_pool_identities", lambda: 0)
+    logs = [sync_log(valid_pool, 0), sync_log(invalid_pool, 1), v4_log]
+    try:
+        store.ingest([block], [])
+        with store.transaction() as connection:
+            assert scanner._queue_deferred_pool_identities(
+                connection, logs, (),
+            ) == 1
+
+        assert scanner._resolve_deferred_pool_identities_once() is True
+
+        event = store.read().execute(
+            "SELECT pool_id,protocol FROM events WHERE tx_hash=?",
+            (tx_hash,),
+        ).fetchone()
+        assert tuple(event) == (valid_pool, "v2")
+        assert store.pool(valid_pool) is not None
+        assert store.pool(invalid_pool) is None
+        assert store.pool(transient_v4) is None
+        pending = store.read().execute(
+            "SELECT next_attempt,last_error FROM pending_enrichment "
+            "WHERE tx_hash=?",
+            (tx_hash,),
+        ).fetchone()
+        marker = scanner._pool_identity_marker(pending["last_error"])
+        assert marker["addresses"] == [transient_v4]
+        assert len(marker["logs"]) == 1
+        assert pending["next_attempt"] > time.time()
+    finally:
+        scanner.close()
+        store.close()
+
+
+def test_deferred_identity_batch_keeps_all_rows_when_anchor_changes(monkeypatch):
+    pools = ("0x" + "31" * 20, "0x" + "32" * 20)
+    tokens = {
+        pools[0]: ("0x" + "41" * 20, "0x" + "42" * 20),
+        pools[1]: ("0x" + "43" * 20, "0x" + "44" * 20),
+    }
+    factory = sorted(V2_FACTORIES)[0]
+    transactions = ("0x" + "51" * 32, "0x" + "52" * 32)
+    current_number = 100
+
+    def address_word(address):
+        return "0x" + address[2:].rjust(64, "0")
+
+    def sync_log(pool_id, tx_hash, number):
+        block = header(number)
+        return {
+            "address": pool_id,
+            "topics": [V2_SYNC_TOPIC],
+            "data": "0x" + f"{123:064x}{456:064x}",
+            "blockNumber": block["number"],
+            "blockHash": block["hash"],
+            "transactionHash": tx_hash,
+            "transactionIndex": "0x0",
+            "logIndex": "0x0",
+            "removed": False,
+        }
+
+    membership = {
+        GET_PAIR_SELECTOR
+        + token0[2:].rjust(64, "0")
+        + token1[2:].rjust(64, "0"): pool_id
+        for pool_id, (token0, token1) in tokens.items()
+    }
+
+    class ReorgingIdentityRpc(StaticRpc):
+        def __init__(self):
+            super().__init__(current_number)
+            self.current_reads = 0
+
+        def call(self, method, params):
+            if method == "eth_getBlockByNumber":
+                number = int(params[0], 16)
+                block = header(number)
+                if number == current_number:
+                    self.current_reads += 1
+                    if self.current_reads > 1:
+                        block["hash"] = "0x" + "aa" * 32
+                return block
+            if method == "eth_call":
+                request, tag = params
+                assert tag == hex(current_number)
+                target = request["to"].lower()
+                selector = request["data"][:10]
+                if target in tokens:
+                    if selector in {FEE_SELECTOR, TICK_SPACING_SELECTOR}:
+                        raise RpcError("execution reverted", code=3)
+                    token0, token1 = tokens[target]
+                    return {
+                        FACTORY_SELECTOR: address_word(factory),
+                        TOKEN0_SELECTOR: address_word(token0),
+                        TOKEN1_SELECTOR: address_word(token1),
+                    }[selector]
+                if target == factory:
+                    return address_word(membership[request["data"]])
+                raise AssertionError((target, selector))
+            return super().call(method, params)
+
+    store = MarketStore(":memory:")
+    scanner = indexer(store, ReorgingIdentityRpc())
+    monkeypatch.setattr(scanner, "_seed_deferred_v4_pool_identities", lambda: 0)
+    logs = [
+        sync_log(pool_id, tx_hash, number)
+        for pool_id, tx_hash, number in zip(pools, transactions, (9, 10))
+    ]
+    try:
+        store.ingest([header(9), header(10)], [])
+        with store.transaction() as connection:
+            assert scanner._queue_deferred_pool_identities(
+                connection, logs, (),
+            ) == 2
+
+        assert scanner._resolve_deferred_pool_identities_once() is True
+
+        assert store.read().execute(
+            "SELECT COUNT(*) FROM events WHERE tx_hash IN (?,?)",
+            transactions,
+        ).fetchone()[0] == 0
+        assert all(store.pool(pool_id) is None for pool_id in pools)
+        queued = store.read().execute(
+            "SELECT next_attempt,last_error FROM pending_enrichment "
+            "WHERE tx_hash IN (?,?) ORDER BY tx_hash",
+            transactions,
+        ).fetchall()
+        assert len(queued) == 2
+        assert all(row["next_attempt"] > time.time() for row in queued)
+        assert all(
+            scanner._pool_identity_marker(row["last_error"]) is not None
+            for row in queued
+        )
+    finally:
+        scanner.close()
+        store.close()
+
+
+def test_v4_identity_batch_replays_duplicates_and_yields_to_current_lane(
+    monkeypatch,
+):
+    from eth_utils import keccak
+
+    token0 = "0x" + "11" * 20
+    token1 = "0x" + "22" * 20
+    hook = "0x" + "33" * 20
+    current_token1 = "0x" + "44" * 20
+
+    def pool_key(second_token):
+        values = (token0, second_token, 3000, 8, hook)
+        raw = b"".join(
+            (value if isinstance(value, int) else int(value, 16)).to_bytes(
+                32, "big",
+            )
+            for value in values
+        )
+        return "0x" + keccak(raw).hex(), raw
+
+    duplicate_pool, duplicate_key = pool_key(token1)
+    current_pool, current_key = pool_key(current_token1)
+    invalid_pool = "0x" + "99" * 32
+    transactions = {
+        duplicate_pool: ("0x" + "61" * 32, "0x" + "62" * 32),
+        invalid_pool: ("0x" + "63" * 32,),
+        current_pool: ("0x" + "64" * 32,),
+    }
+
+    def v4_log(pool_id, tx_hash, number):
+        block = header(number)
+
+        def word(value):
+            return f"{value & ((1 << 256) - 1):064x}"
+
+        return {
+            "address": POOL_MANAGER,
+            "topics": [
+                V4_MODIFY_LIQUIDITY_TOPIC,
+                pool_id,
+                "0x" + word(int("0x" + "55" * 20, 16)),
+            ],
+            "data": "0x" + "".join(
+                word(value) for value in (-10, 10, 100, 7)
+            ),
+            "blockNumber": block["number"],
+            "blockHash": block["hash"],
+            "transactionHash": tx_hash,
+            "transactionIndex": "0x0",
+            "logIndex": "0x0",
+            "removed": False,
+        }
+
+    logs = [
+        v4_log(duplicate_pool, transactions[duplicate_pool][0], 9),
+        v4_log(duplicate_pool, transactions[duplicate_pool][1], 10),
+        v4_log(invalid_pool, transactions[invalid_pool][0], 11),
+        v4_log(current_pool, transactions[current_pool][0], 12),
+    ]
+    getter_results = {
+        V4_POOL_KEYS_SELECTOR + duplicate_pool[2:52] + "00" * 7:
+            duplicate_key,
+        V4_POOL_KEYS_SELECTOR + invalid_pool[2:52] + "00" * 7:
+            duplicate_key,
+        V4_POOL_KEYS_SELECTOR + current_pool[2:52] + "00" * 7:
+            current_key,
+    }
+    invalid_tx = {
+        "hash": transactions[invalid_pool][0],
+        "blockHash": header(11)["hash"],
+        "blockNumber": header(11)["number"],
+        "input": "0x",
+    }
+    invalid_receipt = {
+        "transactionHash": transactions[invalid_pool][0],
+        "blockHash": header(11)["hash"],
+        "logs": [logs[2]],
+    }
+
+    class V4IdentityRpc(StaticRpc):
+        def __init__(self):
+            super().__init__(100)
+
+        def call(self, method, params):
+            if method == "eth_call":
+                request, tag = params
+                assert tag == hex(self.head)
+                if request["to"].lower() != V4_POSITION_MANAGER:
+                    raise AssertionError(request["to"])
+                return "0x" + getter_results[request["data"]].hex()
+            if method == "eth_getTransactionByHash":
+                assert params == [transactions[invalid_pool][0]]
+                return invalid_tx
+            if method == "eth_getTransactionReceipt":
+                assert params == [transactions[invalid_pool][0]]
+                return invalid_receipt
+            return super().call(method, params)
+
+    store = MarketStore(":memory:")
+    scanner = indexer(store, V4IdentityRpc())
+    monkeypatch.setattr(scanner, "_seed_deferred_v4_pool_identities", lambda: 0)
+    try:
+        store.ingest([header(number) for number in range(9, 13)], [])
+        with store.transaction() as connection:
+            assert scanner._queue_deferred_pool_identities(
+                connection, logs, (),
+            ) == 4
+        with scanner._current_receipt_lock:
+            scanner._current_pool_pending.add(current_pool)
+
+        assert scanner._resolve_deferred_pool_identities_once() is True
+
+        replayed = store.read().execute(
+            "SELECT tx_hash,pool_id FROM events WHERE tx_hash IN (?,?,?,?) "
+            "ORDER BY tx_hash",
+            tuple(
+                tx_hash
+                for pool_transactions in transactions.values()
+                for tx_hash in pool_transactions
+            ),
+        ).fetchall()
+        assert [tuple(row) for row in replayed] == [
+            (transactions[duplicate_pool][0], duplicate_pool),
+            (transactions[duplicate_pool][1], duplicate_pool),
+            (transactions[invalid_pool][0], invalid_pool),
+        ]
+        assert store.pool(duplicate_pool)["source"] == "PositionManager.poolKeys"
+        assert store.pool(invalid_pool) is None
+        waiting = store.read().execute(
+            "SELECT tx_hash,last_error FROM pending_enrichment "
+            "WHERE last_error GLOB 'pool_identity_pending:*'"
+        ).fetchall()
+        assert [row["tx_hash"] for row in waiting] == [
+            transactions[current_pool][0]
+        ]
+        marker = scanner._pool_identity_marker(waiting[0]["last_error"])
+        assert marker["addresses"] == [current_pool]
+
+        with scanner._current_receipt_lock:
+            scanner._current_pool_pending.remove(current_pool)
+        assert scanner._resolve_deferred_pool_identities_once() is True
+        assert store.read().execute(
+            "SELECT pool_id FROM events WHERE tx_hash=?",
+            (transactions[current_pool][0],),
+        ).fetchone()["pool_id"] == current_pool
+        assert store.pool(current_pool)["source"] == "PositionManager.poolKeys"
+    finally:
+        scanner.close()
+        store.close()
+
 
 
 @pytest.mark.parametrize("lane", ["live", "history"])

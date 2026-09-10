@@ -248,6 +248,11 @@ class MarketStore:
                 "PRAGMA table_info(lp_accounting_pending)"
             ).fetchall()
         }
+        if "append_only" not in pending_columns:
+            connection.execute(
+                "ALTER TABLE lp_accounting_pending ADD COLUMN "
+                "append_only INTEGER NOT NULL DEFAULT 0"
+            )
         if "identities_ready" not in pending_columns:
             connection.execute(
                 "ALTER TABLE lp_accounting_pending ADD COLUMN "
@@ -571,6 +576,14 @@ class MarketStore:
                 self.connection.execute("PRAGMA user_version=9")
             if int(self.connection.execute("PRAGMA user_version").fetchone()[0]) < 10:
                 self.connection.execute("PRAGMA user_version=10")
+            if int(self.connection.execute("PRAGMA user_version").fetchone()[0]) < 11:
+                accounting_pending_installed = self.connection.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type='table' AND name='lp_accounting_pending'"
+                ).fetchone() is not None
+                if accounting_pending_installed:
+                    self._install_accounting_pending_identities(self.connection)
+                self.connection.execute("PRAGMA user_version=11")
             self.connection.execute(
                 "CREATE INDEX IF NOT EXISTS pending_reprojection_order_idx "
                 "ON pending_reprojection(block_number,tx_index,log_index,event_id)"

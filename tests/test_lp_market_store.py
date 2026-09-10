@@ -792,6 +792,44 @@ def test_reopen_preserves_durable_counts_and_initializes_only_missing_counts(tmp
         store.close()
 
 
+def test_pending_append_proof_upgrade_preserves_existing_queue(tmp_path):
+    path = tmp_path / "pending-append-upgrade.sqlite"
+    connection = sqlite3.connect(path)
+    connection.executescript("""
+        CREATE TABLE lp_accounting_pending(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            position_key TEXT NOT NULL UNIQUE,
+            generation INTEGER NOT NULL,
+            requested_revision INTEGER NOT NULL,
+            requested_epoch INTEGER NOT NULL,
+            priority_block INTEGER NOT NULL,
+            priority_tx_index INTEGER NOT NULL,
+            priority_log_index INTEGER NOT NULL,
+            identities_ready INTEGER NOT NULL DEFAULT 0,
+            identity_cursor INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT INTO lp_accounting_pending(
+            id,position_key,generation,requested_revision,requested_epoch,
+            priority_block,priority_tx_index,priority_log_index,
+            identities_ready,identity_cursor
+        ) VALUES(41,'existing-position',7,19,3,10,2,5,1,123);
+        PRAGMA user_version=10;
+    """)
+    connection.close()
+
+    with MarketStore(path) as store:
+        assert store.read().execute("PRAGMA user_version").fetchone()[0] == 11
+        assert tuple(store.read().execute(
+            "SELECT id,position_key,generation,append_only,"
+            "requested_revision,requested_epoch,priority_block,"
+            "priority_tx_index,priority_log_index,"
+            "identities_ready,identity_cursor "
+            "FROM lp_accounting_pending"
+        ).fetchone()) == (
+            41, "existing-position", 7, 0, 19, 3, 10, 2, 5, 1, 123,
+        )
+
+
 def test_schema_migrations_preserve_durable_accounting_state(tmp_path):
     path = tmp_path / "schema-migration.sqlite"
     block = header(10)
@@ -948,9 +986,10 @@ def test_schema_migrations_preserve_durable_accounting_state(tmp_path):
                     )
                 ],
                 "pending": tuple(connection.execute(
-                    "SELECT id,position_key,generation,requested_revision,"
-                    "requested_epoch,priority_block,priority_tx_index,"
-                    "priority_log_index FROM lp_accounting_pending"
+                    "SELECT id,position_key,generation,append_only,"
+                    "requested_revision,requested_epoch,priority_block,"
+                    "priority_tx_index,priority_log_index "
+                    "FROM lp_accounting_pending"
                 ).fetchone()),
             }
 
@@ -1000,9 +1039,9 @@ def test_schema_migrations_preserve_durable_accounting_state(tmp_path):
         assert committed_after_v9 == committed_before_v9
         assert store.cursor("live") == cursor
         assert tuple(reader.execute(
-            "SELECT identities_ready,identity_cursor "
+            "SELECT append_only,identities_ready,identity_cursor "
             "FROM lp_accounting_pending WHERE position_key='shared-position'"
-        ).fetchone()) == (0, 0)
+        ).fetchone()) == (0, 0, 0)
 
         with store.transaction() as connection:
             store._install_accounting_pending_identities(connection)

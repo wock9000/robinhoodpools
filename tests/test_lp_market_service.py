@@ -1885,13 +1885,13 @@ def test_owner_summary_deduplicates_shared_transaction_costs_and_preserves_unkno
         owner2 = "0x" + "78" * 20
         blocks = [header(100 + i, int(time.time()) - 60 + i) for i in range(6)]
         opened_a = lp_effect(blocks[0], "v4", "add", 1000, (1_000_000, 1_000_000),
-                             position_state(0), position_state(1000), key="a")
+                             position_state(0), position_state(1000), key="gas-position-a")
         opened_b = lp_effect(blocks[1], "v4", "add", 1000, (1_000_000, 1_000_000),
-                             position_state(0), position_state(1000), key="b")
+                             position_state(0), position_state(1000), key="gas-position-b")
         closed_a = lp_effect(blocks[2], "v4", "remove", -1000, (1_000_000, 1_000_000),
-                             position_state(1000), position_state(0), key="a")
+                             position_state(1000), position_state(0), key="gas-position-a")
         closed_b = lp_effect(blocks[2], "v4", "remove", -1000, (1_000_000, 1_000_000),
-                             position_state(1000), position_state(0), key="b")
+                             position_state(1000), position_state(0), key="gas-position-b")
         closed_b.update(tx_hash=closed_a["tx_hash"], log_index=1)
         for event in (opened_a, opened_b, closed_a, closed_b):
             event["custody"] = MANAGER
@@ -1944,6 +1944,11 @@ def test_owner_summary_deduplicates_shared_transaction_costs_and_preserves_unkno
         assert owner_rows[TOKEN]["gas_usd"] == pytest.approx(0.03)
         assert owner_rows[TOKEN]["net_pnl_usd"] == pytest.approx(0.17)
         assert owner_rows[TOKEN]["coverage"]["cost_qualified"] is True
+        scoped = app.book.owners({
+            "window": "all", "q": "gas-position-a", "identity_scope": "wallets",
+        })["rows"][0]
+        assert scoped["gas_usd"] == pytest.approx(0.02)
+        assert scoped["net_pnl_usd"] == pytest.approx(0.08)
         assert owner_rows[owner2]["fees_usd"] is None
         assert owner_rows[owner2]["gas_usd"] is None
         assert owner_rows[owner2]["net_pnl_usd"] is None
@@ -3075,6 +3080,7 @@ def test_cold_v4_activity_resolves_only_a_complete_verified_pool_key(
     tmp_path, monkeypatch, matching_key, delivery,
 ):
     from eth_utils import keccak
+    from rhpools.lp_market_index import MarketIndexer
     from rhpools import workbench_market as market
 
     class OfflineRpc:
@@ -3083,6 +3089,14 @@ def test_cold_v4_activity_resolves_only_a_complete_verified_pool_key(
 
         def close(self):
             pass
+
+    original_init = MarketIndexer.__init__
+    monkeypatch.setattr(
+        MarketIndexer, "__init__",
+        lambda self, *args, **kwargs: original_init(
+            self, *args, rpc=OfflineRpc(), **kwargs,
+        ),
+    )
 
     universe = market._Universe((), {}, {"v2": 0, "v3": 0, "v4": 0}, (), (), {})
     monkeypatch.setattr(market, "_load_universe", lambda: universe)
@@ -3118,7 +3132,7 @@ def test_cold_v4_activity_resolves_only_a_complete_verified_pool_key(
     } for index, token in enumerate((token0, token1))]
     receipt = {
         "transactionHash": log["transactionHash"], "blockHash": block["hash"],
-        "logs": [log, *transfers],
+        "blockNumber": block["number"], "logs": [log, *transfers],
     }
     # A router supplies reversed currencies, two unrelated addresses, then
     # the fee/spacing/hook tuple. It does not embed a contiguous PoolKey.
@@ -3136,7 +3150,7 @@ def test_cold_v4_activity_resolves_only_a_complete_verified_pool_key(
         if method == "eth_getTransactionByHash":
             return transaction if from_input else None
         if method == "eth_getBlockByNumber":
-            return block
+            return {block["number"]: block, current["number"]: current}[params[0]]
         if method != "eth_call":
             raise AssertionError(method)
         if not release.wait(3):

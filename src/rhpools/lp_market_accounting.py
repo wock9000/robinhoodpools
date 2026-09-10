@@ -287,6 +287,7 @@ CREATE TABLE IF NOT EXISTS lp_accounting_pending (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     position_key TEXT NOT NULL UNIQUE,
     generation INTEGER NOT NULL,
+    append_only INTEGER NOT NULL DEFAULT 0,
     requested_revision INTEGER NOT NULL,
     requested_epoch INTEGER NOT NULL,
     priority_block INTEGER NOT NULL,
@@ -343,7 +344,7 @@ def _dict_rows(cursor: sqlite3.Cursor) -> list[dict[str, Any]]:
 
 
 class _ReplayWrites:
-    """Coalesce and pre-diff a full position replay outside the writer."""
+    """Coalesce and pre-diff a full replay or a proven append."""
 
     _GROUPS = {
         "ownership": (
@@ -368,8 +369,9 @@ class _ReplayWrites:
         ),
     }
 
-    def __init__(self, position_key: str) -> None:
+    def __init__(self, position_key: str, *, append_only: bool = False) -> None:
         self.position_key = position_key
+        self._append_only = bool(append_only)
         self._statements: dict[str, str] = {}
         self._rows: dict[str, dict[Any, tuple[Any, ...]]] = {
             group: {} for group in self._GROUPS
@@ -384,6 +386,8 @@ class _ReplayWrites:
         self, conn: sqlite3.Connection, state: dict[str, Any],
     ) -> None:
         """Keep persisted episode IDs when backfill adds earlier boundaries."""
+        if self._append_only:
+            return
         ordinal = int(state.get("episode_ordinal") or 0)
         prior = conn.execute(
             "SELECT json_extract(state_json,'$.episode_ordinal') "
@@ -435,14 +439,41 @@ class _ReplayWrites:
         for group in ("ownership", "episodes", "positions"):
             table, row_key, _delete_sql = self._GROUPS[group]
             desired = self._rows[group]
-            existing: dict[Any, tuple[Any, ...]] = {
-                row_key(row): tuple(row)
-                for row in conn.execute(
-                    f"SELECT * FROM {table} WHERE position_key=?",
-                    (self.position_key,),
-                ).fetchall()
-            }
-            stale = sorted(existing.keys() - desired.keys())
+            if self._append_only and group == "ownership":
+                existing = {}
+                ordinals = sorted(int(key[1]) for key in desired)
+                for batch in _batches(ordinals):
+                    marks = ",".join("?" for _ in batch)
+                    existing.update({
+                        row_key(row): tuple(row)
+                        for row in conn.execute(
+                            f"SELECT * FROM {table} WHERE position_key=? "
+                            f"AND ordinal IN ({marks})",
+                            (self.position_key, *batch),
+                        ).fetchall()
+                    })
+            elif self._append_only and group == "episodes":
+                existing = {}
+                for batch in _batches(sorted(desired)):
+                    marks = ",".join("?" for _ in batch)
+                    existing.update({
+                        row_key(row): tuple(row)
+                        for row in conn.execute(
+                            f"SELECT * FROM {table} WHERE id IN ({marks})",
+                            batch,
+                        ).fetchall()
+                    })
+            else:
+                existing = {
+                    row_key(row): tuple(row)
+                    for row in conn.execute(
+                        f"SELECT * FROM {table} WHERE position_key=?",
+                        (self.position_key,),
+                    ).fetchall()
+                }
+            stale = [] if self._append_only else sorted(
+                existing.keys() - desired.keys()
+            )
             deletes[group] = [
                 key if isinstance(key, tuple) else (key,) for key in stale
             ]
@@ -476,57 +507,84 @@ class _ReplayWrites:
         changed_effects: list[int] = []
         stale_effects: list[int] = []
         columns = ",".join(_EFFECT_COLUMNS)
-        # Stream the position range instead of retaining a second full history
-        # of Python rows and probing every effect again by primary key.
-        for row in conn.execute(
-            f"SELECT {columns} FROM lp_accounting_effects WHERE position_key=?",
-            (self.position_key,),
-        ):
-            event_id = int(row[0])
-            desired = desired_effects.get(event_id)
-            if desired is None:
-                stale_effects.append(event_id)
-                if row[5]:
-                    self._affected_txs.add(str(row[5]))
-                if row[2]:
-                    self._changed_episodes.add(str(row[2]))
-                continue
-            remaining_ids.discard(event_id)
-            if tuple(row) != desired:
+        if self._append_only:
+            for batch in _batches(sorted(desired_effects)):
+                marks = ",".join("?" for _ in batch)
+                existing = {
+                    int(row[0]): tuple(row) for row in conn.execute(
+                        f"SELECT {columns} FROM lp_accounting_effects "
+                        f"WHERE event_id IN ({marks})", batch,
+                    )
+                }
+                for event_id, prior in existing.items():
+                    desired = desired_effects[event_id]
+                    remaining_ids.discard(event_id)
+                    if prior == desired:
+                        continue
+                    changed_effects.append(event_id)
+                    if prior[5]:
+                        self._affected_txs.add(str(prior[5]))
+                    if prior[2] and prior[2] != desired[2]:
+                        self._changed_episodes.add(str(prior[2]))
+                    if desired[5]:
+                        self._affected_txs.add(str(desired[5]))
+            for event_id in sorted(remaining_ids):
                 changed_effects.append(event_id)
-                if row[5]:
-                    self._affected_txs.add(str(row[5]))
-                if row[2] and row[2] != desired[2]:
-                    self._changed_episodes.add(str(row[2]))
-                if desired[5]:
-                    self._affected_txs.add(str(desired[5]))
-        # A newly mapped event may still belong to another position. Preserve
-        # that prior transaction's attribution when moving the effect.
-        for batch in _batches(sorted(remaining_ids)):
-            marks = ",".join("?" for _ in batch)
-            existing = {
-                int(row[0]): tuple(row) for row in conn.execute(
-                    f"SELECT {columns} FROM lp_accounting_effects "
-                    f"WHERE event_id IN ({marks})", batch,
-                )
-            }
-            for event_id in batch:
                 desired = desired_effects[event_id]
-                prior = existing.get(event_id)
-                if prior == desired:
-                    continue
-                changed_effects.append(event_id)
-                if prior is not None and prior[5]:
-                    self._affected_txs.add(str(prior[5]))
-                if prior is not None and prior[2] and prior[2] != desired[2]:
-                    self._changed_episodes.add(str(prior[2]))
                 if desired[5]:
                     self._affected_txs.add(str(desired[5]))
+        else:
+            # Stream the position range instead of retaining a second full
+            # history of Python rows and probing every effect by primary key.
+            for row in conn.execute(
+                f"SELECT {columns} FROM lp_accounting_effects WHERE position_key=?",
+                (self.position_key,),
+            ):
+                event_id = int(row[0])
+                desired = desired_effects.get(event_id)
+                if desired is None:
+                    stale_effects.append(event_id)
+                    if row[5]:
+                        self._affected_txs.add(str(row[5]))
+                    if row[2]:
+                        self._changed_episodes.add(str(row[2]))
+                    continue
+                remaining_ids.discard(event_id)
+                if tuple(row) != desired:
+                    changed_effects.append(event_id)
+                    if row[5]:
+                        self._affected_txs.add(str(row[5]))
+                    if row[2] and row[2] != desired[2]:
+                        self._changed_episodes.add(str(row[2]))
+                    if desired[5]:
+                        self._affected_txs.add(str(desired[5]))
+            # A newly mapped event may still belong to another position.
+            # Preserve that prior transaction's attribution when moving it.
+            for batch in _batches(sorted(remaining_ids)):
+                marks = ",".join("?" for _ in batch)
+                existing = {
+                    int(row[0]): tuple(row) for row in conn.execute(
+                        f"SELECT {columns} FROM lp_accounting_effects "
+                        f"WHERE event_id IN ({marks})", batch,
+                    )
+                }
+                for event_id in batch:
+                    desired = desired_effects[event_id]
+                    prior = existing.get(event_id)
+                    if prior == desired:
+                        continue
+                    changed_effects.append(event_id)
+                    if prior is not None and prior[5]:
+                        self._affected_txs.add(str(prior[5]))
+                    if prior is not None and prior[2] and prior[2] != desired[2]:
+                        self._changed_episodes.add(str(prior[2]))
+                    if desired[5]:
+                        self._affected_txs.add(str(desired[5]))
         deletes["effects"] = [(event_id,) for event_id in sorted(stale_effects)]
         changed["effects"] = [
             desired_effects[event_id] for event_id in sorted(changed_effects)
         ]
-        if desired_effects:
+        if desired_effects and not self._append_only:
             # Receipt or price enrichment can change gas without changing any
             # LP effect. Retain those dependencies instead of waiting for a
             # later liquidity action to refresh transaction attribution.
@@ -1034,6 +1092,7 @@ class AccountBook:
         revision: int | None = None,
         epoch: int | None = None,
         hinted: bool = False,
+        append_only: Mapping[str, bool] | None = None,
     ) -> None:
         if not priorities:
             self._finish_if_idle(conn)
@@ -1046,9 +1105,11 @@ class AccountBook:
             self._store_metadata_int(conn, "epoch")
             if epoch is None else int(epoch)
         )
+        append_proofs = append_only or {}
         rows = [
             (
-                key, 0, requested_revision, requested_epoch,
+                key, 0, int(append_proofs.get(key, False)),
+                requested_revision, requested_epoch,
                 int(order[0]), int(order[1]), int(order[2]),
                 int(hinted), 0,
             )
@@ -1057,15 +1118,19 @@ class AccountBook:
         before = conn.total_changes
         conn.executemany(
             "INSERT OR IGNORE INTO lp_accounting_pending("
-            "position_key,generation,requested_revision,requested_epoch,"
+            "position_key,generation,append_only,"
+            "requested_revision,requested_epoch,"
             "priority_block,priority_tx_index,priority_log_index,"
             "identities_ready,identity_cursor"
-            ") VALUES(?,?,?,?,?,?,?,?,?)",
+            ") VALUES(?,?,?,?,?,?,?,?,?,?)",
             rows,
         )
         inserted = conn.total_changes - before
+        # Any uncertain requeue invalidates the proof until the guarded
+        # publication fulfills and deletes this pending row.
         conn.executemany(
             "UPDATE lp_accounting_pending SET generation=generation+1,"
+            "append_only=append_only AND ?,"
             "requested_revision=MAX(requested_revision,?),requested_epoch=?,"
             "priority_block=MAX(priority_block,?),"
             "priority_tx_index=MAX(priority_tx_index,?),"
@@ -1075,6 +1140,7 @@ class AccountBook:
             "WHERE position_key=?",
             (
                 (
+                    int(append_proofs.get(key, False)),
                     requested_revision, requested_epoch,
                     int(order[0]), int(order[1]), int(order[2]),
                     int(hinted), int(hinted), key,
@@ -1464,13 +1530,35 @@ class AccountBook:
     def _prepare_pending(self, position_key: str) -> _PreparedProjection | None:
         with self._reader() as conn:
             pending = conn.execute(
-                "SELECT generation FROM lp_accounting_pending "
+                "SELECT generation,append_only FROM lp_accounting_pending "
                 "WHERE position_key=?",
                 (position_key,),
             ).fetchone()
             if pending is None:
                 return None
             epoch = self._store_metadata_int(conn, "epoch")
+            # Missing effects identify unprojected events. _append_position
+            # still verifies the persisted state schema and block boundary.
+            if bool(pending["append_only"]):
+                event_ids = [
+                    int(row[0]) for row in conn.execute(
+                        "SELECT k.event_id FROM lp_accounting_event_keys k "
+                        "LEFT JOIN lp_accounting_effects x "
+                        "ON x.event_id=k.event_id "
+                        "WHERE k.position_key=? AND x.event_id IS NULL "
+                        "ORDER BY k.event_id",
+                        (position_key,),
+                    )
+                ]
+                writes = _ReplayWrites(position_key, append_only=True)
+                if self._append_position(
+                    conn, position_key, event_ids,
+                    refresh_values=False, writes=writes, flush_writes=False,
+                ):
+                    writes.prepare(conn)
+                    return _PreparedProjection(
+                        position_key, int(pending["generation"]), epoch, writes,
+                    )
             events = self._event_rows(conn, position_key)
             writes = _ReplayWrites(position_key)
             if events:
@@ -1881,6 +1969,7 @@ class AccountBook:
             if event.get("id") is not None
         ]
         old_mapping: dict[int, str] = {}
+        projected_ids: set[int] = set()
         affected_txs: set[str] = set()
         for batch in _batches(ids):
             marks = ",".join("?" for _ in batch)
@@ -1893,6 +1982,14 @@ class AccountBook:
                     batch,
                 ).fetchall()
             })
+            if self.deferred:
+                projected_ids.update(
+                    int(row[0]) for row in conn.execute(
+                        "SELECT event_id FROM lp_accounting_effects "
+                        f"WHERE event_id IN ({marks})",
+                        batch,
+                    )
+                )
             if not self.deferred:
                 affected_txs.update(str(row[0]) for row in conn.execute(
                     "SELECT DISTINCT tx_hash FROM lp_accounting_effects "
@@ -1944,6 +2041,7 @@ class AccountBook:
         inventory_pools.update(pool for pool in legacy_positions.values() if pool)
         if self.deferred:
             priorities: dict[str, tuple[int, int, int]] = {}
+            append_proofs: dict[str, bool] = {}
             identity_hints: dict[
                 tuple[str, str, str, str, str], int
             ] = {}
@@ -1952,16 +2050,25 @@ class AccountBook:
                     continue
                 event_id = int(event["id"])
                 order = _order(event)[:3]
+                new_key = self._event_position_key(event)
                 event_keys = {
                     key for key in (
                         old_mapping.get(event_id),
-                        self._event_position_key(event),
+                        new_key,
                     )
                     if key
                 }
                 for key in event_keys:
                     priorities[key] = max(
                         priorities.get(key, order), order,
+                    )
+                    # An existing mapping or effect means same-order source
+                    # facts may have changed, so only a full replay is safe.
+                    append_proofs[key] = (
+                        append_proofs.get(key, True)
+                        and event_id not in old_mapping
+                        and event_id not in projected_ids
+                        and key == new_key
                     )
                     self._add_event_identity_hints(
                         identity_hints, key, event,
@@ -1979,7 +2086,12 @@ class AccountBook:
                         batch,
                     ).fetchall()
                 )
-            self._queue_position_keys(conn, priorities, hinted=True)
+            for key in legacy_positions:
+                if key in append_proofs:
+                    append_proofs[key] = False
+            self._queue_position_keys(
+                conn, priorities, hinted=True, append_only=append_proofs,
+            )
             if unqueued_legacy := legacy_positions.keys() - priorities.keys():
                 latest = max(_order(event)[:3] for event in events)
                 self._queue_position_keys(
@@ -2295,6 +2407,8 @@ class AccountBook:
         self, conn: sqlite3.Connection, key: str, event_ids: Sequence[int], *,
         refresh_values: bool = True,
         position: Mapping[str, Any] | None | object = _MISSING,
+        writes: _ReplayWrites | None = None,
+        flush_writes: bool = True,
     ) -> bool:
         if not event_ids:
             return False
@@ -2304,14 +2418,19 @@ class AccountBook:
             ))
         if not isinstance(position, Mapping):
             return False
-        marks = ",".join("?" for _ in event_ids)
-        if conn.execute(
-            f"SELECT 1 FROM lp_accounting_effects WHERE event_id IN ({marks}) LIMIT 1",
-            list(event_ids),).fetchone() is not None:
-            return False
-        events = self._event_rows(conn, key, event_ids)
+        events: list[dict[str, Any]] = []
+        for batch in _batches(event_ids):
+            marks = ",".join("?" for _ in batch)
+            if conn.execute(
+                "SELECT 1 FROM lp_accounting_effects "
+                f"WHERE event_id IN ({marks}) LIMIT 1",
+                batch,
+            ).fetchone() is not None:
+                return False
+            events.extend(self._event_rows(conn, key, batch))
         if len(events) != len(event_ids):
             return False
+        events.sort(key=_order)
         last = (int(position["last_block"]), int(position["last_tx_index"]),
                 int(position["last_log_index"]), -1)
         # Pinned before/after snapshots are block-boundary reads.  A second
@@ -2323,7 +2442,10 @@ class AccountBook:
         state = _json(position.get("state_json"))
         if not state or state.get("version") != _SCHEMA_VERSION:
             return False
-        self._derive(conn, key, events, state, refresh_values=refresh_values)
+        self._derive(
+            conn, key, events, state, refresh_values=refresh_values,
+            writes=writes, flush_writes=flush_writes,
+        )
         return True
 
     def _rebuild_position(
@@ -3949,6 +4071,8 @@ class AccountBook:
         # spans several episodes belonging to that owner. Retain the existing
         # per-owner missing-cost short circuit for exactly those uncertain
         # owners; only owners which pass it pay for the de-duplicated sum.
+        # Exact transactions within an uncertain owner's total still have
+        # direct episode attribution; only shared costs need an effects probe.
         uncertain = [owner for owner in selected if owner not in complete]
         for batch in _batches(uncertain, 400):
             values = ",".join("(?)" for _ in batch)
@@ -3967,14 +4091,19 @@ class AccountBook:
                 " AND c.gas_usd IS NULL) THEN NULL ELSE ("
                 "SELECT SUM(c.gas_usd) FROM lp_accounting_tx_costs c "
                 "INDEXED BY lp_accounting_tx_costs_owner "
-                "WHERE c.owner=selected.owner AND EXISTS ("
+                "WHERE c.owner=selected.owner AND CASE "
+                "WHEN c.episode_id IS NOT NULL THEN EXISTS ("
+                "SELECT 1 FROM lp_accounting_episodes ep "
+                "LEFT JOIN pools p ON p.id=ep.pool_id "
+                "WHERE ep.id=c.episode_id AND ep.owner=selected.owner AND "
+                + predicate + ") ELSE EXISTS ("
                 "SELECT 1 FROM lp_accounting_effects fx "
                 "INDEXED BY lp_accounting_effects_tx "
                 "JOIN lp_accounting_episodes ep ON ep.id=fx.episode_id "
                 "LEFT JOIN pools p ON p.id=ep.pool_id "
                 "WHERE fx.tx_hash=c.tx_hash AND ep.owner=selected.owner AND "
-                + predicate + ")) END AS gas_usd FROM selected",
-                [*batch, *args, *args],
+                + predicate + ") END) END AS gas_usd FROM selected",
+                [*batch, *args, *args, *args],
             )
             for row in rows:
                 result[str(row["owner"])] = row["gas_usd"]
