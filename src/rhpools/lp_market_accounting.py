@@ -342,11 +342,15 @@ _EFFECT_WRITE_SQL = (
     + ",".join(
         f"{column}=excluded.{column}" for column in _EFFECT_MUTABLE_COLUMNS
     )
-    + " WHERE "
+    + " WHERE ("
     + " OR ".join(
         f"{column} IS NOT excluded.{column}"
         for column in _EFFECT_MUTABLE_COLUMNS
     )
+    + ") AND (lp_accounting_effects.position_key=excluded.position_key "
+    "OR EXISTS (SELECT 1 FROM lp_accounting_event_keys k "
+    "WHERE k.event_id=excluded.event_id "
+    "AND k.position_key=excluded.position_key))"
 )
 
 
@@ -372,7 +376,7 @@ class _ReplayWrites:
         "effects": (
             "lp_accounting_effects",
             lambda row: int(row[0]),
-            "DELETE FROM lp_accounting_effects WHERE event_id=?",
+            "DELETE FROM lp_accounting_effects WHERE event_id=? AND position_key=?",
         ),
         "positions": (
             "lp_accounting_positions",
@@ -626,7 +630,9 @@ class _ReplayWrites:
                             self._changed_episodes.add(str(prior[2]))
                     if desired[5]:
                         self._affected_txs.add(str(desired[5]))
-        deletes["effects"] = [(event_id,) for event_id in sorted(stale_effects)]
+        deletes["effects"] = [
+            (event_id, self.position_key) for event_id in sorted(stale_effects)
+        ]
         changed["effects"] = [
             desired_effects[event_id] for event_id in sorted(changed_effects)
         ]

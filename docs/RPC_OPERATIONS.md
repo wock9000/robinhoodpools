@@ -285,6 +285,9 @@ indivisible position can exceed the target. Epoch checks reject reorged work,
 and generation-guarded completion preserves same-epoch input that arrived during
 preparation. Repricing updates the source revision before projections without
 rewriting every event index; search terms refresh only when identity changes.
+Effect cleanup is scoped to its prepared position. An upsert can take an effect
+from another position only when the current canonical event mapping names that
+target; stale remap snapshots cannot remove or reclaim a newer position's gas.
 New, previously unprojected events can use the existing incremental append path.
 Persisted state must be compatible and the events must start in a later block.
 An existing-event correction, remap, uncertain trigger or mixed queue generation

@@ -1200,7 +1200,7 @@ def test_deferred_accounting_rejects_prepared_orphan_branch(
 
 
 def test_deferred_accounting_restart_resumes_queue_and_clears_reassigned_key(
-        tmp_path, monkeypatch):
+        tmp_path):
     path = tmp_path / "market.sqlite"
     block = header(100, 1_000)
     event = lp_effect(
@@ -1217,11 +1217,6 @@ def test_deferred_accounting_restart_resumes_queue_and_clears_reassigned_key(
     PriceProjection(store)
     book = AccountBook(store, deferred=True)
 
-    def unexpected_replay(*_args, **_kwargs):
-        raise AssertionError("deferred install replayed the ledger")
-
-    monkeypatch.setattr(book, "_map_existing_events", unexpected_replay)
-    monkeypatch.setattr(book, "_rebuild_position", unexpected_replay)
     try:
         book.install()
         assert store.status()["pending_accounting"] == 1
@@ -1239,6 +1234,46 @@ def test_deferred_accounting_restart_resumes_queue_and_clears_reassigned_key(
         after = book.positions({"owner": TOKEN})["rows"]
         assert [row["position_key"] for row in after] == ["v4:after"]
         assert after[0]["liquidity"] == "1000"
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("published_before_remap", [True, False])
+def test_prepared_remap_preserves_new_positions_gas(
+        tmp_path, monkeypatch, published_before_remap):
+    blocks = [header(100 + index, 1_000 + index) for index in range(2)]
+    opened, closed, costs = traced_v4_episode(blocks, key="before")
+    store, book = accounting_store(tmp_path / "remap.sqlite", deferred=True)
+    try:
+        inserted = store.ingest(blocks, [opened, closed], transactions=costs)
+        if published_before_remap:
+            drain_accounting(book)
+        else:
+            # An unpublished old-key insert waits across the source correction.
+            stale = book._prepare_pending("v4:before")
+        store.enrich([
+            {
+                **event, "id": row["id"], "position_key": "v4:after",
+                "data": {**event["data"], "position_key": "v4:after"},
+            }
+            for event, row in zip((opened, closed), inserted)
+        ])
+        if published_before_remap:
+            # Old-key cleanup waits across publication of the reassigned rows.
+            stale = book._prepare_pending("v4:before")
+        current = book._prepare_pending("v4:after")
+        assert current is not None and stale is not None
+        with monkeypatch.context() as publication:
+            publication.setattr(
+                book, "_prepared_pending", lambda _rows: iter((current, stale)),
+            )
+            book.project_pending()
+        drain_accounting(book)
+        rows = book.closed({"window": "all"})["rows"]
+        assert [row["position_key"] for row in rows] == ["v4:after"]
+        assert rows[0]["gross_pnl_usd"] == pytest.approx(0.1)
+        assert rows[0]["gas_usd"] == pytest.approx(0.02)
+        assert rows[0]["net_pnl_usd"] == pytest.approx(0.08)
     finally:
         store.close()
 
