@@ -1066,7 +1066,9 @@ class LPMarketService:
         self.market = market
         self.store = MarketStore(path, checkpoint_on_commit=not start)
         self.prices = PriceProjection(self.store)
-        self.book = AccountBook(self.store, deferred=start)
+        self.book = AccountBook(
+            self.store, deferred=start, preparation_workers=2 if start else 0,
+        )
         self.book.install()
         self._current_activity_lock = threading.RLock()
         self._current_activity_headers: OrderedDict[int, dict[str, Any]] = OrderedDict()
@@ -1641,6 +1643,7 @@ class LPMarketService:
             self._search_thread.join()
         self.claims.close()
         self.indexer.close()
+        self.book.close()
         self._frame_executor.shutdown(wait=True, cancel_futures=True)
         self.store.close()
 

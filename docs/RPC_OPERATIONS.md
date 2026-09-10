@@ -275,8 +275,11 @@ canonical events and queue completion commit together.
 Price sample, reserve, mark, and state inserts use the same multi-row helper
 as event ingestion.
 
-Accounting prepares bounded groups off the writer and publishes each group with
-one valuation, shared-transaction attribution, episode-cost refresh, and cache
+Accounting prepares bounded groups in two spawned, read-only processes, with at
+most four positions submitted ahead. These workers do not inherit the service's
+writer connection, locks or Python interpreter contention from web queries.
+Only the existing accounting coordinator publishes: each group gets one
+valuation, shared-transaction attribution, episode-cost refresh, and cache
 invalidation pass. Preparation and publication target 0.2 seconds each; one
 indivisible position can exceed the target. Epoch checks reject reorged work,
 and generation-guarded completion preserves same-epoch input that arrived during

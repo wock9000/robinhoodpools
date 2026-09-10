@@ -8,13 +8,17 @@ for already-priced USD presentation values.
 
 from __future__ import annotations
 
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict, defaultdict, deque
 from collections.abc import Mapping
+from concurrent.futures import Future, ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from contextlib import contextmanager
 from functools import lru_cache
-from itertools import groupby
+from itertools import groupby, islice
 import json
 import math
+import multiprocessing
+from pathlib import Path
 import sqlite3
 import threading
 import time
@@ -706,6 +710,35 @@ class _PreparedIdentityHints(NamedTuple):
     hints: tuple[tuple[str, str, str, str, str, int], ...]
 
 
+class _PreparationReader:
+    """Worker-local reader; cannot install schema or publish ledger changes."""
+
+    def __init__(self, path: str) -> None:
+        self._connection = sqlite3.connect(
+            Path(path).resolve().as_uri() + "?mode=ro", uri=True,
+            isolation_level=None, timeout=5.0,
+        )
+        self._connection.row_factory = sqlite3.Row
+        self._connection.execute("PRAGMA query_only=ON")
+
+    def read(self) -> sqlite3.Connection:
+        return self._connection
+
+
+_preparation_book: AccountBook | None = None
+
+
+def _initialize_preparation_worker(path: str) -> None:
+    global _preparation_book
+    _preparation_book = AccountBook(_PreparationReader(path), deferred=True)
+
+
+def _prepare_in_worker(position_key: str) -> _PreparedProjection | None:
+    if _preparation_book is None:
+        raise RuntimeError("accounting preparation worker is not initialized")
+    return _preparation_book._prepare_pending(position_key)
+
+
 def _batches(values: Sequence[Any], size: int = 500) -> Iterable[Sequence[Any]]:
     for start in range(0, len(values), size):
         yield values[start:start + size]
@@ -864,10 +897,15 @@ def _pair(pool: Mapping[str, Any]) -> str:
 class AccountBook:
     """Canonical, reorg-safe LP ownership and episode projection."""
 
-    def __init__(self, store: Any, *, deferred: bool = False):
+    def __init__(
+        self, store: Any, *, deferred: bool = False,
+        preparation_workers: int = 0,
+    ):
         self.store = store
         self.deferred = bool(deferred)
         self._installed = False
+        self._preparation_workers = preparation_workers
+        self._preparation_pool: ProcessPoolExecutor | None = None
         self._projection_lock = threading.Lock()
         self._cache_lock = threading.RLock()
         self._priority_lock = threading.Lock()
@@ -884,6 +922,54 @@ class AccountBook:
         self._owner_activity_cache: OrderedDict[
             tuple[Any, ...], dict[str, Any] | None
         ] = OrderedDict()
+
+    def close(self) -> None:
+        """Join preparation after the accounting coordinator has stopped."""
+        with self._projection_lock:
+            if self._preparation_pool is not None:
+                self._preparation_pool.shutdown(wait=True, cancel_futures=True)
+                self._preparation_pool = None
+
+    def _prepared_pending(
+        self, pending: Sequence[Mapping[str, Any]],
+    ) -> Iterable[_PreparedProjection | None]:
+        if not self._preparation_workers:
+            for row in pending:
+                yield self._prepare_pending(str(row["position_key"]))
+            return
+        if not pending:
+            return
+        if self._preparation_pool is None:
+            # Spawn never inherits the writer connection, locks or web threads.
+            self._preparation_pool = ProcessPoolExecutor(
+                max_workers=self._preparation_workers,
+                mp_context=multiprocessing.get_context("spawn"),
+                initializer=_initialize_preparation_worker,
+                initargs=(str(self.store.path),),
+            )
+        pool = self._preparation_pool
+        source = iter(pending)
+        waiting: deque[Future[_PreparedProjection | None]] = deque()
+        try:
+            for row in islice(source, self._preparation_workers * 2):
+                waiting.append(pool.submit(
+                    _prepare_in_worker, str(row["position_key"]),
+                ))
+            while waiting:
+                prepared = waiting.popleft().result()
+                row = next(source, None)
+                if row is not None:
+                    waiting.append(pool.submit(
+                        _prepare_in_worker, str(row["position_key"]),
+                    ))
+                yield prepared
+        except BrokenProcessPool:
+            pool.shutdown(wait=False, cancel_futures=True)
+            self._preparation_pool = None
+            raise
+        finally:
+            for future in waiting:
+                future.cancel()
 
     @property
     def owners_revision(self) -> int:
@@ -1718,6 +1804,7 @@ class AccountBook:
             pending = self._pending_rows(bounded)
             if pending:
                 worked = True
+            prepared_rows = iter(self._prepared_pending(pending))
             cursor = 0
             while cursor < len(pending):
                 prepared_batch: list[_PreparedProjection] = []
@@ -1730,11 +1817,8 @@ class AccountBook:
                         < _PENDING_PREPARATION_SECONDS
                     )
                 ):
-                    row = pending[cursor]
+                    prepared = next(prepared_rows)
                     cursor += 1
-                    prepared = self._prepare_pending(
-                        str(row["position_key"]),
-                    )
                     if prepared is not None:
                         prepared_batch.append(prepared)
                 published = 0

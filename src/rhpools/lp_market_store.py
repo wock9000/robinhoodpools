@@ -2370,6 +2370,8 @@ class MarketStore:
                 removed = connection.total_changes - before
                 if removed:
                     self._bump(connection, "pending_enrichment", -removed)
+            for event in enriched:
+                event.pop("_transaction_source", None)
             return enriched
 
     def prioritize_enrichment(self, tx_hashes: Iterable[str]) -> None:
