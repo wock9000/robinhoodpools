@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import json
+import sqlite3
 import threading
 import time
 from types import SimpleNamespace
@@ -659,6 +660,102 @@ def test_small_trace_refills_rotate_history_requested_and_recent(monkeypatch):
         second_trace = tuple(row for batch in submitted[True] for row in batch)
         assert [row["block_number"] for row in second_trace] == [700, 699]
     finally:
+        scanner.close()
+        store.close()
+
+
+def test_worker_recovers_when_error_status_persistence_fails(tmp_path, monkeypatch):
+    store = MarketStore(tmp_path / "market.sqlite")
+    allow_recovery = threading.Event()
+    park_worker = threading.Event()
+    operation_failed = threading.Event()
+    operation_resumed = threading.Event()
+    status_write_failed = threading.Event()
+    status_write_recovered = threading.Event()
+    operation_attempts = 0
+    status_attempts = 0
+
+    def project_accounting():
+        nonlocal operation_attempts
+        operation_attempts += 1
+        if operation_attempts == 1:
+            operation_failed.set()
+            raise sqlite3.OperationalError("ledger database or disk is full")
+        if operation_attempts == 2:
+            assert allow_recovery.wait(2)
+            operation_resumed.set()
+            return True
+        park_worker.wait(5)
+        return False
+
+    scanner = indexer(store, accounting_projector=project_accounting)
+    update_status = store.update_status
+
+    def intermittent_status(**values):
+        nonlocal status_attempts
+        status_attempts += 1
+        if status_attempts == 1:
+            status_write_failed.set()
+            raise sqlite3.OperationalError("status database or disk is full")
+        update_status(**values)
+        status_write_recovered.set()
+
+    monkeypatch.setattr(store, "update_status", intermittent_status)
+    accounting = threading.Thread(
+        target=scanner._accounting_run,
+        name="lp-market-accounting",
+        daemon=True,
+    )
+    scanner._threads.append(accounting)
+    accounting.start()
+    scanner._started = True
+    try:
+        assert operation_failed.wait(2)
+        assert status_write_failed.wait(2)
+        deadline = time.monotonic() + 2
+        while "status_persistence" not in scanner.runtime_status().get("errors", {}):
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        failed = scanner.runtime_status()
+        assert accounting.is_alive()
+        assert failed["state"] == "degraded"
+        assert failed["errors"] == {
+            "accounting": "ledger database or disk is full",
+            "status_persistence": "status database or disk is full",
+        }
+        assert failed["workers"]["missing"] == []
+
+        allow_recovery.set()
+        assert operation_resumed.wait(2)
+        assert status_write_recovered.wait(2)
+        deadline = time.monotonic() + 2
+        while scanner.runtime_status().get("errors"):
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        recovered = scanner.runtime_status()
+        assert accounting.is_alive()
+        assert recovered["state"] == "live"
+        assert store.status()["state"] == "live"
+        assert store.status()["errors"] == {}
+
+        dead_history = threading.Thread(
+            target=lambda: None,
+            name="lp-market-history",
+            daemon=True,
+        )
+        scanner._threads.append(dead_history)
+        dead_history.start()
+        dead_history.join(2)
+        assert not dead_history.is_alive()
+        unhealthy = scanner.runtime_status()
+        assert unhealthy["state"] == "degraded"
+        assert unhealthy["workers"]["missing"] == ["lp-market-history"]
+        assert unhealthy["errors"]["workers"] == (
+            "required workers not running: lp-market-history"
+        )
+    finally:
+        allow_recovery.set()
+        park_worker.set()
         scanner.close()
         store.close()
 

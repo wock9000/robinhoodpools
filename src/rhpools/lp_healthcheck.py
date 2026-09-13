@@ -194,6 +194,30 @@ def _validate_status(body: bytes) -> tuple[dict[str, Any] | None, str | None]:
         or not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", state)
     ):
         return None, "invalid_schema"
+    workers = payload.get("workers")
+    if not isinstance(workers, dict):
+        return None, "invalid_schema"
+    groups: dict[str, list[str]] = {}
+    for key in ("required", "running", "missing"):
+        names = workers.get(key)
+        if (
+            not isinstance(names, list)
+            or any(
+                not isinstance(name, str)
+                or not re.fullmatch(r"[a-z][a-z0-9-]{0,63}", name)
+                for name in names
+            )
+            or len(names) != len(set(names))
+        ):
+            return None, "invalid_schema"
+        groups[key] = names
+    required = set(groups["required"])
+    running = set(groups["running"])
+    missing = set(groups["missing"])
+    if not required or running & missing or running | missing != required:
+        return None, "invalid_schema"
+    if missing:
+        return payload, "required_workers_missing"
     return payload, None
 
 

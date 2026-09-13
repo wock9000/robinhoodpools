@@ -399,6 +399,22 @@ the directory is empty, before copying any database or sidecar files. This
 disables Btrfs data checksums and compression for those files; SQLite WAL
 checksums and `synchronous=FULL` remain in use.
 
+If a durable commit fails because storage is full or unavailable, the store
+rolls the failed transaction back before the worker retries. Runtime-status
+persistence is a separate health write. Its failure appears in the live
+`errors.status_persistence` field but cannot terminate ingestion, history,
+metadata, projection, balance, repair, or accounting loops. The status
+`workers` object lists every required index worker and separates running and
+missing threads.
+
+After restoring capacity, do not delete SQLite sidecars or attach a
+write-capable inspection process. If `workers.missing` is empty, leave the
+single owner running and verify that `storage_free_bytes` changes, the
+`status_persistence` error clears, and the affected cursor or backlog advances.
+An old process that already lost a required thread cannot recreate it. Install
+the corrected code, stop that owner, preserve the database, `-wal`, and `-shm`
+together, and start exactly one owner.
+
 For relocation, stop the watchdog and owner, verify the copied files by checksum,
 compare committed cursor/accounting/coverage state, then update `RHP_DATABASE`
 and start one owner. Retain the original files until destination readiness and
@@ -419,4 +435,4 @@ systemctl --user enable --now robinhoodpools-healthcheck.timer
 
 When migrating an existing installation, preserve its database path with `RHP_DATABASE` in a local service drop-in and stop the previous database owner before starting this service. Keep credential-bearing RPC configuration in separate owner-only files.
 
-The watchdog probes both loopback and the public hostname. Three consecutive local failures are required before an application restart; attempts are limited to three per hour with a ten-minute cooldown. A public-only failure does not restart a healthy indexer. The tunnel is restarted only when its unit is inactive or failed. This intentionally avoids restart loops for DNS, registrar, WAF, or upstream-provider failures. Recovery state is stored outside the checkout under `~/.local/state/rhpools/`.
+The watchdog probes both loopback and the public hostname. A status response with a missing required worker is unhealthy even when the HTTP process still serves requests. Three consecutive local failures are required before an application restart; attempts are limited to three per hour with a ten-minute cooldown. A public-only failure does not restart a healthy indexer. The tunnel is restarted only when its unit is inactive or failed. This intentionally avoids restart loops for DNS, registrar, WAF, or upstream-provider failures. Recovery state is stored outside the checkout under `~/.local/state/rhpools/`.

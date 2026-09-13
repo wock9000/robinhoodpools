@@ -751,7 +751,17 @@ class MarketStore:
                 self.connection.rollback()
                 raise
             else:
-                self.connection.commit()
+                try:
+                    self.connection.commit()
+                except BaseException:
+                    # SQLite can leave a transaction open when COMMIT fails for
+                    # SQLITE_FULL or an I/O error. Reset the shared writer so a
+                    # later retry can recover after storage becomes available.
+                    try:
+                        self.connection.rollback()
+                    except Exception:
+                        pass
+                    raise
                 self._change_token += 1
                 if self._local.pool_metadata_dirty:
                     self._pool_metadata_token += 1

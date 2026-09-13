@@ -180,6 +180,34 @@ async function probeStatus() {
       throw new ProbeFailure("invalid_indexed_head");
     }
 
+    const workers = payload.workers;
+    if (workers === null || typeof workers !== "object" || Array.isArray(workers)) {
+      throw new ProbeFailure("invalid_workers");
+    }
+    const groups = ["required", "running", "missing"].map((name) => workers[name]);
+    if (groups.some((names) => (
+      !Array.isArray(names) ||
+      names.some((name) => typeof name !== "string" || !/^[a-z][a-z0-9-]{0,63}$/.test(name)) ||
+      new Set(names).size !== names.length
+    ))) {
+      throw new ProbeFailure("invalid_workers");
+    }
+    const [requiredWorkers, runningWorkers, missingWorkers] = groups.map(
+      (names) => new Set(names),
+    );
+    const accountedWorkers = new Set([...runningWorkers, ...missingWorkers]);
+    if (
+      requiredWorkers.size === 0 ||
+      [...runningWorkers].some((name) => missingWorkers.has(name)) ||
+      accountedWorkers.size !== requiredWorkers.size ||
+      [...accountedWorkers].some((name) => !requiredWorkers.has(name))
+    ) {
+      throw new ProbeFailure("invalid_workers");
+    }
+    if (missingWorkers.size !== 0) {
+      throw new ProbeFailure("required_workers_missing");
+    }
+
     const lagBlocks = isFiniteNumber(payload.lag_blocks)
       ? payload.lag_blocks
       : Math.max(0, payload.head - payload.indexed_head);

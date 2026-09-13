@@ -388,6 +388,7 @@ class MarketIndexer:
         self._runtime_status: dict[str, Any] = {}
         self._runtime_persist_at = 0.0
         self._runtime_error_signature: tuple[tuple[str, str], ...] = ()
+        self._runtime_persistence_error: str | None = None
         self._stop = threading.Event()
         self._live_wakeup = threading.Event()
         self._started = False
@@ -1942,15 +1943,26 @@ class MarketIndexer:
             if latency is not None:
                 self._latency[lane] = round(float(latency), 6)
             self._runtime_status.update(values)
+            errors = dict(self._errors)
+            if self._runtime_persistence_error is not None:
+                errors["status_persistence"] = self._runtime_persistence_error
             self._runtime_status.update({
                 "chain_id": CHAIN_ID,
                 "state": "stopped" if self._stop.is_set()
-                else ("degraded" if self._errors else "live"),
-                "errors": dict(self._errors),
+                else ("degraded" if errors else "live"),
+                "errors": errors,
                 "latency": dict(self._latency),
             })
             payload = dict(self._runtime_status)
-            error_signature = tuple(sorted(self._errors.items()))
+            # A successful write proves that the prior status-persistence error
+            # recovered, so do not write that stale error back into SQLite.
+            persistent_errors = dict(self._errors)
+            payload.update({
+                "state": "stopped" if self._stop.is_set()
+                else ("degraded" if persistent_errors else "live"),
+                "errors": persistent_errors,
+            })
+            error_signature = tuple(sorted(errors.items()))
             urgent = (
                 error_signature != self._runtime_error_signature
                 or any(key in values for key in ("reorg", "startup", "storage_paused"))
@@ -1960,16 +1972,56 @@ class MarketIndexer:
             if persist:
                 self._runtime_persist_at = now
                 self._runtime_error_signature = error_signature
-        if persist and self.store.lock.acquire(blocking=False):
+        if not persist:
+            return
+        try:
+            if not self.store.lock.acquire(blocking=False):
+                return
             try:
                 # Operational health must never queue behind ledger writers.
                 self.store.update_status(**payload)
             finally:
                 self.store.lock.release()
+        except Exception as exc:
+            with self._status_lock:
+                self._runtime_persistence_error = str(exc)[:1000]
+                errors = dict(self._errors)
+                errors["status_persistence"] = self._runtime_persistence_error
+                self._runtime_status.update({
+                    "state": "stopped" if self._stop.is_set() else "degraded",
+                    "errors": errors,
+                })
+        else:
+            with self._status_lock:
+                self._runtime_persistence_error = None
+                errors = dict(self._errors)
+                self._runtime_status.update({
+                    "state": "stopped" if self._stop.is_set()
+                    else ("degraded" if errors else "live"),
+                    "errors": errors,
+                })
 
     def runtime_status(self) -> dict[str, Any]:
         with self._status_lock:
-            return dict(self._runtime_status)
+            status = dict(self._runtime_status)
+        if not self._started:
+            return status
+        required = [thread.name for thread in self._threads]
+        running = [thread.name for thread in self._threads if thread.is_alive()]
+        running_names = set(running)
+        missing = [name for name in required if name not in running_names]
+        status["workers"] = {
+            "required": required,
+            "running": running,
+            "missing": missing,
+        }
+        if missing and not self._stop.is_set():
+            errors = dict(status.get("errors") or {})
+            errors["workers"] = "required workers not running: " + ", ".join(missing)
+            status.update({"state": "degraded", "errors": errors})
+        elif self._stop.is_set():
+            status["state"] = "stopped"
+        return status
 
     def _verify_chain(self, lane: str) -> None:
         chain_id = _hex_int(self._clients[lane].call("eth_chainId", []), "chain id")
@@ -2111,9 +2163,9 @@ class MarketIndexer:
                             daemon=True,
                         ),
                     ]
-                self._started = True
                 for thread in self._threads:
                     thread.start()
+                self._started = True
             except BaseException:
                 self._stop.set()
                 self._initialized.set()

@@ -1328,6 +1328,35 @@ def test_pool_metadata_token_tracks_only_committed_material_changes():
     finally:
         store.close()
 
+def test_failed_commit_resets_writer_for_storage_recovery(tmp_path):
+    store = MarketStore(tmp_path / "market.sqlite")
+    connection = store.connection
+
+    class FailingCommit:
+        fail = True
+
+        def __getattr__(self, name):
+            return getattr(connection, name)
+
+        def commit(self):
+            if self.fail:
+                self.fail = False
+                raise sqlite3.OperationalError("database or disk is full")
+            connection.commit()
+
+    store.connection = FailingCommit()
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="database or disk is full"):
+            store.update_status(marker="uncommitted")
+        assert not connection.in_transaction
+
+        store.update_status(marker="recovered")
+        assert store.status()["marker"] == "recovered"
+    finally:
+        store.connection = connection
+        store.close()
+
+
 def test_close_cancels_running_reader_without_losing_committed_data(tmp_path):
     import sqlite3
     import threading
