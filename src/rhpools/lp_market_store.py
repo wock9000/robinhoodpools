@@ -744,8 +744,8 @@ class MarketStore:
                 return
             self._local.write_depth = 1
             self._local.pool_metadata_dirty = False
-            self.connection.execute("BEGIN IMMEDIATE")
             try:
+                self.connection.execute("BEGIN IMMEDIATE")
                 yield self.connection
             except BaseException:
                 self.connection.rollback()

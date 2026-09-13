@@ -1328,6 +1328,39 @@ def test_pool_metadata_token_tracks_only_committed_material_changes():
     finally:
         store.close()
 
+def test_failed_begin_preserves_atomicity_after_storage_recovery(tmp_path):
+    store = MarketStore(tmp_path / "market.sqlite")
+    connection = store.connection
+
+    class FailingBegin:
+        fail = True
+
+        def __getattr__(self, name):
+            return getattr(connection, name)
+
+        def execute(self, statement, *parameters):
+            if statement == "BEGIN IMMEDIATE" and self.fail:
+                self.fail = False
+                raise sqlite3.OperationalError("database or disk is full")
+            return connection.execute(statement, *parameters)
+
+    store.connection = FailingBegin()
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="database or disk is full"):
+            store.update_status(marker="not_started")
+        with pytest.raises(RuntimeError, match="abort work"):
+            with store.transaction():
+                store.update_status(marker="must_roll_back")
+                raise RuntimeError("abort work")
+        assert store.status().get("marker") is None
+
+        store.update_status(marker="recovered")
+        assert store.status()["marker"] == "recovered"
+    finally:
+        store.connection = connection
+        store.close()
+
+
 def test_failed_commit_resets_writer_for_storage_recovery(tmp_path):
     store = MarketStore(tmp_path / "market.sqlite")
     connection = store.connection
