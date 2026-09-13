@@ -49,3 +49,30 @@ def test_stale_index_and_public_failure_do_not_restart_healthy_origin(tmp_path, 
         assert report["origin"]["status"]["fresh"] is False
         assert report["public"]["ok"] is False
     assert restarts == []
+
+
+def test_status_with_missing_required_worker_is_unhealthy():
+    payload = {
+        "chain_id": 4663,
+        "head": 200_000,
+        "indexed_head": 199_999,
+        "lag_blocks": 1,
+        "state": "degraded",
+        "workers": {
+            "required": ["lp-market-live", "lp-market-history"],
+            "running": ["lp-market-live"],
+            "missing": ["lp-market-history"],
+        },
+    }
+
+    parsed, error = health._validate_status(json.dumps(payload).encode())
+
+    assert parsed == payload
+    assert error == "required_workers_missing"
+
+    payload["state"] = "live"
+    payload["workers"]["running"].append("lp-market-history")
+    payload["workers"]["missing"].clear()
+    parsed, error = health._validate_status(json.dumps(payload).encode())
+    assert parsed == payload
+    assert error is None
