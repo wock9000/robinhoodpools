@@ -303,6 +303,109 @@ def test_rpc_demand_counts_batch_items_and_expires_window(monkeypatch):
     assert gate.traffic()["rpc_calls_per_second"] == round(2 / 60, 3)
 
 
+def test_large_batch_respects_provider_item_limit(provider, monkeypatch):
+    clock = SimpleNamespace(now=100.0)
+    gate = lp_rpc._SourceGate(started_at=clock.now)
+    arrivals = []
+
+    def sleep(delay):
+        clock.now += delay
+
+    monkeypatch.setattr(lp_rpc, "time", SimpleNamespace(
+        monotonic=lambda: clock.now, time=lambda: clock.now, sleep=sleep,
+    ))
+    monkeypatch.setattr(lp_rpc, "_gate", lambda _url: gate)
+
+    def post(_url, *, data, **_kwargs):
+        payload = json.loads(data)
+        items = payload if isinstance(payload, list) else [payload]
+        arrivals[:] = [at for at in arrivals if at > clock.now - 1]
+        limited = len(arrivals) + len(items) > 50
+        arrivals.extend([clock.now] * len(items))
+        responses = []
+        for item in reversed(items):
+            result = {"jsonrpc": "2.0", "id": item["id"]}
+            if limited:
+                result["error"] = {
+                    "code": -32007, "message": "50/second request limit reached",
+                }
+            else:
+                result["result"] = (
+                    hex(CHAIN_ID) if item["method"] == "eth_chainId"
+                    else {"number": item["params"][0]}
+                )
+            responses.append(result)
+        encoded = json.dumps(
+            responses if isinstance(payload, list) else responses[0],
+        ).encode()
+        return SimpleNamespace(
+            raise_for_status=lambda: None,
+            raw=SimpleNamespace(read=lambda *_args, **_kwargs: encoded),
+            close=lambda: None,
+        )
+
+    session = SimpleNamespace(post=post)
+    monkeypatch.setattr(provider._registry, "_session", lambda _source: session)
+    calls = [("eth_getBlockByNumber", [hex(index), False]) for index in range(100)]
+    assert provider("live").batch(calls) == [
+        {"number": hex(index)} for index in range(100)
+    ]
+
+
+@pytest.mark.parametrize("failure_kind", ["transport", "item", "exhausted"])
+def test_chunk_failure_keeps_completed_results(monkeypatch, failure_kind):
+    sources = (
+        lp_rpc._Source("primary", "https://chunk-primary.test/rpc"),
+        lp_rpc._Source("fallback", "https://chunk-fallback.test/rpc"),
+    )
+    monkeypatch.setattr(lp_rpc, "_source_list", lambda *_args: sources)
+    monkeypatch.setattr(lp_rpc, "head_subscription_urls", lambda: ())
+
+    def post(_client, source, payload):
+        if not isinstance(payload, list):
+            return {"jsonrpc": "2.0", "id": payload["id"], "result": hex(CHAIN_ID)}
+        fails = source.name == "primary" and any(
+            item["params"][0]["data"] == hex(12) for item in payload
+        )
+        if (
+            fails and failure_kind != "item"
+            or source.name == "fallback" and failure_kind == "exhausted"
+        ):
+            raise RuntimeError("connection reset")
+        responses = []
+        for item in reversed(payload):
+            result = {"jsonrpc": "2.0", "id": item["id"]}
+            if fails and item["params"][0]["data"] == hex(12):
+                result["error"] = {"code": -32000, "message": "missing trie node"}
+            else:
+                result["result"] = "0x01" if source.name == "primary" else "0x99"
+            responses.append(result)
+        return responses
+
+    monkeypatch.setattr(lp_rpc.RoutedRpc, "_post", post)
+    factory = lp_rpc.build_rpc_factory("", RuntimeError)
+    calls = [
+        ("eth_call", [{"to": "0x" + "1" * 40, "data": hex(index)}, "latest"])
+        for index in range(25)
+    ]
+    fallback_indexes = (
+        set(range(10, 25)) if failure_kind != "item" else {12, *range(20, 25)}
+    )
+    try:
+        if failure_kind == "exhausted":
+            results = factory("state").batch_results(calls)
+            assert len(results) == 25
+            assert results[:10] == ["0x01"] * 10
+            assert all(isinstance(result, RuntimeError) for result in results[10:])
+            return
+        assert factory("state").batch(calls) == [
+            "0x99" if index in fallback_indexes else "0x01"
+            for index in range(25)
+        ]
+    finally:
+        factory.close()
+
+
 @pytest.mark.parametrize("endpoint", [
     "https://rpc.example.test/?key={credential}",
     "https://rpc.example.test/{credential}/",

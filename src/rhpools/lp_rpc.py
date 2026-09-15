@@ -727,10 +727,8 @@ class RoutedRpc:
     def _post(self, source: _Source, payload: Any) -> Any:
         body = json.dumps(payload, separators=(",", ":"))
         calls = len(payload) if isinstance(payload, list) else 1
-        hostname = (urlsplit(source.url).hostname or "").lower()
-        cost = calls if hostname == "edge.goldsky.com" else 1
         gate = _gate(source.url)
-        gate.acquire(_minimum_interval(source.url), cost)
+        gate.acquire(_minimum_interval(source.url), calls)
         response: requests.Response | None = None
         session: requests.Session | None = None
         try:
@@ -1152,76 +1150,86 @@ class RoutedRpc:
                 break
             if not self._registry.can_try(source, capability):
                 continue
-            started = time.monotonic()
-            attempted = pending
-            attempted_specs = [
-                specification for _index, specification in attempted
-            ]
-            try:
-                self._ensure_chain(source)
-                if (
-                    capability == "logs"
-                    and not self._local_log_range_eligible(
-                        source, attempted_specs,
-                    )
-                ):
-                    continue
-                request_ids = self._reserve_ids(len(attempted))
-                payload = [
-                    {
-                        "jsonrpc": "2.0", "id": request_id,
-                        "method": method, "params": params,
-                    }
-                    for request_id, (
-                        _index, (method, params)
-                    ) in zip(request_ids, attempted)
-                ]
-                raw = self._post(source, payload)
-                if not isinstance(raw, list):
-                    raise self._error(
-                        f"{source.name} returned non-list batch response"
-                    )
-                by_id = {
-                    item.get("id"): item
-                    for item in raw if isinstance(item, Mapping)
-                }
-            except Exception as exc:
-                self._registry.failure(source, capability, exc)
-                remember(attempted, source, exc)
-                continue
-
-            unresolved: list[
-                tuple[int, tuple[str, list[Any]]]
-            ] = []
-            first_failure: Exception | None = None
-            for request_id, (
-                index, (method, params)
-            ) in zip(request_ids, attempted):
-                try:
-                    output[index] = self._validate_item(
-                        source, by_id.get(request_id), request_id, method,
-                        allow_revert=allow_reverts,
-                    )
-                except _ExecutionReverted as exc:
-                    output[index] = exc.error
-                except Exception as exc:
-                    unresolved.append((index, (method, params)))
-                    remember(((index, (method, params)),), source, exc)
-                    if first_failure is None:
-                        first_failure = exc
-            if unresolved:
-                assert first_failure is not None
-                self._registry.failure(
-                    source, capability, first_failure,
-                )
-                pending = unresolved
-                continue
-            for _index, (method, _params) in attempted:
-                self._registry.success(
-                    source, capability, method,
-                    time.monotonic() - started,
-                )
+            interval = _minimum_interval(source.url)
+            batch_limit = max(1, int(1 / interval)) if interval else MAX_BATCH_CALLS
+            remaining = pending
             pending = []
+            for offset in range(0, len(remaining), batch_limit):
+                started = time.monotonic()
+                attempted = (
+                    remaining if len(remaining) <= batch_limit
+                    else remaining[offset:offset + batch_limit]
+                )
+                attempted_specs = [
+                    specification for _index, specification in attempted
+                ]
+                try:
+                    self._ensure_chain(source)
+                    if (
+                        capability == "logs"
+                        and not self._local_log_range_eligible(
+                            source, attempted_specs,
+                        )
+                    ):
+                        pending = remaining[offset:]
+                        break
+                    request_ids = self._reserve_ids(len(attempted))
+                    payload = [
+                        {
+                            "jsonrpc": "2.0", "id": request_id,
+                            "method": method, "params": params,
+                        }
+                        for request_id, (
+                            _index, (method, params)
+                        ) in zip(request_ids, attempted)
+                    ]
+                    raw = self._post(source, payload)
+                    if not isinstance(raw, list):
+                        raise self._error(
+                            f"{source.name} returned non-list batch response"
+                        )
+                    by_id = {
+                        item.get("id"): item
+                        for item in raw if isinstance(item, Mapping)
+                    }
+                except Exception as exc:
+                    self._registry.failure(source, capability, exc)
+                    remember(attempted, source, exc)
+                    pending = remaining[offset:]
+                    break
+
+                unresolved: list[
+                    tuple[int, tuple[str, list[Any]]]
+                ] = []
+                first_failure: Exception | None = None
+                for request_id, (
+                    index, (method, params)
+                ) in zip(request_ids, attempted):
+                    try:
+                        output[index] = self._validate_item(
+                            source, by_id.get(request_id), request_id, method,
+                            allow_revert=allow_reverts,
+                        )
+                    except _ExecutionReverted as exc:
+                        output[index] = exc.error
+                    except Exception as exc:
+                        unresolved.append((index, (method, params)))
+                        remember(((index, (method, params)),), source, exc)
+                        if first_failure is None:
+                            first_failure = exc
+                if unresolved:
+                    assert first_failure is not None
+                    self._registry.failure(
+                        source, capability, first_failure,
+                    )
+                    unresolved.extend(remaining[offset + batch_limit:])
+                    pending = unresolved
+                    break
+                for _index, (method, _params) in attempted:
+                    self._registry.success(
+                        source, capability, method,
+                        time.monotonic() - started,
+                    )
 
         for index, _specification in pending:
             messages = failure_messages[index]
