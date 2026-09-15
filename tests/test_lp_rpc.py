@@ -248,6 +248,42 @@ def test_rpc_credentials_reject_public_files_and_bad_urls_without_leaking(tmp_pa
     assert "example-only" not in str(failure.value)
 
 
+def test_wss_credentials_reject_exposed_files_and_wrong_transport(tmp_path, monkeypatch):
+    credential = tmp_path / "provider.url"
+    credential.write_text("wss://rpc.example.test/private-token/\n")
+    credential.chmod(0o644)
+    monkeypatch.setenv("LP_RPC_HEAD_WSS_URL_FILES", str(credential))
+    with pytest.raises(ValueError) as failure:
+        lp_rpc.head_subscription_urls()
+    assert "private-token" not in str(failure.value)
+    credential.chmod(0o600)
+    credential.write_text("https://rpc.example.test/private-token/\n")
+    with pytest.raises(ValueError) as failure:
+        lp_rpc.head_subscription_urls()
+    assert "private-token" not in str(failure.value)
+
+    credential.write_text("wss://rpc.example.test/private-token/#note\n")
+    with pytest.raises(ValueError) as failure:
+        lp_rpc.head_subscription_urls()
+    assert "private-token" not in str(failure.value)
+
+
+def test_wss_credentials_preserve_source_precedence_and_local_safety(tmp_path, monkeypatch):
+    credential = tmp_path / "provider.url"
+    credential.write_text("wss://sponsored.example.test/token/\nws://127.0.0.1:8549\n")
+    credential.chmod(0o600)
+    monkeypatch.setenv("LP_RPC_HEAD_WSS_URL_FILES", str(credential))
+    monkeypatch.setenv("LP_RPC_HEAD_WSS_URLS", "wss://explicit.example.test")
+    monkeypatch.setenv("RHP_RPC_WSS", "wss://sponsored.example.test/token/")
+    monkeypatch.setenv("LP_RPC_DISABLE_LOCAL_FALLBACK", "1")
+    monkeypatch.setenv("LP_RPC_DISABLE_ALCHEMY", "1")
+    assert lp_rpc.head_subscription_urls() == (
+        "wss://explicit.example.test",
+        "wss://sponsored.example.test/token/",
+        "wss://robinhood-rpc.publicnode.com",
+    )
+
+
 def test_rpc_demand_counts_batch_items_and_expires_window(monkeypatch):
     clock = SimpleNamespace(now=100.0)
     monkeypatch.setattr(lp_rpc.time, "monotonic", lambda: clock.now)
@@ -267,17 +303,21 @@ def test_rpc_demand_counts_batch_items_and_expires_window(monkeypatch):
     assert gate.traffic()["rpc_calls_per_second"] == round(2 / 60, 3)
 
 
-def test_rpc_transport_traceback_does_not_expose_url_credentials(monkeypatch):
+@pytest.mark.parametrize("endpoint", [
+    "https://rpc.example.test/?key={credential}",
+    "https://rpc.example.test/{credential}/",
+])
+def test_rpc_transport_traceback_does_not_expose_url_credentials(monkeypatch, endpoint):
     import traceback
 
     credential = "test-credential-never-log"
-    source = lp_rpc._Source("private-provider", f"https://rpc.example.test/?key={credential}")
+    source = lp_rpc._Source("private-provider", endpoint.format(credential=credential))
     monkeypatch.setattr(lp_rpc, "_source_list", lambda *_args: (source,))
     monkeypatch.setattr(lp_rpc, "head_subscription_urls", lambda: ())
     factory = lp_rpc.build_rpc_factory("", RuntimeError)
 
     def failed_request(*_args, **_kwargs):
-        raise lp_rpc.requests.ConnectionError(f"connection failed for {source.url}")
+        raise lp_rpc.requests.ConnectionError(f"connection failed for {source.url}; token={credential}")
 
     monkeypatch.setattr(lp_rpc.requests.Session, "post", failed_request)
     try:

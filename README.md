@@ -76,6 +76,8 @@ The default service observes and simulates; it never signs or broadcasts a trans
 
 RPC credentials, when needed, belong only in local mode-`0600` files containing one URL per line. Point a capability-specific variable such as `LP_RPC_STATE_URL_FILES` or `LP_RPC_TRACE_URL_FILES` at the file; `LP_RPC_HEAD_URL_FILES`, `LP_RPC_HISTORY_STATE_URL_FILES`, `LP_RPC_LOG_URL_FILES`, and `LP_RPC_RECEIPT_URL_FILES` follow the same convention. Generic runtime RPC files use `RHP_RPC_URL_FILES`. Do not put credential-bearing URLs in CLI arguments, browser storage, committed environment files, fixtures, screenshots, or logs.
 
+Private WebSocket endpoints use `LP_RPC_HEAD_WSS_URL_FILES` with the same file permissions and size limit. These files contain `ws://` or `wss://` URLs. See [RPC operations](docs/RPC_OPERATIONS.md) for Quicknode setup and capability checks.
+
 One running `rhpools` process owns a database. Do not point concurrent processes at the same SQLite file, inspect it with write-capable tools while the service is running, or use a live database in tests. Stop the owner before backup or migration work and copy the database together with its SQLite sidecar files when they exist.
 
 ## Data interpretation

@@ -15,6 +15,8 @@ from urllib.parse import parse_qsl, unquote, urlsplit
 
 import requests
 from requests.adapters import HTTPAdapter
+from websockets.exceptions import InvalidURI
+from websockets.uri import parse_uri
 
 from .lp_chain import CHAIN_ID
 
@@ -138,9 +140,16 @@ def _split_urls(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
-def _valid_url(url: str) -> bool:
+def _valid_url(url: str, schemes: tuple[str, ...] = ("http", "https")) -> bool:
     parsed = urlsplit(url)
-    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+    if parsed.scheme not in schemes or not parsed.netloc:
+        return False
+    if parsed.scheme in ("ws", "wss"):
+        try:
+            parse_uri(url)
+        except (InvalidURI, ValueError, UnicodeError):
+            return False
+    return True
 
 
 def _local(url: str) -> bool:
@@ -153,7 +162,7 @@ def _configured_alchemy() -> str | None:
     return f"https://robinhood-mainnet.g.alchemy.com/v2/{key}" if key else None
 
 
-def _file_urls(variable: str) -> list[str]:
+def _file_urls(variable: str, schemes: tuple[str, ...] = ("http", "https")) -> list[str]:
     """Load operator-owned credentials without exposing them in process arguments."""
     urls: list[str] = []
     for filename in _split_urls(os.environ.get(variable, "")):
@@ -166,8 +175,8 @@ def _file_urls(variable: str) -> list[str]:
             if len(raw) > 8192:
                 raise ValueError(f"{variable} credential file exceeds 8192 bytes")
             values = [line.strip() for line in raw.decode("utf-8").splitlines() if line.strip()]
-            if not values or any(not _valid_url(url) for url in values):
-                raise ValueError(f"{variable} must contain HTTP(S) URLs, one per line")
+            if not values or any(not _valid_url(url, schemes) for url in values):
+                raise ValueError(f"{variable} must contain supported URLs, one per line")
             urls.extend(values)
         except (OSError, UnicodeError, ValueError) as exc:
             raise ValueError(f"Unable to load secure RPC configuration from {variable}") from None
@@ -387,10 +396,7 @@ class _Registry:
         secrets.extend(item for _key, item in source.headers)
         if parsed.password:
             secrets.append(parsed.password)
-        # Path-key providers (e.g. /v2/<key>) and query-key providers must
-        # remain redacted even when a remote error echoes just the key.
-        if "/v2/" in parsed.path:
-            secrets.append(unquote(parsed.path.split("/v2/", 1)[1]))
+        secrets.extend(unquote(part) for part in parsed.path.split("/") if part)
         for secret in secrets:
             if len(secret) >= 4:
                 text = text.replace(secret, "<redacted>")
@@ -1266,6 +1272,7 @@ class RpcFactory:
 def head_subscription_urls() -> tuple[str, ...]:
     """Return public/explicit WSS new-head sources under the RPC safety flags."""
     candidates = _split_urls(os.environ.get("LP_RPC_HEAD_WSS_URLS", ""))
+    candidates.extend(_file_urls("LP_RPC_HEAD_WSS_URL_FILES", ("ws", "wss")))
     candidates.extend(_split_urls(os.environ.get("RHP_RPC_WSS", "")))
     disable_local = os.environ.get(
         "LP_RPC_DISABLE_LOCAL_FALLBACK", "",

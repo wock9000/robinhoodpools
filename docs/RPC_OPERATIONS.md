@@ -6,6 +6,8 @@ RPC configuration belongs to the indexer operator, not to an arbitrary browser r
 
 Use `LP_RPC_HEAD_URL_FILES`, `LP_RPC_STATE_URL_FILES`, `LP_RPC_HISTORY_STATE_URL_FILES`, `LP_RPC_LOG_URL_FILES`, `LP_RPC_RECEIPT_URL_FILES`, or `LP_RPC_TRACE_URL_FILES`. Each variable contains comma-separated local filenames. Each file contains HTTP(S) endpoints, one per line, is owned by the service user, and has mode `0600` (or stricter). Files larger than 8 KiB, non-regular files, invalid URLs, and group/world-readable files fail startup without printing their contents.
 
+`LP_RPC_HEAD_WSS_URL_FILES` uses the same ownership, permission, and size checks for files containing WebSocket URLs. Only `ws://` and `wss://` URLs are accepted. Explicit `LP_RPC_HEAD_WSS_URLS` entries precede file-loaded endpoints, followed by `RHP_RPC_WSS` and existing provider fallbacks. `LP_RPC_DISABLE_LOCAL_FALLBACK=1` still excludes local WebSocket endpoints.
+
 Store files outside the checkout. Do not paste a keyed URL into a unit's command line, public example, browser setting, issue, or status report. The file path can safely appear in a systemd drop-in:
 
 ```ini
@@ -35,6 +37,46 @@ they do not repeat the batch serially. A verified same-receipt mint proves the
 parent-block position absent, but the current-block position read remains
 required. V3 receipts do not wait for trace capability. Successful receipts
 containing V4 PoolManager liquidity modifications still require `callTracer`.
+
+## Quicknode sponsorship
+
+Quicknode supports Robinhood mainnet, chain ID `4663`, over HTTPS and WSS. Keep separate owner-only files for the two endpoint URLs. The token is an endpoint credential, not a platform API key.
+
+```ini
+[Service]
+Environment=LP_RPC_STATE_URL_FILES=%h/.config/robinhoodpools/quicknode-http.urls,%h/.config/robinhoodpools/goldsky.url
+Environment=LP_RPC_HISTORY_STATE_URL_FILES=%h/.config/robinhoodpools/quicknode-http.urls,%h/.config/robinhoodpools/goldsky.url
+Environment=LP_RPC_TRACE_URL_FILES=%h/.config/robinhoodpools/quicknode-http.urls,%h/.config/robinhoodpools/goldsky.url
+Environment=LP_RPC_HEAD_WSS_URLS=
+Environment=LP_RPC_HEAD_WSS_URL_FILES=%h/.config/robinhoodpools/quicknode-wss.urls
+Environment=LP_RPC_DISABLE_TRACE=0
+```
+
+This example retains an existing Goldsky fallback. Omit that filename if it is not configured. Keep working local header, log, and receipt sources ahead of remote fallbacks. Add the HTTPS file to the corresponding `LP_RPC_HEAD_URL_FILES`, `LP_RPC_LOG_URL_FILES`, and `LP_RPC_RECEIPT_URL_FILES` lists when needed.
+
+`deploy/robinhoodpools-quicknode.conf` also replaces stale explicit head, log, and receipt primaries. Install it as a later service drop-in only after confirming the existing node is unsuitable. A deployment probe found the local node behind the durable cursor, so a successful `eth_chainId` alone was not enough to retain that node as primary.
+
+Before switching, verify chain identity, a pinned historical contract read, receipts, filtered logs, a JSON-RPC batch, and `debug_traceTransaction` with `callTracer`. Verify WSS `newHeads` and log subscriptions separately. A successful head read does not prove archive or trace access.
+
+The sponsored endpoint passed archive USDG `decimals()` at block `30,000,000`, pool state ten million blocks behind the observed head, transaction and call tracing, block receipts, filtered logs, gas estimation, fee history, and `eth_simulateV1`. Simulation does not sign or broadcast transactions. These observations do not establish unlimited retention, a rate allowance, or an SLA.
+
+The existing router paces unrecognized HTTPS hosts, including Quicknode, at 10 JSON-RPC items per second per endpoint with four concurrent requests. Do not raise this limit without the account's allowance and a measured workload. WSS traffic is separate and is not included in the HTTP traffic counters.
+
+The [Robinhood credit table](https://www.quicknode.com/api-credits/robinhood) lists 20 credits for ordinary reads and 40 for transaction/call tracing. At a sustained 10 ordinary reads per second, the HTTP budget alone would consume 518.4 million credits in 30 days. This is a ceiling estimate, not observed usage or the sponsorship allowance. Streams charge for processed blocks even when filters discard the output.
+
+Back up the affected source files and service drop-ins before deployment. Preserve local-only safety changes, the database path, storage guards, and transaction-preparation settings. Never replace the whole installed directory with an upstream checkout without checking for drift. If the process is recovering a large SQLite WAL, let recovery finish before restarting it for an RPC change.
+
+After deployment, check both loopback and public `/api/lp/status`, all required workers, observed and indexed heads, provider failures, and source traffic. Compare cursor and chain gains over the same interval. Roll back only the changed source files and drop-in if the integration fails. Never delete the database or WAL to recover a provider change.
+
+Quicknode's Robinhood documentation lists no endpoint add-ons. Streams and Webhooks require separate product configuration and platform credentials. The Robinhood endpoint cannot serve Apollo's Solana or Base reads. MEV redistribution is not enabled by this integration.
+
+References:
+
+- <https://www.quicknode.com/docs/robinhood/llms.txt>
+- <https://www.quicknode.com/docs/robinhood/endpoint-security>
+- <https://www.quicknode.com/docs/robinhood/add-ons>
+- <https://www.quicknode.com/docs/streams/rest-api>
+- <https://www.quicknode.com/brand>
 
 ## Goldsky measurements and limits
 
