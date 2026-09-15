@@ -16,3 +16,4 @@
 }
 
 .source-link { flex: none; color: var(--rhp-cyan); white-space: nowrap; }
+.sponsor-link { flex: none; color: var(--rhp-text); white-space: nowrap; text-transform: none; }

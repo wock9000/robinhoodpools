@@ -591,6 +591,11 @@ select:focus { border-color: var(--text); color: var(--text); }
 .terminal-footer span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .terminal-footer span:last-child { flex: none; }
 
+@media (max-width: 600px) {
+  .terminal-footer { height: auto; flex-wrap: wrap; gap: 0 12px; }
+  .terminal-footer #footer-state { flex: 1 0 100%; }
+}
+
 .pool-inspector {
   position: fixed;
   z-index: 100;
