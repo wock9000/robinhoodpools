@@ -21,6 +21,7 @@ from .lp_market_store import _insert_rows
 from .workbench_market import _price_from_sqrt
 
 WINDOWS = {"1h": 3600, "24h": 86400, "7d": 604800, "30d": 2592000, "all": None}
+WINDOW_CACHE_TTL = {"1h": 3.0, "24h": 3.0, "7d": 30.0, "30d": 120.0, "all": 120.0}
 PRICING_BASIS = "USDG quote (1 USDG = 1 quote dollar); not a fiat oracle"
 PRICE_PROJECTION_VERSION = 1
 BUCKET_FIELDS = (
@@ -1158,6 +1159,10 @@ class LPMarketService:
         self._cache = OrderedDict()
         self._cache_lock = threading.Lock()
         self._cache_futures: dict[tuple[Any, ...], Future] = {}
+        self._cache_refreshing: set[tuple[Any, ...]] = set()
+        self._cache_executor = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="lp-market-cache",
+        )
         self._status_cache_lock = threading.Lock()
         self._status_refresh_lock = threading.Lock()
         self._status_cache_at = 0.0
@@ -1698,6 +1703,7 @@ class LPMarketService:
         self.book.close()
         self.store.close()
         self._frame_executor.shutdown(wait=True, cancel_futures=True)
+        self._cache_executor.shutdown(wait=True, cancel_futures=True)
 
     def _load_status(self) -> dict[str, Any]:
         out = dict(self.store.status())
@@ -1781,13 +1787,50 @@ class LPMarketService:
         if epoch is None:
             epoch = self.status()["epoch"]
         key = (epoch, *key)
-        leader = False
-        future = None
         with self._cache_lock:
             cached = self._cache.get(key)
             if cached is not None and now - cached[0] < ttl:
                 self._cache.move_to_end(key)
                 return cached[1]
+            stale = cached[1] if cached is not None else _MISSING
+            if stale is _MISSING and math.isfinite(ttl):
+                # An epoch bump only re-prefixes response-cache keys; the old
+                # entry stays servable while one background refresh revalidates
+                # it. Revision-addressed (infinite-ttl) shared scans must
+                # recompute instead: the epoch fence marks rolled-back data.
+                suffix = key[1:]
+                for candidate, entry in reversed(self._cache.items()):
+                    if candidate[1:] == suffix:
+                        stale = entry[1]
+                        break
+            refresh = stale is not _MISSING and key not in self._cache_refreshing
+            if refresh:
+                self._cache_refreshing.add(key)
+        if refresh:
+            self._cache_executor.submit(self._revalidate_cache_entry, key, loader, ttl)
+        if stale is not _MISSING:
+            return stale
+        return self._load_cached(key, loader)
+
+    def _revalidate_cache_entry(self, key, loader, ttl):
+        try:
+            now = time.monotonic()
+            with self._cache_lock:
+                cached = self._cache.get(key)
+                fresh = cached is not None and now - cached[0] < ttl
+            if not fresh:
+                self._load_cached(key, loader)
+        except BaseException:
+            # A stale value keeps being served; the next request past ttl retries.
+            pass
+        finally:
+            with self._cache_lock:
+                self._cache_refreshing.discard(key)
+
+    def _load_cached(self, key, loader):
+        leader = False
+        future = None
+        with self._cache_lock:
             future = self._cache_futures.get(key)
             if future is None and len(self._cache_futures) < 64:
                 future = Future()
@@ -1971,7 +2014,7 @@ class LPMarketService:
         revision = int(status.get("revision") or 0)
         aggregate = self._cached(
             ("overview", revision, self.book.owners_revision, name),
-            load, ttl=3.0, epoch=int(status.get("epoch") or 0),
+            load, ttl=WINDOW_CACHE_TTL[name], epoch=int(status.get("epoch") or 0),
         )
         return {**aggregate, "status": status}
 
@@ -2320,7 +2363,7 @@ class LPMarketService:
                 "pools", snapshot_revision, snapshot_pool_metadata_token,
                 owner_revision, name, where, *filters, sort, order, limit, offset,
             ),
-            load, ttl=3.0, epoch=int(status.get("epoch") or 0),
+            load, ttl=WINDOW_CACHE_TTL[name], epoch=int(status.get("epoch") or 0),
         )
 
     @staticmethod
