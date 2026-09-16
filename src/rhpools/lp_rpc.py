@@ -15,6 +15,8 @@ from urllib.parse import parse_qsl, unquote, urlsplit
 
 import requests
 from requests.adapters import HTTPAdapter
+from websockets.exceptions import InvalidURI
+from websockets.uri import parse_uri
 
 from .lp_chain import CHAIN_ID
 
@@ -138,9 +140,16 @@ def _split_urls(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
-def _valid_url(url: str) -> bool:
+def _valid_url(url: str, schemes: tuple[str, ...] = ("http", "https")) -> bool:
     parsed = urlsplit(url)
-    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+    if parsed.scheme not in schemes or not parsed.netloc:
+        return False
+    if parsed.scheme in ("ws", "wss"):
+        try:
+            parse_uri(url)
+        except (InvalidURI, ValueError, UnicodeError):
+            return False
+    return True
 
 
 def _local(url: str) -> bool:
@@ -153,7 +162,7 @@ def _configured_alchemy() -> str | None:
     return f"https://robinhood-mainnet.g.alchemy.com/v2/{key}" if key else None
 
 
-def _file_urls(variable: str) -> list[str]:
+def _file_urls(variable: str, schemes: tuple[str, ...] = ("http", "https")) -> list[str]:
     """Load operator-owned credentials without exposing them in process arguments."""
     urls: list[str] = []
     for filename in _split_urls(os.environ.get(variable, "")):
@@ -166,8 +175,8 @@ def _file_urls(variable: str) -> list[str]:
             if len(raw) > 8192:
                 raise ValueError(f"{variable} credential file exceeds 8192 bytes")
             values = [line.strip() for line in raw.decode("utf-8").splitlines() if line.strip()]
-            if not values or any(not _valid_url(url) for url in values):
-                raise ValueError(f"{variable} must contain HTTP(S) URLs, one per line")
+            if not values or any(not _valid_url(url, schemes) for url in values):
+                raise ValueError(f"{variable} must contain supported URLs, one per line")
             urls.extend(values)
         except (OSError, UnicodeError, ValueError) as exc:
             raise ValueError(f"Unable to load secure RPC configuration from {variable}") from None
@@ -301,6 +310,19 @@ def _capability(method: str, params: Sequence[Any], lane: str) -> str:
     return "head"
 
 
+def _explicit_block_header(method: str, params: Sequence[Any]) -> bool:
+    """Identify numbered header reads that cannot select a lagging local tip."""
+    if method != "eth_getBlockByNumber" or not params:
+        return False
+    tag = params[0]
+    if not isinstance(tag, str) or not tag.startswith("0x"):
+        return False
+    try:
+        return int(tag, 16) >= 0
+    except ValueError:
+        return False
+
+
 class _Registry:
     def __init__(self, primary_url: str, error_type: type[Exception]) -> None:
         self.error_type = error_type
@@ -366,14 +388,19 @@ class _Registry:
                 self._verification_locks[source.url] = lock
             return lock
 
-    def candidates(self, capability: str) -> tuple[_Source, ...]:
+    def candidates(
+        self, capability: str, *, prefer_local: bool = False,
+    ) -> tuple[_Source, ...]:
         sources = self.sources[capability]
         now = time.monotonic()
         with self._lock:
-            return tuple(
+            available = tuple(
                 source for source in sources
                 if self._states[(capability, source.name)].retry_at <= now
             )
+        if prefer_local:
+            return tuple(sorted(available, key=lambda source: not _local(source.url)))
+        return available
 
     def can_try(self, source: _Source, capability: str) -> bool:
         with self._lock:
@@ -387,10 +414,7 @@ class _Registry:
         secrets.extend(item for _key, item in source.headers)
         if parsed.password:
             secrets.append(parsed.password)
-        # Path-key providers (e.g. /v2/<key>) and query-key providers must
-        # remain redacted even when a remote error echoes just the key.
-        if "/v2/" in parsed.path:
-            secrets.append(unquote(parsed.path.split("/v2/", 1)[1]))
+        secrets.extend(unquote(part) for part in parsed.path.split("/") if part)
         for secret in secrets:
             if len(secret) >= 4:
                 text = text.replace(secret, "<redacted>")
@@ -721,10 +745,8 @@ class RoutedRpc:
     def _post(self, source: _Source, payload: Any) -> Any:
         body = json.dumps(payload, separators=(",", ":"))
         calls = len(payload) if isinstance(payload, list) else 1
-        hostname = (urlsplit(source.url).hostname or "").lower()
-        cost = calls if hostname == "edge.goldsky.com" else 1
         gate = _gate(source.url)
-        gate.acquire(_minimum_interval(source.url), cost)
+        gate.acquire(_minimum_interval(source.url), calls)
         response: requests.Response | None = None
         session: requests.Session | None = None
         try:
@@ -781,7 +803,10 @@ class RoutedRpc:
             raise failure
         if "result" not in item:
             raise self._error(f"{source.name} {method} response omitted result")
-        return item["result"]
+        result = item["result"]
+        if method == "eth_getBlockByNumber" and result is None:
+            raise self._error(f"{source.name} has no requested block header")
+        return result
 
     def _ensure_chain(self, source: _Source) -> None:
         if self._registry.verified(source):
@@ -967,7 +992,10 @@ class RoutedRpc:
         self._check_open()
         values = list(params or ())
         capability = _capability(method, values, self._lane)
-        sources = self._registry.candidates(capability)
+        sources = self._registry.candidates(
+            capability,
+            prefer_local=_explicit_block_header(method, values),
+        )
         if not sources and not self._registry.sources[capability]:
             raise self._error(
                 f"{capability} RPC unavailable; "
@@ -1111,7 +1139,13 @@ class RoutedRpc:
             return output
 
         capability = capabilities.pop()
-        sources = self._registry.candidates(capability)
+        explicit_headers = all(
+            _explicit_block_header(method, params)
+            for method, params in specifications
+        )
+        sources = self._registry.candidates(
+            capability, prefer_local=explicit_headers,
+        )
         if not sources and not self._registry.sources[capability]:
             failure = self._error(
                 f"{capability} RPC unavailable; "
@@ -1146,76 +1180,94 @@ class RoutedRpc:
                 break
             if not self._registry.can_try(source, capability):
                 continue
-            started = time.monotonic()
-            attempted = pending
-            attempted_specs = [
-                specification for _index, specification in attempted
-            ]
-            try:
-                self._ensure_chain(source)
-                if (
-                    capability == "logs"
-                    and not self._local_log_range_eligible(
-                        source, attempted_specs,
-                    )
-                ):
-                    continue
-                request_ids = self._reserve_ids(len(attempted))
-                payload = [
-                    {
-                        "jsonrpc": "2.0", "id": request_id,
-                        "method": method, "params": params,
-                    }
-                    for request_id, (
-                        _index, (method, params)
-                    ) in zip(request_ids, attempted)
-                ]
-                raw = self._post(source, payload)
-                if not isinstance(raw, list):
-                    raise self._error(
-                        f"{source.name} returned non-list batch response"
-                    )
-                by_id = {
-                    item.get("id"): item
-                    for item in raw if isinstance(item, Mapping)
-                }
-            except Exception as exc:
-                self._registry.failure(source, capability, exc)
-                remember(attempted, source, exc)
-                continue
-
-            unresolved: list[
-                tuple[int, tuple[str, list[Any]]]
-            ] = []
-            first_failure: Exception | None = None
-            for request_id, (
-                index, (method, params)
-            ) in zip(request_ids, attempted):
-                try:
-                    output[index] = self._validate_item(
-                        source, by_id.get(request_id), request_id, method,
-                        allow_revert=allow_reverts,
-                    )
-                except _ExecutionReverted as exc:
-                    output[index] = exc.error
-                except Exception as exc:
-                    unresolved.append((index, (method, params)))
-                    remember(((index, (method, params)),), source, exc)
-                    if first_failure is None:
-                        first_failure = exc
-            if unresolved:
-                assert first_failure is not None
-                self._registry.failure(
-                    source, capability, first_failure,
+            if explicit_headers:
+                # _post charges every batch item to the shared rate gate. Keep
+                # this permitted header burst in one bounded HTTP request.
+                batch_limit = MAX_BATCH_CALLS
+            else:
+                interval = _minimum_interval(source.url)
+                batch_limit = (
+                    max(1, int(1 / interval))
+                    if interval else MAX_BATCH_CALLS
                 )
-                pending = unresolved
-                continue
-            for _index, (method, _params) in attempted:
-                self._registry.success(
-                    source, capability, method,
-                    time.monotonic() - started,
-                )
+            remaining = pending
             pending = []
+            for offset in range(0, len(remaining), batch_limit):
+                started = time.monotonic()
+                attempted = (
+                    remaining if len(remaining) <= batch_limit
+                    else remaining[offset:offset + batch_limit]
+                )
+                attempted_specs = [
+                    specification for _index, specification in attempted
+                ]
+                try:
+                    self._ensure_chain(source)
+                    if (
+                        capability == "logs"
+                        and not self._local_log_range_eligible(
+                            source, attempted_specs,
+                        )
+                    ):
+                        pending = remaining[offset:]
+                        break
+                    request_ids = self._reserve_ids(len(attempted))
+                    payload = [
+                        {
+                            "jsonrpc": "2.0", "id": request_id,
+                            "method": method, "params": params,
+                        }
+                        for request_id, (
+                            _index, (method, params)
+                        ) in zip(request_ids, attempted)
+                    ]
+                    raw = self._post(source, payload)
+                    if not isinstance(raw, list):
+                        raise self._error(
+                            f"{source.name} returned non-list batch response"
+                        )
+                    by_id = {
+                        item.get("id"): item
+                        for item in raw if isinstance(item, Mapping)
+                    }
+                except Exception as exc:
+                    self._registry.failure(source, capability, exc)
+                    remember(attempted, source, exc)
+                    pending = remaining[offset:]
+                    break
+
+                unresolved: list[
+                    tuple[int, tuple[str, list[Any]]]
+                ] = []
+                first_failure: Exception | None = None
+                for request_id, (
+                    index, (method, params)
+                ) in zip(request_ids, attempted):
+                    try:
+                        output[index] = self._validate_item(
+                            source, by_id.get(request_id), request_id, method,
+                            allow_revert=allow_reverts,
+                        )
+                    except _ExecutionReverted as exc:
+                        output[index] = exc.error
+                    except Exception as exc:
+                        unresolved.append((index, (method, params)))
+                        remember(((index, (method, params)),), source, exc)
+                        if first_failure is None:
+                            first_failure = exc
+                if unresolved:
+                    assert first_failure is not None
+                    self._registry.failure(
+                        source, capability, first_failure,
+                    )
+                    unresolved.extend(remaining[offset + batch_limit:])
+                    pending = unresolved
+                    break
+                for _index, (method, _params) in attempted:
+                    self._registry.success(
+                        source, capability, method,
+                        time.monotonic() - started,
+                    )
 
         for index, _specification in pending:
             messages = failure_messages[index]
@@ -1266,6 +1318,7 @@ class RpcFactory:
 def head_subscription_urls() -> tuple[str, ...]:
     """Return public/explicit WSS new-head sources under the RPC safety flags."""
     candidates = _split_urls(os.environ.get("LP_RPC_HEAD_WSS_URLS", ""))
+    candidates.extend(_file_urls("LP_RPC_HEAD_WSS_URL_FILES", ("ws", "wss")))
     candidates.extend(_split_urls(os.environ.get("RHP_RPC_WSS", "")))
     disable_local = os.environ.get(
         "LP_RPC_DISABLE_LOCAL_FALLBACK", "",

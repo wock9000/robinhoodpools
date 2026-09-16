@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import json
+
 import pytest
-from eth_utils import keccak
 
 from rhpools import workbench_actions as actions
-from rhpools.lp_math import sqrt_ratio_at_tick
 
 POOL = "0x1111111111111111111111111111111111111111"
 TOKEN0 = "0x2222222222222222222222222222222222222222"
@@ -30,8 +31,6 @@ class FakeRPC:
         self.chain_id = actions.CHAIN_ID
         self.block = 100
         self.block_hash = "0x" + "ab" * 32
-        self.allowances = {TOKEN0: 0, TOKEN1: 0}
-        self.balances = {TOKEN0: 10**18, TOKEN1: 10**18}
         self.position_liquidity = 1_000_000_000
         self.owed0 = 1_000
         self.owed1 = 2_000
@@ -39,10 +38,8 @@ class FakeRPC:
         self.fee_growth1_last = 0
         self.fee_growth_global0 = 0
         self.fee_growth_global1 = 0
-        self.mint_revert: str | None = None
         self.pool_factory = actions.V3_FACTORY
         self.factory_pool = POOL
-        self.router_code = "0x6001"
         self.sqrt_price = 1 << 96
         self.tick = 0
         self.calls: list[tuple[str, list]] = []
@@ -57,8 +54,6 @@ class FakeRPC:
             return {"number": hex(number), "hash": self.block_hash}
         if method == "eth_getCode":
             address = params[0].lower()
-            if address == actions.MINI_ROUTER2:
-                return self.router_code
             if address in {POOL, TOKEN0, TOKEN1, actions.V3_FACTORY}:
                 return "0x6002"
             return "0x"
@@ -84,8 +79,6 @@ class FakeRPC:
                 return _encoded(60)
             if selector == actions.SEL_SLOT0:
                 return _encoded(self.sqrt_price, self.tick, 0, 0, 0, 0, 1)
-            if selector == actions.SEL_LIQUIDITY:
-                return _encoded(10**12)
             if selector == actions.SEL_POSITIONS:
                 return _encoded(
                     self.position_liquidity,
@@ -109,30 +102,12 @@ class FakeRPC:
         if target in (TOKEN0, TOKEN1):
             if selector == actions.SEL_DECIMALS:
                 return _encoded(6)
-            if selector == actions.SEL_BALANCE_OF:
-                return _encoded(self.balances[target])
-            if selector == actions.SEL_ALLOWANCE:
-                return _encoded(self.allowances[target])
-            if selector == actions.SEL_APPROVE:
-                return _encoded(1)
-        if target == actions.MINI_ROUTER2:
-            if selector == actions.SEL_GUARD:
-                return _encoded(0)
-            if selector == actions.SEL_MINT:
-                if self.mint_revert:
-                    raise RuntimeError(self.mint_revert)
-                return _encoded(50_000_000, 50_000_000)
         raise AssertionError(f"unexpected eth_call target={target} selector={selector}")
 
 
 @pytest.fixture
-def service(monkeypatch):
+def service():
     rpc = FakeRPC()
-    monkeypatch.setattr(
-        actions,
-        "MINI_ROUTER2_CODE_HASH",
-        "0x" + keccak(bytes.fromhex("6001")).hex(),
-    )
     rpc.call = rpc.__call__
     return actions.ActionService(rpc), rpc
 
@@ -141,11 +116,11 @@ def _payload(**updates):
     result = {
         "pool_id": POOL,
         "owner": OWNER,
-        "action": "add",
+        "action": "remove",
         "tick_lower": -60,
         "tick_upper": 60,
-        "amount0": "100",
-        "amount1": "100",
+        "amount0": "0",
+        "amount1": "0",
         "liquidity_bps": 10_000,
         "slippage_bps": 100,
     }
@@ -153,123 +128,46 @@ def _payload(**updates):
     return result
 
 
-def _approved_amount(step: dict) -> int:
-    data = step["transaction"]["data"]
-    assert data[2:10] == actions.SEL_APPROVE
-    assert data[10:74] == actions.MINI_ROUTER2[2:].rjust(64, "0")
-    return int(data[-64:], 16)
 
 
-def test_add_requires_bounded_approvals_then_resimulates_and_prepares(service):
+def test_add_is_retired_without_reading_chain_or_caching_a_quote(service):
     svc, rpc = service
 
-    blocked = svc.simulate(_payload())
+    with pytest.raises(actions.ActionError, match="MiniRouter2 .* is retired.*unsafe"):
+        svc.simulate(_payload(action="add", amount0="100", amount1="100"))
 
-    assert blocked["ready"] is False
-    assert [step["id"] for step in blocked["steps"]] == [
-        "approve-token0",
-        "approve-token1",
-    ]
-    approved = [_approved_amount(step) for step in blocked["steps"]]
-    assert approved == [100 * 10**6, 100 * 10**6]
-    assert all(amount != actions.MAX_UINT256 for amount in approved)
-    assert all(step["simulation"]["success"] for step in blocked["steps"])
+    assert rpc.calls == []
+    assert svc._quotes == {}
 
-    rpc.allowances = {TOKEN0: approved[0], TOKEN1: approved[1]}
-    quote = svc.simulate(_payload())
 
-    assert quote["ready"] is True
-    assert [step["id"] for step in quote["steps"]] == ["mint"]
-    mint = quote["steps"][0]["transaction"]
-    assert mint == {
-        "from": OWNER,
-        "to": actions.MINI_ROUTER2,
-        "data": mint["data"],
-        "value": "0x0",
-        "chainId": actions.CHAIN_ID,
+@pytest.mark.parametrize(
+    ("action", "step_id"),
+    (("add", "mint"), ("add", "approve-token0"), ("remove", "approve-token1")),
+)
+def test_prepare_rejects_legacy_add_and_approval_quotes(
+    service, monkeypatch, action, step_id
+):
+    svc, rpc = service
+    monkeypatch.setattr(actions.time, "time", lambda: 1_000)
+    simulation_id = "ab" * 32
+    binding = {"owner": OWNER, "action": action, "expires_at": 1_001}
+    canonical = json.dumps(binding, sort_keys=True, separators=(",", ":")).encode()
+    svc._quotes[simulation_id] = {
+        "binding": binding,
+        "binding_hash": hashlib.sha256(canonical).hexdigest(),
+        "steps": {},
     }
-    assert mint["data"][2:10] == actions.SEL_MINT
 
-    prepared = svc.prepare(
-        {
-            "simulation_id": quote["simulation_id"],
-            "owner": OWNER,
-            "step_id": "mint",
-        }
-    )
-    assert prepared["transaction"] == mint
-    assert prepared["simulation"] == {"success": True, "gas_estimate": 80_000}
-
-    rpc.allowances[TOKEN0] = actions.MAX_UINT256
-    with pytest.raises(actions.ActionError, match="no longer equal the exact spend ceilings"):
+    with pytest.raises(actions.ActionError, match="MiniRouter2 .* is retired.*unsafe"):
         svc.prepare(
             {
-                "simulation_id": quote["simulation_id"],
+                "simulation_id": simulation_id,
                 "owner": OWNER,
-                "step_id": "mint",
+                "step_id": step_id,
             }
         )
 
-
-def test_existing_unbounded_allowance_is_replaced_not_treated_as_ready(service):
-    svc, rpc = service
-    rpc.allowances = {TOKEN0: actions.MAX_UINT256, TOKEN1: actions.MAX_UINT256}
-
-    quote = svc.simulate(_payload())
-
-    assert quote["ready"] is False
-    assert [step["kind"] for step in quote["steps"]] == ["approval", "approval"]
-    assert all(_approved_amount(step) < actions.MAX_UINT256 for step in quote["steps"])
-
-
-def test_user_budget_ceilings_stay_stable_across_approval_receipts(service):
-    svc, rpc = service
-    approvals = svc.simulate(_payload())["steps"]
-    expected = [_approved_amount(step) for step in approvals]
-    rpc.allowances = {TOKEN0: expected[0], TOKEN1: expected[1]}
-    rpc.sqrt_price = sqrt_ratio_at_tick(50)
-    rpc.tick = 50
-
-    quote = svc.simulate(_payload())
-
-    assert quote["ready"] is True
-    assert [step["id"] for step in quote["steps"]] == ["mint"]
-
-
-def test_unused_token_allowance_is_explicitly_reset_to_zero(service):
-    svc, rpc = service
-    rpc.allowances = {TOKEN0: 0, TOKEN1: actions.MAX_UINT256}
-
-    quote = svc.simulate(
-        _payload(tick_lower=60, tick_upper=120, amount1="0")
-    )
-
-    approvals = {step["id"]: _approved_amount(step) for step in quote["steps"]}
-    assert approvals["approve-token0"] > 0
-    assert approvals["approve-token1"] == 0
-
-
-def test_mint_revert_is_actionable_and_cannot_be_prepared(service):
-    svc, rpc = service
-    approval_quote = svc.simulate(_payload())
-    approved = [_approved_amount(step) for step in approval_quote["steps"]]
-    rpc.allowances = {TOKEN0: approved[0], TOKEN1: approved[1]}
-    rpc.mint_revert = "execution reverted: M0 token payment shortfall"
-
-    quote = svc.simulate(_payload())
-
-    assert quote["ready"] is False
-    assert quote["steps"][0]["simulation"]["success"] is False
-    assert "M0 token payment shortfall" in quote["steps"][0]["simulation"]["error"]
-    with pytest.raises(actions.ActionError, match="not executable"):
-        svc.prepare(
-            {
-                "simulation_id": quote["simulation_id"],
-                "owner": OWNER,
-                "step_id": "mint",
-            }
-        )
-
+    assert rpc.calls == []
 
 def test_wrong_chain_and_owner_are_rejected(service):
     svc, rpc = service
@@ -284,7 +182,7 @@ def test_wrong_chain_and_owner_are_rejected(service):
             {
                 "simulation_id": quote["simulation_id"],
                 "owner": OTHER,
-                "step_id": "approve-token0",
+                "step_id": "burn",
             }
         )
 
@@ -294,7 +192,7 @@ def test_wrong_chain_and_owner_are_rejected(service):
             {
                 "simulation_id": quote["simulation_id"],
                 "owner": OWNER,
-                "step_id": "approve-token0",
+                "step_id": "burn",
             }
         )
 
@@ -311,7 +209,7 @@ def test_expired_quote_requires_rebuild(service, monkeypatch):
             {
                 "simulation_id": quote["simulation_id"],
                 "owner": OWNER,
-                "step_id": "approve-token0",
+                "step_id": "burn",
             }
         )
 
@@ -324,7 +222,7 @@ def test_bad_tick_spacing_and_range_are_rejected(service):
         svc.simulate(_payload(tick_lower=60, tick_upper=60))
 
 
-def test_factory_membership_and_verified_router_code_are_required(service):
+def test_factory_membership_is_required_for_direct_pool_actions(service):
     svc, rpc = service
     rpc.pool_factory = OTHER
     with pytest.raises(actions.ActionError, match="allowlisted canonical V3 factory"):
@@ -335,22 +233,13 @@ def test_factory_membership_and_verified_router_code_are_required(service):
     with pytest.raises(actions.ActionError, match="factory getPool"):
         svc.simulate(_payload())
 
-    rpc.factory_pool = POOL
-    rpc.router_code = "0x6003"
-    with pytest.raises(actions.ActionError, match="bytecode does not match"):
-        svc.simulate(_payload())
 
 
 
 def test_prepare_refuses_price_move_beyond_slippage_ceiling(service):
     svc, rpc = service
-    approvals = svc.simulate(_payload())["steps"]
-    rpc.allowances = {
-        TOKEN0: _approved_amount(approvals[0]),
-        TOKEN1: _approved_amount(approvals[1]),
-    }
     quote = svc.simulate(_payload())
-    rpc.sqrt_price = sqrt_ratio_at_tick(200)
+    rpc.sqrt_price = actions.sqrt_ratio_at_tick(200)
     rpc.tick = 200
 
     with pytest.raises(actions.ActionError, match="price moved beyond slippage_bps"):
@@ -358,7 +247,7 @@ def test_prepare_refuses_price_move_beyond_slippage_ceiling(service):
             {
                 "simulation_id": quote["simulation_id"],
                 "owner": OWNER,
-                "step_id": "mint",
+                "step_id": "burn",
             }
         )
 
@@ -386,6 +275,15 @@ def test_remove_is_direct_burn_then_collect_and_rechecks_owned_liquidity(service
         step["transaction"]["data"][2:10] for step in quote["steps"]
     }
     assert OWNER[2:].rjust(64, "0") == quote["steps"][1]["transaction"]["data"][10:74]
+
+    prepared_burn = svc.prepare(
+        {
+            "simulation_id": quote["simulation_id"],
+            "owner": OWNER,
+            "step_id": "burn",
+        }
+    )
+    assert prepared_burn["transaction"] == quote["steps"][0]["transaction"]
 
     rpc.position_liquidity = int(quote["summary"]["liquidity"]) - 1
     with pytest.raises(actions.ActionError, match="below the quoted burn amount"):

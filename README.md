@@ -1,7 +1,5 @@
 # Robinhood Pools
 
-Live explorer: **[rhpools.lol](https://rhpools.lol)**.
-
 Robinhood Pools is a standalone observatory for liquidity pools on Robinhood Chain (chain ID `4663`). One Python process reads public RPC data, maintains a local SQLite index, serves JSON/SSE APIs, and serves the plain-HTML/CSS/JavaScript terminal and workbench. It does not require another checkout or any private application files.
 
 The service covers reviewed V2, V3-style, Slipstream, and V4 deployments recorded in `rhpools.lp_chain`. Coverage is deliberately chain-specific: addresses or assumptions from other chains must not be added without review. A V4 manager address identifies the manager, not an individual pool.
@@ -40,30 +38,11 @@ uv run rhpools \
 
 Run `uv run rhpools --help` for the installed command's complete option list. `--public-origin` may be repeated to authorize an additional browser origin for protected POST requests. Keep the listener on loopback unless you have separately designed authentication, TLS, proxy limits, and host-level access control.
 
-The equivalent environment settings are `RHP_HTTP_HOST`, `RHP_HTTP_PORT`, `RHP_RPC_URL`, `RHP_DATA_DIR`, `RHP_DATABASE`, `LP_HISTORY_DAYS`, and `LP_DISK_RESERVE_GIB`. Additional origins and transaction preparation require explicit CLI flags; there is no environment switch that silently enables preparation.
+The equivalent environment settings are `RHP_HTTP_HOST`, `RHP_HTTP_PORT`, `RHP_RPC_URL`, `RHP_DATA_DIR`, `RHP_DATABASE`, `LP_HISTORY_DAYS`, and `LP_DISK_RESERVE_GIB`. Additional origins and preparation of supported direct-pool transactions require explicit CLI flags; there is no environment switch that silently enables preparation.
 
 ### Serving health is not index freshness
 
 A successful request to `/` establishes only that the HTTP process can serve the installed UI. Index progress and source coverage are separate; inspect `/api/lp/status` and its observed head, indexed head, lag, history coverage, and provider status before treating results as current. During startup, catch-up, provider failure, or a chain reorganization, the server can remain available while indexed data is incomplete or stale.
-
-Recent live lag, older historical backfill, and pending accounting enrichment
-are separate backlogs. Closing the live gap does not make historical position
-accounting complete. Live ingestion and historical backfill share a serialized
-database writer; status exposes both coverage intervals and pending enrichment,
-balance, and reprojection counts.
-
-Financial workers prefer recent work while reserving historical progress.
-Existing V3 positions affected by same-transaction mint/burn log ordering are
-repaired in resumable background batches, not a full-ledger startup replay.
-An **OBS** fee amount is observed, priced collected-fee evidence from only part
-of a wallet's selected episodes; it is not a complete fee total or P/L.
-Wallet time windows select episodes with activity in that window, then report
-those episodes' lifetime financials—not fees earned exclusively within the window.
-
-Select the terminal's **HEAD / INDEX** readout, labeled **INDEX STATUS** on mobile, to open index details.
-It shows backlog counts and the last live/history batch's RPC, writer-wait,
-storage, and post-processing timings. Index time lag is the age of indexed
-blocks, not a catch-up ETA. Individual batch timings are not sustained throughput.
 
 ```sh
 curl -fsS http://127.0.0.1:8196/ >/dev/null
@@ -72,7 +51,7 @@ curl -fsS http://127.0.0.1:8196/api/lp/status
 
 ## Safety model
 
-The default service observes and simulates; it never signs or broadcasts a transaction. Transaction preparation is disabled unless `--enable-transaction-prepare` is supplied. Enabling it permits generation of unsigned transaction data for independent inspection and external signing; it does not enable server signing or broadcasting. Never give this process, its browser UI, configuration, or repository a seed phrase or private key.
+The default service observes and simulates; it never signs or broadcasts a transaction. Transaction preparation is disabled unless `--enable-transaction-prepare` is supplied. Enabling it permits generation of unsigned direct-pool remove and collect transaction data for independent inspection and external signing; it does not enable server signing or broadcasting. Add-liquidity execution through MiniRouter2 `0x5295e633dfb504298d4a1896ba0738acb6c89e6a` is retired because that deployment is unsafe, and the service rejects both new add requests and preparation from old add or approval quotes. Revoke any remaining token allowances to that router independently. Never give this process, its browser UI, configuration, or repository a seed phrase or private key.
 
 RPC credentials, when needed, belong only in local mode-`0600` files containing one URL per line. Point a capability-specific variable such as `LP_RPC_STATE_URL_FILES` or `LP_RPC_TRACE_URL_FILES` at the file; `LP_RPC_HEAD_URL_FILES`, `LP_RPC_HISTORY_STATE_URL_FILES`, `LP_RPC_LOG_URL_FILES`, and `LP_RPC_RECEIPT_URL_FILES` follow the same convention. Generic runtime RPC files use `RHP_RPC_URL_FILES`. Do not put credential-bearing URLs in CLI arguments, browser storage, committed environment files, fixtures, screenshots, or logs.
 
