@@ -133,7 +133,7 @@ def _payload(**updates):
 def test_add_is_retired_without_reading_chain_or_caching_a_quote(service):
     svc, rpc = service
 
-    with pytest.raises(actions.ActionError, match="MiniRouter2 .* is retired.*unsafe"):
+    with pytest.raises(actions.ActionError, match="adding liquidity is not supported.*unsafe"):
         svc.simulate(_payload(action="add", amount0="100", amount1="100"))
 
     assert rpc.calls == []
@@ -158,7 +158,7 @@ def test_prepare_rejects_legacy_add_and_approval_quotes(
         "steps": {},
     }
 
-    with pytest.raises(actions.ActionError, match="MiniRouter2 .* is retired.*unsafe"):
+    with pytest.raises(actions.ActionError, match="adding liquidity is not supported.*unsafe"):
         svc.prepare(
             {
                 "simulation_id": simulation_id,

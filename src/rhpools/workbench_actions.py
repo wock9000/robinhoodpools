@@ -1,8 +1,8 @@
 """Read-only LP action quoting and unsigned browser-wallet transactions.
 
-Only the canonical chain-4663 Uniswap V3 factory is supported. MiniRouter2 is
-retired and this service rejects every add-liquidity request. Removing liquidity
-and collecting call the pool directly from the connected EOA.
+Only the canonical chain-4663 Uniswap V3 factory is supported. This service
+rejects every add-liquidity request. Removing liquidity and collecting call the
+pool directly from the connected EOA.
 
 This module never signs or submits a transaction. ``prepare`` returns the same
 allowlisted direct-pool calldata quoted by ``simulate`` only after a fresh chain
@@ -33,11 +33,10 @@ MAX_TICK = 887272
 MAX_UINT128 = (1 << 128) - 1
 MAX_UINT256 = (1 << 256) - 1
 ZERO_ADDRESS = "0x" + "00" * 20
-RETIRED_MINI_ROUTER2 = "0x5295e633dfb504298d4a1896ba0738acb6c89e6a"
 ADD_RETIRED_ERROR = (
-    f"adding liquidity through MiniRouter2 {RETIRED_MINI_ROUTER2} is retired because "
-    "the deployment is unsafe; revoke its token allowances and use no transaction "
-    "prepared from an earlier add quote"
+    "adding liquidity is not supported; the add router this service once used is unsafe, "
+    "revoke its token allowances (see SECURITY.md) and use no transaction prepared "
+    "from an earlier add quote"
 )
 
 _ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
