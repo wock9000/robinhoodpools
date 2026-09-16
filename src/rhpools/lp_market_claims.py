@@ -37,7 +37,7 @@ def fetch_position_claims(
     """Read principal and outstanding claims at one canonical end-of-block pin."""
     if not positions:
         return []
-    with book._reader() as conn:
+    with store.reader_snapshot() as conn:
         cursor = store._metadata(conn, "cursor:live", {})
         if not cursor:
             return []
@@ -204,7 +204,7 @@ def fetch_position_claims(
         )
         mark = {"block_number": number, "tx_index": 2**31 - 1,
                 "log_index": 2**31 - 1, "timestamp": timestamp}
-        with book._reader() as conn:
+        with store.reader_snapshot() as conn:
             price0, price1, _basis = prices._quote(conn, pool, mark, ratio)
         output.append({
             "position_key": position["position_key"], "epoch": epoch,
@@ -285,7 +285,7 @@ class PositionClaims:
         self._rpc_next = time.monotonic() + items / 8.0
 
     def _refresh(self, owner, state):
-        with self.book._reader() as conn:
+        with self.store.reader_snapshot() as conn:
             positions = [dict(row) for row in conn.execute(
                 "SELECT p.*,c.timestamp AS claim_timestamp,c.epoch AS claim_epoch "
                 "FROM lp_accounting_positions p "

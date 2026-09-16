@@ -133,6 +133,19 @@ def _minimum_interval(url: str) -> float:
         return 0.20
     return 0.10
 
+_RATE_LIMITED_CODES = frozenset({-32005, -32007})
+
+
+def _is_rate_limited(exc: BaseException) -> bool:
+    """The provider throttled the whole request; a smaller retry can pass."""
+    if getattr(exc, "code", None) in _RATE_LIMITED_CODES:
+        return True
+    text = str(exc).lower()
+    return any(
+        fragment in text
+        for fragment in ("request limit", "rate limit", "too many requests")
+    )
+
 
 
 
@@ -1192,12 +1205,15 @@ class RoutedRpc:
                 )
             remaining = pending
             pending = []
-            for offset in range(0, len(remaining), batch_limit):
+            chunks: list[
+                tuple[list[tuple[int, tuple[str, list[Any]]]], bool]
+            ] = [
+                (remaining[offset:offset + batch_limit], False)
+                for offset in range(0, len(remaining), batch_limit)
+            ]
+            while chunks:
+                attempted, split = chunks.pop(0)
                 started = time.monotonic()
-                attempted = (
-                    remaining if len(remaining) <= batch_limit
-                    else remaining[offset:offset + batch_limit]
-                )
                 attempted_specs = [
                     specification for _index, specification in attempted
                 ]
@@ -1209,7 +1225,10 @@ class RoutedRpc:
                             source, attempted_specs,
                         )
                     ):
-                        pending = remaining[offset:]
+                        chunks.insert(0, (attempted, split))
+                        pending = [
+                            item for chunk, _split in chunks for item in chunk
+                        ]
                         break
                     request_ids = self._reserve_ids(len(attempted))
                     payload = [
@@ -1233,12 +1252,16 @@ class RoutedRpc:
                 except Exception as exc:
                     self._registry.failure(source, capability, exc)
                     remember(attempted, source, exc)
-                    pending = remaining[offset:]
+                    chunks.insert(0, (attempted, split))
+                    pending = [
+                        item for chunk, _split in chunks for item in chunk
+                    ]
                     break
 
                 unresolved: list[
                     tuple[int, tuple[str, list[Any]]]
                 ] = []
+                throttled: list[Exception] = []
                 first_failure: Exception | None = None
                 for request_id, (
                     index, (method, params)
@@ -1252,15 +1275,29 @@ class RoutedRpc:
                         output[index] = exc.error
                     except Exception as exc:
                         unresolved.append((index, (method, params)))
+                        throttled.append(exc)
                         remember(((index, (method, params)),), source, exc)
                         if first_failure is None:
                             first_failure = exc
                 if unresolved:
                     assert first_failure is not None
+                    if not split and len(attempted) > 1 and all(
+                        _is_rate_limited(exc) for exc in throttled
+                    ):
+                        # The provider throttled the burst, not each item:
+                        # retry the same items as two smaller gate-paced posts.
+                        half = len(attempted) // 2
+                        chunks[0:0] = [
+                            (attempted[:half], True),
+                            (attempted[half:], True),
+                        ]
+                        continue
                     self._registry.failure(
                         source, capability, first_failure,
                     )
-                    unresolved.extend(remaining[offset + batch_limit:])
+                    unresolved.extend(
+                        item for chunk, _split in chunks for item in chunk
+                    )
                     pending = unresolved
                     break
                 for _index, (method, _params) in attempted:
