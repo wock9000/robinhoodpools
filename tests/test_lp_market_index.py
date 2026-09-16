@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 from types import SimpleNamespace
@@ -9,6 +10,7 @@ import pytest
 
 from rhpools.lp_market_index import (
     FACTORY_SELECTOR,
+    FEED_SECONDARY_MAX_SECONDS,
     FEE_SELECTOR,
     GET_PAIR_SELECTOR,
     TICK_SPACING_SELECTOR,
@@ -22,8 +24,12 @@ from rhpools.lp_market_index import (
 )
 from rhpools.lp_market_store import CanonicalConflict, MarketStore
 from rhpools.lp_market_protocols import (
+    LIQUIDITY_SELECTOR,
+    POSITIONS_SELECTOR,
+    SLOT0_SELECTOR,
     V2_FACTORIES,
     V2_SYNC_TOPIC,
+    V3_MINT_TOPIC,
     POOL_MANAGER,
     TRANSFER_TOPIC,
     V4_MODIFY_LIQUIDITY_TOPIC,
@@ -240,6 +246,209 @@ def test_enrichment_rpc_failure_retries_without_dropping_job():
         assert before < row["next_attempt"] <= before + 301
         assert "receipt provider unavailable" in row["last_error"].lower()
         assert "enrichment" in scanner.runtime_status()["errors"]
+    finally:
+        scanner.close()
+        store.close()
+
+def test_unresolved_v3_factory_pool_enriches_without_batch_error():
+    from eth_abi import encode
+
+    from rhpools import _mc
+
+    pool_address = "0x" + "34" * 20
+    owner = "0x" + "12" * 20
+    block = header(10)
+    tx_hash = "0x" + "9a" * 32
+    lower, upper = -60, 60
+    mint_log = {
+        "address": pool_address,
+        "blockNumber": "0xa",
+        "blockHash": block["hash"],
+        "transactionHash": tx_hash,
+        "transactionIndex": "0x0",
+        "logIndex": "0x0",
+        "topics": [
+            V3_MINT_TOPIC,
+            "0x" + f"{int(owner, 16):064x}",
+            "0x" + f"{lower & ((1 << 256) - 1):064x}",
+            "0x" + f"{upper:064x}",
+        ],
+        "data": "0x" + encode(
+            ["address", "uint128", "uint256", "uint256"], [owner, 100, 25, 50],
+        ).hex(),
+    }
+    receipt = {
+        "transactionHash": tx_hash,
+        "blockNumber": "0xa",
+        "blockHash": block["hash"],
+        "transactionIndex": "0x0",
+        "from": owner,
+        "status": "0x1",
+        "gasUsed": "0x5208",
+        "effectiveGasPrice": "0x1",
+        "logs": [mint_log],
+    }
+
+    def words(*values: int) -> str:
+        return "0x" + "".join(f"{value & ((1 << 256) - 1):064x}" for value in values)
+
+    slot0_result = words(1 << 96, 60, 0, 1, 1, 0, 1)
+    liquidity_result = words(123)
+    position_result = words(0, 0, 0, 0, 0)
+
+    class CensusCatalogRpc(StaticRpc):
+        def call(self, method, params):
+            if method == "eth_getTransactionReceipt":
+                return dict(receipt)
+            if method == "eth_call":
+                call_data = params[0]
+                if call_data.get("to") == _mc.MULTICALL3:
+                    return None
+                data = str(call_data.get("data") or "")
+                if data.startswith(SLOT0_SELECTOR):
+                    return slot0_result
+                if data.startswith(LIQUIDITY_SELECTOR):
+                    return liquidity_result
+                if data.startswith(POSITIONS_SELECTOR):
+                    return position_result
+                raise AssertionError(("eth_call", data[:10]))
+            return super().call(method, params)
+
+    class CensusMarket:
+        universe = SimpleNamespace(tokens={})
+
+        @staticmethod
+        def _pool_by_id(pool_id):
+            if str(pool_id).lower() == pool_address:
+                return {
+                    "id": pool_address,
+                    "address": pool_address,
+                    "protocol": "v3",
+                    "source": "census",
+                    "token0": "0x" + "aa" * 20,
+                    "token1": "0x" + "bb" * 20,
+                }
+            return None
+
+
+
+    store = MarketStore(":memory:")
+    scanner = MarketIndexer(
+        store, CensusMarket(), "http://unused.invalid", rpc=CensusCatalogRpc(),
+        history_disk_reserve_bytes=0,
+    )
+    pending_event = {
+        "block_number": 10,
+        "block_hash": block["hash"],
+        "tx_hash": tx_hash,
+        "tx_index": 0,
+        "log_index": 0,
+        "timestamp": int(block["timestamp"], 16),
+        "pool_id": pool_address,
+        "protocol": "v3",
+        "kind": "add",
+        "owner": owner,
+        "data": {},
+    }
+    store.ingest([block], [pending_event])
+    try:
+        pending = store.read().execute(
+            "SELECT 1 FROM pending_enrichment WHERE tx_hash=?", (tx_hash,),
+        ).fetchone()
+        assert pending is not None
+        deadline = time.monotonic() + 10
+        while pending is not None and time.monotonic() < deadline:
+            scanner._enrich_once()
+            time.sleep(0.02)
+            pending = store.read().execute(
+                "SELECT 1 FROM pending_enrichment WHERE tx_hash=?", (tx_hash,),
+            ).fetchone()
+        assert pending is None
+        assert "enrichment" not in scanner.runtime_status()["errors"]
+        data = json.loads(store.read().execute(
+            "SELECT data FROM events WHERE tx_hash=? AND kind='add'", (tx_hash,),
+        ).fetchone()["data"])
+        state = data["pool_state_before"]
+        assert state["source"] == "factory_unresolved"
+        assert state["pinned_block"] == 9
+        assert state["liquidity"] == "123"
+    finally:
+        scanner.close()
+        store.close()
+
+def test_head_feed_secondary_session_is_bounded_and_fails_back(
+    monkeypatch, caplog,
+):
+    store = MarketStore(":memory:")
+    scanner = indexer(store)
+    primary, secondary = "wss://primary.example", "wss://secondary.example"
+    scanner._head_wss_urls = (primary, secondary)
+    calls: list[tuple[str, float | None]] = []
+    started = time.monotonic()
+
+    def fake_head_once(url, *, session_deadline=None):
+        calls.append((url, session_deadline))
+        if len(calls) >= 8:
+            scanner._stop.set()
+        if session_deadline is None:
+            raise RpcError("primary head feed unavailable")
+        return None
+
+    monkeypatch.setattr(scanner, "_head_wss_once", fake_head_once)
+    monkeypatch.setattr(scanner, "_reconcile_current_head", lambda *a, **k: None)
+    with caplog.at_level(logging.INFO, logger="rhpools.lp_market_index"):
+        scanner._head_run()
+    try:
+        assert [url for url, _ in calls] == [primary, secondary] * 4
+        for url, deadline_value in calls:
+            if url == primary:
+                assert deadline_value is None
+            else:
+                assert (
+                    started + FEED_SECONDARY_MAX_SECONDS - 5
+                    <= deadline_value
+                    <= started + FEED_SECONDARY_MAX_SECONDS + 5
+                )
+        assert "failing back to the primary feed" in caplog.text
+        assert "rpc_poll:head" not in json.dumps(scanner.runtime_status())
+    finally:
+        scanner.close()
+        store.close()
+
+
+def test_activity_feed_secondary_session_is_bounded_and_fails_back(
+    monkeypatch, caplog,
+):
+    store = MarketStore(":memory:")
+    scanner = indexer(store)
+    primary, secondary = "wss://primary.example", "wss://secondary.example"
+    scanner._head_wss_urls = (primary, secondary)
+    calls: list[tuple[str, float | None]] = []
+    started = time.monotonic()
+
+    def fake_activity_once(url, *, session_deadline=None):
+        calls.append((url, session_deadline))
+        if len(calls) >= 6:
+            scanner._stop.set()
+        if session_deadline is None:
+            raise RpcError("primary activity feed unavailable")
+        return None
+
+    monkeypatch.setattr(scanner, "_activity_wss_once", fake_activity_once)
+    with caplog.at_level(logging.INFO, logger="rhpools.lp_market_index"):
+        scanner._activity_run()
+    try:
+        assert [url for url, _ in calls] == [primary, secondary] * 3
+        for url, deadline_value in calls:
+            if url == primary:
+                assert deadline_value is None
+            else:
+                assert (
+                    started + FEED_SECONDARY_MAX_SECONDS - 5
+                    <= deadline_value
+                    <= started + FEED_SECONDARY_MAX_SECONDS + 5
+                )
+        assert "failing back to the primary feed" in caplog.text
     finally:
         scanner.close()
         store.close()

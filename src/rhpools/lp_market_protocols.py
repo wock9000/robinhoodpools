@@ -2482,9 +2482,12 @@ def decode_position_state_results(
                 correlation.get("factory"), "V3 pool factory", strict=False
             )
             if factory not in CONCENTRATED_FACTORIES:
-                raise ProtocolDecodeError(
-                    "V3 slot0 factory identity is unresolved or unverified"
-                )
+                # Census-catalog pools can be identity-verified without a
+                # proven factory, so their slot0 ABI variant is unknowable.
+                # Record the gap for this component instead of failing the
+                # complete pinned batch.
+                state.update(exists=False, source="factory_unresolved")
+                continue
             # Slipstream's primary ICLPoolState ABI returns six values and
             # deliberately has no protocol-fee word.  Its fee() and
             # unstakedFee() accessors are separate and do not prove a protocol
