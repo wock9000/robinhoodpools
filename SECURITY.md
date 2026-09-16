@@ -14,7 +14,7 @@ In the private report, include the affected version or commit, impact, prerequis
 
 ## Secrets and transaction safety
 
-Robinhood Pools must never receive or store a wallet private key or seed phrase. The default service is read-only with respect to the chain: it observes, indexes, previews, and simulates, but does not sign or broadcast. The optional transaction-preparation mode produces unsigned data only and must not become a server-signing path.
+Robinhood Pools must never receive or store a wallet private key or seed phrase. The default service is read-only with respect to the chain: it observes, indexes, previews, and simulates, but does not sign or broadcast. The optional transaction-preparation mode produces unsigned direct-pool remove and collect data only and must not become a server-signing path. MiniRouter2 `0x5295e633dfb504298d4a1896ba0738acb6c89e6a` add-liquidity execution is retired as unsafe; revoke remaining token allowances to it, and do not sign transactions from earlier add or approval quotes.
 
 Treat credential-bearing RPC URLs as secrets. Store them outside the repository in mode-`0600` files with one URL per line and refer to them through the appropriate `LP_RPC_*_URL_FILES` or `RHP_RPC_URL_FILES` environment variable. Do not put them in command-line arguments, source, `.env` files, tests, browser code or storage, logs, screenshots, or reports. Rotate a credential immediately if it is exposed.
 

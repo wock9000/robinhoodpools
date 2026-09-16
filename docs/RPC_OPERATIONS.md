@@ -21,6 +21,23 @@ The corresponding `*_URLS` variables remain suitable for unkeyed endpoints and a
 
 Capability routing checks chain ID 4663 and keeps failure/cooldown state separate for logs, head, current state, archive state, receipts, and traces. A pruned node's missing archive state must not invalidate its valid block headers or logs.
 
+Explicit numbered `eth_getBlockByNumber` reads prefer a configured local head
+source. Latest/head discovery keeps the configured remote-first order. A local
+null result fails over only the unresolved numbered reads. To qualify only local
+headers while keeping general local state fallback disabled, put the local URL
+in a private file listed under `LP_RPC_HEAD_URL_FILES` and retain
+`LP_RPC_DISABLE_LOCAL_FALLBACK=1`.
+
+Header batches use the existing 100-item bound and endpoint-wide quota.
+Post-log missing headers and the duplicate end-boundary verification share one
+batch. Log/header hash checks and the before/after end-hash check still precede
+the durable cursor commit. Production scans illustrate the endpoint cost: with
+Quicknode first for logs and head, a 96-block scan spent 4.011 s fetching
+boundary headers and a 112-block scan spent 17.548 s on per-event headers while
+catch-up shared the endpoint; with Goldsky first, a 66-block scan spent 0.100 s
+on boundary headers and 0.053 s on event headers. Single-scan samples under
+live contention, not percentiles.
+
 For routed HTTP `eth_call` and `eth_estimateGas`, an EVM execution revert is a
 contract outcome, not a provider outage. The caller receives the RPC error and
 the provider remains available for other calls. Transport failures, malformed
@@ -82,7 +99,20 @@ References:
 
 A small anonymous-output probe from the production host verified the donated provider privately: chain 4663; exact matching block/header and log digests against the local node; old block headers; USDG `decimals()` at blocks 30,000,000 and 56,400,000; receipts; `debug_traceTransaction` with `callTracer`; and a four-item JSON-RPC batch. The local pruned node could not answer those archive-state calls. Individual successful Goldsky requests in this probe took roughly 76–352 ms; these are samples, not percentile/SLA claims.
 
-Goldsky supports HTTPS JSON-RPC, not WSS subscriptions. Keep the independent WSS head/activity source. Route cheap local headers/logs locally. An explicit `LP_RPC_RECEIPT_URLS` can also put the local node ahead of the archive fallback: a production probe returned 12 historical/current receipts with matching canonical hashes, plus three complete block-receipt results, in 32 ms. This does not establish archive-state or trace availability; those capabilities remain separately routed to Goldsky.
+Goldsky supports HTTPS JSON-RPC, not WSS subscriptions. Keep the independent WSS
+head/activity source. Qualify local capabilities separately rather than assuming
+a pruned node can serve archive state. An earlier production probe returned 12
+historical/current receipts with matching canonical hashes and three complete
+block-receipt results in 32 ms; that evidence does not qualify archive state or
+traces.
+
+The production route gives Goldsky first choice for HTTP head discovery and
+logs, with Quicknode fallback. Quicknode remains first for state, archive state,
+receipts and traces, and supplies the WSS feed. This separates catch-up from
+background accounting's shared endpoint quota. A 256-block comparison returned
+2,432 byte-equivalent canonical log records from both providers, taking 0.626 s
+on Quicknode and 0.403 s on Goldsky. These isolated timings do not include
+contention with the running service.
 
 The donated allowance is 6,000 requests/minute. This process paces Goldsky at at most 80 JSON-RPC items/second on average per endpoint, counting batch elements conservatively, with four concurrent HTTP requests. Bursts are bounded by 80-item envelopes. This leaves nominal headroom under 100/s but does not account for other applications sharing the key. Provider billing/rate accounting remains authoritative.
 
@@ -430,9 +460,78 @@ summaries from 0.110 s to 0.007 s, with identical output digests.
 
 ### SQLite storage
 
-WAL checkpoints run outside the ingestion writer lock. The writer retains at most 256 MiB of reusable journal allocation after a safe reset; this is not a hard cap on active transactions or snapshots. A reader may still pin older WAL frames until its snapshot finishes. A real SQLite smoke kept an old reader at one row while 530 large rows committed, then safely reclaimed the journal after that reader ended; all 532 final rows survived reopen.
+WAL maintenance owns a dedicated connection and worker, independent of projection
+and ingestion writer locks. It runs a passive checkpoint every second after the
+previous pass finishes. Bulk workers wait for the initial storage assessment;
+live ingestion and head observation remain available.
+
+Bulk history, enrichment, projection, metadata, repair, balances and accounting
+pause at 512 MiB of uncheckpointed WAL pages and resume at 128 MiB. Allocated WAL
+length alone does not pause work because SQLite can reuse checkpointed frames.
+At 1 GiB of active WAL pages, maintenance closes admission to new analytics
+snapshots and signals admitted managed readers to abort. Managed snapshots have
+a 15-second lease, checked by SQLite's progress handler. Expired or interrupted
+reads roll back and discard their result; partial rows are not published or
+cached. Accounting preparation workers enforce the same read budget on their
+own connections. Writer and caller-owned transactions are not interrupted.
+Progress callbacks cannot preempt kernel I/O or Python work between SQLite
+operations, so the lease is not a hard wall-clock I/O cancellation guarantee.
+Short ordinary reads, status, tape and live ingestion remain available.
+Bulk workers also pause during the drain. Cached complete frames remain
+available while fresh analytics wait. A drain lasts at most 60 seconds,
+followed by a 60-second admission cooldown if it expires.
+
+Once owned snapshots drain, `TRUNCATE` allows at most 100 ms of SQLite lock
+waiting. Busy resets retry on the next maintenance pass; successful resets are
+limited to one per minute. An oversized but already-reused allocation gets only
+an ordinary nonwaiting reset, without draining analytics. The journal is never
+deleted directly. Both writer and maintenance connections retain
+`synchronous=FULL`.
+
+`LP_DISK_RESERVE_GIB` pauses the same bulk workers when free space falls below the
+configured reserve. They resume above the reserve plus the larger of 1 GiB or
+25%. Set this reserve above any host-level emergency stop threshold. Measurement
+or checkpoint errors also pause bulk work until maintenance recovers.
+
+`/api/lp/status` exposes `wal_checkpoint`, `storage_pause_reasons`,
+`storage_pressure`, `storage_observed_at`, `storage_resume_bytes` and `bulk_work`.
+Checkpoint frame progress and backlog reduction are separate measurements:
+ingestion may increase backlog even while checkpointing makes progress.
+`wal_checkpoint.log_bytes` measures active WAL pages separately from allocation.
+`active_reader_snapshots` counts admitted in-process analytics snapshots, and
+`reader_drain_pending` reports the admission gate. Process-worker or external
+readers can still make SQLite report busy after the in-process count reaches zero.
+
+Owner scope queries select matching hints and episodes before expanding pending
+identities, rather than probing every queued position for each pool query.
+Background frame jobs release their reader connections on success and failure.
+Failed jobs clear completed traceback locals before a Future can retain an
+abandoned cursor and pin the WAL. Caller-owned accounting snapshots remain
+consistent until their caller ends them.
+
+Owner financial scope reads use the global indexed canonical boundary rather
+than searching unrelated event history for a presentation-filter match.
+Historical activity resolves its exact block, transaction and log boundary
+through `events_block_idx` instead of expanding every related event key.
+Pool summaries use one managed snapshot over the existing pool/bucket/tape read
+models. Shutdown signals managed-reader interruption before joining frame jobs.
 
 An oversized WAL can make recovery slow before HTTP is available. Preserve the database, `-wal`, and `-shm` together; never delete the journal to force startup. For planned exclusive checkpoint maintenance, stop the watchdog and all database owners first, let SQLite complete `PRAGMA wal_checkpoint(TRUNCATE)`, verify success, then start exactly one application owner and resume monitoring.
+
+The September 15 recovery checkpoint retained the journal and completed in
+239.217 s, returning `[0, 0, 0]` with zero allocated WAL bytes. This is a recovery
+receipt, not a database backup or a normal checkpoint latency target.
+
+The production service has `CPUQuota=600%`, `CPUWeight=100`, `MemoryHigh=20G`
+and `MemoryMax=28G`. These are per-service ceilings and pressure controls, not
+a host-wide reliability guarantee. Measure cursor gain against chain gain
+under these limits. A single fast scan does not establish sustainable catch-up.
+
+Browser pool requests have a 15-second deadline, including response-body reads.
+An initial failed request displays `POOL DATA UNAVAILABLE · RETRYING`, not
+indefinite syncing. Completed cached views remain available during refresh.
+A real-browser stalled-request probe observed the error state and recovered
+100 pool rows on the next request.
 
 Check filesystem capacity and copy-on-write behavior when durable commit time
 dominates. A nearly full Btrfs volume can make SQLite's write workload expensive

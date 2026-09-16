@@ -8,4 +8,4 @@ The integer TickMath constants and rounding semantics used by `src/rhpools/lp_ma
 
 Deployment addresses and ABI selectors describe public on-chain interfaces. Installed Python dependencies retain their own licenses. The software license does not relicense external data feeds or grant access to keyed providers; the Apollo and RH Trenches adapters retain source attribution and coverage boundaries, and the paid FomoAPI feed is not bypassed.
 
-The runtime prepares unsigned transaction data only when explicitly enabled. It does not store private keys, sign transactions, or broadcast transactions.
+The runtime prepares unsigned direct-pool remove and collect transaction data only when explicitly enabled. It rejects add-liquidity execution through the retired, unsafe MiniRouter2 deployment `0x5295e633dfb504298d4a1896ba0738acb6c89e6a`, including preparation from stale add or approval quotes. It does not store private keys, sign transactions, or broadcast transactions.

@@ -41,9 +41,11 @@ _IDENTITY_BOOTSTRAP_EVENTS = 4096
 _IDENTITY_BOOTSTRAP_KEYS = 256
 _IDENTITY_BOOTSTRAP_PAGE = 256
 _PENDING_PREPARATION_SECONDS = 0.2
-_PENDING_PUBLICATION_SECONDS = 0.2
+_PENDING_TRANSACTION_SECONDS = 0.2
 _POSITION_INTEREST_LIMIT = 2048
 _POSITION_INTEREST_SECONDS = 180.0
+_PREPARATION_SNAPSHOT_SECONDS = 15.0
+_PREPARATION_PROGRESS_STEPS = 1_000
 
 
 class _PoolInventory(NamedTuple):
@@ -205,6 +207,12 @@ CREATE INDEX IF NOT EXISTS lp_accounting_episodes_pool
     ON lp_accounting_episodes(pool_id, closed_at, opened_at);
 CREATE INDEX IF NOT EXISTS lp_accounting_episodes_last_timestamp
     ON lp_accounting_episodes(last_timestamp);
+CREATE INDEX IF NOT EXISTS lp_accounting_episodes_owner_window_cover
+    ON lp_accounting_episodes(
+        last_timestamp,owner,custody,protocol,pool_id,position_key,closed_at,status,
+        id,gross_pnl_usd,gas_usd,history_complete,fees_complete,pricing_complete,
+        fees_usd,deposit_usd,proceeds_usd
+    );
 CREATE INDEX IF NOT EXISTS lp_accounting_episodes_closed_order
     ON lp_accounting_episodes(
         closed_at DESC, opened_block DESC,
@@ -730,6 +738,29 @@ class _PreparationReader:
     def read(self) -> sqlite3.Connection:
         return self._connection
 
+    @contextmanager
+    def reader_snapshot(self):
+        connection = self.read()
+        if connection.in_transaction:
+            yield connection
+            return
+        deadline = time.monotonic() + _PREPARATION_SNAPSHOT_SECONDS
+        try:
+            connection.execute("BEGIN")
+            connection.set_progress_handler(
+                lambda: int(time.monotonic() >= deadline),
+                _PREPARATION_PROGRESS_STEPS,
+            )
+            yield connection
+            if time.monotonic() >= deadline:
+                raise RuntimeError("accounting preparation snapshot exceeded its deadline")
+        finally:
+            try:
+                connection.set_progress_handler(None, 0)
+            finally:
+                if connection.in_transaction:
+                    connection.rollback()
+
 
 _preparation_book: AccountBook | None = None
 
@@ -913,6 +944,7 @@ class AccountBook:
         self._preparation_workers = preparation_workers
         self._preparation_pool: ProcessPoolExecutor | None = None
         self._projection_lock = threading.Lock()
+        self._pending_transaction_batch = 1
         self._cache_lock = threading.RLock()
         self._priority_lock = threading.Lock()
         self._priority_positions: OrderedDict[str, float] = OrderedDict()
@@ -1470,7 +1502,7 @@ class AccountBook:
     ) -> list[_PreparedIdentityHints]:
         prepared: list[_PreparedIdentityHints] = []
         remaining = _IDENTITY_BOOTSTRAP_EVENTS
-        with self._reader() as conn:
+        with self.store.reader_snapshot() as conn:
             if self._accounting_meta(
                 conn, "bootstrap_phase", "complete",
             ) != "complete":
@@ -1536,7 +1568,7 @@ class AccountBook:
                     and (
                         published == first
                         or time.monotonic() - acquired_at
-                        < _PENDING_PUBLICATION_SECONDS
+                        < _PENDING_TRANSACTION_SECONDS
                     )
                 ):
                     item = prepared[published]
@@ -1688,7 +1720,7 @@ class AccountBook:
         return selected
 
     def _prepare_pending(self, position_key: str) -> _PreparedProjection | None:
-        with self._reader() as conn:
+        with self.store.reader_snapshot() as conn:
             pending = conn.execute(
                 "SELECT generation,append_only,cost_only "
                 "FROM lp_accounting_pending WHERE position_key=?",
@@ -1812,6 +1844,7 @@ class AccountBook:
                 worked = True
             prepared_rows = iter(self._prepared_pending(pending))
             cursor = 0
+            transaction_batch = self._pending_transaction_batch
             while cursor < len(pending):
                 prepared_batch: list[_PreparedProjection] = []
                 started_at = time.monotonic()
@@ -1835,15 +1868,17 @@ class AccountBook:
                         position_keys: set[str] = set()
                         affected_pools: set[str] = set()
                         published_any = False
+                        published_positions = 0
                         affected_txs: set[str] = set()
                         changed_episodes: set[str] = set()
                         gas_changed_episodes: set[str] = set()
                         while (
                             published < len(prepared_batch)
+                            and published - batch_start < transaction_batch
                             and (
                                 published == batch_start
                                 or time.monotonic() - acquired_at
-                                < _PENDING_PUBLICATION_SECONDS
+                                < _PENDING_TRANSACTION_SECONDS
                             )
                         ):
                             prepared = prepared_batch[published]
@@ -1852,6 +1887,7 @@ class AccountBook:
                             if changes is None:
                                 continue
                             published_any = True
+                            published_positions += 1
                             if changes.refresh_position:
                                 position_keys.add(changes.position_key)
                             affected_pools.update(changes.pool_ids)
@@ -1879,6 +1915,22 @@ class AccountBook:
                             )
                             self._finish_if_idle(conn)
                             self._invalidate_cache(conn, affected_pools)
+                    # Size the next batch from the whole completed transaction,
+                    # including derived refreshes and the FULL-durability commit.
+                    # Those values must remain atomic with their position publish.
+                    transaction_seconds = time.monotonic() - acquired_at
+                    if published_positions:
+                        target = max(1, min(
+                            128,
+                            int(
+                                published_positions * _PENDING_TRANSACTION_SECONDS
+                                / max(transaction_seconds, 1e-9)
+                            ),
+                        ))
+                        if target > transaction_batch:
+                            target = min(target, transaction_batch * 2)
+                        transaction_batch = target
+                        self._pending_transaction_batch = target
             return worked
 
     def publish_claims(self, rows: Sequence[Mapping[str, Any]]) -> bool:
@@ -4247,17 +4299,6 @@ class AccountBook:
                     episode=episode,
                 )
 
-    @contextmanager
-    def _reader(self):
-        connection = self.store.read()
-        owns_snapshot = not connection.in_transaction
-        if owns_snapshot:
-            connection.execute("BEGIN")
-        try:
-            yield connection
-        finally:
-            if owns_snapshot and connection.in_transaction:
-                connection.rollback()
 
     @staticmethod
     def _owner_cost_values(
@@ -4299,83 +4340,37 @@ class AccountBook:
 
     @staticmethod
     def _owner_gas_values(
-            conn: sqlite3.Connection, identities: Iterable[Any],
-            owner_clauses: Sequence[str], args: Sequence[Any],
-            complete_identities: Iterable[Any] = (),
+            conn: sqlite3.Connection, owner_clauses: Sequence[str],
+            args: Sequence[Any],
     ) -> dict[str, float | None]:
-        selected = sorted({
-            str(identity) for identity in identities if identity is not None
-        })
-        if not selected:
-            return {}
-        complete = {
-            str(identity) for identity in complete_identities
-            if identity is not None
-        }
         predicate = " AND ".join(owner_clauses)
-        result: dict[str, float | None] = {}
-        # A non-NULL episode gas aggregate proves every selected transaction
-        # has an exact episode attribution. Sum those costs in the same owner
-        # index order as before, but resolve scope through c.episode_id instead
-        # of probing the effects table once per transaction.
-        known = [owner for owner in selected if owner in complete]
-        for batch in _batches(known, 400):
-            values = ",".join("(?)" for _ in batch)
-            rows = conn.execute(
-                "WITH selected(owner) AS (VALUES " + values + ") "
-                "SELECT selected.owner,(SELECT SUM(c.gas_usd) "
-                "FROM lp_accounting_tx_costs c "
-                "INDEXED BY lp_accounting_tx_costs_owner "
-                "WHERE c.owner=selected.owner AND EXISTS ("
-                "SELECT 1 FROM lp_accounting_episodes ep "
-                "LEFT JOIN pools p ON p.id=ep.pool_id "
-                "WHERE ep.id=c.episode_id AND ep.owner=selected.owner AND "
-                + predicate + ")) AS gas_usd FROM selected",
-                [*batch, *args],
+        episode_source = "lp_accounting_episodes ep"
+        if any("ep.last_timestamp" in clause for clause in owner_clauses):
+            episode_source += (
+                " INDEXED BY lp_accounting_episodes_owner_window_cover"
             )
-            for row in rows:
-                result[str(row["owner"])] = row["gas_usd"]
-        # Episode NULLs can still be owner-qualified when one transaction
-        # spans several episodes belonging to that owner. Retain the existing
-        # per-owner missing-cost short circuit for exactly those uncertain
-        # owners; only owners which pass it pay for the de-duplicated sum.
-        # Exact transactions within an uncertain owner's total still have
-        # direct episode attribution; only shared costs need an effects probe.
-        uncertain = [owner for owner in selected if owner not in complete]
-        for batch in _batches(uncertain, 400):
-            values = ",".join("(?)" for _ in batch)
-            rows = conn.execute(
-                "WITH selected(owner) AS (VALUES " + values + ") "
-                "SELECT selected.owner,CASE WHEN EXISTS ("
-                "SELECT 1 FROM lp_accounting_episodes ep "
-                "INDEXED BY lp_accounting_episodes_owner "
-                "JOIN lp_accounting_effects fx "
-                "INDEXED BY lp_accounting_effects_episode "
-                "ON fx.episode_id=ep.id "
-                "LEFT JOIN lp_accounting_tx_costs c "
-                "ON c.tx_hash=fx.tx_hash AND c.owner=ep.owner "
-                "LEFT JOIN pools p ON p.id=ep.pool_id "
-                "WHERE ep.owner=selected.owner AND " + predicate +
-                " AND c.gas_usd IS NULL) THEN NULL ELSE ("
-                "SELECT SUM(c.gas_usd) FROM lp_accounting_tx_costs c "
-                "INDEXED BY lp_accounting_tx_costs_owner "
-                "WHERE c.owner=selected.owner AND CASE "
-                "WHEN c.episode_id IS NOT NULL THEN EXISTS ("
-                "SELECT 1 FROM lp_accounting_episodes ep "
-                "LEFT JOIN pools p ON p.id=ep.pool_id "
-                "WHERE ep.id=c.episode_id AND ep.owner=selected.owner AND "
-                + predicate + ") ELSE EXISTS ("
-                "SELECT 1 FROM lp_accounting_effects fx "
-                "INDEXED BY lp_accounting_effects_tx "
-                "JOIN lp_accounting_episodes ep ON ep.id=fx.episode_id "
-                "LEFT JOIN pools p ON p.id=ep.pool_id "
-                "WHERE fx.tx_hash=c.tx_hash AND ep.owner=selected.owner AND "
-                + predicate + ") END) END AS gas_usd FROM selected",
-                [*batch, *args, *args, *args],
-            )
-            for row in rows:
-                result[str(row["owner"])] = row["gas_usd"]
-        return result
+        elif any("ep.pool_id" in clause for clause in owner_clauses):
+            episode_source += " INDEXED BY lp_accounting_episodes_pool"
+        # Resolve each scoped transaction once. The old correlated query walked
+        # the same episode/effect paths once per owner and exceeded the reader
+        # deadline when most recent owners had one not-yet-attributed episode.
+        rows = conn.execute(
+            "WITH scoped(owner,tx_hash) AS MATERIALIZED ("
+            "SELECT DISTINCT ep.owner,fx.tx_hash FROM " + episode_source + " "
+            "JOIN lp_accounting_effects fx "
+            "INDEXED BY lp_accounting_effects_episode "
+            "ON fx.episode_id=ep.id LEFT JOIN pools p ON p.id=ep.pool_id "
+            "WHERE " + predicate + " AND ep.gas_usd IS NULL),"
+            "owner_costs(owner,tx_hash,gas_usd) AS ("
+            "SELECT s.owner,s.tx_hash,c.gas_usd FROM scoped s "
+            "LEFT JOIN lp_accounting_tx_costs c ON c.tx_hash=s.tx_hash "
+            "AND c.owner=s.owner) "
+            "SELECT owner,CASE WHEN COUNT(gas_usd)<>COUNT(tx_hash) "
+            "THEN NULL ELSE SUM(gas_usd) END AS gas_usd "
+            "FROM owner_costs GROUP BY owner",
+            args,
+        )
+        return {str(row["owner"]): row["gas_usd"] for row in rows}
 
     def _status_coverage(self) -> dict[str, Any]:
         try:
@@ -4639,7 +4634,7 @@ class AccountBook:
             source += " INDEXED BY lp_accounting_episodes_last_timestamp"
             where = " WHERE last_timestamp>=?"
             args = (int(time.time()) - cutoff_seconds,)
-        with self._reader() as conn:
+        with self.store.reader_snapshot() as conn:
             row = conn.execute(
                 "SELECT COUNT(DISTINCT owner)+COUNT(DISTINCT custody)"
                 + source + where,
@@ -4730,8 +4725,8 @@ class AccountBook:
                 "SUM(e.status='complete') AS closed_episodes,"
                 "CASE WHEN COUNT(e.gross_pnl_usd)=COUNT(*) "
                 "THEN SUM(e.gross_pnl_usd) END AS gross_pnl_usd,"
-                "CASE WHEN COUNT(e.gas_usd)=COUNT(*) "
-                "THEN SUM(e.gas_usd) END AS gas_usd,"
+                "SUM(e.gas_usd) AS _observed_gas_usd,"
+                "SUM(e.gas_usd IS NULL) AS _missing_gas_episodes,"
                 "CASE WHEN MIN(e.history_complete AND e.fees_complete "
                 "AND e.pricing_complete)=1 AND COUNT(e.fees_usd)=COUNT(*) "
                 "THEN SUM(e.fees_usd) END AS fees_usd,"
@@ -4775,15 +4770,13 @@ class AccountBook:
             source = " FROM lp_accounting_episodes e "
             if cutoff_seconds is not None and not pool_id:
                 source += (
-                    "INDEXED BY lp_accounting_episodes_last_timestamp "
+                    "INDEXED BY lp_accounting_episodes_owner_window_cover "
                 )
             if query:
                 source += "LEFT JOIN pools p ON p.id=e.pool_id"
-            with self._reader() as conn:
+            with self.store.reader_snapshot() as conn:
                 # Pin totals, gas attribution and coverage to one WAL snapshot.
                 # Continuous appends must not restart this expensive materialization.
-                if not conn.in_transaction:
-                    conn.execute("BEGIN")
                 coverage = self._status_coverage()
                 coverage.update({
                     "window": window,
@@ -4826,17 +4819,13 @@ class AccountBook:
                 ]
                 gas_clauses.append("ep.owner IS NOT NULL")
                 gas_by_owner = self._owner_gas_values(
-                    conn, (row.get("owner") for row in beneficial),
-                    gas_clauses, args,
-                    (
-                        row.get("owner") for row in beneficial
-                        if row.get("gas_usd") is not None
-                    ),
+                    conn, gas_clauses, args,
                 )
                 financial_state = self._scoped_owner_financial_state(
                     conn, params,
                     now - cutoff_seconds
                     if cutoff_seconds is not None else None,
+                    (),
                 )
             rows = beneficial
             (
@@ -4866,7 +4855,22 @@ class AccountBook:
                     expires = int(timestamp) + cutoff_seconds + 1
                     valid_until = expires if valid_until is None else min(valid_until, expires)
                 qualified = row.get("gross_pnl_usd") is not None
-                row["gas_usd"] = gas_by_owner.get(str(row["owner"]))
+                owner = str(row["owner"])
+                observed_gas = _finite_float(
+                    row.pop("_observed_gas_usd", None)
+                )
+                missing_gas_episodes = int(
+                    row.pop("_missing_gas_episodes", 0) or 0
+                )
+                unresolved_gas = gas_by_owner.get(owner, ...)
+                if missing_gas_episodes and unresolved_gas is None:
+                    row["gas_usd"] = None
+                elif unresolved_gas is ...:
+                    row["gas_usd"] = observed_gas
+                else:
+                    row["gas_usd"] = (
+                        (observed_gas or 0.0) + float(unresolved_gas)
+                    )
                 row["net_pnl_usd"] = (
                     row["gross_pnl_usd"] - row["gas_usd"]
                     if row.get("gross_pnl_usd") is not None
@@ -5134,14 +5138,12 @@ class AccountBook:
                     + " FROM selected s JOIN events e ON e.id=("
                     "SELECT a.id FROM lp_ownership_intervals i "
                     "INDEXED BY lp_ownership_intervals_owner "
-                    "JOIN lp_accounting_event_keys k "
-                    "ON k.position_key=i.position_key "
-                    "JOIN events a ON a.id=k.event_id "
-                    + pool_join + "WHERE i.owner=s.identity "
-                    "AND i.end_block IS NOT NULL "
-                    "AND a.block_number=i.end_block "
+                    "JOIN events a INDEXED BY events_block_idx "
+                    "ON a.block_number=i.end_block "
                     "AND a.tx_index=i.end_tx_index "
-                    "AND a.log_index=i.end_log_index AND "
+                    "AND a.log_index=i.end_log_index "
+                    + pool_join + "WHERE i.owner=s.identity "
+                    "AND i.end_block IS NOT NULL AND "
                     + " AND ".join(clauses)
                     + " ORDER BY i.end_block DESC,i.end_tx_index DESC,"
                     "i.end_log_index DESC LIMIT 1) "
@@ -5179,6 +5181,7 @@ class AccountBook:
     def _scoped_owner_financial_state(
             self, conn: sqlite3.Connection, params: Mapping[str, Any],
             cutoff_timestamp: int | None,
+            identities: Sequence[tuple[str, str]] | None = None,
     ) -> tuple[
         dict[str, int] | None, int | None, set[str], set[str], bool,
     ]:
@@ -5186,54 +5189,34 @@ class AccountBook:
         cutoff = cutoff_timestamp
         protocol = str(params.get("protocol") or "").lower()
         pool_id = str(params.get("pool") or params.get("pool_id") or "").lower()
-        event_clauses: list[str] = []
-        event_args: list[Any] = []
         episode_clauses: list[str] = []
         episode_args: list[Any] = []
         hint_clauses = ["h.kind='scope'"]
         hint_args: list[Any] = []
         if cutoff is not None:
-            event_clauses.append("e.timestamp>=?")
-            event_args.append(cutoff)
             episode_clauses.append("ep.last_timestamp>=?")
             episode_args.append(cutoff)
             hint_clauses.append("h.timestamp>=?")
             hint_args.append(cutoff)
         if protocol:
-            event_clauses.append(
-                "(e.protocol=? OR (e.protocol='nft' AND "
-                "json_extract(e.data,'$.manager_protocol')=?))"
-            )
-            event_args.extend((protocol, protocol))
             episode_clauses.append("ep.protocol=?")
             episode_args.append(protocol)
             hint_clauses.append("h.protocol=?")
             hint_args.append(protocol)
         if pool_id:
-            event_clauses.append("e.pool_id=?")
-            event_args.append(pool_id)
             episode_clauses.append("ep.pool_id=?")
             episode_args.append(pool_id)
             hint_clauses.append("h.pool_id=?")
             hint_args.append(pool_id)
-        event_where = (
-            " WHERE " + " AND ".join(event_clauses)
-            if event_clauses else ""
-        )
-        through = None
-        # A window lookup must not sort the entire recent ledger to find its
-        # newest event. Check empty scopes before walking the ordered index.
-        if not event_clauses or conn.execute(
-            "SELECT 1 FROM events e" + event_where + " LIMIT 1", event_args,
-        ).fetchone() is not None:
-            order_index = "" if pool_id else " INDEXED BY events_block_idx"
-            through = conn.execute(
-                "SELECT e.block_number,e.tx_index,e.log_index,e.timestamp "
-                "FROM events e" + order_index + event_where
-                + " ORDER BY e.block_number DESC,e.tx_index DESC,"
-                "e.log_index DESC LIMIT 1",
-                event_args,
-            ).fetchone()
+        # The accounting projection consumes the global canonical stream.
+        # Its upper boundary is therefore the latest event in this snapshot,
+        # independent of presentation filters. Filtering this lookup can turn
+        # an absent or sparse protocol into a reverse scan of all events.
+        through = conn.execute(
+            "SELECT block_number,tx_index,log_index,timestamp "
+            "FROM events INDEXED BY events_block_idx "
+            "ORDER BY block_number DESC,tx_index DESC,log_index DESC LIMIT 1"
+        ).fetchone()
         through_order = (
             {
                 "block_number": int(through["block_number"]),
@@ -5263,47 +5246,186 @@ class AccountBook:
             "WHERE identities_ready=0 LIMIT 1"
         ).fetchone() is not None:
             return through_order, through_as_of, set(), set(), False
-        if cutoff is not None or protocol or pool_id:
-            hint_scope = " AND " + " AND ".join(hint_clauses)
-            episode_scope = " AND " + " AND ".join(episode_clauses)
-            scoped_keys = (
-                "SELECT q.position_key FROM lp_accounting_pending q WHERE "
-                "EXISTS(SELECT 1 "
-                "FROM lp_accounting_pending_identities h "
-                "WHERE h.position_key=q.position_key" + hint_scope + ") OR "
-                "EXISTS(SELECT 1 FROM lp_accounting_episodes ep "
-                "WHERE ep.position_key=q.position_key" + episode_scope + ")"
-            )
-            scoped_args = [*hint_args, *episode_args]
-        else:
-            scoped_keys = (
-                "SELECT q.position_key FROM lp_accounting_pending q"
-            )
-            scoped_args = []
-        pending_rows = conn.execute(
-            "WITH scoped_keys AS MATERIALIZED (" + scoped_keys + ") "
-            "SELECT ep.owner,ep.custody "
-            "FROM scoped_keys s CROSS JOIN lp_accounting_episodes ep "
-            "ON ep.position_key=s.position_key "
-            "UNION "
-            "SELECT CASE WHEN h.kind='owner' THEN h.identity END AS owner,"
-            "CASE WHEN h.kind='custody' THEN h.identity END AS custody "
-            "FROM scoped_keys s "
-            "CROSS JOIN lp_accounting_pending_identities h "
-            "ON h.position_key=s.position_key "
-            "WHERE h.kind IN ('owner','custody')",
-            scoped_args,
+        if identities is None:
+            if cutoff is not None or protocol or pool_id:
+                hint_scope = " WHERE " + " AND ".join(hint_clauses)
+                episode_scope = " WHERE " + " AND ".join(episode_clauses)
+                hint_source = " FROM lp_accounting_pending_identities h"
+                episode_source = " FROM lp_accounting_episodes ep"
+                if pool_id:
+                    hint_source += (
+                        " INDEXED BY lp_accounting_pending_identities_pool"
+                    )
+                    episode_source += " INDEXED BY lp_accounting_episodes_pool"
+                elif cutoff is not None:
+                    hint_source += (
+                        " INDEXED BY "
+                        "lp_accounting_pending_identities_scope_timestamp"
+                    )
+                    episode_source += (
+                        " INDEXED BY lp_accounting_episodes_last_timestamp"
+                    )
+                scoped_keys = (
+                    "SELECT h.position_key" + hint_source + " JOIN "
+                    "lp_accounting_pending q ON q.position_key=h.position_key"
+                    + hint_scope + " UNION ALL SELECT ep.position_key"
+                    + episode_source + " JOIN lp_accounting_pending q "
+                    "ON q.position_key=ep.position_key" + episode_scope
+                )
+                scoped_args = [*hint_args, *episode_args]
+            else:
+                scoped_keys = ""
+                scoped_args = []
+            owners: set[str] = set()
+            custodies: set[str] = set()
+
+            def retain(rows: Iterable[sqlite3.Row]) -> None:
+                for row in rows:
+                    owner = _address(row["owner"])
+                    custody = _address(row["custody"])
+                    if owner is not None:
+                        owners.add(owner)
+                    if custody is not None:
+                        custodies.add(custody)
+
+            if scoped_keys:
+                scoped_rows = conn.execute(scoped_keys, scoped_args)
+                while True:
+                    keys = list(dict.fromkeys(
+                        str(row[0]) for row in islice(scoped_rows, 400)
+                    ))
+                    if not keys:
+                        break
+                    values = ",".join("(?)" for _ in keys)
+                    retain(conn.execute(
+                        "WITH selected(position_key) AS (VALUES " + values + ") "
+                        "SELECT ep.owner,ep.custody FROM selected s CROSS JOIN "
+                        "lp_accounting_episodes ep "
+                        "ON ep.position_key=s.position_key UNION ALL "
+                        "SELECT CASE WHEN h.kind='owner' THEN h.identity END,"
+                        "CASE WHEN h.kind='custody' THEN h.identity END "
+                        "FROM selected s CROSS JOIN "
+                        "lp_accounting_pending_identities h "
+                        "ON h.position_key=s.position_key "
+                        "WHERE h.kind IN ('owner','custody')",
+                        keys,
+                    ))
+            else:
+                retain(conn.execute(
+                    "SELECT ep.owner,ep.custody FROM lp_accounting_episodes ep "
+                    "WHERE EXISTS(SELECT 1 FROM lp_accounting_pending q "
+                    "WHERE q.position_key=ep.position_key) UNION ALL "
+                    "SELECT CASE WHEN h.kind='owner' THEN h.identity END,"
+                    "CASE WHEN h.kind='custody' THEN h.identity END "
+                    "FROM lp_accounting_pending_identities h "
+                    "WHERE h.kind IN ('owner','custody') AND EXISTS("
+                    "SELECT 1 FROM lp_accounting_pending q "
+                    "WHERE q.position_key=h.position_key)"
+                ))
+            return through_order, through_as_of, owners, custodies, True
+        if not identities:
+            # Candidate ordering does not depend on pending flags. Resolve the
+            # requested page after sorting, retaining this snapshot's order.
+            return through_order, through_as_of, set(), set(), True
+        selected = sorted({
+            (kind, identity)
+            for kind, identity in identities
+            if kind in {"owner", "custody"} and _address(identity) is not None
+        })
+        if not selected:
+            return through_order, through_as_of, set(), set(), True
+        values = ",".join("(?,?)" for _ in selected)
+        selected_args = [item for pair in selected for item in pair]
+        scope_predicate = " AND ".join(
+            clause.replace("h.", "scope.") for clause in hint_clauses
+        )
+        rows = conn.execute(
+            "WITH selected(kind,identity) AS (VALUES " + values + "), "
+            "candidate_positions(kind,identity,position_key) AS MATERIALIZED ("
+            "SELECT s.kind,s.identity,ep.position_key FROM selected s "
+            "CROSS JOIN lp_accounting_episodes ep "
+            "INDEXED BY lp_accounting_episodes_owner_position "
+            "WHERE s.kind='owner' AND ep.owner=s.identity UNION "
+            "SELECT s.kind,s.identity,ep.position_key FROM selected s "
+            "CROSS JOIN lp_accounting_episodes ep "
+            "INDEXED BY lp_accounting_episodes_custody "
+            "WHERE s.kind='custody' AND ep.custody=s.identity UNION "
+            "SELECT s.kind,s.identity,oi.position_key FROM selected s "
+            "CROSS JOIN lp_ownership_intervals oi "
+            "INDEXED BY lp_ownership_intervals_owner "
+            "WHERE s.kind='owner' AND oi.owner=s.identity UNION "
+            "SELECT s.kind,s.identity,k.position_key FROM selected s "
+            "CROSS JOIN events e INDEXED BY events_owner_time_idx "
+            "JOIN lp_accounting_event_keys k ON k.event_id=e.id "
+            "WHERE s.kind='owner' AND e.owner=s.identity UNION "
+            "SELECT s.kind,s.identity,k.position_key FROM selected s "
+            "CROSS JOIN events e INDEXED BY events_custody_time_idx "
+            "JOIN lp_accounting_event_keys k ON k.event_id=e.id "
+            "WHERE s.kind='custody' AND e.custody=s.identity) "
+            "SELECT DISTINCT cp.kind,cp.identity FROM "
+            + (
+                "lp_accounting_pending_identities scope INDEXED BY "
+                + (
+                    "lp_accounting_pending_identities_pool"
+                    if pool_id else
+                    "lp_accounting_pending_identities_scope_timestamp"
+                )
+                + " CROSS JOIN candidate_positions cp "
+                "ON cp.position_key=scope.position_key WHERE "
+                + scope_predicate
+                if cutoff is not None or pool_id else
+                "candidate_positions cp WHERE EXISTS(SELECT 1 FROM "
+                "lp_accounting_pending_identities scope WHERE "
+                "scope.position_key=cp.position_key AND " + scope_predicate + ")"
+            ),
+            [*selected_args, *hint_args],
         )
         owners: set[str] = set()
         custodies: set[str] = set()
-        for row in pending_rows:
-            owner = _address(row["owner"])
-            custody = _address(row["custody"])
-            if owner is not None:
-                owners.add(owner)
-            if custody is not None:
-                custodies.add(custody)
+        for row in rows:
+            identity = _address(row["identity"])
+            if identity is None:
+                continue
+            if row["kind"] == "owner":
+                owners.add(identity)
+            elif row["kind"] == "custody":
+                custodies.add(identity)
         return through_order, through_as_of, owners, custodies, True
+
+    def decorate_owner_financial_state(
+            self, rows: Sequence[dict[str, Any]],
+            params: Mapping[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        params = params or {}
+        identities = [
+            ("owner", owner) if owner is not None else ("custody", custody)
+            for row in rows
+            if (owner := _address(row.get("owner"))) is not None
+            or (custody := _address(row.get("custody"))) is not None
+        ]
+        cutoff_seconds = _cutoff(params)
+        with self.store.reader_snapshot() as conn:
+            _, _, pending_owners, pending_custodies, mapping_complete = (
+                self._scoped_owner_financial_state(
+                    conn, params,
+                    int(time.time()) - cutoff_seconds
+                    if cutoff_seconds is not None else None,
+                    identities,
+                )
+            )
+        for row in rows:
+            owner = _address(row.get("owner"))
+            custody = _address(row.get("custody"))
+            pending = (
+                not mapping_complete
+                or owner is not None and owner in pending_owners
+                or custody is not None and custody in pending_custodies
+            )
+            if pending:
+                row["financial_pending"] = True
+                row["financial_through_order"] = None
+                row["financial_through_as_of"] = None
+        return list(rows)
 
     def decorate_owner_activity(
             self, rows: Sequence[Mapping[str, Any]],
@@ -5337,7 +5459,7 @@ class AccountBook:
                     row, cached if isinstance(cached, Mapping) else None,
                 )
         if missing:
-            with self._reader() as conn:
+            with self.store.reader_snapshot() as conn:
                 activities = self._historical_owner_activity(
                     conn, [output[index] for index, _ in missing], params,
                 )
@@ -5364,6 +5486,7 @@ class AccountBook:
         rows = candidates["rows"]
         self._owner_sort(rows, str(params.get("sort") or "net_pnl").lower())
         selected = self.decorate_owner_activity(rows[offset:offset + limit], params)
+        self.decorate_owner_financial_state(selected, params)
         for row in selected:
             if not isinstance(row.get("activity"), Mapping):
                 row["activity"] = {
@@ -5413,7 +5536,7 @@ class AccountBook:
         order = recent_order
         if sort_value is not None:
             order = "sort_value IS NULL,sort_value DESC," + recent_order
-        with self._reader() as conn:
+        with self.store.reader_snapshot() as conn:
             if query_pool:
                 conn.create_function(
                     "rhpools_episode_query", 8, self._episode_query,
@@ -5484,7 +5607,7 @@ class AccountBook:
             (" WHERE " + " AND ".join(clauses) if clauses else "") +
             " ORDER BY p.last_timestamp DESC,p.position_key"
         )
-        with self._reader() as conn:
+        with self.store.reader_snapshot() as conn:
             rows = _dict_rows(conn.execute(sql, args))
             active_keys = [
                 str(row["position_key"]) for row in rows
@@ -5572,7 +5695,7 @@ class AccountBook:
         detail_params["owner"] = identity
         detail_params["limit"] = _MAX_LIMIT
         position_rows = self.positions(detail_params)["rows"]
-        with self._reader() as conn:
+        with self.store.reader_snapshot() as conn:
             episodes = self._episode_rows(conn, detail_params, identity=identity)
             gas_values = self._owner_cost_values(
                 conn, (str(episode["id"]) for episode in episodes), identity
@@ -5936,202 +6059,195 @@ class AccountBook:
             "complete_inventory": False,
         }
         results: dict[str, dict[str, Any]] = {}
-        with self._reader() as conn:
-            owns_snapshot = not conn.in_transaction
-            try:
-                marks = ",".join("?" for _ in requested)
-                if owns_snapshot:
-                    conn.execute("BEGIN")
-                generations = {pool_id: 0 for pool_id in requested}
-                generations.update({
-                    str(row[0]).lower(): int(row[1])
-                    for row in conn.execute(
-                        "SELECT pool_id,generation "
-                        "FROM lp_accounting_pool_generations "
-                        f"WHERE pool_id IN ({marks})",
-                        requested,
-                    ).fetchall()
-                })
-                if not self._table_exists(conn, "lp_pool_state"):
-                    return {pool_id: dict(empty) for pool_id in requested}
-                state_rows = _dict_rows(conn.execute(
-                    f"SELECT pool_id,tick,sqrt_price_x96,"
-                    f"price0_usd,price1_usd "
-                    f"FROM lp_pool_state WHERE pool_id IN ({marks})",
+        with self.store.reader_snapshot() as conn:
+            marks = ",".join("?" for _ in requested)
+            generations = {pool_id: 0 for pool_id in requested}
+            generations.update({
+                str(row[0]).lower(): int(row[1])
+                for row in conn.execute(
+                    "SELECT pool_id,generation "
+                    "FROM lp_accounting_pool_generations "
+                    f"WHERE pool_id IN ({marks})",
+                    requested,
+                ).fetchall()
+            })
+            if not self._table_exists(conn, "lp_pool_state"):
+                return {pool_id: dict(empty) for pool_id in requested}
+            state_rows = _dict_rows(conn.execute(
+                f"SELECT pool_id,tick,sqrt_price_x96,"
+                f"price0_usd,price1_usd "
+                f"FROM lp_pool_state WHERE pool_id IN ({marks})",
+                requested,
+            ))
+            status = self._status_coverage()
+            state = {
+                str(row["pool_id"]).lower(): row for row in state_rows
+            }
+            metadata = {
+                str(row["id"]).lower(): row
+                for row in _dict_rows(conn.execute(
+                    f"SELECT id,created_block,decimals0,decimals1 "
+                    f"FROM pools WHERE id IN ({marks})",
                     requested,
                 ))
-                status = self._status_coverage()
-                state = {
-                    str(row["pool_id"]).lower(): row for row in state_rows
-                }
-                metadata = {
-                    str(row["id"]).lower(): row
+            }
+            history_from = _raw_int(status.get("history_from_block"))
+            backfill = status.get("backfill")
+            backfill_done = (
+                backfill is False
+                or backfill == "complete"
+                or (
+                    isinstance(backfill, Mapping)
+                    and (
+                        _flag(backfill.get("complete"))
+                        or backfill.get("remaining") == 0
+                    )
+                )
+            )
+            unknown_scope = conn.execute(
+                "SELECT 1 FROM lp_accounting_pending WHERE identities_ready=0 LIMIT 1"
+            ).fetchone() is not None
+            pending_pools = {
+                str(row[0]) for row in conn.execute(
+                    "SELECT DISTINCT h.pool_id FROM lp_accounting_pending_identities h "
+                    "JOIN lp_accounting_pending p ON p.position_key=h.position_key "
+                    f"WHERE h.kind='scope' AND h.pool_id IN ({marks})", requested,
+                )
+            } if backfill_done and not unknown_scope else set()
+            complete_pools = (
+                set(requested) - pending_pools
+                if backfill_done and not unknown_scope else set()
+            )
+            cache_keys: dict[str, tuple[Any, ...]] = {}
+            inventory_hits: dict[str, _PoolInventory] = {}
+            missing_results: list[str] = []
+            missing_inventory: list[str] = []
+            with self._cache_lock:
+                for pool_id in requested:
+                    mark = state.get(pool_id, {})
+                    pool = metadata.get(pool_id, {})
+                    generation = generations[pool_id]
+                    cache_key = (
+                        generation, pool_id,
+                        mark.get("tick"),
+                        mark.get("sqrt_price_x96"),
+                        mark.get("price0_usd"),
+                        mark.get("price1_usd"),
+                        pool.get("created_block"),
+                        pool.get("decimals0"),
+                        pool.get("decimals1"),
+                        history_from,
+                        pool_id in complete_pools,
+                    )
+                    cache_keys[pool_id] = cache_key
+                    cached = self._pool_cache.get(cache_key)
+                    if cached is not None:
+                        results[pool_id] = dict(cached)
+                        self._pool_cache.move_to_end(cache_key)
+                        continue
+                    missing_results.append(pool_id)
+                    inventory_entry = self._pool_inventory_cache.get(pool_id)
+                    if (
+                        inventory_entry is not None
+                        and inventory_entry[0] == generation
+                    ):
+                        inventory_hits[pool_id] = inventory_entry[1]
+                        self._pool_inventory_cache.move_to_end(pool_id)
+                    else:
+                        missing_inventory.append(pool_id)
+            for pool_id in missing_results:
+                inventory = inventory_hits.get(pool_id)
+                if inventory is None:
+                    continue
+                result, _ = self._reduce_pool_inventory(
+                    inventory.positions,
+                    lp_count=inventory.lp_count,
+                    history_complete=inventory.history_complete,
+                    mark=state.get(pool_id, {}),
+                    metadata=metadata.get(pool_id, {}),
+                    history_from=history_from,
+                    backfill_done=pool_id in complete_pools,
+                    retain_inventory=False,
+                )
+                results[pool_id] = result
+                self._cache_pool_stats(
+                    pool_id, generations[pool_id],
+                    cache_keys[pool_id], result,
+                )
+            if missing_inventory:
+                position_marks = ",".join("?" for _ in missing_inventory)
+                summaries = {
+                    str(row["pool_id"]).lower(): (
+                        int(row["lp_count"] or 0),
+                        bool(row["history_complete"]),
+                    )
                     for row in _dict_rows(conn.execute(
-                        f"SELECT id,created_block,decimals0,decimals1 "
-                        f"FROM pools WHERE id IN ({marks})",
-                        requested,
+                        f"SELECT pool_id,"
+                        f"COUNT(DISTINCT CASE "
+                        f"WHEN owner IS NOT NULL AND owner<>'' THEN owner "
+                        f"WHEN custody IS NOT NULL AND custody<>'' THEN custody "
+                        f"END) AS lp_count,"
+                        f"MIN(history_complete) AS history_complete "
+                        f"FROM lp_accounting_positions "
+                        f"INDEXED BY lp_accounting_positions_active_inventory "
+                        f"WHERE pool_id IN ({position_marks}) "
+                        f"AND active_episode_id IS NOT NULL GROUP BY pool_id",
+                        missing_inventory,
                     ))
                 }
-                history_from = _raw_int(status.get("history_from_block"))
-                backfill = status.get("backfill")
-                backfill_done = (
-                    backfill is False
-                    or backfill == "complete"
-                    or (
-                        isinstance(backfill, Mapping)
-                        and (
-                            _flag(backfill.get("complete"))
-                            or backfill.get("remaining") == 0
-                        )
-                    )
+                position_rows = conn.execute(
+                    f"SELECT pool_id,protocol,liquidity,liquidity_known,"
+                    f"tick_lower,tick_upper FROM lp_accounting_positions "
+                    f"INDEXED BY lp_accounting_positions_active_inventory "
+                    f"WHERE pool_id IN ({position_marks}) "
+                    f"AND active_episode_id IS NOT NULL ORDER BY pool_id",
+                    missing_inventory,
                 )
-                unknown_scope = conn.execute(
-                    "SELECT 1 FROM lp_accounting_pending WHERE identities_ready=0 LIMIT 1"
-                ).fetchone() is not None
-                pending_pools = {
-                    str(row[0]) for row in conn.execute(
-                        "SELECT DISTINCT h.pool_id FROM lp_accounting_pending_identities h "
-                        "JOIN lp_accounting_pending p ON p.position_key=h.position_key "
-                        f"WHERE h.kind='scope' AND h.pool_id IN ({marks})", requested,
+                evaluated: set[str] = set()
+                for raw_pool_id, group in groupby(
+                    position_rows, key=lambda row: str(row[0]).lower(),
+                ):
+                    pool_id = str(raw_pool_id)
+                    lp_count, history_complete = summaries.get(
+                        pool_id, (0, True),
                     )
-                } if backfill_done and not unknown_scope else set()
-                complete_pools = (
-                    set(requested) - pending_pools
-                    if backfill_done and not unknown_scope else set()
-                )
-                cache_keys: dict[str, tuple[Any, ...]] = {}
-                inventory_hits: dict[str, _PoolInventory] = {}
-                missing_results: list[str] = []
-                missing_inventory: list[str] = []
-                with self._cache_lock:
-                    for pool_id in requested:
-                        mark = state.get(pool_id, {})
-                        pool = metadata.get(pool_id, {})
-                        generation = generations[pool_id]
-                        cache_key = (
-                            generation, pool_id,
-                            mark.get("tick"),
-                            mark.get("sqrt_price_x96"),
-                            mark.get("price0_usd"),
-                            mark.get("price1_usd"),
-                            pool.get("created_block"),
-                            pool.get("decimals0"),
-                            pool.get("decimals1"),
-                            history_from,
-                            pool_id in complete_pools,
-                        )
-                        cache_keys[pool_id] = cache_key
-                        cached = self._pool_cache.get(cache_key)
-                        if cached is not None:
-                            results[pool_id] = dict(cached)
-                            self._pool_cache.move_to_end(cache_key)
-                            continue
-                        missing_results.append(pool_id)
-                        inventory_entry = self._pool_inventory_cache.get(pool_id)
-                        if (
-                            inventory_entry is not None
-                            and inventory_entry[0] == generation
-                        ):
-                            inventory_hits[pool_id] = inventory_entry[1]
-                            self._pool_inventory_cache.move_to_end(pool_id)
-                        else:
-                            missing_inventory.append(pool_id)
-                for pool_id in missing_results:
-                    inventory = inventory_hits.get(pool_id)
-                    if inventory is None:
-                        continue
-                    result, _ = self._reduce_pool_inventory(
-                        inventory.positions,
-                        lp_count=inventory.lp_count,
-                        history_complete=inventory.history_complete,
+                    result, inventory = self._reduce_pool_inventory(
+                        (
+                            self._pool_inventory_position(row)
+                            for row in group
+                        ),
+                        lp_count=lp_count,
+                        history_complete=history_complete,
                         mark=state.get(pool_id, {}),
                         metadata=metadata.get(pool_id, {}),
                         history_from=history_from,
                         backfill_done=pool_id in complete_pools,
-                        retain_inventory=False,
+                        retain_inventory=True,
+                    )
+                    evaluated.add(pool_id)
+                    results[pool_id] = result
+                    self._cache_pool_stats(
+                        pool_id, generations[pool_id],
+                        cache_keys[pool_id], result, inventory,
+                    )
+                for pool_id in missing_inventory:
+                    if pool_id in evaluated:
+                        continue
+                    result, inventory = self._reduce_pool_inventory(
+                        (),
+                        lp_count=0,
+                        history_complete=True,
+                        mark=state.get(pool_id, {}),
+                        metadata=metadata.get(pool_id, {}),
+                        history_from=history_from,
+                        backfill_done=pool_id in complete_pools,
+                        retain_inventory=True,
                     )
                     results[pool_id] = result
                     self._cache_pool_stats(
                         pool_id, generations[pool_id],
-                        cache_keys[pool_id], result,
+                        cache_keys[pool_id], result, inventory,
                     )
-                if missing_inventory:
-                    position_marks = ",".join("?" for _ in missing_inventory)
-                    summaries = {
-                        str(row["pool_id"]).lower(): (
-                            int(row["lp_count"] or 0),
-                            bool(row["history_complete"]),
-                        )
-                        for row in _dict_rows(conn.execute(
-                            f"SELECT pool_id,"
-                            f"COUNT(DISTINCT CASE "
-                            f"WHEN owner IS NOT NULL AND owner<>'' THEN owner "
-                            f"WHEN custody IS NOT NULL AND custody<>'' THEN custody "
-                            f"END) AS lp_count,"
-                            f"MIN(history_complete) AS history_complete "
-                            f"FROM lp_accounting_positions "
-                            f"INDEXED BY lp_accounting_positions_active_inventory "
-                            f"WHERE pool_id IN ({position_marks}) "
-                            f"AND active_episode_id IS NOT NULL GROUP BY pool_id",
-                            missing_inventory,
-                        ))
-                    }
-                    position_rows = conn.execute(
-                        f"SELECT pool_id,protocol,liquidity,liquidity_known,"
-                        f"tick_lower,tick_upper FROM lp_accounting_positions "
-                        f"INDEXED BY lp_accounting_positions_active_inventory "
-                        f"WHERE pool_id IN ({position_marks}) "
-                        f"AND active_episode_id IS NOT NULL ORDER BY pool_id",
-                        missing_inventory,
-                    )
-                    evaluated: set[str] = set()
-                    for raw_pool_id, group in groupby(
-                        position_rows, key=lambda row: str(row[0]).lower(),
-                    ):
-                        pool_id = str(raw_pool_id)
-                        lp_count, history_complete = summaries.get(
-                            pool_id, (0, True),
-                        )
-                        result, inventory = self._reduce_pool_inventory(
-                            (
-                                self._pool_inventory_position(row)
-                                for row in group
-                            ),
-                            lp_count=lp_count,
-                            history_complete=history_complete,
-                            mark=state.get(pool_id, {}),
-                            metadata=metadata.get(pool_id, {}),
-                            history_from=history_from,
-                            backfill_done=pool_id in complete_pools,
-                            retain_inventory=True,
-                        )
-                        evaluated.add(pool_id)
-                        results[pool_id] = result
-                        self._cache_pool_stats(
-                            pool_id, generations[pool_id],
-                            cache_keys[pool_id], result, inventory,
-                        )
-                    for pool_id in missing_inventory:
-                        if pool_id in evaluated:
-                            continue
-                        result, inventory = self._reduce_pool_inventory(
-                            (),
-                            lp_count=0,
-                            history_complete=True,
-                            mark=state.get(pool_id, {}),
-                            metadata=metadata.get(pool_id, {}),
-                            history_from=history_from,
-                            backfill_done=pool_id in complete_pools,
-                            retain_inventory=True,
-                        )
-                        results[pool_id] = result
-                        self._cache_pool_stats(
-                            pool_id, generations[pool_id],
-                            cache_keys[pool_id], result, inventory,
-                        )
-            finally:
-                if owns_snapshot and conn.in_transaction:
-                    conn.rollback()
         return {
             pool_id: results.get(pool_id, dict(empty))
             for pool_id in requested
