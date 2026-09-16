@@ -91,6 +91,45 @@ def test_pending_selection_skips_deferred_positions():
         store.close()
 
 
+def test_pending_selection_caps_heavy_positions_and_submits_them_last():
+    store = MarketStore(":memory:")
+    book = AccountBook(store, deferred=True).install()
+    try:
+        with store.transaction() as connection:
+            for key, priority in (
+                ("cheap-g", 10), ("cheap-h", 9),
+                ("heavy-0", 1005), ("heavy-1", 1004), ("heavy-2", 1003),
+                ("heavy-3", 1002), ("heavy-4", 1001), ("heavy-5", 1000),
+                ("cheap-a", 500), ("cheap-b", 499), ("cheap-c", 498),
+                ("cheap-d", 497), ("cheap-e", 496), ("cheap-f", 495),
+            ):
+                connection.execute(
+                    "INSERT INTO lp_accounting_pending("
+                    "position_key,generation,requested_revision,requested_epoch,"
+                    "priority_block,priority_tx_index,priority_log_index"
+                    ") VALUES(?,0,0,0,?,0,0)",
+                    (key, priority),
+                )
+            connection.executemany(
+                "INSERT INTO lp_accounting_event_keys("
+                "event_id,position_key,token_id) VALUES(?,?,NULL)",
+                (
+                    (event_id, f"heavy-{index}")
+                    for index in range(6)
+                    for event_id in range(
+                        index * 10_005 + 1, index * 10_005 + 10_002,
+                    )
+                ),
+            )
+        keys = [row["position_key"] for row in book._pending_rows(8)]
+        heavies = [key for key in keys if key.startswith("heavy")]
+        assert len(heavies) == 2
+        assert keys[-2:] == heavies
+        assert all(key in keys for key in ("cheap-a", "cheap-g"))
+    finally:
+        store.close()
+
+
 def test_snapshot_budget_grows_with_event_count_and_failures():
     store = MarketStore(":memory:")
     book = AccountBook(store, deferred=True).install()

@@ -51,6 +51,8 @@ _PREPARATION_EVENTS_PER_SECOND = 2_000.0
 _DEFER_RETRY_BASE_SECONDS = 60.0
 _DEFER_RETRY_MAX_SECONDS = 3_600.0
 _DEFER_REGISTRY_LIMIT = 4_096
+_HEAVY_POSITION_EVENTS = 10_000
+_HEAVY_POSITIONS_PER_PASS = 2
 
 
 class PreparationDeadlineError(RuntimeError):
@@ -1803,19 +1805,29 @@ class AccountBook:
         recent_capacity = max(0, limit - historical - len(selected))
         if recent_capacity:
             recent = _dict_rows(conn.execute(
-                "SELECT * FROM lp_accounting_pending "
+                "SELECT *, (SELECT COUNT(*) FROM lp_accounting_event_keys k "
+                "WHERE k.position_key=lp_accounting_pending.position_key"
+                ") AS event_count FROM lp_accounting_pending "
                 f"WHERE {eligible} "
                 "ORDER BY priority_block DESC,priority_tx_index DESC,"
                 "priority_log_index DESC,id DESC LIMIT ?",
-                (recent_capacity + len(seen) + len(excluded),),
+                ((recent_capacity + len(seen) + len(excluded)) * 4,),
             ))
+            heavy: list[dict[str, Any]] = []
             for row in recent:
                 position_key = str(row["position_key"])
-                if position_key not in seen and position_key not in excluded:
-                    selected.append(row)
-                    seen.add(position_key)
-                    if len(selected) >= limit - historical:
-                        break
+                if position_key in seen or position_key in excluded:
+                    continue
+                if int(row["event_count"] or 0) > _HEAVY_POSITION_EVENTS:
+                    if len(heavy) < _HEAVY_POSITIONS_PER_PASS:
+                        heavy.append(row)
+                    continue
+                selected.append(row)
+                seen.add(position_key)
+                if len(selected) >= limit - historical:
+                    break
+        else:
+            heavy = []
         oldest = _dict_rows(conn.execute(
             f"SELECT * FROM lp_accounting_pending WHERE {eligible} ORDER BY id LIMIT ?",
             (historical + len(seen) + len(excluded),),
@@ -1827,6 +1839,8 @@ class AccountBook:
                 seen.add(position_key)
                 if len(selected) >= limit:
                     break
+        for row in heavy:
+            selected.append(row)
         return selected
 
 
