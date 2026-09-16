@@ -46,6 +46,24 @@ _POSITION_INTEREST_LIMIT = 2048
 _POSITION_INTEREST_SECONDS = 180.0
 _PREPARATION_SNAPSHOT_SECONDS = 15.0
 _PREPARATION_PROGRESS_STEPS = 1_000
+_PREPARATION_SNAPSHOT_MAX_SECONDS = 300.0
+_PREPARATION_EVENTS_PER_SECOND = 2_000.0
+_DEFER_RETRY_BASE_SECONDS = 60.0
+_DEFER_RETRY_MAX_SECONDS = 3_600.0
+_DEFER_REGISTRY_LIMIT = 4_096
+
+
+class PreparationDeadlineError(RuntimeError):
+    """A bounded preparation snapshot ran out of time for one position."""
+
+
+def _snapshot_deadline_error(exc: BaseException) -> bool:
+    message = str(exc)
+    return (
+        isinstance(exc, PreparationDeadlineError)
+        or message == "interrupted"
+        or message.endswith("exceeded its deadline")
+    )
 
 
 class _PoolInventory(NamedTuple):
@@ -739,12 +757,16 @@ class _PreparationReader:
         return self._connection
 
     @contextmanager
-    def reader_snapshot(self):
+    def reader_snapshot(self, seconds: float | None = None):
         connection = self.read()
         if connection.in_transaction:
             yield connection
             return
-        deadline = time.monotonic() + _PREPARATION_SNAPSHOT_SECONDS
+        deadline = time.monotonic() + (
+            _PREPARATION_SNAPSHOT_SECONDS
+            if seconds is None
+            else max(_PREPARATION_SNAPSHOT_SECONDS, float(seconds))
+        )
         try:
             connection.execute("BEGIN")
             connection.set_progress_handler(
@@ -753,7 +775,9 @@ class _PreparationReader:
             )
             yield connection
             if time.monotonic() >= deadline:
-                raise RuntimeError("accounting preparation snapshot exceeded its deadline")
+                raise PreparationDeadlineError(
+                    "accounting preparation snapshot exceeded its deadline"
+                )
         finally:
             try:
                 connection.set_progress_handler(None, 0)
@@ -770,10 +794,12 @@ def _initialize_preparation_worker(path: str) -> None:
     _preparation_book = AccountBook(_PreparationReader(path), deferred=True)
 
 
-def _prepare_in_worker(position_key: str) -> _PreparedProjection | None:
+def _prepare_in_worker(
+    position_key: str, budget_scale: float = 1.0,
+) -> _PreparedProjection | None:
     if _preparation_book is None:
         raise RuntimeError("accounting preparation worker is not initialized")
-    return _preparation_book._prepare_pending(position_key)
+    return _preparation_book._prepare_pending(position_key, budget_scale)
 
 
 def _batches(values: Sequence[Any], size: int = 500) -> Iterable[Sequence[Any]]:
@@ -948,6 +974,7 @@ class AccountBook:
         self._cache_lock = threading.RLock()
         self._priority_lock = threading.Lock()
         self._priority_positions: OrderedDict[str, float] = OrderedDict()
+        self._deferred_positions: OrderedDict[str, tuple[float, int]] = OrderedDict()
         self._pool_cache: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
         self._pool_inventory_cache: OrderedDict[
             str, tuple[int, _PoolInventory]
@@ -968,15 +995,76 @@ class AccountBook:
                 self._preparation_pool.shutdown(wait=True, cancel_futures=True)
                 self._preparation_pool = None
 
+    def _prepare_position(self, position_key: str):
+        try:
+            return self._prepare_pending(
+                position_key, self._position_budget_scale(position_key),
+            )
+        except Exception as exc:
+            if not _snapshot_deadline_error(exc):
+                raise
+            self._defer_position(position_key)
+            return None
+
     def _prepared_pending(
         self, pending: Sequence[Mapping[str, Any]],
     ) -> Iterable[_PreparedProjection | None]:
         if not self._preparation_workers:
             for row in pending:
-                yield self._prepare_pending(str(row["position_key"]))
+                position_key = str(row["position_key"])
+                prepared = self._prepare_position(position_key)
+                if prepared is not None:
+                    self._release_position(position_key)
+                yield prepared
             return
         if not pending:
             return
+        source = iter(pending)
+        waiting: deque[tuple[str, Future[_PreparedProjection | None]]] = deque()
+        try:
+            while True:
+                while len(waiting) < self._preparation_workers * 2:
+                    row = next(source, None)
+                    if row is None:
+                        break
+                    position_key = str(row["position_key"])
+                    waiting.append((
+                        position_key,
+                        self._submit_preparation(position_key),
+                    ))
+                if not waiting:
+                    break
+                position_key, future = waiting.popleft()
+                try:
+                    prepared = future.result()
+                except Exception as exc:
+                    if not _snapshot_deadline_error(exc) and not isinstance(
+                        exc, BrokenProcessPool,
+                    ):
+                        raise
+                    if isinstance(exc, BrokenProcessPool):
+                        for queued_key, queued_future in waiting:
+                            queued_future.cancel()
+                            self._defer_position(queued_key)
+                        waiting.clear()
+                        if self._preparation_pool is not None:
+                            self._preparation_pool.shutdown(
+                                wait=False, cancel_futures=True,
+                            )
+                            self._preparation_pool = None
+                    self._defer_position(position_key)
+                    yield None
+                    continue
+                if prepared is not None:
+                    self._release_position(position_key)
+                yield prepared
+        finally:
+            for _queued_key, future in waiting:
+                future.cancel()
+
+    def _submit_preparation(
+        self, position_key: str,
+    ) -> Future[_PreparedProjection | None]:
         if self._preparation_pool is None:
             # Spawn never inherits the writer connection, locks or web threads.
             self._preparation_pool = ProcessPoolExecutor(
@@ -985,29 +1073,49 @@ class AccountBook:
                 initializer=_initialize_preparation_worker,
                 initargs=(str(self.store.path),),
             )
-        pool = self._preparation_pool
-        source = iter(pending)
-        waiting: deque[Future[_PreparedProjection | None]] = deque()
-        try:
-            for row in islice(source, self._preparation_workers * 2):
-                waiting.append(pool.submit(
-                    _prepare_in_worker, str(row["position_key"]),
-                ))
-            while waiting:
-                prepared = waiting.popleft().result()
-                row = next(source, None)
-                if row is not None:
-                    waiting.append(pool.submit(
-                        _prepare_in_worker, str(row["position_key"]),
-                    ))
-                yield prepared
-        except BrokenProcessPool:
-            pool.shutdown(wait=False, cancel_futures=True)
-            self._preparation_pool = None
-            raise
-        finally:
-            for future in waiting:
-                future.cancel()
+        return self._preparation_pool.submit(
+            _prepare_in_worker, position_key, self._position_budget_scale(
+                position_key,
+            ),
+        )
+
+    def _defer_position(self, position_key: str) -> None:
+        now = time.monotonic()
+        with self._priority_lock:
+            _retry_at, failures = self._deferred_positions.get(
+                position_key, (now, 0),
+            )
+            failures += 1
+            self._deferred_positions[position_key] = (
+                now + min(
+                    _DEFER_RETRY_MAX_SECONDS,
+                    _DEFER_RETRY_BASE_SECONDS * (2 ** min(failures - 1, 6)),
+                ),
+                failures,
+            )
+            self._deferred_positions.move_to_end(position_key)
+            while len(self._deferred_positions) > _DEFER_REGISTRY_LIMIT:
+                self._deferred_positions.popitem(last=False)
+
+    def _release_position(self, position_key: str) -> None:
+        with self._priority_lock:
+            self._deferred_positions.pop(position_key, None)
+
+    def _position_budget_scale(self, position_key: str) -> float:
+        with self._priority_lock:
+            _retry_at, failures = self._deferred_positions.get(
+                position_key, (0.0, 0),
+            )
+        return 1.0 + min(failures, 15)
+
+    def _deferred_position_keys(self) -> set[str]:
+        now = time.monotonic()
+        with self._priority_lock:
+            return {
+                key
+                for key, (retry_at, _failures) in self._deferred_positions.items()
+                if retry_at > now
+            }
 
     @property
     def owners_revision(self) -> int:
@@ -1657,6 +1765,7 @@ class AccountBook:
             "WHERE h.position_key=lp_accounting_pending.position_key AND h.kind='scope')))"
         )
         now = time.monotonic()
+        excluded = self._deferred_position_keys()
         with self._priority_lock:
             while self._priority_positions:
                 _key, expires_at = next(iter(self._priority_positions.items()))
@@ -1688,6 +1797,7 @@ class AccountBook:
             interested_pending[position_key]
             for position_key in reversed(interests)
             if position_key in interested_pending
+            and position_key not in excluded
         ][:requested_capacity]
         seen = {str(row["position_key"]) for row in selected}
         recent_capacity = max(0, limit - historical - len(selected))
@@ -1697,30 +1807,58 @@ class AccountBook:
                 f"WHERE {eligible} "
                 "ORDER BY priority_block DESC,priority_tx_index DESC,"
                 "priority_log_index DESC,id DESC LIMIT ?",
-                (recent_capacity + len(seen),),
+                (recent_capacity + len(seen) + len(excluded),),
             ))
             for row in recent:
                 position_key = str(row["position_key"])
-                if position_key not in seen:
+                if position_key not in seen and position_key not in excluded:
                     selected.append(row)
                     seen.add(position_key)
                     if len(selected) >= limit - historical:
                         break
         oldest = _dict_rows(conn.execute(
             f"SELECT * FROM lp_accounting_pending WHERE {eligible} ORDER BY id LIMIT ?",
-            (historical + len(seen),),
+            (historical + len(seen) + len(excluded),),
         ))
         for row in oldest:
             position_key = str(row["position_key"])
-            if position_key not in seen:
+            if position_key not in seen and position_key not in excluded:
                 selected.append(row)
                 seen.add(position_key)
                 if len(selected) >= limit:
                     break
         return selected
 
-    def _prepare_pending(self, position_key: str) -> _PreparedProjection | None:
-        with self.store.reader_snapshot() as conn:
+
+    def _position_event_count(self, position_key: str) -> int:
+        try:
+            row = self.store.read().execute(
+                "SELECT COUNT(*) FROM lp_accounting_event_keys "
+                "WHERE position_key=?",
+                (position_key,),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return 0
+        return int(row[0]) if row else 0
+
+    def _position_snapshot_seconds(
+        self, position_key: str, budget_scale: float,
+    ) -> float | None:
+        count = self._position_event_count(position_key)
+        if not count:
+            return None
+        seconds = min(
+            _PREPARATION_SNAPSHOT_MAX_SECONDS,
+            count / _PREPARATION_EVENTS_PER_SECOND * max(1.0, budget_scale),
+        )
+        return seconds if seconds > _PREPARATION_SNAPSHOT_SECONDS else None
+
+    def _prepare_pending(
+        self, position_key: str, budget_scale: float = 1.0,
+    ) -> _PreparedProjection | None:
+        with self.store.reader_snapshot(
+            self._position_snapshot_seconds(position_key, budget_scale),
+        ) as conn:
             pending = conn.execute(
                 "SELECT generation,append_only,cost_only "
                 "FROM lp_accounting_pending WHERE position_key=?",

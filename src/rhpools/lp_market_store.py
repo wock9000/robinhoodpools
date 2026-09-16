@@ -814,7 +814,9 @@ class MarketStore:
             )
 
     @contextlib.contextmanager
-    def reader_snapshot(self) -> Iterator[sqlite3.Connection]:
+    def reader_snapshot(
+        self, seconds: float | None = None,
+    ) -> Iterator[sqlite3.Connection]:
         """Own one bounded, coherent read transaction."""
         connection = self.read()
         if connection.in_transaction:
@@ -835,8 +837,11 @@ class MarketStore:
             if self._closed:
                 raise MarketStoreError("market store is closed")
             self._active_reader_snapshots += 1
-
-        deadline = time.monotonic() + _READER_SNAPSHOT_SECONDS
+        deadline = time.monotonic() + (
+            _READER_SNAPSHOT_SECONDS
+            if seconds is None
+            else max(1.0, float(seconds))
+        )
         interrupted = False
 
         def interrupt_read() -> int:
