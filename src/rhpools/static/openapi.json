@@ -478,9 +478,25 @@
       },
       "StateCoverage": {
         "type": "object",
-        "required": ["requested_pools", "available_pools", "unavailable_pools"],
+        "required": [
+          "requested_pools",
+          "state_read_limit",
+          "pools_over_limit",
+          "available_pools",
+          "unavailable_pools"
+        ],
         "properties": {
           "requested_pools": {"type": "integer", "minimum": 0},
+          "state_read_limit": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Per-request bound on block-pinned contract reads. Pools beyond it keep their catalog row and return unavailable state with reason state_read_budget, selected most-recently-active first."
+          },
+          "pools_over_limit": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Matching pools beyond the state-read limit; their liquidity and current dynamic fee are not read and are reported unavailable rather than dropped."
+          },
           "available_pools": {"type": "integer", "minimum": 0},
           "unavailable_pools": {"type": "integer", "minimum": 0}
         },

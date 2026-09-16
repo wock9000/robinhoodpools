@@ -54,6 +54,10 @@ _MULTICALL_CHUNK_SIZE = _mc.MAX_PER_BATCH
 # At most 1,920 contract reads per HTTP request; the RPC router accounts for
 # every enclosed method against the existing per-source request budget.
 _MULTICALL_RPC_BATCH_SIZE = 8
+# Block-pinned contract reads are bounded per request.  Matching pools beyond
+# the budget keep their catalog row and return unavailable state with the
+# explicit "state_read_budget" reason instead of being dropped.
+_STATE_READ_BUDGET = 512
 
 
 class PublicAPIError(RuntimeError):
@@ -768,14 +772,56 @@ class PublicMarketAPI:
             }
         return row
 
+    def _state_read_selection(
+        self, pools: Sequence[Mapping[str, Any]],
+    ) -> set[str] | None:
+        # Most-recently-active first, from the indexed lp_pool_state order;
+        # pools without an observed state row rank last in response order.
+        # None means every matching pool is read.
+        if len(pools) <= _STATE_READ_BUDGET:
+            return None
+        wanted = {pool["id"] for pool in pools}
+        selected: list[str] = []
+        connection = self.store.read()
+        try:
+            cursor = connection.execute(
+                "SELECT pool_id FROM lp_pool_state "
+                "ORDER BY block_number DESC, tx_index DESC, log_index DESC"
+            )
+            try:
+                for row in cursor:
+                    pool_id = row[0]
+                    if pool_id in wanted:
+                        selected.append(pool_id)
+                        if len(selected) >= _STATE_READ_BUDGET:
+                            break
+            finally:
+                cursor.close()
+        finally:
+            self._close_reader()
+        chosen = set(selected)
+        for pool in pools:
+            if len(chosen) >= _STATE_READ_BUDGET:
+                break
+            chosen.add(pool["id"])
+        return chosen
+
     def _read_state(
         self, pools: Sequence[Mapping[str, Any]], header: Mapping[str, Any], token: str,
-    ) -> tuple[list[dict[str, Any]], list[str]]:
+    ) -> tuple[list[dict[str, Any]], list[str], int]:
         block_tag = hex(int(header["number"]))
         rows = [self._public_pool(pool, token) for pool in pools]
+        selected = self._state_read_selection(pools)
         calls: list[tuple[str, list[Any]]] = []
         plan: list[tuple[int, str]] = []
         for index, pool in enumerate(pools):
+            if selected is not None and pool["id"] not in selected:
+                row = rows[index]
+                row["liquidity"]["unavailable_reason"] = "state_read_budget"
+                row["availability"]["reasons"].append("state_read_budget")
+                if row["fee"]["current_status"] == "pending_block_read":
+                    row["fee"]["current_status"] = "unavailable"
+                continue
             protocol = pool["protocol"]
             if protocol == "v2":
                 calls.append(("eth_call", [{
@@ -849,7 +895,8 @@ class PublicMarketAPI:
             row["availability"]["state"] = (
                 "available" if liquid and not reasons else "partial" if liquid else "unavailable"
             )
-        return rows, transports
+        over_limit = 0 if selected is None else len(pools) - len(selected)
+        return rows, transports, over_limit
 
     def _catalog_coverage(
         self, returned: int, issues: Mapping[str, Any],
@@ -940,13 +987,15 @@ class PublicMarketAPI:
     def _load_pools(self, token: str) -> dict[str, Any]:
         pools, issues = self._known_pools(token)
         header = self._header()
-        rows, transports = self._read_state(pools, header, token)
+        rows, transports, pools_over_limit = self._read_state(pools, header, token)
         self._confirm(header)
         coverage = {
             "catalog": self._catalog_coverage(len(rows), issues),
             "history": self._history_coverage(),
             "state": {
                 "requested_pools": len(rows),
+                "state_read_limit": _STATE_READ_BUDGET,
+                "pools_over_limit": pools_over_limit,
                 "available_pools": sum(
                     row["liquidity"]["status"] == "available" for row in rows
                 ),
