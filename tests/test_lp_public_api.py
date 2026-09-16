@@ -18,7 +18,7 @@ from rhpools.lp_market_protocols import (
     V3_FACTORIES,
 )
 from rhpools.lp_market_store import MarketStore
-from rhpools.lp_public_api import PublicAPIReorg, PublicMarketAPI
+from rhpools.lp_public_api import PublicAPIReorg, PublicMarketAPI, _STATE_READ_BUDGET
 from rhpools.workbench_market import (
     LIQUIDITY_SELECTOR,
     NATIVE,
@@ -87,6 +87,25 @@ def _pool(
 def _insert(store: MarketStore, rows: list[dict]) -> None:
     with store.transaction() as connection:
         store._upsert_pools(connection, rows)
+
+def _record_activity(store: MarketStore, rows: list[tuple[str, int]]) -> None:
+    with store.transaction() as connection:
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS lp_pool_state ("
+            "pool_id TEXT PRIMARY KEY, block_number INTEGER NOT NULL, tx_index INTEGER NOT NULL,"
+            " log_index INTEGER NOT NULL, timestamp INTEGER NOT NULL, sqrt_price_x96 TEXT,"
+            " tick INTEGER, liquidity TEXT, price0_usd REAL, price1_usd REAL, price REAL,"
+            " fee_ppm INTEGER, pricing_basis TEXT)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS lp_state_order"
+            " ON lp_pool_state(block_number,tx_index,log_index)"
+        )
+        connection.executemany(
+            "INSERT INTO lp_pool_state(pool_id, block_number, tx_index, log_index, timestamp)"
+            " VALUES (?,?,?,?,1)",
+            [(pool_id, block, 0, 0) for pool_id, block in rows],
+        )
 
 
 class SnapshotRpc:
@@ -347,6 +366,8 @@ def test_large_token_snapshot_batches_multicalls_without_hiding_pool_failures():
         assert result["pool_count"] == pool_count
         assert result["coverage"]["state"] == {
             "requested_pools": pool_count,
+            "state_read_limit": _STATE_READ_BUDGET,
+            "pools_over_limit": 0,
             "available_pools": pool_count - 1,
             "unavailable_pools": 1,
         }
@@ -361,6 +382,90 @@ def test_large_token_snapshot_batches_multicalls_without_hiding_pool_failures():
     finally:
         api.close()
         store.close()
+
+
+def test_state_read_budget_marks_only_least_recently_active_pools_unavailable():
+    budget = _STATE_READ_BUDGET
+    dynamic_fee = 0x800000
+    spacing = 60
+    oldest = _v4_id(TOKEN, HIGH, dynamic_fee, spacing, NATIVE)
+    v3_ids = [f"0x{index + 1:040x}" for index in range(budget)]
+    store = MarketStore(":memory:")
+    _insert(store, [
+        _pool(
+            oldest, "v4", TOKEN, HIGH, spacing=spacing, hooks=NATIVE,
+            configured_fee=dynamic_fee,
+        ),
+        *(
+            _pool(pool_id, "v3", TOKEN, HIGH, fee=500, spacing=10)
+            for pool_id in v3_ids
+        ),
+    ])
+    _record_activity(
+        store,
+        [(oldest, 1)]
+        + [(pool_id, index + 2) for index, pool_id in enumerate(v3_ids)],
+    )
+    responses = {
+        (pool_id, LIQUIDITY_SELECTOR): abi_encode(["uint128"], [7])
+        for pool_id in v3_ids
+    }
+    rpc = SnapshotRpc(responses)
+    api = PublicMarketAPI(Service(store, rpc), cache_ttl=0)
+    try:
+        result = api.pools({"token": TOKEN})
+        assert result["pool_count"] == budget + 1
+        assert result["coverage"]["state"] == {
+            "requested_pools": budget + 1,
+            "state_read_limit": budget,
+            "pools_over_limit": 1,
+            "available_pools": budget,
+            "unavailable_pools": 1,
+        }
+        over = next(row for row in result["pools"] if row["protocol"] == "v4")
+        assert over["pool_id"] == oldest
+        assert over["liquidity"]["status"] == "unavailable"
+        assert over["liquidity"]["unavailable_reason"] == "state_read_budget"
+        assert over["availability"] == {
+            "state": "unavailable", "reasons": ["state_read_budget"],
+        }
+        assert over["fee"]["current_status"] == "unavailable"
+        assert all(
+            row["liquidity"]["active_liquidity_raw"] == "7"
+            for row in result["pools"]
+            if row["protocol"] == "v3"
+        )
+        assert rpc.multicalls == 3
+    finally:
+        api.close()
+        store.close()
+
+    exact_store = MarketStore(":memory:")
+    _insert(exact_store, [
+        _pool(pool_id, "v3", TOKEN, HIGH, fee=500, spacing=10)
+        for pool_id in v3_ids
+    ])
+    _record_activity(
+        exact_store,
+        [(pool_id, index + 1) for index, pool_id in enumerate(v3_ids)],
+    )
+    exact_rpc = SnapshotRpc({
+        (pool_id, LIQUIDITY_SELECTOR): abi_encode(["uint128"], [9])
+        for pool_id in v3_ids
+    })
+    exact_api = PublicMarketAPI(Service(exact_store, exact_rpc), cache_ttl=0)
+    try:
+        exact = exact_api.pools({"token": TOKEN})
+        assert exact["coverage"]["state"] == {
+            "requested_pools": budget,
+            "state_read_limit": budget,
+            "pools_over_limit": 0,
+            "available_pools": budget,
+            "unavailable_pools": 0,
+        }
+    finally:
+        exact_api.close()
+        exact_store.close()
 
 
 def test_native_catalog_recovers_shared_legacy_v4_configurations_completely():

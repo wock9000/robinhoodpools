@@ -198,6 +198,7 @@
           <button type="button" id="tab-pools" role="tab" aria-selected="true" aria-controls="pool-panel" tabindex="0" data-tab="pools">POOLS</button>
           <button type="button" id="tab-flow" role="tab" aria-selected="false" aria-controls="pool-panel" tabindex="-1" data-tab="flow">CAPITAL FLOW</button>
           <button type="button" id="tab-fresh" role="tab" aria-selected="false" aria-controls="pool-panel" tabindex="-1" data-tab="fresh">FRESH POOLS</button>
+          <button type="button" id="tab-disloc" role="tab" aria-selected="false" aria-controls="pool-panel" tabindex="-1" data-tab="disloc">DISLOCATIONS</button>
         </div>
       </header>
       <div class="mobile-only mobile-pool-controls" role="group" aria-label="Pool sorting">
@@ -224,6 +225,12 @@
           <table class="terminal-table" id="pools-table" role="table">
             <thead><tr><th>pair</th><th>proto</th><th class="numeric"><button type="button" data-pool-sort="fee">fee</button></th><th class="numeric"><button type="button" data-pool-sort="tvl">TVL</button></th><th class="numeric desktop-column"><button type="button" data-pool-sort="active_tvl">active TVL</button></th><th class="numeric desktop-column"><button type="button" data-pool-sort="observed_active_tvl">observed active</button></th><th class="numeric"><button type="button" data-pool-sort="volume">volume</button></th><th class="numeric"><button type="button" data-pool-sort="fees">fees</button></th><th class="numeric"><button type="button" data-pool-sort="flow">net flow</button></th><th class="numeric desktop-column"><button type="button" data-pool-sort="swaps">swaps</button></th><th class="numeric desktop-column"><button type="button" data-pool-sort="adds">adds</button></th><th class="numeric desktop-column"><button type="button" data-pool-sort="removes">removes</button></th><th class="numeric"><button type="button" data-pool-sort="lps">LPs</button></th><th class="numeric desktop-column"><button type="button" data-pool-sort="price">price t1/t0</button></th><th class="numeric desktop-column"><button type="button" data-pool-sort="change">change</button></th></tr></thead>
             <tbody id="pools-body"></tbody>
+          </table>
+        </div>
+        <div class="table-wrap pool-wrap" id="dislocations-wrap" tabindex="0" aria-label="Cross-pool price dislocations, horizontally scrollable" hidden>
+          <table class="terminal-table" id="dislocations-table" role="table">
+            <thead><tr><th>pair</th><th class="numeric">spread</th><th class="numeric">fees</th><th class="numeric">net</th><th class="numeric">depth</th><th>buy at</th><th class="numeric">price</th><th class="numeric desktop-column">age</th><th>sell at</th><th class="numeric">price</th><th class="numeric desktop-column">age</th><th class="numeric desktop-column">pools</th></tr></thead>
+            <tbody id="dislocations-body"></tbody>
           </table>
         </div>
       </div>

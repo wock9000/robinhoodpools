@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
+import logging
 import os
 import shutil
 import threading
@@ -51,6 +52,7 @@ from .lp_market_store import (
     LP_ENRICHMENT_KINDS, CanonicalConflict, MarketStore,
 )
 
+logger = logging.getLogger(__name__)
 
 MAX_RPC_RESPONSE_BYTES = 64 * 1024 * 1024
 MAX_BATCH_CALLS = 100
@@ -120,6 +122,8 @@ HEAD_FEED_MAX_EVENTS = 8192
 HEAD_REPLAY_LIMIT = 64
 HEAD_LOG_GRACE_S = 0.25
 HEAD_POLL_S = 0.5
+# Secondary WSS feeds serve a bounded session so the primary is retried.
+FEED_SECONDARY_MAX_SECONDS = 600.0
 CURRENT_RECEIPT_MAX_PENDING = 128
 CURRENT_RECEIPT_CACHE_SIZE = 2048
 CURRENT_POOL_INPUT_MAX_BYTES = 64 * 1024
@@ -1655,7 +1659,9 @@ class MarketIndexer:
             start = bounded_start
         self._fetch_current_range(start, number, source=source, first_gap=gap)
 
-    def _head_wss_once(self, url: str) -> None:
+    def _head_wss_once(
+        self, url: str, *, session_deadline: float | None = None,
+    ) -> None:
         from websockets.sync.client import connect
 
         source = self._head_source(url)
@@ -1710,13 +1716,20 @@ class MarketIndexer:
             for message in early:
                 receive(message)
             while not self._stop.is_set():
+                if (
+                    session_deadline is not None
+                    and time.monotonic() >= session_deadline
+                ):
+                    return
                 try:
                     raw_message = websocket.recv(timeout=0.25)
                 except TimeoutError:
                     continue
                 receive(json.loads(raw_message))
 
-    def _activity_wss_once(self, url: str) -> None:
+    def _activity_wss_once(
+        self, url: str, *, session_deadline: float | None = None,
+    ) -> None:
         from websockets.sync.client import connect
 
         source = self._head_source(url, "wss-logs")
@@ -1827,6 +1840,11 @@ class MarketIndexer:
                 receive(message)
             flush_ready()
             while not self._stop.is_set():
+                if (
+                    session_deadline is not None
+                    and time.monotonic() >= session_deadline
+                ):
+                    return
                 try:
                     raw_message = websocket.recv(timeout=0.05)
                 except TimeoutError:
@@ -1838,17 +1856,35 @@ class MarketIndexer:
     def _activity_run(self) -> None:
         backoff = 1.0
         while not self._stop.is_set():
-            for url in self._head_wss_urls:
+            served = False
+            for index, url in enumerate(self._head_wss_urls):
                 if self._stop.is_set():
                     return
                 try:
-                    self._activity_wss_once(url)
+                    self._activity_wss_once(
+                        url,
+                        session_deadline=(
+                            None if index == 0
+                            else time.monotonic() + FEED_SECONDARY_MAX_SECONDS
+                        ),
+                    )
                 except Exception as exc:
                     self._set_runtime(
                         "activity_feed", error=exc,
                         activity_feed_source=self._head_source(url, "wss-logs"),
                     )
                     continue
+                served = True
+                if index > 0:
+                    logger.info(
+                        "activity feed secondary %s session ended after %.0fs; "
+                        "failing back to the primary feed",
+                        self._head_source(url, "wss-logs"),
+                        FEED_SECONDARY_MAX_SECONDS,
+                    )
+                break
+            if served:
+                continue
             self._stop.wait(backoff)
             backoff = min(15.0, backoff * 2.0)
 
@@ -1856,17 +1892,31 @@ class MarketIndexer:
         retry_delay = 1.0
         while not self._stop.is_set():
             connected = False
-            for url in self._head_wss_urls:
+            for index, url in enumerate(self._head_wss_urls):
                 if self._stop.is_set():
                     return
                 try:
-                    self._head_wss_once(url)
+                    self._head_wss_once(
+                        url,
+                        session_deadline=(
+                            None if index == 0
+                            else time.monotonic() + FEED_SECONDARY_MAX_SECONDS
+                        ),
+                    )
                 except Exception as exc:
                     self._set_runtime("head_feed", error=exc,
                                       head_feed_source=self._head_source(url))
                     continue
                 connected = True
                 retry_delay = 1.0
+                if index > 0:
+                    logger.info(
+                        "head feed secondary %s session ended after %.0fs; "
+                        "failing back to the primary feed",
+                        self._head_source(url),
+                        FEED_SECONDARY_MAX_SECONDS,
+                    )
+                break
             if connected:
                 continue
             retry_at = time.monotonic() + retry_delay
