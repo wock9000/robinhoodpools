@@ -31,6 +31,15 @@ _SUM_FIELDS = ",".join(f"SUM({name}) AS {name}" for name in BUCKET_FIELDS)
 _BUCKET_INDEX = {name: index for index, name in enumerate(BUCKET_FIELDS)}
 
 _MISSING = object()
+# A pool swept to a tick limit reports the boundary sqrt price (MIN/MAX_SQRT_RATIO
+# plus the one-unit step a limit swap lands on). That is empty-pool geometry,
+# not a market, even when a later same-block add covers the limit tick.
+_MIN_TRADEABLE_SQRT = 4295128740
+_MAX_TRADEABLE_SQRT = 1461446703485210103287273052203988822378723970341
+
+
+def _tradeable_sqrt(sqrt):
+    return sqrt is not None and _MIN_TRADEABLE_SQRT < int(sqrt) < _MAX_TRADEABLE_SQRT
 
 
 def _batches(values, size=500):
@@ -453,7 +462,10 @@ class PriceProjection:
             active_liquidity = self._active_liquidity(
                 conn, pool, event, pool_state,
             )
-            if active_liquidity is not None and active_liquidity > 0:
+            if (
+                active_liquidity is not None and active_liquidity > 0
+                and _tradeable_sqrt(sqrt)
+            ):
                 valuation_ratio = ratio
         anchor_token = (
             self._anchor_token(pool)

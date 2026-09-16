@@ -750,7 +750,14 @@ def test_empty_pool_limit_price_cannot_value_withdrawals_or_borrow_future_marks(
         app.close()
 
 
-def test_same_block_drain_outranks_pinned_pre_state_for_remove_pricing(tmp_path):
+@pytest.mark.parametrize("drained_sqrt,drained_tick", [
+    # Swept to the tick limit: boundary geometry is never a mark.
+    ("4295128740", -887272),
+    # Swept into a liquidity gap at an ordinary price: depth decides.
+    (str(2 << 96), 13863),
+])
+def test_same_block_drain_outranks_pinned_pre_state_for_remove_pricing(
+        tmp_path, drained_sqrt, drained_tick):
     """A remove logged after a full drain in the same block must not be valued
     at the pre-drain depth from its block-(N-1) pool_state_before view."""
     app = service(tmp_path / "market.sqlite")
@@ -759,7 +766,7 @@ def test_same_block_drain_outranks_pinned_pre_state_for_remove_pricing(tmp_path)
         blocks = [header(100 + i, int(time.time()) - 60 + i) for i in range(2)]
         app.store.ingest([blocks[0]], [swap(blocks[0], V4, "v4")])
         drain = swap(blocks[1], V4, "v4")
-        drain.update(sqrt_price_x96="4295128740", tick=-887272, liquidity="0")
+        drain.update(sqrt_price_x96=drained_sqrt, tick=drained_tick, liquidity="0")
         closed = lp_effect(blocks[1], "v4", "remove", -1000,
                            (10_000_000, 20_000_000), position_state(1000), position_state(0))
         closed.update(sqrt_price_x96=None, tick=None, liquidity=None, log_index=1,
@@ -785,6 +792,34 @@ def test_same_block_drain_outranks_pinned_pre_state_for_remove_pricing(tmp_path)
         row = next(row for row in app.tape({"window": "all"})["rows"] if row["kind"] == "remove")
         assert row["price0_usd"] is None
         assert app.overview({"window": "all"})["coverage"]["unpriced_flows"] == 1
+    finally:
+        app.close()
+
+
+def test_add_covering_the_tick_limit_is_not_valued_at_boundary_price(tmp_path):
+    """Re-adding full-range liquidity to a pool swept to MIN_SQRT_RATIO puts
+    depth at the boundary, but the boundary is still not a market price."""
+    app = service(tmp_path / "market.sqlite")
+    try:
+        app.store.upsert_pools(pools())
+        blocks = [header(100 + i, int(time.time()) - 60 + i) for i in range(2)]
+        app.store.ingest([blocks[0]], [swap(blocks[0], V4, "v4")])
+        drain = swap(blocks[1], V4, "v4")
+        drain.update(sqrt_price_x96="4295128740", tick=-887272, liquidity="0")
+        opened = lp_effect(blocks[1], "v4", "add", 1000,
+                           (10_000_000, 20_000_000), position_state(0), position_state(1000))
+        opened.update(sqrt_price_x96=None, tick=None, liquidity=None, log_index=1,
+                      tick_lower=-887272, tick_upper=887272,
+                      tx_hash="0x" + f"{int(blocks[1]['hash'], 16) * 100 + 1:064x}")
+        opened["data"]["pool_state_before"] = {
+            "sqrt_price_x96": "4295128740", "tick": -887272,
+            "liquidity": "0", "pinned_block": 100,
+        }
+        ingest_effects(app, [blocks[1]], [drain, opened])
+        row = next(row for row in app.tape({"window": "all"})["rows"] if row["kind"] == "add")
+        assert row["price0_usd"] is None
+        assert row["size_usd"] is None
+        assert app.overview({"window": "all"})["net_deposits_usd"] is None
     finally:
         app.close()
 
