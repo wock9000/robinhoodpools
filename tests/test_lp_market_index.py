@@ -1294,6 +1294,81 @@ def test_metadata_rejections_revalidate_slowly_without_masking_rpc_health(
         store.close()
 
 
+def test_reverted_token_metadata_is_recorded_per_token_not_global(monkeypatch):
+    store = MarketStore(":memory:")
+    scanner = indexer(store)
+    symbol_revert = "0x" + "c3" * 20
+    decimals_revert = "0x" + "d4" * 20
+    revert_result = {
+        "error": {"code": 3, "message": "execution reverted", "data": "0x"},
+    }
+    symbol_result = "0x" + "41" * 8
+    decimals_result = "0x" + f"{18:064x}"
+    with store.transaction() as connection:
+        connection.executemany(
+            "INSERT INTO pending_token_metadata(address) VALUES(?)",
+            [(symbol_revert,), (decimals_revert,)],
+        )
+        store._bump(connection, "pending_metadata", 2)
+
+    def fake_batch(calls, _client):
+        address = calls[0][1][0]["to"]
+        if address == symbol_revert:
+            return [revert_result, decimals_result]
+        return [symbol_result, revert_result]
+
+    monkeypatch.setattr(scanner, "_rpc_state_batch", fake_batch)
+    try:
+        assert scanner._metadata_once() is True
+        status = scanner.runtime_status()
+        assert "metadata" not in status["errors"]
+        assert {
+            address: detail["classification"]
+            for address, detail in status["metadata_failures"].items()
+        } == {
+            symbol_revert: "invalid_metadata",
+            decimals_revert: "invalid_metadata",
+        }
+        rows = store.read().execute(
+            "SELECT address,last_error FROM pending_token_metadata "
+            "ORDER BY address"
+        ).fetchall()
+        assert all(
+            row["last_error"].startswith(TOKEN_METADATA_INVALID_PREFIX)
+            for row in rows
+        )
+    finally:
+        scanner.close()
+        store.close()
+
+
+def test_accounting_worker_clears_stale_error_after_recovery():
+    store = MarketStore(":memory:")
+    scanner = indexer(store)
+
+    def stop_and_work():
+        scanner._stop.set()
+        return True
+
+    scanner._accounting_projector = stop_and_work
+    scanner._accounting_recovery = stop_and_work
+    try:
+        scanner._set_runtime("accounting", error="interrupted")
+        scanner._set_runtime(
+            "identity_recovery", error="reader snapshot exceeded its deadline",
+        )
+        scanner._initialized.set()
+        scanner._accounting_run()
+        assert "accounting" not in scanner.runtime_status()["errors"]
+        scanner._stop.clear()
+        scanner._accounting_recovery_run()
+        errors = scanner.runtime_status()["errors"]
+        assert "identity_recovery" not in errors
+    finally:
+        scanner.close()
+        store.close()
+
+
 def test_pool_resolution_reports_address_and_recovers_health(monkeypatch):
     store = MarketStore(":memory:")
     scanner = indexer(store)

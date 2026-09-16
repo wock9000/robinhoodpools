@@ -163,6 +163,13 @@ class _InvalidTokenMetadata(ValueError):
     """An on-chain metadata response decoded to an unusable token value."""
 
 
+def _reverted_call(value: Any) -> bool:
+    error = value.get("error") if isinstance(value, Mapping) else None
+    if not isinstance(error, Mapping):
+        return False
+    return "revert" in str(error.get("message") or "").lower()
+
+
 class _HttpRpc:
     """Bounded pooled HTTP JSON-RPC client dedicated to one indexer lane."""
 
@@ -5682,6 +5689,10 @@ class MarketIndexer:
     @staticmethod
     def _decode_token_symbol(value: Any) -> str:
         if isinstance(value, Mapping) and value.get("error") is not None:
+            if _reverted_call(value):
+                raise _InvalidTokenMetadata(
+                    f"symbol eth_call reverted: {value['error']}"
+                )
             raise RpcError(f"symbol eth_call failed: {value['error']}")
         if not isinstance(value, str) or not value.startswith("0x"):
             raise RpcError("symbol eth_call returned malformed data")
@@ -5717,6 +5728,10 @@ class MarketIndexer:
         ], self._worker_rpc())
         symbol = self._decode_token_symbol(results[0])
         if isinstance(results[1], Mapping) and results[1].get("error") is not None:
+            if _reverted_call(results[1]):
+                raise _InvalidTokenMetadata(
+                    f"decimals eth_call reverted: {results[1]['error']}"
+                )
             raise RpcError(f"decimals eth_call failed: {results[1]['error']}")
         decimals = _hex_int(results[1], "token decimals")
         if not 0 <= decimals <= 255:
@@ -6116,6 +6131,10 @@ class MarketIndexer:
                 backoff = min(30.0, backoff * 2.0)
             else:
                 backoff = 0.5
+                with self._status_lock:
+                    recovered = "metadata" in self._errors
+                if recovered:
+                    self._set_runtime("metadata")
                 self._stop.wait(0.05 if worked else 0.5)
 
     def _repair_v4_owners_once(self) -> bool:
@@ -6223,6 +6242,10 @@ class MarketIndexer:
                 backoff = min(30.0, backoff * 2.0)
             else:
                 backoff = 0.5
+                with self._status_lock:
+                    recovered = "accounting" in self._errors
+                if recovered:
+                    self._set_runtime("accounting")
                 self._stop.wait(0.01 if worked else 0.1)
 
     def _accounting_recovery_run(self) -> None:
@@ -6247,6 +6270,10 @@ class MarketIndexer:
                 backoff = min(30.0, backoff * 2.0)
             else:
                 backoff = 0.5
+                with self._status_lock:
+                    recovered = "identity_recovery" in self._errors
+                if recovered:
+                    self._set_runtime("identity_recovery")
                 self._stop.wait(0.01 if worked else 0.1)
 
     def _projection_run(self) -> None:
