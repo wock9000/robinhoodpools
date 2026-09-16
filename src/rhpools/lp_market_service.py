@@ -42,6 +42,16 @@ def _tradeable_sqrt(sqrt):
     return sqrt is not None and _MIN_TRADEABLE_SQRT < int(sqrt) < _MAX_TRADEABLE_SQRT
 
 
+# Anchor marks were already capped here; a direct-pool spot or cross-derived
+# price past it is thin-pool geometry (one dust swap in an emptied range), not
+# a dollar mark, and falls back to the anchor like an empty pool would.
+_MAX_TOKEN_USD = 1e9
+
+
+def _plausible_usd(price):
+    return price if price is not None and 0 < price <= _MAX_TOKEN_USD else None
+
+
 def _batches(values, size=500):
     for start in range(0, len(values), size):
         yield values[start:start + size]
@@ -295,20 +305,21 @@ class PriceProjection:
     def _quote(self, conn, pool, event, ratio, heads=None):
         token0, token1 = pool["token0"], pool["token1"]
         basis = "at-or-before USDG anchor (max age 300s)"
-        if token0 == USDG:
-            price1 = _number(1.0 / ratio) if ratio else self._anchor(
-                conn, token1, event, heads,
-            )
-            return 1.0, price1, "direct USDG pool spot" if ratio else basis
-        if token1 == USDG:
-            price0 = ratio if ratio else self._anchor(conn, token0, event, heads)
-            return price0, 1.0, "direct USDG pool spot" if ratio else basis
+        if USDG in (token0, token1):
+            other = token1 if token0 == USDG else token0
+            spot = _plausible_usd(
+                _number(1.0 / ratio) if token0 == USDG else ratio,
+            ) if ratio else None
+            price = spot if spot is not None else self._anchor(conn, other, event, heads)
+            if spot is not None:
+                basis = "direct USDG pool spot"
+            return (1.0, price, basis) if token0 == USDG else (price, 1.0, basis)
         price0 = self._anchor(conn, token0, event, heads)
         price1 = self._anchor(conn, token1, event, heads)
         if ratio and price0 is not None and price1 is None:
-            price1 = _number(price0 / ratio)
+            price1 = _plausible_usd(_number(price0 / ratio))
         elif ratio and price1 is not None and price0 is None:
-            price0 = _number(price1 * ratio)
+            price0 = _plausible_usd(_number(price1 * ratio))
         return price0, price1, basis
 
     @staticmethod
@@ -542,7 +553,7 @@ class PriceProjection:
             # graph cycles and empty-pool geometry never become dollar oracles.
             if anchor_token is not None and valuation_ratio is not None:
                 price = price0 if anchor_token == pool["token0"] else price1
-                if price and 0 < price <= 1e9:
+                if _plausible_usd(price) is not None:
                     mark_row = (
                         anchor_token, event["id"], pool["id"], *_order(event),
                         event["timestamp"], price, basis,

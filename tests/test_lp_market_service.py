@@ -824,6 +824,30 @@ def test_add_covering_the_tick_limit_is_not_valued_at_boundary_price(tmp_path):
         app.close()
 
 
+def test_implausible_direct_spot_falls_back_to_recent_anchor(tmp_path):
+    """A dust swap that leaves a thin pool quoting the asset above 1e9 USD is
+    not a mark; flows use the recent anchor, as an emptied pool would."""
+    app = service(tmp_path / "market.sqlite")
+    try:
+        app.store.upsert_pools(pools())
+        blocks = [header(100 + i, int(time.time()) - 60 + i) for i in range(2)]
+        app.store.ingest([blocks[0]], [swap(blocks[0], V3, "v3")])
+        spike = swap(blocks[1], V3, "v3")
+        spike.update(sqrt_price_x96=str(100_000 << 96), tick=230_270)
+        closed = lp_effect(blocks[1], "v3", "remove", -1000,
+                           (10_000_000, 20_000_000), position_state(1000), position_state(0))
+        closed.update(sqrt_price_x96=None, tick=None, liquidity=None, log_index=1,
+                      tx_hash="0x" + f"{int(blocks[1]['hash'], 16) * 100 + 1:064x}",
+                      cashflow0="10000000", cashflow1="20000000")
+        ingest_effects(app, [blocks[1]], [spike, closed])
+        row = next(row for row in app.tape({"window": "all"})["rows"] if row["kind"] == "remove")
+        assert row["price0_usd"] == pytest.approx(1.0)
+        assert row["pricing_basis"].startswith("at-or-before USDG anchor")
+        assert row["size_usd"] == pytest.approx(30)
+    finally:
+        app.close()
+
+
 def test_flat_range_waits_for_final_claim_and_keeps_costs_after_rebuild(tmp_path):
     app = service(tmp_path / "market.sqlite")
     try:
