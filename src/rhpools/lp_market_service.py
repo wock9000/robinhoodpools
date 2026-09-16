@@ -1794,16 +1794,6 @@ class LPMarketService:
                 self._cache.move_to_end(key)
                 return cached[1]
             stale = cached[1] if cached is not None else _MISSING
-            if stale is _MISSING and math.isfinite(ttl):
-                # An epoch bump only re-prefixes response-cache keys; the old
-                # entry stays servable while one background refresh revalidates
-                # it. Revision-addressed (infinite-ttl) shared scans must
-                # recompute instead: the epoch fence marks rolled-back data.
-                suffix = key[1:]
-                for candidate, entry in reversed(self._cache.items()):
-                    if candidate[1:] == suffix:
-                        stale = entry[1]
-                        break
             refresh = stale is not _MISSING and key not in self._cache_refreshing
             if refresh:
                 self._cache_refreshing.add(key)
@@ -2012,9 +2002,8 @@ class LPMarketService:
                              "priced_flows": priced_flows,
                              "unpriced_flows": int(total("flows")) - priced_flows},
             }
-        revision = int(status.get("revision") or 0)
         aggregate = self._cached(
-            ("overview", revision, self.book.owners_revision, name),
+            ("overview", name),
             load, ttl=WINDOW_CACHE_TTL[name], epoch=int(status.get("epoch") or 0),
         )
         return {**aggregate, "status": status}
@@ -2360,10 +2349,7 @@ class LPMarketService:
                 )
                 return materialize(conn, bucket_aggregates)
         return self._cached(
-            (
-                "pools", snapshot_revision, snapshot_pool_metadata_token,
-                owner_revision, name, where, *filters, sort, order, limit, offset,
-            ),
+            ("pools", name, where, *filters, sort, order, limit, offset),
             load, ttl=WINDOW_CACHE_TTL[name], epoch=int(status.get("epoch") or 0),
         )
 
@@ -2561,7 +2547,7 @@ class LPMarketService:
                 }
         return self._cached(
             (
-                "dislocations", int(status.get("revision") or 0), min_bps, min_depth_usd,
+                "dislocations", min_bps, min_depth_usd,
                 max_age_s, max_stale_s, where, *filters, sort, limit, offset,
             ),
             load, ttl=2.0, epoch=int(status.get("epoch") or 0),
