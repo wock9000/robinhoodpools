@@ -251,6 +251,7 @@ class PriceProjection:
         CREATE INDEX IF NOT EXISTS lp_buckets_hour_window ON lp_pool_buckets
             (resolution,bucket,pool_id,{window_columns}) WHERE resolution=3600;
         CREATE INDEX IF NOT EXISTS lp_events_time ON events(timestamp,block_number,tx_index,log_index);
+        CREATE INDEX IF NOT EXISTS lp_pools_pair ON pools(token0,token1);
         CREATE INDEX IF NOT EXISTS lp_events_pool_order ON events(pool_id,block_number,tx_index,log_index);
         """
         with store.transaction() as conn:
@@ -2397,6 +2398,190 @@ class LPMarketService:
         if token0 is None or token1 is None:
             return str(row.get("pool_id") or row.get("id") or "unresolved pool")
         return f"{row.get('symbol0') or token0} / {row.get('symbol1') or token1}"
+
+    @staticmethod
+    def _block_at(conn, timestamp, low, high):
+        while low < high:
+            middle = (low + high) // 2
+            row = conn.execute("SELECT timestamp FROM blocks WHERE number=?", (middle,)).fetchone()
+            if row is None or int(row[0]) < timestamp:
+                low = middle + 1
+            else:
+                high = middle
+        return low
+
+    @staticmethod
+    def _dislocation_tradeable(row):
+        if row["protocol"] == "v2":
+            return int(row["reserve0"] or 0) > 0 and int(row["reserve1"] or 0) > 0
+        return int(row["liquidity"] or 0) > 0 and _tradeable_sqrt(row["sqrt_price_x96"])
+
+    @staticmethod
+    def _dislocation_depth(row, ratio):
+        if ratio <= 0:
+            return None
+        move = math.sqrt(ratio)
+        if row["protocol"] == "v2":
+            if row.get("reserve0") is None or row.get("reserve1") is None:
+                return None
+            amount0 = int(row["reserve0"]) * abs(1 / move - 1)
+            amount1 = int(row["reserve1"]) * abs(move - 1)
+        else:
+            liquidity = int(row["liquidity"] or 0)
+            sqrt = int(row["sqrt_price_x96"] or 0)
+            if liquidity <= 0 or sqrt <= 0:
+                return None
+            target = sqrt * move
+            amount1 = liquidity * abs(target - sqrt) / 2 ** 96
+            amount0 = liquidity * 2 ** 96 * abs(sqrt - target) / (sqrt * target)
+        for amount, side in ((amount1, 1), (amount0, 0)):
+            usd, decimals = row.get(f"price{side}_usd"), row.get(f"decimals{side}")
+            if usd and decimals is not None:
+                return amount / 10 ** int(decimals) * float(usd)
+        return None
+
+    def dislocations(self, params):
+        status = self.status()
+        try:
+            min_bps = float(params.get("min_bps") or 30)
+            min_depth_usd = float(params.get("min_depth_usd") or 100)
+            max_age_s = int(params.get("max_age_s") or 3600)
+            max_stale_s = int(params.get("max_stale_s") or 0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("min_bps and min_depth_usd must be numbers, max_age_s and max_stale_s integers") from exc
+        if not 0 <= min_bps <= 100_000:
+            raise ValueError("min_bps must be between 0 and 100000")
+        if min_depth_usd < 0:
+            raise ValueError("min_depth_usd must not be negative")
+        max_age_s = min(86_400, max(60, max_age_s))
+        max_stale_s = max(0, max_stale_s)
+        limit, offset = self._page(params)
+        where, filters = self._filters(params)
+        token = str(params.get("token") or "").lower()
+        if token:
+            if len(token) != 42 or not token.startswith("0x"):
+                raise ValueError("token must be a 20-byte address")
+            where += " AND (p.token0=? OR p.token1=?)"
+            filters = [*filters, token, token]
+        sort = str(params.get("sort") or "net")
+        if sort not in ("net", "spread", "depth"):
+            raise ValueError("sort must be net, spread or depth")
+        head_block = int(status.get("indexed_head") or 0)
+        head_timestamp = int(status.get("history_to") or time.time())
+        since = head_timestamp - max_age_s
+
+        def load():
+            with self.store.reader_snapshot() as conn:
+                oldest = conn.execute("SELECT MIN(number) FROM blocks").fetchone()[0]
+                since_block = self._block_at(conn, since, int(oldest or 0), head_block)
+                groups: dict[tuple[str, str], list[dict]] = {}
+                for row in conn.execute(
+                    "WITH active AS (SELECT DISTINCT p.token0,p.token1 FROM lp_pool_state s "
+                    "JOIN pools p ON p.id=s.pool_id "
+                    f"WHERE s.block_number>=? AND s.price>0 AND {where}) "
+                    "SELECT p.*,s.block_number AS state_block,s.timestamp,s.sqrt_price_x96,s.tick,"
+                    "s.liquidity,s.price,s.price0_usd,s.price1_usd,"
+                    "COALESCE(s.fee_ppm,p.fee_ppm) AS current_fee,"
+                    "CASE WHEN p.protocol='v2' THEN (SELECT r.reserve0 FROM lp_v2_reserve_samples r "
+                    "WHERE r.pool_id=p.id ORDER BY r.block_number DESC,r.tx_index DESC,r.log_index DESC LIMIT 1) "
+                    "END AS reserve0,"
+                    "CASE WHEN p.protocol='v2' THEN (SELECT r.reserve1 FROM lp_v2_reserve_samples r "
+                    "WHERE r.pool_id=p.id ORDER BY r.block_number DESC,r.tx_index DESC,r.log_index DESC LIMIT 1) "
+                    "END AS reserve1 "
+                    "FROM active a JOIN pools p ON p.token0=a.token0 AND p.token1=a.token1 "
+                    "JOIN lp_pool_state s ON s.pool_id=p.id "
+                    f"WHERE s.price>0 AND {where}",
+                    [since_block, *filters, *filters],
+                ):
+                    row = dict(row)
+                    if self._dislocation_tradeable(row):
+                        groups.setdefault((row["token0"], row["token1"]), []).append(row)
+                rows = []
+                for pools in groups.values():
+                    if len(pools) < 2:
+                        continue
+                    buy = min(pools, key=lambda row: row["price"])
+                    sell = max(pools, key=lambda row: row["price"])
+                    spread_bps = (sell["price"] / buy["price"] - 1) * 10_000
+                    if spread_bps < min_bps:
+                        continue
+                    mid = math.sqrt(buy["price"] * sell["price"])
+                    for row in pools:
+                        row["depth_usd"] = self._dislocation_depth(row, mid / row["price"])
+                    depths = (buy["depth_usd"], sell["depth_usd"])
+                    depth = min(depths) if None not in depths else None
+                    if min_depth_usd and (depth is None or depth < min_depth_usd):
+                        continue
+                    if max_stale_s and head_timestamp - min(int(buy["timestamp"]), int(sell["timestamp"])) > max_stale_s:
+                        continue
+                    fees = (buy["current_fee"], sell["current_fee"])
+                    fee_bps = sum(fees) / 100 if None not in fees else None
+                    legs = sorted(
+                        (self._dislocation_leg(row, head_timestamp) for row in pools),
+                        key=lambda leg: (leg["depth_usd"] is not None, leg["depth_usd"] or 0),
+                        reverse=True,
+                    )
+                    rows.append({
+                        "pair": self._pair(buy),
+                        "token0": self._token(buy, 0), "token1": self._token(buy, 1),
+                        "pool_count": len(pools), "spread_bps": spread_bps,
+                        "fee_bps": fee_bps,
+                        "net_bps": spread_bps - fee_bps if fee_bps is not None else None,
+                        "depth_usd": depth,
+                        "buy": self._dislocation_leg(buy, head_timestamp),
+                        "sell": self._dislocation_leg(sell, head_timestamp),
+                        "pools": legs[:25], "pools_omitted": max(0, len(legs) - 25),
+                    })
+                keys = {
+                    "net": lambda row: (row["net_bps"] is not None, row["net_bps"] or 0, row["spread_bps"]),
+                    "spread": lambda row: row["spread_bps"],
+                    "depth": lambda row: (row["depth_usd"] is not None, row["depth_usd"] or 0),
+                }
+                rows.sort(key=keys[sort], reverse=True)
+                return {
+                    "rows": rows[offset:offset + limit], "total": len(rows),
+                    "min_bps": min_bps, "min_depth_usd": min_depth_usd, "max_age_s": max_age_s,
+                    "max_stale_s": max_stale_s,
+                    "sort": sort, "since_block": since_block, "head_block": head_block,
+                    "revision": int(status.get("revision") or 0),
+                    "epoch": int(status.get("epoch") or 0), "as_of": status["as_of"],
+                    "coverage": {
+                        "pairs_scanned": len(groups),
+                        "price_basis": "token1 per token0 from the last indexed sqrtPriceX96 or V2 reserves; "
+                                       "mid price, not an executable quote",
+                        "spread_basis": "max pool price over min pool price across the pair; "
+                                        "fee_bps is the two pools' configured fee, net_bps ignores gas and slippage",
+                        "depth_basis": "USD needed to move a leg to the geometric mid assuming no tick "
+                                       "crossing (V3/V4) or constant product (V2); row depth is the thinner leg",
+                        "pricing_basis": PRICING_BASIS,
+                        "pair_selection": "pairs with at least one priced pool state since since_block; "
+                                          "pools with zero active liquidity or reserves are excluded; "
+                                          "max_stale_s bounds the older of the buy and sell legs",
+                    },
+                }
+        return self._cached(
+            (
+                "dislocations", int(status.get("revision") or 0), min_bps, min_depth_usd,
+                max_age_s, max_stale_s, where, *filters, sort, limit, offset,
+            ),
+            load, ttl=2.0, epoch=int(status.get("epoch") or 0),
+        )
+
+    @staticmethod
+    def _dislocation_leg(row, head_timestamp):
+        return {
+            "id": row["id"], "protocol": row["protocol"], "address": row.get("address"),
+            "fee_ppm": row.get("current_fee"), "tick_spacing": row.get("tick_spacing"),
+            "hook": row.get("hook"), "price": row["price"],
+            "sqrt_price_x96": row.get("sqrt_price_x96"), "tick": row.get("tick"),
+            "liquidity": row.get("liquidity"),
+            "reserve0": row.get("reserve0"), "reserve1": row.get("reserve1"),
+            "price0_usd": row.get("price0_usd"), "price1_usd": row.get("price1_usd"),
+            "depth_usd": row.get("depth_usd"),
+            "block_number": row["state_block"], "timestamp": row["timestamp"],
+            "age_s": max(0, head_timestamp - int(row["timestamp"])),
+        }
+
     def search(self, params):
         query = str(params.get("q") or "").strip()[:128]
         try:

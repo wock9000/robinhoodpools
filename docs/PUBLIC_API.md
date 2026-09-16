@@ -63,7 +63,8 @@ The response contains:
 - `coverage.history`, which separately describes indexed canonical event
   history; and
 - `coverage.state`, which counts available and unavailable current liquidity
-  reads.
+  reads, reports the per-request state-read limit, and counts matching pools
+  beyond that limit.
 
 “Every verified known match” does not mean every pool deployed on-chain.
 `coverage.catalog.complete_for_known_catalog` applies only to supported known
@@ -73,8 +74,12 @@ Verified pool identities are cached separately from current liquidity snapshots
 and invalidated when pool or token metadata changes. Recovering an omitted V4
 tick spacing reuses candidates from previously verified PoolKeys, but each
 candidate must still reproduce the requested pool hash. Large-token responses
-remain complete rather than silently capped; state reads use bounded RPC
-batches and retain the exact-block confirmation described above.
+remain complete rather than silently capped: every matching pool is returned.
+Block-pinned state reads are bounded to the 512 most recently active matching
+pools per request, selected by latest indexed pool activity; `coverage.state`
+reports the bound as `state_read_limit` and the unmatched remainder as
+`pools_over_limit`. Attempted state reads use bounded RPC batches and retain
+the exact-block confirmation described above.
 
 ### Pool identity and dynamic fees
 
@@ -113,6 +118,14 @@ A successful zero is `"0"`. A failed, reverted, or malformed contract read has
 `status: "unavailable"`, null value fields, and an `unavailable_reason`.
 Unavailable state is never converted to zero. One unavailable pool does not
 discard successful reads for other pools.
+
+A pool beyond the per-request state-read bound (`coverage.state.pools_over_limit`
+greater than zero) has not been read at all: it keeps its complete catalog row
+but returns `liquidity.status: "unavailable"` with `unavailable_reason:
+"state_read_budget"`, `availability.reasons: ["state_read_budget"]`, and, for
+dynamic V4, `fee.current_status: "unavailable"`. Selection is most
+recently active first; such pools are never dropped, zeroed, or hidden from
+counts.
 
 ### `GET /api/v1/assets`
 
@@ -242,6 +255,42 @@ Coverage dimensions are independent:
   identity scope, omissions, and evidence.
 
 Preserve nulls and these qualifications in derived data.
+
+### Cross-pool dislocations
+
+`GET /api/lp/dislocations` compares the last indexed price of every pool
+that shares a token pair and returns the pairs whose pools disagree. It is a
+read of indexed state, not an executable quote, and it never submits or
+recommends a trade.
+
+| Parameter | Default | Behavior |
+| --- | --- | --- |
+| `min_bps` | `30` | Minimum `spread_bps` (max pool price over min pool price, in basis points) |
+| `min_depth_usd` | `100` | Minimum `depth_usd`; `0` keeps pairs whose depth cannot be priced |
+| `max_age_s` | `3600` | A pair qualifies when at least one of its pools has indexed state this recent; clamped to 60–86400 |
+| `max_stale_s` | `0` | When positive, drops pairs whose older buy or sell leg exceeds this age |
+| `protocol` | | `v2`, `v3`, or `v4`; compares only pools of that protocol |
+| `token` | | 20-byte address; keeps pairs containing it |
+| `q` | | Substring over pool id, token addresses, and symbols |
+| `sort` | `net` | `net`, `spread`, or `depth`, descending |
+| `limit`, `offset` | `50`, `0` | Page bounds; `limit` is at most 150 |
+
+Each row carries the pair's tokens, `pool_count`, `spread_bps`, `fee_bps`
+(the configured fee of the buy and sell pools, summed; `null` when either fee
+is unknown), `net_bps` (`spread_bps - fee_bps`, ignoring gas and slippage),
+`depth_usd`, a `buy` leg (lowest price of token0 in token1), a `sell` leg
+(highest), and up to 25 `pools` ordered by depth with `pools_omitted`. Every
+leg exposes `id`, `protocol`, `address`, `fee_ppm`, `tick_spacing`, `hook`,
+`price`, `sqrt_price_x96`, `tick`, `liquidity`, V2 `reserve0`/`reserve1`,
+`price0_usd`/`price1_usd`, `depth_usd`, `block_number`, `timestamp`, and
+`age_s` relative to the indexed head.
+
+`depth_usd` is the USDG-quote value required to move a leg to the geometric
+mid of the buy and sell prices assuming no tick crossing (V3/V4) or constant
+product (V2); the row value is the thinner leg. Pools with zero active
+liquidity or reserves, and pools at a tick limit, are excluded before
+comparison. A stale leg (large `age_s`) is the side that has not repriced;
+treat token transfer restrictions, hooks, and pool honesty as unverified.
 
 ### Terminal wallet accounting
 

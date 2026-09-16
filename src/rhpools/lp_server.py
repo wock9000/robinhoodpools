@@ -43,7 +43,7 @@ for _name in (
 
 _GET_METHODS = {
     "/api/lp/" + name: ("lp", name)
-    for name in ("status", "search", "overview", "pools", "tape", "owners", "closed", "owner")
+    for name in ("status", "search", "overview", "pools", "tape", "owners", "closed", "owner", "dislocations")
 }
 _GET_METHODS.update({
     "/api/v1/pools": ("public", "pools"),

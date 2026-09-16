@@ -11,7 +11,8 @@
   const FILTER_DELAY_MS = 280;
   const ROBINSCAN = "https://robinscan.io";
   const WINDOW_KEYS = { "1": "1h", "2": "24h", "3": "7d", "4": "30d", "5": "all" };
-  const POOL_SORT = { pools: ["fees", "desc"], flow: ["flow", "desc"], fresh: ["created", "desc"] };
+  const POOL_SORT = { pools: ["fees", "desc"], flow: ["flow", "desc"], fresh: ["created", "desc"], disloc: ["fees", "desc"] };
+  const DISLOCATION_PARAMS = { min_bps: 25, min_depth_usd: 100, max_age_s: 3600, max_stale_s: 86_400, sort: "net", limit: 100 };
   const OWNER_SORT_API = { activity: "activity", net_pnl_usd: "net", fees_usd: "fees" };
   const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
   const SEARCH_KINDS = new Set(["pool", "token", "protocol", "owner", "custody", "transaction", "position"]);
@@ -124,6 +125,10 @@
     ownersReady: false,
     ownerViewCache: new Map(),
     poolsEnvelope: null,
+    dislocations: null,
+    dislocationsAt: 0,
+    dislocationsScope: "",
+    dislocationsController: null,
     revision: null,
     epoch: null,
     stream: null,
@@ -321,6 +326,14 @@
     if (number < 3600) return `${Math.round(number / 60)}m`;
     if (number < 86400) return `${(number / 3600).toFixed(1)}h`;
     return `${(number / 86400).toFixed(1)}d`;
+  }
+
+  function formatBps(value) {
+    const number = finite(value);
+    if (number == null) return "—";
+    const absolute = Math.abs(number);
+    if (absolute >= 10_000) return `${(number / 100).toFixed(0)}%`;
+    return `${number.toFixed(absolute >= 100 ? 0 : 1)}bp`;
   }
 
   function formatDuration(seconds) {
@@ -975,6 +988,34 @@
     setTextCell(cells[14], formatPercent(item.price_change_pct), `numeric desktop-column ${valueClass(item.price_change_pct)}`);
   }
 
+  function dislocationLeg(cells, index, leg) {
+    const poolId = leg && leg.id || "";
+    const fee = finite(leg && leg.fee_ppm);
+    const label = `${leg && leg.protocol || "?"} ${fee == null ? "?" : `${(fee / 10_000).toFixed(fee % 100 === 0 ? 2 : 3)}%`}`;
+    setNodeCell(cells[index], `${poolId}|${label}`, "pair-symbol", () => {
+      const link = internalPoolLink(poolId, "", label);
+      link.title = `${poolId}\nblock #${leg.block_number}\ndepth to mid ${formatUsd(leg.depth_usd)}`;
+      return link;
+    });
+    setTextCell(cells[index + 1], formatPrice(leg && leg.price), "numeric dim", "Token1 per token0 at the pool's last indexed state");
+    const age = finite(leg && leg.age_s);
+    setTextCell(cells[index + 2], formatAge(age), `numeric desktop-column ${age != null && age > 3600 ? "unknown" : "dim"}`, "Age of the pool's last indexed state; a stale leg is the side that has not repriced");
+  }
+
+  function patchDislocationRow(row, item) {
+    const cells = row.cells;
+    const net = finite(item.net_bps);
+    row.className = net != null && net > 0 ? "event-add" : "";
+    setTextCell(cells[0], pairFor(item), "pair-symbol", `${item.pool_count} priced pools with liquidity`);
+    setTextCell(cells[1], formatBps(item.spread_bps), "numeric", "Max pool price over min pool price");
+    setTextCell(cells[2], formatBps(item.fee_bps), `numeric ${item.fee_bps == null ? "unknown" : "dim"}`, "Configured fee of the buy and sell pools, summed");
+    setTextCell(cells[3], formatBps(item.net_bps), `numeric ${net == null ? "unknown" : net > 0 ? "positive" : "negative"}`, "Spread less pool fees; ignores gas and slippage");
+    setTextCell(cells[4], formatUsd(item.depth_usd), `numeric ${item.depth_usd == null ? "unknown" : ""}`, "USD to move the thinner leg to the geometric mid without crossing a tick");
+    dislocationLeg(cells, 5, item.buy);
+    dislocationLeg(cells, 8, item.sell);
+    setTextCell(cells[11], formatCount(item.pool_count), "numeric dim desktop-column");
+  }
+
   function patchPositionRow(row, item) {
     const cells = row.cells;
     setTextCell(cells[0], pairFor(item), "pair-symbol");
@@ -1016,6 +1057,7 @@
   const tapeTable = new KeyedTable(byId("tape-body"), eventKey, () => makeTableRow(8), patchTapeRow, 8);
   const ownersTable = new KeyedTable(byId("owners-body"), (row) => ownerIdentityKey(row), () => makeTableRow(8), patchOwnerRow, 8);
   const poolsTable = new KeyedTable(byId("pools-body"), (row) => `pool:${row.id || row.pool_id || row.address || pairFor(row)}`, () => makeTableRow(15), patchPoolRow, 15);
+  const dislocationsTable = new KeyedTable(byId("dislocations-body"), (row) => `disloc:${row.token0 && row.token0.address}:${row.token1 && row.token1.address}`, () => makeTableRow(12), patchDislocationRow, 12);
   const ownerPositionsTable = new KeyedTable(byId("owner-positions-body"), (row) => `position:${row.position_key || row.token_id || row.id || `${row.pool_id || ""}:${row.tick_lower || ""}:${row.tick_upper || ""}`}`, () => makeTableRow(10), patchPositionRow, 10);
   const ownerClosedTable = new KeyedTable(byId("owner-closed-body"), (row) => `owner-closed:${row.id || `${row.position_key || row.pool_id || ""}:${row.opened_at || ""}:${row.closed_at || ""}`}`, () => makeTableRow(12), patchOwnerClosedRow, 12);
 
@@ -1178,6 +1220,44 @@
     const health = state.health.get("pools");
     const empty = !health ? "POOL SUMMARY SYNCING" : health.ok ? "NO POOL MATCHES" : "POOL DATA UNAVAILABLE · RETRYING";
     poolsTable.reconcile(rows, empty);
+  }
+
+  function renderDislocations() {
+    if (!state.dislocations) {
+      const failed = state.health.get("dislocations")?.ok === false;
+      dislocationsTable.reconcile([], failed ? "DISLOCATION DATA UNAVAILABLE · RETRYING" : "SCANNING PAIRS");
+      return;
+    }
+    const rows = (Array.isArray(state.dislocations.rows) ? state.dislocations.rows : []).slice(0, TABLE_LIMIT);
+    dislocationsTable.reconcile(rows, `NO PAIR DISLOCATED ≥${DISLOCATION_PARAMS.min_bps}bp WITH ≥${formatUsd(DISLOCATION_PARAMS.min_depth_usd)} DEPTH`);
+  }
+
+  async function refreshDislocations() {
+    if (!poolPanelActive() || state.tab !== "disloc") return;
+    const scope = JSON.stringify([state.q, state.protocol]);
+    if (scope !== state.dislocationsScope) {
+      state.dislocations = null;
+      state.dislocationsAt = 0;
+      state.dislocationsScope = scope;
+      scheduleRender("dislocations", renderDislocations);
+    }
+    if (state.dislocationsController || Date.now() - state.dislocationsAt < REFRESH_MS) return;
+    const controller = new AbortController();
+    state.dislocationsController = controller;
+    byId("dislocations-table").setAttribute("aria-busy", "true");
+    try {
+      const payload = await api("/dislocations", { ...DISLOCATION_PARAMS, q: state.q, protocol: state.protocol }, controller.signal);
+      if (controller.signal.aborted || scope !== state.dislocationsScope) return;
+      state.dislocations = payload;
+      state.dislocationsAt = Date.now();
+      healthSuccess("dislocations");
+    } catch (error) {
+      if (error.name !== "AbortError" && !controller.signal.aborted) healthFailure("dislocations", error);
+    } finally {
+      if (state.dislocationsController === controller) state.dislocationsController = null;
+      byId("dislocations-table").setAttribute("aria-busy", "false");
+      scheduleRender("dislocations", renderDislocations);
+    }
   }
 
   function renderAllTables() {
@@ -1512,7 +1592,7 @@
   function renderHealth() {
     const now = Date.now();
     const fragments = [];
-    const names = ["status", "overview", "tape", "owners", "pools"];
+    const names = ["status", "overview", "tape", "owners", "pools", "dislocations"];
     for (const name of names) {
       const health = state.health.get(name);
       if (!health) continue;
@@ -1939,6 +2019,7 @@
 
   async function refreshPools() {
     if (!poolPanelActive()) return;
+    if (state.tab === "disloc") return refreshDislocations();
     const scope = JSON.stringify([state.window, state.q, state.protocol]);
     if (scope !== state.poolScope) {
       abortPoolRequests();
@@ -2191,6 +2272,9 @@
       }
     });
     updatePoolSortControls();
+    const dislocated = next === "disloc";
+    byId("pools-table").parentElement.hidden = dislocated;
+    byId("dislocations-wrap").hidden = !dislocated;
     if (changed) {
       byId("pools-table").parentElement.scrollTop = 0;
       activatePoolView();
