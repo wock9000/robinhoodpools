@@ -446,7 +446,13 @@ class PriceProjection:
                     ):
                         valuation_ratio = ratio
         elif sqrt is not None:
-            ratio = _price_from_sqrt(int(sqrt), pool["decimals0"], pool["decimals1"])
+            # An initialize price nobody has traded against is geometry, not
+            # a mark: launchpad templates created 100+ pools at 60k USDG per
+            # token and their single-sided seeds valued at 5.5T USD each.
+            # State keeps the sqrt; the sample and state price stay None
+            # until the first swap.
+            if event["kind"] != "create":
+                ratio = _price_from_sqrt(int(sqrt), pool["decimals0"], pool["decimals1"])
         else:
             cached = pool_state if (
                 pool_state is not _MISSING

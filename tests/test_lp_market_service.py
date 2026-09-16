@@ -848,6 +848,37 @@ def test_implausible_direct_spot_falls_back_to_recent_anchor(tmp_path):
         app.close()
 
 
+def test_seeds_before_the_first_swap_are_not_valued_at_the_initialize_price(tmp_path):
+    """Initialize sets a price nobody has traded; single-sided seeds against it
+    are unpriced until a swap exists, then later flows value normally."""
+    app = service(tmp_path / "market.sqlite")
+    try:
+        app.store.upsert_pools(pools())
+        blocks = [header(100 + i, int(time.time()) - 60 + i) for i in range(3)]
+        created = swap(blocks[0], V4, "v4")
+        created.update(kind="create", amount0=None, amount1=None, liquidity="0")
+        seed = lp_effect(blocks[0], "v4", "add", 1000,
+                         (10_000_000, 0), position_state(0), position_state(1000))
+        seed.update(sqrt_price_x96=None, tick=None, liquidity=None, log_index=1,
+                    tx_hash="0x" + f"{int(blocks[0]['hash'], 16) * 100 + 1:064x}",
+                    cashflow0="-10000000", cashflow1="0")
+        ingest_effects(app, [blocks[0]], [created, seed])
+        row = next(row for row in app.tape({"window": "all"})["rows"] if row["kind"] == "add")
+        assert row["price0_usd"] is None
+        assert row["size_usd"] is None
+
+        app.store.ingest([blocks[1]], [swap(blocks[1], V4, "v4")])
+        later = lp_effect(blocks[2], "v4", "add", 1000,
+                          (10_000_000, 20_000_000), position_state(1000), position_state(2000))
+        later.update(sqrt_price_x96=None, tick=None, liquidity=None)
+        ingest_effects(app, [blocks[2]], [later])
+        priced = next(row for row in app.tape({"window": "all"})["rows"]
+                      if row["kind"] == "add" and row["block_number"] == 102)
+        assert priced["size_usd"] == pytest.approx(30)
+    finally:
+        app.close()
+
+
 def test_flat_range_waits_for_final_claim_and_keeps_costs_after_rebuild(tmp_path):
     app = service(tmp_path / "market.sqlite")
     try:
