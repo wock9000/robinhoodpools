@@ -144,6 +144,61 @@ def test_status_gap_uses_current_head_and_durable_cursor(tmp_path):
         app.close()
 
 
+def test_multi_day_window_scans_stay_inside_covering_index(tmp_path):
+    """7d/30d aggregates timed out in production once the hourly range scan
+    dereferenced every rowid; the window source must resolve the hourly arm
+    from its covering index and page totals from the per-pool index."""
+    from rhpools.lp_market_service import _SUM_FIELDS
+
+    app = service(tmp_path / "market.sqlite")
+    try:
+        now = int(time.time()) // 3600 * 3600 + 1_800
+        with app.store.transaction() as connection:
+            values = (2, 2, 0, 0, 0, 2.0, 0.2, 0, 0, 2, 2, 0, 0, 5)
+            connection.executemany(
+                "INSERT INTO lp_pool_buckets VALUES(?,?,?" + ",?" * len(values) + ")",
+                [
+                    (resolution, bucket, pool, *values)
+                    for pool in (V3, V4)
+                    for resolution, step in ((3600, 3600), (60, 900))
+                    for bucket in range(now - 40 * 86_400, now, step)
+                ],
+            )
+        start, end = now - 7 * 86_400 + 7, now - 200
+        source, args = app._bucket_source(start, end)
+        page_source, page_args = app._bucket_source(start, end, by_pool=True)
+        with app.store.reader_snapshot() as connection:
+            aggregate_plan = [row[3] for row in connection.execute(
+                f"EXPLAIN QUERY PLAN SELECT pool_id,{_SUM_FIELDS} FROM {source} "
+                "GROUP BY pool_id", args,
+            )]
+            page_plan = [row[3] for row in connection.execute(
+                f"EXPLAIN QUERY PLAN SELECT pool_id,{_SUM_FIELDS} FROM {page_source} "
+                "WHERE pool_id IN (?,?) GROUP BY pool_id", [*page_args, V3, V4],
+            )]
+            aggregated = {
+                row["pool_id"]: (row["events"], row["swaps"]) for row in connection.execute(
+                    f"SELECT pool_id,{_SUM_FIELDS} FROM {source} GROUP BY pool_id", args,
+                )
+            }
+            low_minute, high_minute = start // 60 * 60, end // 60 * 60
+            low_hour = (low_minute + 3599) // 3600 * 3600
+            high_hour = high_minute // 3600 * 3600
+            expected = connection.execute(
+                "SELECT SUM(events) FROM lp_pool_buckets WHERE pool_id=? AND "
+                "((resolution=3600 AND bucket>=? AND bucket<?) OR (resolution=60 AND "
+                "((bucket>=? AND bucket<?) OR (bucket>=? AND bucket<=?))))",
+                (V3, low_hour, high_hour, low_minute, low_hour, high_hour, high_minute),
+            ).fetchone()[0]
+        assert any("COVERING INDEX lp_buckets_hour_window" in step for step in aggregate_plan)
+        assert all(
+            "lp_buckets_pool" in step for step in page_plan if "SEARCH lp_pool_buckets" in step
+        )
+        assert aggregated == {V3: (expected, expected), V4: (expected, expected)}
+    finally:
+        app.close()
+
+
 def test_overview_refreshes_live_head_without_advancing_financial_coverage(
         tmp_path, monkeypatch):
     clock = [time.monotonic()]

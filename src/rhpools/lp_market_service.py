@@ -191,6 +191,7 @@ class PriceProjection:
     def __init__(self, store):
         self.store = store
         fields = ",".join(f"{name} REAL NOT NULL DEFAULT 0" for name in BUCKET_FIELDS)
+        window_columns = ",".join(BUCKET_FIELDS)
         schema = f"""
         CREATE TABLE IF NOT EXISTS lp_pool_state (
             pool_id TEXT PRIMARY KEY, block_number INTEGER NOT NULL, tx_index INTEGER NOT NULL,
@@ -227,6 +228,8 @@ class PriceProjection:
             PRIMARY KEY(resolution,bucket,pool_id)
         );
         CREATE INDEX IF NOT EXISTS lp_buckets_pool ON lp_pool_buckets(pool_id,resolution,bucket);
+        CREATE INDEX IF NOT EXISTS lp_buckets_hour_window ON lp_pool_buckets
+            (resolution,bucket,pool_id,{window_columns}) WHERE resolution=3600;
         CREATE INDEX IF NOT EXISTS lp_events_time ON events(timestamp,block_number,tx_index,log_index);
         CREATE INDEX IF NOT EXISTS lp_events_pool_order ON events(pool_id,block_number,tx_index,log_index);
         """
@@ -1784,27 +1787,41 @@ class LPMarketService:
         return name, start, end, coverage
 
     @staticmethod
-    def _bucket_clause(start, end):
+    def _bucket_source(start, end, by_pool=False):
         # Full hours plus only the boundary minutes: bounded read amplification.
+        # UNION ALL rather than OR: the OR optimizer resolves rowids and then
+        # reads table rows, so the hourly arm could never stay inside its
+        # covering index and cold multi-day scans became random page reads.
+        # Without ANALYZE statistics the planner prefers that covering range
+        # scan even under an outer pool_id filter, so page totals pin the
+        # per-pool index.
+        columns = "pool_id," + ",".join(BUCKET_FIELDS)
+        table = "lp_pool_buckets" + (" INDEXED BY lp_buckets_pool" if by_pool else "")
         low_minute, high_minute = start // 60 * 60, end // 60 * 60
         low_hour = (low_minute + 3599) // 3600 * 3600
         high_hour = high_minute // 3600 * 3600
+        minutes = (
+            f"SELECT {columns} FROM {table} "
+            "WHERE resolution=60 AND bucket>=? AND bucket<=?"
+        )
         if low_hour >= high_hour:
-            return "resolution=60 AND bucket>=? AND bucket<=?", [low_minute, high_minute]
-        return ("((resolution=3600 AND bucket>=? AND bucket<?) OR "
-                "(resolution=60 AND ((bucket>=? AND bucket<?) OR (bucket>=? AND bucket<=?))))",
-                [low_hour, high_hour, low_minute, low_hour, high_hour, high_minute])
+            return f"({minutes})", [low_minute, high_minute]
+        return (
+            f"(SELECT {columns} FROM {table} "
+            "WHERE resolution=3600 AND bucket>=? AND bucket<? "
+            f"UNION ALL {minutes} UNION ALL {minutes})",
+            [low_hour, high_hour, low_minute, low_hour - 60, high_hour, high_minute],
+        )
 
     def _bucket_aggregates(self, status, start, end):
         """Share one canonical interval scan across overview and pool metrics."""
-        clause, args = self._bucket_clause(start, end)
+        source, args = self._bucket_source(start, end)
         events_revision = int(status.get("events_revision") or 0)
 
         def load():
             with self.store.reader_snapshot() as connection:
                 rows = connection.execute(
-                    f"SELECT pool_id,{_SUM_FIELDS} FROM lp_pool_buckets "
-                    f"WHERE {clause} GROUP BY pool_id",
+                    f"SELECT pool_id,{_SUM_FIELDS} FROM {source} GROUP BY pool_id",
                     args,
                 ).fetchall()
             return {
@@ -1815,7 +1832,7 @@ class LPMarketService:
             }
 
         epoch = int(status.get("epoch") or 0)
-        cache_key = ("bucket-aggregates", events_revision, clause, *args)
+        cache_key = ("bucket-aggregates", events_revision, *args)
         aggregates = self._cached(
             cache_key, load, ttl=float("inf"), epoch=epoch,
         )
@@ -1985,7 +2002,7 @@ class LPMarketService:
                 "fees, flow, swaps, adds, removes, lps, price, change or created"
             )
         aggregate_fields = bucket_sort_fields.get(sort)
-        clause, bucket_args = self._bucket_clause(start, end)
+        bucket_source, bucket_args = self._bucket_source(start, end, by_pool=True)
         capital_sort = sort in {"active_tvl", "observed_active_tvl", "lps"}
         snapshot_revision = int(status.get("revision") or 0)
         snapshot_events_revision = int(status.get("events_revision") or 0)
@@ -1993,7 +2010,7 @@ class LPMarketService:
         owner_revision = self.book.owners_revision
         metric_revision = (
             (
-                snapshot_events_revision, clause, *bucket_args
+                snapshot_events_revision, *bucket_args
             ) if aggregate_fields is not None else (
                 snapshot_revision, start, end
             ),
@@ -2108,8 +2125,8 @@ class LPMarketService:
                         f"SUM({field}) AS {field}" for field in row_bucket_fields
                     )
                     page_totals = (
-                        f"WITH t AS (SELECT pool_id,{row_sums} FROM lp_pool_buckets "
-                        f"WHERE {clause} AND pool_id IN ({marks}) GROUP BY pool_id) "
+                        f"WITH t AS (SELECT pool_id,{row_sums} FROM {bucket_source} "
+                        f"WHERE pool_id IN ({marks}) GROUP BY pool_id) "
                     )
                     raw_rows = conn.execute(
                         page_totals
