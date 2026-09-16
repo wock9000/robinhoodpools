@@ -750,6 +750,45 @@ def test_empty_pool_limit_price_cannot_value_withdrawals_or_borrow_future_marks(
         app.close()
 
 
+def test_same_block_drain_outranks_pinned_pre_state_for_remove_pricing(tmp_path):
+    """A remove logged after a full drain in the same block must not be valued
+    at the pre-drain depth from its block-(N-1) pool_state_before view."""
+    app = service(tmp_path / "market.sqlite")
+    try:
+        app.store.upsert_pools(pools())
+        blocks = [header(100 + i, int(time.time()) - 60 + i) for i in range(2)]
+        app.store.ingest([blocks[0]], [swap(blocks[0], V4, "v4")])
+        drain = swap(blocks[1], V4, "v4")
+        drain.update(sqrt_price_x96="4295128740", tick=-887272, liquidity="0")
+        closed = lp_effect(blocks[1], "v4", "remove", -1000,
+                           (10_000_000, 20_000_000), position_state(1000), position_state(0))
+        closed.update(sqrt_price_x96=None, tick=None, liquidity=None, log_index=1,
+                      tx_hash="0x" + f"{int(blocks[1]['hash'], 16) * 100 + 1:064x}",
+                      cashflow0="10000000", cashflow1="20000000")
+        closed["data"]["pool_state_before"] = {
+            "sqrt_price_x96": str(1 << 96), "tick": 0,
+            "liquidity": "1000000000000", "pinned_block": 100,
+        }
+        ingest_effects(app, [blocks[1]], [drain, closed])
+        row = next(row for row in app.tape({"window": "all"})["rows"] if row["kind"] == "remove")
+        assert row["price0_usd"] is None
+        assert row["size_usd"] is None
+        assert app.overview({"window": "all"})["net_deposits_usd"] is None
+
+        # Reprojection after lp_pool_state has moved past the event must
+        # recover the same-block drain from the indexed swap, not the pin.
+        later = header(102, int(time.time()) - 50)
+        app.store.ingest([later], [swap(later, V4, "v4")])
+        app.store.reproject([row["id"]])
+        app.close()
+        app = service(tmp_path / "market.sqlite")
+        row = next(row for row in app.tape({"window": "all"})["rows"] if row["kind"] == "remove")
+        assert row["price0_usd"] is None
+        assert app.overview({"window": "all"})["coverage"]["unpriced_flows"] == 1
+    finally:
+        app.close()
+
+
 def test_flat_range_waits_for_final_claim_and_keeps_costs_after_rebuild(tmp_path):
     app = service(tmp_path / "market.sqlite")
     try:

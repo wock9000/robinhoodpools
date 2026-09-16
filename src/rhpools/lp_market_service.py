@@ -338,6 +338,25 @@ class PriceProjection:
         if old_order == order and old["liquidity"] is not None:
             return int(old["liquidity"])
         before = _data(event.get("data")).get("pool_state_before") or {}
+        pinned = before.get("pinned_block")
+        if pinned is not None:
+            # pool_state_before is a block-(N-1) view. State from an earlier
+            # log in this block already reflects that block's swaps; trusting
+            # the pinned view priced removes after a full drain at the
+            # pre-drain depth and the post-drain (floor) price. Live
+            # projection sees that state in lp_pool_state; reprojection, whose
+            # lp_pool_state has moved on, reads it back from the swap itself.
+            newer = old if (
+                old is not None and int(old["block_number"]) > int(pinned)
+            ) else conn.execute(
+                "SELECT tick,liquidity FROM events INDEXED BY lp_events_pool_order "
+                "WHERE pool_id=? AND block_number>? AND "
+                "(block_number,tx_index,log_index)<=(?,?,?) AND liquidity IS NOT NULL "
+                "ORDER BY block_number DESC,tx_index DESC,log_index DESC LIMIT 1",
+                (pool["id"], int(pinned), *order),
+            ).fetchone()
+            if newer is not None:
+                before = {"liquidity": newer["liquidity"], "tick": newer["tick"]}
         liquidity = before.get("liquidity")
         if liquidity is None and old is not None:
             liquidity = old["liquidity"]
