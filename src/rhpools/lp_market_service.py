@@ -31,6 +31,25 @@ _SUM_FIELDS = ",".join(f"SUM({name}) AS {name}" for name in BUCKET_FIELDS)
 _BUCKET_INDEX = {name: index for index, name in enumerate(BUCKET_FIELDS)}
 
 _MISSING = object()
+# A pool swept to a tick limit reports the boundary sqrt price (MIN/MAX_SQRT_RATIO
+# plus the one-unit step a limit swap lands on). That is empty-pool geometry,
+# not a market, even when a later same-block add covers the limit tick.
+_MIN_TRADEABLE_SQRT = 4295128740
+_MAX_TRADEABLE_SQRT = 1461446703485210103287273052203988822378723970341
+
+
+def _tradeable_sqrt(sqrt):
+    return sqrt is not None and _MIN_TRADEABLE_SQRT < int(sqrt) < _MAX_TRADEABLE_SQRT
+
+
+# Anchor marks were already capped here; a direct-pool spot or cross-derived
+# price past it is thin-pool geometry (one dust swap in an emptied range), not
+# a dollar mark, and falls back to the anchor like an empty pool would.
+_MAX_TOKEN_USD = 1e9
+
+
+def _plausible_usd(price):
+    return price if price is not None and 0 < price <= _MAX_TOKEN_USD else None
 
 
 def _batches(values, size=500):
@@ -191,6 +210,7 @@ class PriceProjection:
     def __init__(self, store):
         self.store = store
         fields = ",".join(f"{name} REAL NOT NULL DEFAULT 0" for name in BUCKET_FIELDS)
+        window_columns = ",".join(BUCKET_FIELDS)
         schema = f"""
         CREATE TABLE IF NOT EXISTS lp_pool_state (
             pool_id TEXT PRIMARY KEY, block_number INTEGER NOT NULL, tx_index INTEGER NOT NULL,
@@ -227,6 +247,8 @@ class PriceProjection:
             PRIMARY KEY(resolution,bucket,pool_id)
         );
         CREATE INDEX IF NOT EXISTS lp_buckets_pool ON lp_pool_buckets(pool_id,resolution,bucket);
+        CREATE INDEX IF NOT EXISTS lp_buckets_hour_window ON lp_pool_buckets
+            (resolution,bucket,pool_id,{window_columns}) WHERE resolution=3600;
         CREATE INDEX IF NOT EXISTS lp_events_time ON events(timestamp,block_number,tx_index,log_index);
         CREATE INDEX IF NOT EXISTS lp_events_pool_order ON events(pool_id,block_number,tx_index,log_index);
         """
@@ -283,20 +305,21 @@ class PriceProjection:
     def _quote(self, conn, pool, event, ratio, heads=None):
         token0, token1 = pool["token0"], pool["token1"]
         basis = "at-or-before USDG anchor (max age 300s)"
-        if token0 == USDG:
-            price1 = _number(1.0 / ratio) if ratio else self._anchor(
-                conn, token1, event, heads,
-            )
-            return 1.0, price1, "direct USDG pool spot" if ratio else basis
-        if token1 == USDG:
-            price0 = ratio if ratio else self._anchor(conn, token0, event, heads)
-            return price0, 1.0, "direct USDG pool spot" if ratio else basis
+        if USDG in (token0, token1):
+            other = token1 if token0 == USDG else token0
+            spot = _plausible_usd(
+                _number(1.0 / ratio) if token0 == USDG else ratio,
+            ) if ratio else None
+            price = spot if spot is not None else self._anchor(conn, other, event, heads)
+            if spot is not None:
+                basis = "direct USDG pool spot"
+            return (1.0, price, basis) if token0 == USDG else (price, 1.0, basis)
         price0 = self._anchor(conn, token0, event, heads)
         price1 = self._anchor(conn, token1, event, heads)
         if ratio and price0 is not None and price1 is None:
-            price1 = _number(price0 / ratio)
+            price1 = _plausible_usd(_number(price0 / ratio))
         elif ratio and price1 is not None and price0 is None:
-            price0 = _number(price1 * ratio)
+            price0 = _plausible_usd(_number(price1 * ratio))
         return price0, price1, basis
 
     @staticmethod
@@ -335,6 +358,25 @@ class PriceProjection:
         if old_order == order and old["liquidity"] is not None:
             return int(old["liquidity"])
         before = _data(event.get("data")).get("pool_state_before") or {}
+        pinned = before.get("pinned_block")
+        if pinned is not None:
+            # pool_state_before is a block-(N-1) view. State from an earlier
+            # log in this block already reflects that block's swaps; trusting
+            # the pinned view priced removes after a full drain at the
+            # pre-drain depth and the post-drain (floor) price. Live
+            # projection sees that state in lp_pool_state; reprojection, whose
+            # lp_pool_state has moved on, reads it back from the swap itself.
+            newer = old if (
+                old is not None and int(old["block_number"]) > int(pinned)
+            ) else conn.execute(
+                "SELECT tick,liquidity FROM events INDEXED BY lp_events_pool_order "
+                "WHERE pool_id=? AND block_number>? AND "
+                "(block_number,tx_index,log_index)<=(?,?,?) AND liquidity IS NOT NULL "
+                "ORDER BY block_number DESC,tx_index DESC,log_index DESC LIMIT 1",
+                (pool["id"], int(pinned), *order),
+            ).fetchone()
+            if newer is not None:
+                before = {"liquidity": newer["liquidity"], "tick": newer["tick"]}
         liquidity = before.get("liquidity")
         if liquidity is None and old is not None:
             liquidity = old["liquidity"]
@@ -404,7 +446,13 @@ class PriceProjection:
                     ):
                         valuation_ratio = ratio
         elif sqrt is not None:
-            ratio = _price_from_sqrt(int(sqrt), pool["decimals0"], pool["decimals1"])
+            # An initialize price nobody has traded against is geometry, not
+            # a mark: launchpad templates created 100+ pools at 60k USDG per
+            # token and their single-sided seeds valued at 5.5T USD each.
+            # State keeps the sqrt; the sample and state price stay None
+            # until the first swap.
+            if event["kind"] != "create":
+                ratio = _price_from_sqrt(int(sqrt), pool["decimals0"], pool["decimals1"])
         else:
             cached = pool_state if (
                 pool_state is not _MISSING
@@ -431,7 +479,10 @@ class PriceProjection:
             active_liquidity = self._active_liquidity(
                 conn, pool, event, pool_state,
             )
-            if active_liquidity is not None and active_liquidity > 0:
+            if (
+                active_liquidity is not None and active_liquidity > 0
+                and _tradeable_sqrt(sqrt)
+            ):
                 valuation_ratio = ratio
         anchor_token = (
             self._anchor_token(pool)
@@ -508,7 +559,7 @@ class PriceProjection:
             # graph cycles and empty-pool geometry never become dollar oracles.
             if anchor_token is not None and valuation_ratio is not None:
                 price = price0 if anchor_token == pool["token0"] else price1
-                if price and 0 < price <= 1e9:
+                if _plausible_usd(price) is not None:
                     mark_row = (
                         anchor_token, event["id"], pool["id"], *_order(event),
                         event["timestamp"], price, basis,
@@ -1784,27 +1835,41 @@ class LPMarketService:
         return name, start, end, coverage
 
     @staticmethod
-    def _bucket_clause(start, end):
+    def _bucket_source(start, end, by_pool=False):
         # Full hours plus only the boundary minutes: bounded read amplification.
+        # UNION ALL rather than OR: the OR optimizer resolves rowids and then
+        # reads table rows, so the hourly arm could never stay inside its
+        # covering index and cold multi-day scans became random page reads.
+        # Without ANALYZE statistics the planner prefers that covering range
+        # scan even under an outer pool_id filter, so page totals pin the
+        # per-pool index.
+        columns = "pool_id," + ",".join(BUCKET_FIELDS)
+        table = "lp_pool_buckets" + (" INDEXED BY lp_buckets_pool" if by_pool else "")
         low_minute, high_minute = start // 60 * 60, end // 60 * 60
         low_hour = (low_minute + 3599) // 3600 * 3600
         high_hour = high_minute // 3600 * 3600
+        minutes = (
+            f"SELECT {columns} FROM {table} "
+            "WHERE resolution=60 AND bucket>=? AND bucket<=?"
+        )
         if low_hour >= high_hour:
-            return "resolution=60 AND bucket>=? AND bucket<=?", [low_minute, high_minute]
-        return ("((resolution=3600 AND bucket>=? AND bucket<?) OR "
-                "(resolution=60 AND ((bucket>=? AND bucket<?) OR (bucket>=? AND bucket<=?))))",
-                [low_hour, high_hour, low_minute, low_hour, high_hour, high_minute])
+            return f"({minutes})", [low_minute, high_minute]
+        return (
+            f"(SELECT {columns} FROM {table} "
+            "WHERE resolution=3600 AND bucket>=? AND bucket<? "
+            f"UNION ALL {minutes} UNION ALL {minutes})",
+            [low_hour, high_hour, low_minute, low_hour - 60, high_hour, high_minute],
+        )
 
     def _bucket_aggregates(self, status, start, end):
         """Share one canonical interval scan across overview and pool metrics."""
-        clause, args = self._bucket_clause(start, end)
+        source, args = self._bucket_source(start, end)
         events_revision = int(status.get("events_revision") or 0)
 
         def load():
             with self.store.reader_snapshot() as connection:
                 rows = connection.execute(
-                    f"SELECT pool_id,{_SUM_FIELDS} FROM lp_pool_buckets "
-                    f"WHERE {clause} GROUP BY pool_id",
+                    f"SELECT pool_id,{_SUM_FIELDS} FROM {source} GROUP BY pool_id",
                     args,
                 ).fetchall()
             return {
@@ -1815,7 +1880,7 @@ class LPMarketService:
             }
 
         epoch = int(status.get("epoch") or 0)
-        cache_key = ("bucket-aggregates", events_revision, clause, *args)
+        cache_key = ("bucket-aggregates", events_revision, *args)
         aggregates = self._cached(
             cache_key, load, ttl=float("inf"), epoch=epoch,
         )
@@ -1985,7 +2050,7 @@ class LPMarketService:
                 "fees, flow, swaps, adds, removes, lps, price, change or created"
             )
         aggregate_fields = bucket_sort_fields.get(sort)
-        clause, bucket_args = self._bucket_clause(start, end)
+        bucket_source, bucket_args = self._bucket_source(start, end, by_pool=True)
         capital_sort = sort in {"active_tvl", "observed_active_tvl", "lps"}
         snapshot_revision = int(status.get("revision") or 0)
         snapshot_events_revision = int(status.get("events_revision") or 0)
@@ -1993,7 +2058,7 @@ class LPMarketService:
         owner_revision = self.book.owners_revision
         metric_revision = (
             (
-                snapshot_events_revision, clause, *bucket_args
+                snapshot_events_revision, *bucket_args
             ) if aggregate_fields is not None else (
                 snapshot_revision, start, end
             ),
@@ -2108,8 +2173,8 @@ class LPMarketService:
                         f"SUM({field}) AS {field}" for field in row_bucket_fields
                     )
                     page_totals = (
-                        f"WITH t AS (SELECT pool_id,{row_sums} FROM lp_pool_buckets "
-                        f"WHERE {clause} AND pool_id IN ({marks}) GROUP BY pool_id) "
+                        f"WITH t AS (SELECT pool_id,{row_sums} FROM {bucket_source} "
+                        f"WHERE pool_id IN ({marks}) GROUP BY pool_id) "
                     )
                     raw_rows = conn.execute(
                         page_totals

@@ -144,6 +144,61 @@ def test_status_gap_uses_current_head_and_durable_cursor(tmp_path):
         app.close()
 
 
+def test_multi_day_window_scans_stay_inside_covering_index(tmp_path):
+    """7d/30d aggregates timed out in production once the hourly range scan
+    dereferenced every rowid; the window source must resolve the hourly arm
+    from its covering index and page totals from the per-pool index."""
+    from rhpools.lp_market_service import _SUM_FIELDS
+
+    app = service(tmp_path / "market.sqlite")
+    try:
+        now = int(time.time()) // 3600 * 3600 + 1_800
+        with app.store.transaction() as connection:
+            values = (2, 2, 0, 0, 0, 2.0, 0.2, 0, 0, 2, 2, 0, 0, 5)
+            connection.executemany(
+                "INSERT INTO lp_pool_buckets VALUES(?,?,?" + ",?" * len(values) + ")",
+                [
+                    (resolution, bucket, pool, *values)
+                    for pool in (V3, V4)
+                    for resolution, step in ((3600, 3600), (60, 900))
+                    for bucket in range(now - 40 * 86_400, now, step)
+                ],
+            )
+        start, end = now - 7 * 86_400 + 7, now - 200
+        source, args = app._bucket_source(start, end)
+        page_source, page_args = app._bucket_source(start, end, by_pool=True)
+        with app.store.reader_snapshot() as connection:
+            aggregate_plan = [row[3] for row in connection.execute(
+                f"EXPLAIN QUERY PLAN SELECT pool_id,{_SUM_FIELDS} FROM {source} "
+                "GROUP BY pool_id", args,
+            )]
+            page_plan = [row[3] for row in connection.execute(
+                f"EXPLAIN QUERY PLAN SELECT pool_id,{_SUM_FIELDS} FROM {page_source} "
+                "WHERE pool_id IN (?,?) GROUP BY pool_id", [*page_args, V3, V4],
+            )]
+            aggregated = {
+                row["pool_id"]: (row["events"], row["swaps"]) for row in connection.execute(
+                    f"SELECT pool_id,{_SUM_FIELDS} FROM {source} GROUP BY pool_id", args,
+                )
+            }
+            low_minute, high_minute = start // 60 * 60, end // 60 * 60
+            low_hour = (low_minute + 3599) // 3600 * 3600
+            high_hour = high_minute // 3600 * 3600
+            expected = connection.execute(
+                "SELECT SUM(events) FROM lp_pool_buckets WHERE pool_id=? AND "
+                "((resolution=3600 AND bucket>=? AND bucket<?) OR (resolution=60 AND "
+                "((bucket>=? AND bucket<?) OR (bucket>=? AND bucket<=?))))",
+                (V3, low_hour, high_hour, low_minute, low_hour, high_hour, high_minute),
+            ).fetchone()[0]
+        assert any("COVERING INDEX lp_buckets_hour_window" in step for step in aggregate_plan)
+        assert all(
+            "lp_buckets_pool" in step for step in page_plan if "SEARCH lp_pool_buckets" in step
+        )
+        assert aggregated == {V3: (expected, expected), V4: (expected, expected)}
+    finally:
+        app.close()
+
+
 def test_overview_refreshes_live_head_without_advancing_financial_coverage(
         tmp_path, monkeypatch):
     clock = [time.monotonic()]
@@ -691,6 +746,135 @@ def test_empty_pool_limit_price_cannot_value_withdrawals_or_borrow_future_marks(
         overview = app.overview({"window": "all"})
         assert overview["volume_usd"] == pytest.approx(101)
         assert overview["coverage"]["unpriced_flows"] == 1
+    finally:
+        app.close()
+
+
+@pytest.mark.parametrize("drained_sqrt,drained_tick", [
+    # Swept to the tick limit: boundary geometry is never a mark.
+    ("4295128740", -887272),
+    # Swept into a liquidity gap at an ordinary price: depth decides.
+    (str(2 << 96), 13863),
+])
+def test_same_block_drain_outranks_pinned_pre_state_for_remove_pricing(
+        tmp_path, drained_sqrt, drained_tick):
+    """A remove logged after a full drain in the same block must not be valued
+    at the pre-drain depth from its block-(N-1) pool_state_before view."""
+    app = service(tmp_path / "market.sqlite")
+    try:
+        app.store.upsert_pools(pools())
+        blocks = [header(100 + i, int(time.time()) - 60 + i) for i in range(2)]
+        app.store.ingest([blocks[0]], [swap(blocks[0], V4, "v4")])
+        drain = swap(blocks[1], V4, "v4")
+        drain.update(sqrt_price_x96=drained_sqrt, tick=drained_tick, liquidity="0")
+        closed = lp_effect(blocks[1], "v4", "remove", -1000,
+                           (10_000_000, 20_000_000), position_state(1000), position_state(0))
+        closed.update(sqrt_price_x96=None, tick=None, liquidity=None, log_index=1,
+                      tx_hash="0x" + f"{int(blocks[1]['hash'], 16) * 100 + 1:064x}",
+                      cashflow0="10000000", cashflow1="20000000")
+        closed["data"]["pool_state_before"] = {
+            "sqrt_price_x96": str(1 << 96), "tick": 0,
+            "liquidity": "1000000000000", "pinned_block": 100,
+        }
+        ingest_effects(app, [blocks[1]], [drain, closed])
+        row = next(row for row in app.tape({"window": "all"})["rows"] if row["kind"] == "remove")
+        assert row["price0_usd"] is None
+        assert row["size_usd"] is None
+        assert app.overview({"window": "all"})["net_deposits_usd"] is None
+
+        # Reprojection after lp_pool_state has moved past the event must
+        # recover the same-block drain from the indexed swap, not the pin.
+        later = header(102, int(time.time()) - 50)
+        app.store.ingest([later], [swap(later, V4, "v4")])
+        app.store.reproject([row["id"]])
+        app.close()
+        app = service(tmp_path / "market.sqlite")
+        row = next(row for row in app.tape({"window": "all"})["rows"] if row["kind"] == "remove")
+        assert row["price0_usd"] is None
+        assert app.overview({"window": "all"})["coverage"]["unpriced_flows"] == 1
+    finally:
+        app.close()
+
+
+def test_add_covering_the_tick_limit_is_not_valued_at_boundary_price(tmp_path):
+    """Re-adding full-range liquidity to a pool swept to MIN_SQRT_RATIO puts
+    depth at the boundary, but the boundary is still not a market price."""
+    app = service(tmp_path / "market.sqlite")
+    try:
+        app.store.upsert_pools(pools())
+        blocks = [header(100 + i, int(time.time()) - 60 + i) for i in range(2)]
+        app.store.ingest([blocks[0]], [swap(blocks[0], V4, "v4")])
+        drain = swap(blocks[1], V4, "v4")
+        drain.update(sqrt_price_x96="4295128740", tick=-887272, liquidity="0")
+        opened = lp_effect(blocks[1], "v4", "add", 1000,
+                           (10_000_000, 20_000_000), position_state(0), position_state(1000))
+        opened.update(sqrt_price_x96=None, tick=None, liquidity=None, log_index=1,
+                      tick_lower=-887272, tick_upper=887272,
+                      tx_hash="0x" + f"{int(blocks[1]['hash'], 16) * 100 + 1:064x}")
+        opened["data"]["pool_state_before"] = {
+            "sqrt_price_x96": "4295128740", "tick": -887272,
+            "liquidity": "0", "pinned_block": 100,
+        }
+        ingest_effects(app, [blocks[1]], [drain, opened])
+        row = next(row for row in app.tape({"window": "all"})["rows"] if row["kind"] == "add")
+        assert row["price0_usd"] is None
+        assert row["size_usd"] is None
+        assert app.overview({"window": "all"})["net_deposits_usd"] is None
+    finally:
+        app.close()
+
+
+def test_implausible_direct_spot_falls_back_to_recent_anchor(tmp_path):
+    """A dust swap that leaves a thin pool quoting the asset above 1e9 USD is
+    not a mark; flows use the recent anchor, as an emptied pool would."""
+    app = service(tmp_path / "market.sqlite")
+    try:
+        app.store.upsert_pools(pools())
+        blocks = [header(100 + i, int(time.time()) - 60 + i) for i in range(2)]
+        app.store.ingest([blocks[0]], [swap(blocks[0], V3, "v3")])
+        spike = swap(blocks[1], V3, "v3")
+        spike.update(sqrt_price_x96=str(100_000 << 96), tick=230_270)
+        closed = lp_effect(blocks[1], "v3", "remove", -1000,
+                           (10_000_000, 20_000_000), position_state(1000), position_state(0))
+        closed.update(sqrt_price_x96=None, tick=None, liquidity=None, log_index=1,
+                      tx_hash="0x" + f"{int(blocks[1]['hash'], 16) * 100 + 1:064x}",
+                      cashflow0="10000000", cashflow1="20000000")
+        ingest_effects(app, [blocks[1]], [spike, closed])
+        row = next(row for row in app.tape({"window": "all"})["rows"] if row["kind"] == "remove")
+        assert row["price0_usd"] == pytest.approx(1.0)
+        assert row["pricing_basis"].startswith("at-or-before USDG anchor")
+        assert row["size_usd"] == pytest.approx(30)
+    finally:
+        app.close()
+
+
+def test_seeds_before_the_first_swap_are_not_valued_at_the_initialize_price(tmp_path):
+    """Initialize sets a price nobody has traded; single-sided seeds against it
+    are unpriced until a swap exists, then later flows value normally."""
+    app = service(tmp_path / "market.sqlite")
+    try:
+        app.store.upsert_pools(pools())
+        blocks = [header(100 + i, int(time.time()) - 60 + i) for i in range(3)]
+        created = swap(blocks[0], V4, "v4")
+        created.update(kind="create", amount0=None, amount1=None, liquidity="0")
+        seed = lp_effect(blocks[0], "v4", "add", 1000,
+                         (10_000_000, 0), position_state(0), position_state(1000))
+        seed.update(sqrt_price_x96=None, tick=None, liquidity=None, log_index=1,
+                    tx_hash="0x" + f"{int(blocks[0]['hash'], 16) * 100 + 1:064x}",
+                    cashflow0="-10000000", cashflow1="0")
+        ingest_effects(app, [blocks[0]], [created, seed])
+        row = next(row for row in app.tape({"window": "all"})["rows"] if row["kind"] == "add")
+        assert row["price0_usd"] is None
+        assert row["size_usd"] is None
+
+        app.store.ingest([blocks[1]], [swap(blocks[1], V4, "v4")])
+        later = lp_effect(blocks[2], "v4", "add", 1000,
+                          (10_000_000, 20_000_000), position_state(1000), position_state(2000))
+        later.update(sqrt_price_x96=None, tick=None, liquidity=None)
+        ingest_effects(app, [blocks[2]], [later])
+        priced = next(row for row in app.tape({"window": "all"})["rows"]
+                      if row["kind"] == "add" and row["block_number"] == 102)
+        assert priced["size_usd"] == pytest.approx(30)
     finally:
         app.close()
 
