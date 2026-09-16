@@ -2241,7 +2241,7 @@
       button.closest("th").setAttribute("aria-sort", active ? (state.poolOrder === "asc" ? "ascending" : "descending") : "none");
       button.title = active ? `Sorted ${state.poolOrder}; activate to reverse` : `Sort by ${button.textContent.trim()}`;
     });
-    byId("mobile-pool-sort").value = state.poolSort;
+    byId("mobile-pool-sort").value = state.tab === "disloc" ? "disloc" : state.poolSort;
     byId("mobile-pool-order").textContent = state.poolOrder === "desc" ? "↓" : "↑";
     byId("mobile-pool-order").setAttribute("aria-label", `Reverse pool sort order; currently ${state.poolOrder === "desc" ? "descending" : "ascending"}`);
   }
@@ -3116,6 +3116,10 @@
   byId("mobile-window").addEventListener("change", (event) => setWindow(event.target.value));
   byId("mobile-pool-sort").addEventListener("change", (event) => {
     const key = event.target.value;
+    if (key === "disloc") {
+      setTab("disloc", false, true);
+      return;
+    }
     setTab(key === "flow" ? "flow" : key === "created" ? "fresh" : "pools", false, false);
     setPoolSort(key, false);
   });
