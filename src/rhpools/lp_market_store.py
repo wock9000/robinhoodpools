@@ -67,6 +67,12 @@ _SEARCH_WORD_RE = re.compile(r"[a-z0-9]+")
 _CORE_POSITION_REPAIR_CHECKPOINT = "core_position_key_source_repair_v1"
 _CORE_POSITION_KEY_START = "0x"
 _CORE_POSITION_KEY_END = "0y"
+_CHECKPOINT_MODES = frozenset({"PASSIVE", "RESTART", "TRUNCATE"})
+_READER_DRAIN_SECONDS = 60.0
+_READER_DRAIN_COOLDOWN_SECONDS = 60.0
+_CHECKPOINT_BUSY_TIMEOUT_MS = 100
+_READER_SNAPSHOT_SECONDS = 15.0
+_READER_PROGRESS_STEPS = 1_000
 
 
 class MarketStoreError(RuntimeError):
@@ -182,14 +188,20 @@ class MarketStore:
     the actual header for each event block.  The coverage table records the
     contiguous interval those sparse anchors verify.
 
-    A managed indexer may disable commit-time checkpoints when it owns the
-    periodic checkpoint lane. WAL commits remain fully synchronized.
+    A managed indexer may disable writer autocheckpoints when it owns the
+    dedicated periodic maintenance lane. WAL commits remain fully synchronized.
     """
 
     def __init__(self, path: str | Path, *, checkpoint_on_commit: bool = True) -> None:
         self.path = Path(path) if str(path) != ":memory:" else Path(":memory:")
         self.lock = threading.RLock()
         self._reader_lock = threading.Lock()
+        self._checkpoint_lock = threading.Lock()
+        self._reader_snapshot_condition = threading.Condition()
+        self._reader_drain_interrupt = threading.Event()
+        self._active_reader_snapshots = 0
+        self._reader_drain_deadline: float | None = None
+        self._reader_drain_retry_after = 0.0
         self._local = threading.local()
         self._readers: dict[int, sqlite3.Connection] = {}
         self._projections: list[tuple[ProjectionApply, ProjectionRollback, bool]] = []
@@ -208,8 +220,13 @@ class MarketStore:
             self._uri = False
         self.connection = self._connect(writer=True)
         self._initialize()
+        self._checkpoint_connection = self._connect(writer=False, checkpoint=True)
+        page_row = self._checkpoint_connection.execute("PRAGMA page_size").fetchone()
+        self._page_size = max(0, int(page_row[0])) if page_row is not None else 0
 
-    def _connect(self, *, writer: bool) -> sqlite3.Connection:
+    def _connect(
+        self, *, writer: bool, checkpoint: bool = False,
+    ) -> sqlite3.Connection:
         connection = sqlite3.connect(
             self._database,
             timeout=5.0,
@@ -218,7 +235,7 @@ class MarketStore:
             uri=self._uri,
         )
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA busy_timeout=5000")
+        connection.execute(f"PRAGMA busy_timeout={0 if checkpoint else 5000}")
         connection.execute("PRAGMA foreign_keys=ON")
         # The writer benefits from a large projection working set.  Reader
         # pages are also available through the shared mmap, so keep each
@@ -228,12 +245,17 @@ class MarketStore:
         if writer:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA synchronous=FULL")
-            # Managed services checkpoint on their existing projection lane,
-            # including a large inherited WAL, rather than before HTTP startup.
-            # Standalone stores retain SQLite's automatic checkpoint fallback.
+            # Managed services use their dedicated maintenance lane, including
+            # for a large inherited WAL, rather than checkpointing before HTTP
+            # startup. Standalone stores retain automatic checkpoint fallback.
             pages = 65536 if self._checkpoint_on_commit else 0
             connection.execute(f"PRAGMA wal_autocheckpoint={pages}")
             connection.execute("PRAGMA journal_size_limit=268435456")
+        elif checkpoint:
+            # A checkpoint connection writes database pages even though it
+            # never owns application transactions. Keep its durability
+            # explicit and its busy policy nonwaiting so ingestion wins.
+            connection.execute("PRAGMA synchronous=FULL")
         else:
             connection.execute("PRAGMA query_only=ON")
         return connection
@@ -284,6 +306,12 @@ class MarketStore:
             "timestamp INTEGER NOT NULL,"
             "PRIMARY KEY(position_key,kind,identity,protocol,pool_id)"
             ") WITHOUT ROWID"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS "
+            "lp_accounting_pending_identities_scope_timestamp "
+            "ON lp_accounting_pending_identities(timestamp,position_key) "
+            "WHERE kind='scope'"
         )
 
 
@@ -589,6 +617,50 @@ class MarketStore:
                 if accounting_pending_installed:
                     self._install_accounting_pending_identities(self.connection)
                 self.connection.execute("PRAGMA user_version=11")
+            if int(self.connection.execute("PRAGMA user_version").fetchone()[0]) < 12:
+                accounting_pending_installed = self.connection.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type='table' AND name='lp_accounting_pending'"
+                ).fetchone() is not None
+                if accounting_pending_installed:
+                    self._install_accounting_pending_identities(self.connection)
+                self.connection.execute("PRAGMA user_version=12")
+            if int(self.connection.execute("PRAGMA user_version").fetchone()[0]) < 13:
+                accounting_installed = self.connection.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type='table' AND name='lp_accounting_episodes'"
+                ).fetchone() is not None
+                if accounting_installed:
+                    self.connection.execute(
+                        "CREATE INDEX IF NOT EXISTS "
+                        "lp_accounting_episodes_owner_window_cover ON "
+                        "lp_accounting_episodes("
+                        "last_timestamp,owner,custody,protocol,pool_id,"
+                        "position_key,closed_at,status,gross_pnl_usd,gas_usd,"
+                        "history_complete,fees_complete,pricing_complete,"
+                        "fees_usd,deposit_usd,proceeds_usd)"
+                    )
+                self.connection.execute("PRAGMA user_version=13")
+            if int(self.connection.execute("PRAGMA user_version").fetchone()[0]) < 14:
+                accounting_installed = self.connection.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type='table' AND name='lp_accounting_episodes'"
+                ).fetchone() is not None
+                if accounting_installed:
+                    self.connection.execute(
+                        "DROP INDEX IF EXISTS "
+                        "lp_accounting_episodes_owner_window_cover"
+                    )
+                    self.connection.execute(
+                        "CREATE INDEX "
+                        "lp_accounting_episodes_owner_window_cover ON "
+                        "lp_accounting_episodes("
+                        "last_timestamp,owner,custody,protocol,pool_id,"
+                        "position_key,closed_at,status,id,gross_pnl_usd,"
+                        "gas_usd,history_complete,fees_complete,pricing_complete,"
+                        "fees_usd,deposit_usd,proceeds_usd)"
+                    )
+                self.connection.execute("PRAGMA user_version=14")
             self.connection.execute(
                 "CREATE INDEX IF NOT EXISTS pending_reprojection_order_idx "
                 "ON pending_reprojection(block_number,tx_index,log_index,event_id)"
@@ -712,6 +784,110 @@ class MarketStore:
             self._readers[ident] = connection
         return connection
 
+    def _expire_reader_drain_locked(self, now: float) -> bool:
+        deadline = self._reader_drain_deadline
+        if deadline is None or deadline > now:
+            return False
+        self._reader_drain_deadline = None
+        self._reader_drain_interrupt.clear()
+        self._reader_drain_retry_after = max(
+            self._reader_drain_retry_after,
+            now + _READER_DRAIN_COOLDOWN_SECONDS,
+        )
+        self._reader_snapshot_condition.notify_all()
+        return True
+
+    def _finish_reader_drain(self) -> None:
+        with self._reader_snapshot_condition:
+            self._reader_drain_interrupt.clear()
+            if self._reader_drain_deadline is None:
+                return
+            self._reader_drain_deadline = None
+            self._reader_snapshot_condition.notify_all()
+
+    def _reader_snapshot_state(self) -> tuple[int, int]:
+        with self._reader_snapshot_condition:
+            self._expire_reader_drain_locked(time.monotonic())
+            return (
+                self._active_reader_snapshots,
+                int(self._reader_drain_deadline is not None),
+            )
+
+    @contextlib.contextmanager
+    def reader_snapshot(
+        self, seconds: float | None = None,
+    ) -> Iterator[sqlite3.Connection]:
+        """Own one bounded, coherent read transaction."""
+        connection = self.read()
+        if connection.in_transaction:
+            yield connection
+            return
+
+        condition = self._reader_snapshot_condition
+        # A writer cannot wait for a reset that needs its transaction to finish.
+        in_writer = bool(getattr(self._local, "write_depth", 0))
+        with condition:
+            while self._reader_drain_deadline is not None and not in_writer:
+                if self._closed:
+                    raise MarketStoreError("market store is closed")
+                now = time.monotonic()
+                if self._expire_reader_drain_locked(now):
+                    continue
+                condition.wait(self._reader_drain_deadline - now)
+            if self._closed:
+                raise MarketStoreError("market store is closed")
+            self._active_reader_snapshots += 1
+        deadline = time.monotonic() + (
+            _READER_SNAPSHOT_SECONDS
+            if seconds is None
+            else max(1.0, float(seconds))
+        )
+        interrupted = False
+
+        def interrupt_read() -> int:
+            nonlocal interrupted
+            interrupted = (
+                not in_writer
+                and (
+                    self._reader_drain_interrupt.is_set()
+                    or time.monotonic() >= deadline
+                )
+            )
+            return int(interrupted)
+
+        try:
+            connection.execute("BEGIN")
+            connection.set_progress_handler(
+                interrupt_read, _READER_PROGRESS_STEPS,
+            )
+        except BaseException:
+            with contextlib.suppress(sqlite3.Error):
+                connection.set_progress_handler(None, 0)
+            with condition:
+                self._active_reader_snapshots -= 1
+                condition.notify_all()
+            raise
+        try:
+            yield connection
+            if interrupted or (
+                not in_writer and time.monotonic() >= deadline
+            ):
+                raise MarketStoreError("reader snapshot exceeded its deadline")
+        finally:
+            try:
+                connection.set_progress_handler(None, 0)
+            finally:
+                try:
+                    connection.rollback()
+                finally:
+                    with condition:
+                        self._active_reader_snapshots -= 1
+                        condition.notify_all()
+
+    def cancel_checkpoint_drain(self) -> None:
+        """Reopen reader snapshot admission after managed maintenance stops."""
+        self._finish_reader_drain()
+
     def close_reader(self) -> None:
         """Close and unregister the calling thread's query-only connection."""
         ident = threading.get_ident()
@@ -724,9 +900,112 @@ class MarketStore:
                 self._readers.pop(ident, None)
         connection.close()
 
-    def checkpoint(self) -> None:
-        """Flush committed WAL pages without acquiring the ledger writer lock."""
-        self.read().execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+    def _checkpoint_metrics(
+        self,
+        *,
+        busy: int,
+        log_frames: int,
+        checkpointed_frames: int,
+        active_reader_snapshots: int,
+        reader_drain_pending: int,
+    ) -> dict[str, int]:
+        wal_bytes = 0
+        if not self._uri:
+            try:
+                wal_bytes = Path(f"{self.path}-wal").stat().st_size
+            except FileNotFoundError:
+                pass
+            except OSError:
+                self._finish_reader_drain()
+                raise
+        backlog_bytes = (
+            -1
+            if log_frames < 0 or checkpointed_frames < 0
+            else max(0, log_frames - checkpointed_frames) * self._page_size
+        )
+        return {
+            "busy": int(busy),
+            "log_frames": int(log_frames),
+            "checkpointed_frames": int(checkpointed_frames),
+            "log_bytes": max(0, int(log_frames)) * self._page_size,
+            "backlog_bytes": int(backlog_bytes),
+            "wal_bytes": int(wal_bytes),
+            "active_reader_snapshots": int(active_reader_snapshots),
+            "reader_drain_pending": int(reader_drain_pending),
+        }
+
+    def checkpoint(
+        self, mode: str = "PASSIVE", *, drain_readers: bool = False,
+    ) -> dict[str, int]:
+        """Checkpoint WAL pages, optionally draining owned read snapshots."""
+        if mode not in _CHECKPOINT_MODES:
+            supported = ", ".join(sorted(_CHECKPOINT_MODES))
+            raise ValueError(f"checkpoint mode must be one of {supported}")
+        with self._checkpoint_lock:
+            if self._closed:
+                raise MarketStoreError("market store is closed")
+
+            managed_attempt = False
+            deferred_snapshots = 0
+            managed_drain = drain_readers and mode == "TRUNCATE" and not self._uri
+            if managed_drain:
+                with self._reader_snapshot_condition:
+                    now = time.monotonic()
+                    self._expire_reader_drain_locked(now)
+                    if (
+                        self._reader_drain_deadline is None
+                        and self._reader_drain_retry_after <= now
+                    ):
+                        self._reader_drain_deadline = now + _READER_DRAIN_SECONDS
+                        self._reader_drain_interrupt.set()
+                    if self._reader_drain_deadline is not None:
+                        deferred_snapshots = self._active_reader_snapshots
+                        managed_attempt = not deferred_snapshots
+                if deferred_snapshots:
+                    return self._checkpoint_metrics(
+                        busy=1,
+                        log_frames=-1,
+                        checkpointed_frames=-1,
+                        active_reader_snapshots=deferred_snapshots,
+                        reader_drain_pending=1,
+                    )
+            connection = self._checkpoint_connection
+            try:
+                if managed_attempt:
+                    connection.execute(
+                        f"PRAGMA busy_timeout={_CHECKPOINT_BUSY_TIMEOUT_MS}"
+                    )
+                row = connection.execute(
+                    f"PRAGMA wal_checkpoint({mode})"
+                ).fetchone()
+                if managed_attempt:
+                    connection.execute("PRAGMA busy_timeout=0")
+            except BaseException:
+                if managed_attempt:
+                    with contextlib.suppress(sqlite3.Error):
+                        connection.execute("PRAGMA busy_timeout=0")
+                self._finish_reader_drain()
+                raise
+
+            busy, log_frames, checkpointed_frames = (
+                (0, -1, -1) if row is None else map(int, row)
+            )
+            # SQLite reports -1 frame counts when the database is not using
+            # WAL, including shared in-memory stores.
+            log_frames = max(0, log_frames)
+            checkpointed_frames = max(0, checkpointed_frames)
+            if mode == "TRUNCATE" and not busy:
+                self._finish_reader_drain()
+            active_reader_snapshots, reader_drain_pending = (
+                self._reader_snapshot_state()
+            )
+            return self._checkpoint_metrics(
+                busy=busy,
+                log_frames=log_frames,
+                checkpointed_frames=checkpointed_frames,
+                active_reader_snapshots=active_reader_snapshots,
+                reader_drain_pending=reader_drain_pending,
+            )
 
     @contextlib.contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -3465,10 +3744,17 @@ class MarketStore:
         return status
 
     def close(self) -> None:
-        with self.lock:
+        with self._reader_snapshot_condition:
             if self._closed:
                 return
             self._closed = True
+            self._reader_drain_deadline = None
+            self._reader_drain_interrupt.set()
+            self._reader_snapshot_condition.notify_all()
+
+        with self.lock:
+            with self._checkpoint_lock:
+                self._checkpoint_connection.close()
             with self._reader_lock:
                 readers = tuple(self._readers.items())
                 self._readers.clear()

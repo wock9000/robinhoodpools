@@ -310,6 +310,19 @@ def _capability(method: str, params: Sequence[Any], lane: str) -> str:
     return "head"
 
 
+def _explicit_block_header(method: str, params: Sequence[Any]) -> bool:
+    """Identify numbered header reads that cannot select a lagging local tip."""
+    if method != "eth_getBlockByNumber" or not params:
+        return False
+    tag = params[0]
+    if not isinstance(tag, str) or not tag.startswith("0x"):
+        return False
+    try:
+        return int(tag, 16) >= 0
+    except ValueError:
+        return False
+
+
 class _Registry:
     def __init__(self, primary_url: str, error_type: type[Exception]) -> None:
         self.error_type = error_type
@@ -375,14 +388,19 @@ class _Registry:
                 self._verification_locks[source.url] = lock
             return lock
 
-    def candidates(self, capability: str) -> tuple[_Source, ...]:
+    def candidates(
+        self, capability: str, *, prefer_local: bool = False,
+    ) -> tuple[_Source, ...]:
         sources = self.sources[capability]
         now = time.monotonic()
         with self._lock:
-            return tuple(
+            available = tuple(
                 source for source in sources
                 if self._states[(capability, source.name)].retry_at <= now
             )
+        if prefer_local:
+            return tuple(sorted(available, key=lambda source: not _local(source.url)))
+        return available
 
     def can_try(self, source: _Source, capability: str) -> bool:
         with self._lock:
@@ -785,7 +803,10 @@ class RoutedRpc:
             raise failure
         if "result" not in item:
             raise self._error(f"{source.name} {method} response omitted result")
-        return item["result"]
+        result = item["result"]
+        if method == "eth_getBlockByNumber" and result is None:
+            raise self._error(f"{source.name} has no requested block header")
+        return result
 
     def _ensure_chain(self, source: _Source) -> None:
         if self._registry.verified(source):
@@ -971,7 +992,10 @@ class RoutedRpc:
         self._check_open()
         values = list(params or ())
         capability = _capability(method, values, self._lane)
-        sources = self._registry.candidates(capability)
+        sources = self._registry.candidates(
+            capability,
+            prefer_local=_explicit_block_header(method, values),
+        )
         if not sources and not self._registry.sources[capability]:
             raise self._error(
                 f"{capability} RPC unavailable; "
@@ -1115,7 +1139,13 @@ class RoutedRpc:
             return output
 
         capability = capabilities.pop()
-        sources = self._registry.candidates(capability)
+        explicit_headers = all(
+            _explicit_block_header(method, params)
+            for method, params in specifications
+        )
+        sources = self._registry.candidates(
+            capability, prefer_local=explicit_headers,
+        )
         if not sources and not self._registry.sources[capability]:
             failure = self._error(
                 f"{capability} RPC unavailable; "
@@ -1150,8 +1180,16 @@ class RoutedRpc:
                 break
             if not self._registry.can_try(source, capability):
                 continue
-            interval = _minimum_interval(source.url)
-            batch_limit = max(1, int(1 / interval)) if interval else MAX_BATCH_CALLS
+            if explicit_headers:
+                # _post charges every batch item to the shared rate gate. Keep
+                # this permitted header burst in one bounded HTTP request.
+                batch_limit = MAX_BATCH_CALLS
+            else:
+                interval = _minimum_interval(source.url)
+                batch_limit = (
+                    max(1, int(1 / interval))
+                    if interval else MAX_BATCH_CALLS
+                )
             remaining = pending
             pending = []
             for offset in range(0, len(remaining), batch_limit):

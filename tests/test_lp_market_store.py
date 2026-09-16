@@ -1,13 +1,18 @@
 """Focused durable-store batching and canonical-safety regressions."""
 from __future__ import annotations
-
 import sqlite3
+import threading
 from types import SimpleNamespace
+
 import pytest
 
-from rhpools.lp_market_store import CanonicalConflict, MarketStore
+import rhpools.lp_market_store as market_store_module
+from rhpools.lp_market_store import (
+    CanonicalConflict,
+    MarketStore,
+    MarketStoreError,
+)
 from rhpools.lp_market_accounting import AccountBook
-from rhpools.lp_market_protocols import core_position_key
 
 
 def header(number: int, *, parent: str | None = None) -> dict[str, str]:
@@ -38,210 +43,468 @@ def event(block: dict[str, str], log_index: int) -> dict[str, object]:
     }
 
 
-def v4_core_effect(
-        block, index, raw_key, kind, liquidity_delta, before, after, *,
-        cashflow=(0, 0), fees=(0, 0), deposit_usd=0.0,
-        withdrawal_usd=0.0, fees_usd=0.0):
-    row = event(block, index)
-    row.update({
-        "tx_hash": "0x" + f"{10_000 + index:064x}",
-        "pool_id": None,
-        "protocol": "v4",
-        "kind": kind,
-        "position_key": raw_key,
-        "identity_basis": "verified_owner",
-        "tick_lower": -10,
-        "tick_upper": 10,
-        "liquidity": str(after["liquidity"]),
-        "liquidity_delta": str(liquidity_delta),
-        "amount0": "0",
-        "amount1": "0",
-        "cashflow0": str(cashflow[0]),
-        "cashflow1": str(cashflow[1]),
-        "fee_amount0": str(fees[0]),
-        "fee_amount1": str(fees[1]),
-        "deposit_usd": deposit_usd,
-        "withdrawal_usd": withdrawal_usd,
-        "fees_usd": fees_usd,
-        "accounting_basis": "complete v4 trace",
-        "data": {
-            "core_position_key": raw_key,
-            "position_before": before,
-            "position_after": after,
-            "trace_complete": True,
-            "fees_accrued_exact": True,
-            "principal_delta_exact": True,
-            "principal_delta": {
-                "amount0": str(cashflow[0] - fees[0]),
-                "amount1": str(cashflow[1] - fees[1]),
-            },
-        },
-    })
-    return row
-
-
-def drain_accounting(book):
-    while book.project_pending(limit=32):
-        pass
-
-
-def test_financial_queues_do_not_starve_recent_work_or_history(tmp_path):
-    with MarketStore(tmp_path / "financial-queues.sqlite") as store:
-        pool_id = "0x" + "31" * 20
-        store.upsert_pools([{
-            "id": pool_id, "protocol": "v3", "address": pool_id,
-            "token0": "0x" + "11" * 20, "token1": "0x" + "22" * 20,
-        }])
-        blocks = [header(number) for number in range(1, 49)]
-        store.ingest(blocks, [
-            {
-                **event(block, 0), "pool_id": pool_id, "kind": "add",
-                "tx_hash": "0x" + f"{index:064x}",
-            }
-            for index, block in enumerate(blocks, 1)
-        ])
-        with store.transaction() as connection:
-            connection.execute(
-                "UPDATE pending_enrichment SET last_error="
-                "'pool_identity_pending:{}' WHERE block_number<=8"
-            )
-            connection.execute(
-                "INSERT INTO pending_reprojection"
-                "(event_id,block_number,tx_index,log_index) "
-                "SELECT id,block_number,tx_index,log_index FROM events"
-            )
-            for block in blocks:
-                store.queue_v3_balances(
-                    [pool_id], int(block["number"], 16), block["hash"],
-                )
-            for table in (
-                "pending_enrichment", "pending_reprojection", "pending_balances",
-            ):
-                connection.execute(
-                    f"UPDATE {table} SET next_attempt=1e99 "
-                    "WHERE block_number IN (1,9,48)"
-                )
-
-        for selected, oldest in (
-            (store.pending_enrichments(8), 10),
-            (store.pending_reprojections(8), 2),
-            (store.pending_v3_balances(8), 2),
-        ):
-            numbers = [row["block_number"] for row in selected]
-            assert numbers == sorted(set(numbers))
-            assert len(numbers) == 8
-            assert numbers[0] == oldest
-            assert numbers[-1] == 47
-            assert not {1, 9, 48}.intersection(numbers)
-        store.prioritize_enrichment("0x" + f"{number:064x}" for number in (20, 21, 48))
-        requested = store.pending_enrichments(8)
-        numbers = {row["block_number"] for row in requested}
-        assert {10, 11, 20, 21, 47} <= numbers
-        assert 48 not in numbers
-
-
-def test_enrichment_exclusions_do_not_consume_the_selection_limit(tmp_path):
-    with MarketStore(tmp_path / "enrichment-exclusions.sqlite") as store:
-        blocks = [header(number) for number in range(1, 13)]
-        store.ingest(blocks, [
-            {
-                **event(block, 0),
-                "kind": "add",
-                "tx_hash": "0x" + f"{number:064x}",
-            }
-            for number, block in enumerate(blocks, 1)
-        ])
-
-        excluded = {
-            "0x" + f"{number:064x}" for number in (1, 12)
+def test_checkpoint_recovers_after_external_reader_releases_snapshot(tmp_path):
+    path = tmp_path / "market.sqlite"
+    store = MarketStore(path, checkpoint_on_commit=False)
+    snapshot = None
+    try:
+        cleared = store.checkpoint("TRUNCATE")
+        assert set(cleared) == {
+            "busy", "log_frames", "checkpointed_frames", "log_bytes",
+            "backlog_bytes", "wal_bytes", "active_reader_snapshots",
+            "reader_drain_pending",
         }
-        selected = store.pending_enrichments(4, exclude=excluded)
+        assert cleared["busy"] == 0
 
-        assert [row["block_number"] for row in selected] == [2, 9, 10, 11]
+        snapshot = sqlite3.connect(path, isolation_level=None)
+        snapshot.execute("PRAGMA query_only=ON")
+        snapshot.execute("BEGIN")
+        assert snapshot.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
 
+        block = header(10)
+        records = [event(block, index) for index in range(3)]
+        assert len(store.ingest([block], records)) == len(records)
 
-def test_enrichment_uses_the_newest_requested_interest(tmp_path):
-    with MarketStore(tmp_path / "enrichment-interest.sqlite") as store:
-        blocks = [header(number) for number in range(1, 13)]
-        store.ingest(blocks, [
-            {
-                **event(block, 0),
-                "kind": "add",
-                "tx_hash": "0x" + f"{number:064x}",
-            }
-            for number, block in enumerate(blocks, 1)
-        ])
-        hashes = {
-            number: "0x" + f"{number:064x}" for number in (5, 6)
-        }
+        progress = store.checkpoint()
+        assert progress["busy"] == 0
+        assert progress["log_frames"] > progress["checkpointed_frames"]
+        assert progress["backlog_bytes"] > 0
+        assert progress["log_bytes"] >= progress["backlog_bytes"]
+        assert progress["wal_bytes"] >= progress["backlog_bytes"]
 
-        store.prioritize_enrichment([hashes[5], hashes[6]])
-        selected = store.pending_enrichments(4, prioritized=True)
-        assert {row["block_number"] for row in selected} == {1, 6, 11, 12}
+        blocked_reset = store.checkpoint("TRUNCATE")
+        assert blocked_reset["busy"] == 1
+        assert blocked_reset["backlog_bytes"] > 0
 
-        store.prioritize_enrichment([hashes[5]])
-        selected = store.pending_enrichments(4, prioritized=True)
-        assert {row["block_number"] for row in selected} == {1, 5, 11, 12}
+        snapshot.rollback()
+        snapshot.close()
+        snapshot = None
 
-
-def test_requested_identity_work_preserves_the_normal_lane_interest(tmp_path):
-    with MarketStore(tmp_path / "enrichment-identity-interest.sqlite") as store:
-        blocks = [header(number) for number in range(1, 13)]
-        store.ingest(blocks, [
-            {
-                **event(block, 0),
-                "kind": "add",
-                "tx_hash": "0x" + f"{number:064x}",
-            }
-            for number, block in enumerate(blocks, 1)
-        ])
-        hashes = {
-            number: "0x" + f"{number:064x}" for number in (5, 6)
-        }
-        with store.transaction() as connection:
-            connection.execute(
-                "UPDATE pending_enrichment SET "
-                "last_error='pool_identity_pending:{}' WHERE tx_hash=?",
-                (hashes[5],),
-            )
-        store.prioritize_enrichment([hashes[5], hashes[6]])
-
+        recovered = store.checkpoint("TRUNCATE")
+        assert recovered["busy"] == 0
+        assert recovered["log_frames"] == recovered["checkpointed_frames"]
+        assert recovered["backlog_bytes"] == 0
+        assert recovered["wal_bytes"] == 0
         assert [
-            row["block_number"]
-            for row in store.requested_enrichments(1, identity=True)
-        ] == [5]
-        assert [
-            row["block_number"]
-            for row in store.requested_enrichments(1)
-        ] == [6]
+            (row["block_number"], row["log_index"])
+            for row in store.read().execute(
+                "SELECT block_number,log_index FROM events ORDER BY log_index"
+            ).fetchall()
+        ] == [(10, 0), (10, 1), (10, 2)]
+
+        store.close()
+        store = MarketStore(path, checkpoint_on_commit=False)
+        assert store.read().execute(
+            "SELECT COUNT(*) FROM events"
+        ).fetchone()[0] == len(records)
+    finally:
+        if snapshot is not None:
+            snapshot.rollback()
+            snapshot.close()
+        store.close()
 
 
-def test_bulk_ingest_preserves_conflicts_under_sqlite_parameter_limit(tmp_path):
-    path = tmp_path / "bounded-inserts.sqlite"
-    block = header(10)
-    rows = [
-        {**event(block, index), "tx_hash": "0x" + f"{index + 1:064x}"}
-        for index in range(70)
-    ]
-    with MarketStore(path) as store:
-        store.connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 128)
-        store.ingest(
-            [block], rows + [rows[0]], lane="live",
-            cursor={"block_number": 10, "block_hash": block["hash"]},
+def test_checkpoint_handles_non_wal_memory_store_and_rejects_full_mode():
+    store = MarketStore(":memory:")
+    try:
+        assert store.checkpoint() == {
+            "busy": 0,
+            "log_frames": 0,
+            "log_bytes": 0,
+            "checkpointed_frames": 0,
+            "backlog_bytes": 0,
+            "wal_bytes": 0,
+            "active_reader_snapshots": 0,
+            "reader_drain_pending": 0,
+        }
+        with store.reader_snapshot():
+            managed = store.checkpoint("TRUNCATE", drain_readers=True)
+            assert managed["active_reader_snapshots"] == 1
+            assert managed["reader_drain_pending"] == 0
+        with pytest.raises(ValueError):
+            store.checkpoint("FULL")
+    finally:
+        store.close()
+
+
+def test_restart_checkpoint_does_not_wait_for_active_writer(tmp_path):
+    store = MarketStore(tmp_path / "market.sqlite", checkpoint_on_commit=False)
+    writer_entered = threading.Event()
+    release_writer = threading.Event()
+    checkpoint_done = threading.Event()
+    checkpoint_results = []
+    failures = []
+
+    store.checkpoint("TRUNCATE")
+    with store.transaction() as connection:
+        connection.execute(
+            "INSERT INTO metadata(key,value) VALUES('checkpoint-seed','1')"
         )
-        assert store.ingest([block], rows) == []
-        assert [
-            row["log_index"] for row in store.read().execute(
-                "SELECT log_index FROM events ORDER BY log_index"
-            )
-        ] == list(range(70))
-        assert store.status()["indexed_events"] == 70
 
-    with MarketStore(path) as store:
-        assert store.cursor("live")["block_hash"] == block["hash"]
-        found, total = store.search(str(rows[-1]["tx_hash"]))
-        assert total == 1
-        assert found[0]["id"] == rows[-1]["tx_hash"]
+    def write():
+        try:
+            with store.transaction() as connection:
+                connection.execute(
+                    "UPDATE metadata SET value='2' WHERE key='checkpoint-seed'"
+                )
+                writer_entered.set()
+                release_writer.wait(2)
+        except BaseException as exc:
+            failures.append(exc)
+
+    def checkpoint():
+        try:
+            checkpoint_results.append(store.checkpoint("RESTART"))
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            checkpoint_done.set()
+
+    writer = threading.Thread(target=write)
+    checkpointer = threading.Thread(target=checkpoint)
+    try:
+        writer.start()
+        assert writer_entered.wait(1)
+        checkpointer.start()
+        assert checkpoint_done.wait(
+            0.5
+        ), "RESTART checkpoint waited behind the active writer"
+        assert failures == []
+        assert checkpoint_results[0]["busy"] == 1
+        release_writer.set()
+        writer.join(2)
+        assert failures == []
+        assert store.read().execute(
+            "SELECT value FROM metadata WHERE key='checkpoint-seed'"
+        ).fetchone()[0] == "2"
+    finally:
+        release_writer.set()
+        writer.join(2)
+        checkpointer.join(6)
+        store.close()
+    assert failures == []
+
+
+def test_managed_reader_drain_preserves_snapshot_and_reclaims_wal(tmp_path):
+    store = MarketStore(
+        tmp_path / "market.sqlite",
+        checkpoint_on_commit=False,
+    )
+    existing_started = threading.Event()
+    release_existing = threading.Event()
+    existing_finished = threading.Event()
+    queued_started = threading.Event()
+    queued_admitted = threading.Event()
+    existing_counts = []
+    queued_counts = []
+    failures = []
+
+    def hold_existing_snapshot():
+        try:
+            with store.reader_snapshot() as connection:
+                before = connection.execute(
+                    "SELECT COUNT(*) FROM events"
+                ).fetchone()[0]
+                existing_started.set()
+                if not release_existing.wait(3):
+                    raise AssertionError("existing snapshot was not released")
+                after = connection.execute(
+                    "SELECT COUNT(*) FROM events"
+                ).fetchone()[0]
+                existing_counts.append((before, after))
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            store.close_reader()
+            existing_finished.set()
+
+    def read_after_reset():
+        try:
+            store.read()
+            queued_started.set()
+            with store.reader_snapshot() as connection:
+                queued_counts.append(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM events"
+                    ).fetchone()[0]
+                )
+                queued_admitted.set()
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            store.close_reader()
+
+    existing = threading.Thread(target=hold_existing_snapshot)
+    queued = threading.Thread(target=read_after_reset)
+    try:
+        assert store.checkpoint("TRUNCATE")["busy"] == 0
+        existing.start()
+        assert existing_started.wait(1)
+
+        first = header(10)
+        first_events = [event(first, index) for index in range(3)]
+        assert len(store.ingest([first], first_events)) == 3
+
+        deferred = store.checkpoint("TRUNCATE", drain_readers=True)
+        assert deferred["busy"] == 1
+        assert deferred["active_reader_snapshots"] == 1
+        assert deferred["reader_drain_pending"] == 1
+        assert deferred["log_frames"] == -1
+
+        queued.start()
+        assert queued_started.wait(1)
+        assert not queued_admitted.wait(0.1)
+
+        second = header(11)
+        assert len(store.ingest([second], [event(second, 0)])) == 1
+        passive = store.checkpoint()
+        assert passive["busy"] == 0
+        assert passive["active_reader_snapshots"] == 1
+        assert passive["reader_drain_pending"] == 1
+        assert passive["log_frames"] > passive["checkpointed_frames"]
+
+        release_existing.set()
+        assert existing_finished.wait(1)
+        assert existing_counts == [(0, 0)]
+
+        recovered = store.checkpoint("TRUNCATE", drain_readers=True)
+        assert recovered["busy"] == 0
+        assert recovered["reader_drain_pending"] == 0
+        assert recovered["backlog_bytes"] == 0
+        assert recovered["wal_bytes"] == 0
+        assert queued_admitted.wait(1)
+        queued.join(1)
+        assert queued_counts == [4]
+        assert failures == []
+    finally:
+        release_existing.set()
+        existing.join(3)
+        queued.join(3)
+        store.close()
+
+
+def test_checkpoint_drain_interrupts_running_managed_query(tmp_path, monkeypatch):
+    monkeypatch.setattr(market_store_module, "_READER_PROGRESS_STEPS", 1)
+    store = MarketStore(
+        tmp_path / "market.sqlite",
+        checkpoint_on_commit=False,
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    failures = []
+
+    def run_query():
+        def hold(value):
+            entered.set()
+            if not release.wait(2):
+                raise AssertionError("blocked read was not released")
+            return value
+
+        try:
+            with store.reader_snapshot() as connection:
+                connection.create_function("hold_read", 1, hold)
+                connection.execute(
+                    "SELECT hold_read(value) FROM frame_probe"
+                ).fetchall()
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            store.close_reader()
+
+    reader = threading.Thread(target=run_query)
+    try:
+        with store.transaction() as connection:
+            connection.execute("CREATE TABLE frame_probe(value INTEGER)")
+            connection.execute("INSERT INTO frame_probe VALUES(1)")
+        store.checkpoint("TRUNCATE")
+
+        reader.start()
+        assert entered.wait(1)
+        with store.transaction() as connection:
+            connection.execute("INSERT INTO frame_probe VALUES(2)")
+
+        deferred = store.checkpoint("TRUNCATE", drain_readers=True)
+        assert deferred["active_reader_snapshots"] == 1
+        assert deferred["reader_drain_pending"] == 1
+        release.set()
+        reader.join(2)
+
+        assert len(failures) == 1
+        assert isinstance(failures[0], sqlite3.OperationalError)
+        assert failures[0].sqlite_errorcode == sqlite3.SQLITE_INTERRUPT
+        recovered = store.checkpoint("TRUNCATE", drain_readers=True)
+        assert recovered["busy"] == 0
+        assert recovered["active_reader_snapshots"] == 0
+        assert recovered["reader_drain_pending"] == 0
+        assert recovered["wal_bytes"] == 0
+    finally:
+        release.set()
+        reader.join(2)
+        store.close()
+
+
+def test_reader_snapshot_nesting_borrows_transactions_without_ending_them(tmp_path):
+    store = MarketStore(tmp_path / "market.sqlite", checkpoint_on_commit=False)
+    try:
+        with store.reader_snapshot() as outer:
+            outer.execute("SELECT COUNT(*) FROM events").fetchone()
+            with store.reader_snapshot() as nested:
+                assert nested is outer
+                assert nested.in_transaction
+                metrics = store.checkpoint()
+                assert metrics["active_reader_snapshots"] == 1
+            assert outer.in_transaction
+        assert not outer.in_transaction
+
+        borrowed = store.read()
+        borrowed.execute("BEGIN")
+        with store.reader_snapshot() as connection:
+            assert connection is borrowed
+            connection.execute("SELECT COUNT(*) FROM events").fetchone()
+        assert borrowed.in_transaction
+        assert store.checkpoint()["active_reader_snapshots"] == 0
+        borrowed.rollback()
+    finally:
+        store.close()
+
+
+def test_cancel_checkpoint_drain_admits_waiting_snapshot(tmp_path):
+    store = MarketStore(tmp_path / "market.sqlite", checkpoint_on_commit=False)
+    queued_started = threading.Event()
+    queued_admitted = threading.Event()
+    failures = []
+
+    def queued_reader():
+        try:
+            store.read()
+            queued_started.set()
+            with store.reader_snapshot() as connection:
+                connection.execute("SELECT COUNT(*) FROM events").fetchone()
+                queued_admitted.set()
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            store.close_reader()
+
+    queued = threading.Thread(target=queued_reader)
+    try:
+        with store.reader_snapshot() as active:
+            active.execute("SELECT COUNT(*) FROM events").fetchone()
+            deferred = store.checkpoint("TRUNCATE", drain_readers=True)
+            assert deferred["reader_drain_pending"] == 1
+            queued.start()
+            assert queued_started.wait(1)
+            assert not queued_admitted.wait(0.1)
+            store.cancel_checkpoint_drain()
+            assert queued_admitted.wait(1)
+        queued.join(1)
+        assert store.checkpoint()["reader_drain_pending"] == 0
+        assert failures == []
+    finally:
+        store.cancel_checkpoint_drain()
+        queued.join(3)
+        store.close()
+
+
+def test_waiting_snapshot_expires_abandoned_reader_drain(tmp_path, monkeypatch):
+    monkeypatch.setattr(market_store_module, "_READER_DRAIN_SECONDS", 0.1)
+    store = MarketStore(tmp_path / "market.sqlite", checkpoint_on_commit=False)
+    queued_started = threading.Event()
+    queued_admitted = threading.Event()
+    release_queued = threading.Event()
+    failures = []
+
+    def queued_reader():
+        try:
+            store.read()
+            queued_started.set()
+            with store.reader_snapshot() as connection:
+                connection.execute("SELECT COUNT(*) FROM events").fetchone()
+                queued_admitted.set()
+                if not release_queued.wait(2):
+                    raise AssertionError("queued snapshot was not released")
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            store.close_reader()
+
+    queued = threading.Thread(target=queued_reader)
+    try:
+        with store.reader_snapshot() as active:
+            active.execute("SELECT COUNT(*) FROM events").fetchone()
+            deferred = store.checkpoint("TRUNCATE", drain_readers=True)
+            assert deferred["reader_drain_pending"] == 1
+            queued.start()
+            assert queued_started.wait(1)
+            assert queued_admitted.wait(1)
+            metrics = store.checkpoint()
+            assert metrics["reader_drain_pending"] == 0
+            retry = store.checkpoint("TRUNCATE", drain_readers=True)
+            assert retry["reader_drain_pending"] == 0
+            assert metrics["active_reader_snapshots"] == 2
+        release_queued.set()
+        queued.join(1)
+        assert failures == []
+    finally:
+        release_queued.set()
+        queued.join(3)
+        store.close()
+
+
+def test_close_wakes_snapshot_waiting_for_reader_drain(tmp_path):
+    store = MarketStore(tmp_path / "market.sqlite", checkpoint_on_commit=False)
+    active_started = threading.Event()
+    release_active = threading.Event()
+    queued_started = threading.Event()
+    queued_done = threading.Event()
+    active_failures = []
+    queued_failures = []
+
+    def active_reader():
+        try:
+            with store.reader_snapshot() as connection:
+                connection.execute("SELECT COUNT(*) FROM events").fetchone()
+                active_started.set()
+                if not release_active.wait(3):
+                    raise AssertionError("active snapshot was not released")
+        except BaseException as exc:
+            active_failures.append(exc)
+        finally:
+            store.close_reader()
+
+    def queued_reader():
+        try:
+            store.read()
+            queued_started.set()
+            with store.reader_snapshot():
+                raise AssertionError("closed store admitted a queued snapshot")
+        except BaseException as exc:
+            queued_failures.append(exc)
+        finally:
+            store.close_reader()
+            queued_done.set()
+
+    active = threading.Thread(target=active_reader)
+    queued = threading.Thread(target=queued_reader)
+    try:
+        active.start()
+        assert active_started.wait(1)
+        deferred = store.checkpoint("TRUNCATE", drain_readers=True)
+        assert deferred["reader_drain_pending"] == 1
+        queued.start()
+        assert queued_started.wait(1)
+        assert not queued_done.wait(0.1)
+
+        store.close()
+        assert queued_done.wait(1)
+        assert len(queued_failures) == 1
+        assert isinstance(queued_failures[0], MarketStoreError)
+    finally:
+        release_active.set()
+        active.join(3)
+        queued.join(3)
+        store.close()
+    assert active_failures == []
 
 
 def test_catalog_replay_and_restart_keep_search_counts_exact(tmp_path):
@@ -272,482 +535,6 @@ def test_catalog_replay_and_restart_keep_search_counts_exact(tmp_path):
         store = MarketStore(path)
         assert store.search_catalog("v3")[1] == 1
         assert store.search_catalog("BBB USDG")[1] == 1
-    finally:
-        store.close()
-
-
-def test_legacy_core_position_repair_is_bounded_resumable_and_atomic(tmp_path):
-    path = tmp_path / "core-position-repair.sqlite"
-    raw_key = "0x" + "ca" * 32
-    v3_pool = "0x" + "31" * 20
-    v4_pool = "0x" + "42" * 32
-    v3_key = core_position_key("v3", v3_pool, raw_key)
-    v4_key = core_position_key("v4", v4_pool, raw_key)
-    blocks = [header(number) for number in range(10, 16)]
-    cursor = {
-        "from_block": 10,
-        "to_block": 15,
-        "block_number": 15,
-        "block_hash": blocks[-1]["hash"],
-    }
-    rows = []
-    for index, block in enumerate(blocks):
-        protocol = "v3" if index < 3 else "v4"
-        pool_id = v3_pool if protocol == "v3" else v4_pool
-        rows.append({
-            **event(block, index),
-            "tx_hash": "0x" + f"{index + 1:064x}",
-            "pool_id": None if index == 5 else pool_id,
-            "protocol": protocol,
-            "position_key": raw_key,
-            "amount0": str(100 + index),
-            "fees_usd": index + 0.25,
-            "accounting_basis": f"evidence-{index}",
-            "data": {
-                "core_position_key": raw_key,
-                "evidence": {"trace": index, "source": "receipt"},
-            },
-        })
-
-    store = MarketStore(path)
-    try:
-        book = AccountBook(store, deferred=True).install()
-        inserted = store.ingest(blocks, rows, lane="live", cursor=cursor)
-        cursor = store.cursor("live")
-        with store.transaction() as connection:
-            connection.execute("DELETE FROM lp_accounting_pending")
-            store._set_metadata(connection, "pending_accounting", 0)
-            connection.execute(
-                "UPDATE lp_accounting_event_keys SET position_key=?",
-                (raw_key,),
-            )
-            book._queue_position_keys(connection, {raw_key: (15, 0, 5)})
-        event_ids = [int(row["id"]) for row in inserted]
-        source_before = [
-            tuple(row) for row in store.read().execute(
-                "SELECT id,block_number,block_hash,tx_hash,amount0,fees_usd,"
-                "accounting_basis,data FROM events "
-                "ORDER BY block_number,tx_index,log_index"
-            )
-        ]
-        raw_generation = int(store.read().execute(
-            "SELECT generation FROM lp_accounting_pending WHERE position_key=?",
-            (raw_key,),
-        ).fetchone()[0])
-
-        assert store.repair_legacy_core_position_keys(limit=2) is True
-        assert [
-            row["position_key"] for row in store.read().execute(
-                "SELECT position_key FROM events "
-                "ORDER BY block_number,tx_index,log_index"
-            )
-        ] == [v3_key, v3_key, raw_key, raw_key, raw_key, raw_key]
-        assert [
-            row["position_key"] for row in store.read().execute(
-                "SELECT position_key FROM lp_accounting_event_keys "
-                "ORDER BY event_id"
-            )
-        ] == [v3_key, v3_key, raw_key, raw_key, raw_key, raw_key]
-        checkpoint = store._metadata(
-            store.read(), "core_position_key_source_repair_v1", {},
-        )
-        assert checkpoint["after_position_key"] == "0x"
-        assert checkpoint["repaired_events"] == 2
-        assert {
-            row["id"] for row in store.read().execute(
-                "SELECT id FROM lp_search_entities WHERE kind='position'"
-            )
-        } == {raw_key, v3_key}
-        first_pending = {
-            row["position_key"]: int(row["generation"])
-            for row in store.read().execute(
-                "SELECT position_key,generation FROM lp_accounting_pending"
-            )
-        }
-        assert first_pending[raw_key] > raw_generation
-        assert v3_key in first_pending
-        assert store.cursor("live") == cursor
-        store.close()
-
-        store = MarketStore(path)
-        AccountBook(store, deferred=True).install()
-        checkpoint = store._metadata(
-            store.read(), "core_position_key_source_repair_v1", {},
-        )
-        assert checkpoint["after_position_key"] == "0x"
-        assert checkpoint["repaired_events"] == 2
-
-        assert store.repair_legacy_core_position_keys(limit=2) is True
-        assert [
-            row["position_key"] for row in store.read().execute(
-                "SELECT position_key FROM events "
-                "ORDER BY block_number,tx_index,log_index"
-            )
-        ] == [v3_key, v3_key, v3_key, v4_key, raw_key, raw_key]
-        assert store.repair_legacy_core_position_keys(limit=2) is True
-        checkpoint = store._metadata(
-            store.read(), "core_position_key_source_repair_v1", {},
-        )
-        assert checkpoint["after_position_key"] == raw_key
-        assert checkpoint["repaired_events"] == 5
-
-        assert store.repair_legacy_core_position_keys(limit=2) is True
-        reset_checkpoint = store._metadata(
-            store.read(), "core_position_key_source_repair_v1", {},
-        )
-        assert reset_checkpoint["after_position_key"] == "0x"
-        assert reset_checkpoint["cycles"] == 1
-        assert "exhausted_revision" not in reset_checkpoint
-        assert store.repair_legacy_core_position_keys(limit=2) is False
-        exhausted = store._metadata(
-            store.read(), "core_position_key_source_repair_v1", {},
-        )
-        assert exhausted["exhausted_revision"] == store.status()["events_revision"]
-        assert store.repair_legacy_core_position_keys(limit=2) is False
-        assert store._metadata(
-            store.read(), "core_position_key_source_repair_v1", {},
-        ) == exhausted
-
-        store.enrich([{"id": event_ids[-1], "pool_id": v4_pool}])
-        assert store.repair_legacy_core_position_keys(limit=1) is True
-        assert store.repair_legacy_core_position_keys(limit=1) is True
-        assert store.repair_legacy_core_position_keys(limit=1) is False
-        assert [
-            row["position_key"] for row in store.read().execute(
-                "SELECT position_key FROM events "
-                "ORDER BY block_number,tx_index,log_index"
-            )
-        ] == [v3_key, v3_key, v3_key, v4_key, v4_key, v4_key]
-        assert [
-            tuple(row) for row in store.read().execute(
-                "SELECT id,block_number,block_hash,tx_hash,amount0,fees_usd,"
-                "accounting_basis,data FROM events "
-                "ORDER BY block_number,tx_index,log_index"
-            )
-        ] == source_before
-        assert [
-            int(row["id"]) for row in store.read().execute(
-                "SELECT id FROM events ORDER BY block_number,tx_index,log_index"
-            )
-        ] == event_ids
-        assert {
-            row["id"] for row in store.read().execute(
-                "SELECT id FROM lp_search_entities WHERE kind='position'"
-            )
-        } == {v3_key, v4_key}
-        assert store.read().execute(
-            "SELECT 1 FROM lp_search_terms "
-            "WHERE kind='position' AND id=? LIMIT 1",
-            (raw_key,),
-        ).fetchone() is None
-        assert [
-            row["position_key"] for row in store.read().execute(
-                "SELECT position_key FROM lp_accounting_event_keys "
-                "ORDER BY event_id"
-            )
-        ] == [v3_key, v3_key, v3_key, v4_key, v4_key, v4_key]
-        pending = {
-            row["position_key"]: (
-                int(row["generation"]), int(row["requested_revision"])
-            )
-            for row in store.read().execute(
-                "SELECT position_key,generation,requested_revision "
-                "FROM lp_accounting_pending"
-            )
-        }
-        assert set(pending) == {raw_key, v3_key, v4_key}
-        assert pending[raw_key][0] > first_pending[raw_key]
-        events_revision = store.status()["events_revision"]
-        assert pending[v4_key][1] == events_revision
-        assert all(
-            0 < requested_revision <= events_revision
-            for _generation, requested_revision in pending.values()
-        )
-        assert store.cursor("live") == cursor
-        assert store.read().execute(
-            "SELECT COUNT(*) FROM events "
-            "WHERE position_key>=? AND position_key<? "
-            "AND LENGTH(position_key)=66",
-            ("0x", "0y"),
-        ).fetchone()[0] == 0
-    finally:
-        store.close()
-
-
-def test_partial_core_position_repair_unqualifies_legacy_episode_money(tmp_path):
-    raw_key = "0x" + "d1" * 32
-    first_pool = "0x" + "31" * 32
-    second_pool = "0x" + "42" * 32
-    first_key = core_position_key("v4", first_pool, raw_key)
-    second_key = core_position_key("v4", second_pool, raw_key)
-    owner = "0x" + "11" * 20
-    blocks = [header(number) for number in range(10, 14)]
-    empty = {
-        "liquidity": "0", "tokens_owed0": "0", "tokens_owed1": "0",
-        "claims_empty": True,
-    }
-    funded = {
-        "liquidity": "1000", "tokens_owed0": "0", "tokens_owed1": "0",
-        "claims_empty": True,
-    }
-    events = []
-    for offset in (0, 2):
-        events.extend([
-            v4_core_effect(
-                blocks[offset], offset, raw_key, "add", 1000, empty, funded,
-                cashflow=(-10_000_000, -10_000_000), deposit_usd=20.0,
-            ),
-            v4_core_effect(
-                blocks[offset + 1], offset + 1, raw_key, "remove", -1000,
-                funded, empty, cashflow=(11_000_000, 10_000_000),
-                fees=(1_000_000, 0), withdrawal_usd=21.0, fees_usd=1.0,
-            ),
-        ])
-    transactions = [{
-        "tx_hash": row["tx_hash"],
-        "block_number": row["block_number"],
-        "block_hash": row["block_hash"],
-        "payer": owner,
-        "gas_usd": 0.1,
-    } for row in events]
-
-    store = MarketStore(tmp_path / "partial-core-position-repair.sqlite")
-    book = AccountBook(store).install()
-    try:
-        store.upsert_pools([
-            {
-                "id": pool_id, "protocol": "v4", "address": "0x" + "22" * 20,
-                "token0": "0x" + "51" * 20, "token1": "0x" + "62" * 20,
-                "decimals0": 6, "decimals1": 6, "created_block": 10,
-            }
-            for pool_id in (first_pool, second_pool)
-        ])
-        store.ingest(blocks, events, transactions=transactions)
-
-        # AccountBook qualifies pool-aware raw keys at ingestion. Attach the
-        # canonical source scopes after projection to recreate the durable
-        # pre-scope ledger with two closed episodes under one raw identity.
-        with store.transaction() as connection:
-            connection.execute(
-                "UPDATE events SET pool_id=CASE WHEN block_number<=11 THEN ? ELSE ? END "
-                "WHERE position_key=?",
-                (first_pool, second_pool, raw_key),
-            )
-            connection.execute(
-                "UPDATE lp_accounting_episodes "
-                "SET pool_id=CASE WHEN opened_block=10 THEN ? ELSE ? END "
-                "WHERE position_key=?",
-                (first_pool, second_pool, raw_key),
-            )
-            connection.execute(
-                "UPDATE lp_accounting_positions SET pool_id=? WHERE position_key=?",
-                (second_pool, raw_key),
-            )
-
-        original = book.closed({"window": "all"})["rows"]
-        assert len(original) == 2
-        assert all(row["position_key"] == raw_key for row in original)
-        assert all(row["coverage"]["qualified"] for row in original)
-        assert all(row["coverage"]["cost_qualified"] for row in original)
-        baseline_owner = book.owner(owner, {"window": "all"})
-        assert baseline_owner["summary"]["gross_pnl_usd"] == pytest.approx(2.0)
-        assert baseline_owner["summary"]["net_pnl_usd"] == pytest.approx(1.6)
-        store.close()
-        store = MarketStore(tmp_path / "partial-core-position-repair.sqlite")
-        book = AccountBook(store, deferred=True).install()
-
-        assert store.repair_legacy_core_position_keys(limit=2) is True
-        assert book.project_pending(limit=1) is True
-
-        partial = book.closed({"window": "all"})
-        migrated = next(
-            row for row in partial["rows"] if row["position_key"] == first_key
-        )
-        unresolved = [
-            row for row in partial["rows"] if row["position_key"] == raw_key
-        ]
-        assert migrated["coverage"]["qualified"] is True
-        assert migrated["gross_pnl_usd"] == pytest.approx(1.0)
-        assert migrated["net_pnl_usd"] == pytest.approx(0.8)
-        assert unresolved
-        assert all(row["coverage"]["qualified"] is False for row in unresolved)
-        assert all(row["coverage"]["cost_qualified"] is False for row in unresolved)
-        assert all(row[field] is None for row in unresolved for field in (
-            "fees_usd", "gross_pnl_usd", "gas_usd", "net_pnl_usd", "return_pct",
-        ))
-
-        partial_owner = book.owner(owner, {"window": "all"})
-        assert partial_owner["summary"]["gross_pnl_usd"] is None
-        assert partial_owner["summary"]["net_pnl_usd"] is None
-        assert partial_owner["summary"]["fees_usd"] is None
-        assert partial_owner["summary"]["win_rate"] is None
-        assert partial_owner["coverage"]["qualified"] is False
-        owner_row = book.owners({
-            "window": "all", "identity_scope": "wallets",
-        })["rows"][0]
-        assert owner_row["gross_pnl_usd"] is None
-        assert owner_row["net_pnl_usd"] is None
-        assert owner_row["fees_usd"] is None
-        assert owner_row["volume_usd"] is None
-        assert owner_row["win_rate"] is None
-        assert owner_row["coverage"]["qualified"] is False
-
-        assert store.repair_legacy_core_position_keys(limit=2) is True
-        drain_accounting(book)
-
-        repaired = book.closed({"window": "all"})
-        assert repaired["total"] == 2
-        assert {row["position_key"] for row in repaired["rows"]} == {
-            first_key, second_key,
-        }
-        assert all(row["coverage"]["qualified"] for row in repaired["rows"])
-        assert all(row["coverage"]["cost_qualified"] for row in repaired["rows"])
-        assert all(row["gross_pnl_usd"] == pytest.approx(1.0)
-                   for row in repaired["rows"])
-        assert all(row["net_pnl_usd"] == pytest.approx(0.8)
-                   for row in repaired["rows"])
-        final_owner = book.owner(owner, {"window": "all"})
-        assert final_owner["summary"]["positions"] == 2
-        assert final_owner["summary"]["closed_episodes"] == 2
-        assert final_owner["summary"]["gross_pnl_usd"] == pytest.approx(2.0)
-        assert final_owner["summary"]["gas_usd"] == pytest.approx(0.4)
-        assert final_owner["summary"]["net_pnl_usd"] == pytest.approx(1.6)
-        assert final_owner["summary"]["fees_usd"] == pytest.approx(2.0)
-        assert final_owner["summary"]["win_rate"] == pytest.approx(100.0)
-        assert final_owner["coverage"]["qualified"] is True
-        assert final_owner["coverage"]["cost_qualified"] is True
-        final_owner_row = book.owners({
-            "window": "all", "identity_scope": "wallets",
-        })["rows"][0]
-        assert final_owner_row["gross_pnl_usd"] == pytest.approx(2.0)
-        assert final_owner_row["gas_usd"] == pytest.approx(0.4)
-        assert final_owner_row["net_pnl_usd"] == pytest.approx(1.6)
-        assert final_owner_row["fees_usd"] == pytest.approx(2.0)
-        assert final_owner_row["volume_usd"] == pytest.approx(82.0)
-        assert final_owner_row["win_rate"] == pytest.approx(100.0)
-        assert final_owner_row["coverage"]["qualified"] is True
-        assert raw_key not in {
-            row["position_key"] for row in book.positions()["rows"]
-        }
-    finally:
-        store.close()
-
-
-def test_partial_core_position_repair_does_not_double_pool_inventory(tmp_path):
-    raw_key = "0x" + "d2" * 32
-    pool_id = "0x" + "73" * 32
-    scoped_key = core_position_key("v4", pool_id, raw_key)
-    liquidity = 10**18
-    blocks = [header(number) for number in range(10, 140)]
-    empty = {
-        "liquidity": "0", "tokens_owed0": "0", "tokens_owed1": "0",
-        "claims_empty": True,
-    }
-    funded = {
-        "liquidity": str(liquidity), "tokens_owed0": "0", "tokens_owed1": "0",
-        "claims_empty": True,
-    }
-    events = [
-        v4_core_effect(
-            blocks[0], 0, raw_key, "add", liquidity, empty, funded,
-        ),
-        *[
-            v4_core_effect(
-                block, index, raw_key, "checkpoint", 0, funded, funded,
-            )
-            for index, block in enumerate(blocks[1:], 1)
-        ],
-    ]
-
-    store = MarketStore(tmp_path / "partial-core-position-inventory.sqlite")
-    book = AccountBook(store).install()
-    try:
-        store.upsert_pools([{
-            "id": pool_id, "protocol": "v4", "address": "0x" + "22" * 20,
-            "token0": "0x" + "51" * 20, "token1": "0x" + "62" * 20,
-            "decimals0": 6, "decimals1": 6, "created_block": 10,
-        }])
-        with store.transaction() as connection:
-            connection.execute(
-                "CREATE TABLE lp_pool_state("
-                "pool_id TEXT PRIMARY KEY,block_number INTEGER NOT NULL,"
-                "tx_index INTEGER NOT NULL,log_index INTEGER NOT NULL,"
-                "timestamp INTEGER NOT NULL,sqrt_price_x96 TEXT,tick INTEGER,"
-                "liquidity TEXT,price0_usd REAL,price1_usd REAL)"
-            )
-            connection.execute(
-                "INSERT INTO lp_pool_state VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (
-                    pool_id, 139, 0, 129, 1_700_000_139, str(1 << 96), 0,
-                    str(liquidity), 1.0, 1.0,
-                ),
-            )
-        store.ingest(blocks, events, cursor={
-            "from_block": 10,
-            "to_block": 139,
-            "block_number": 139,
-            "block_hash": blocks[-1]["hash"],
-        })
-        with store.transaction() as connection:
-            connection.execute(
-                "UPDATE events SET pool_id=? WHERE position_key=?",
-                (pool_id, raw_key),
-            )
-            connection.execute(
-                "UPDATE lp_accounting_positions SET pool_id=? WHERE position_key=?",
-                (pool_id, raw_key),
-            )
-
-        baseline = book.pool_stats([pool_id])[pool_id]
-        assert baseline["open_positions"] == 1
-        assert baseline["complete_inventory"] is True
-        assert baseline["observed_principal_usd"] is not None
-        assert baseline["observed_principal_usd"] > 0
-        assert baseline["observed_active_tvl_usd"] == pytest.approx(
-            baseline["observed_principal_usd"],
-        )
-        store.close()
-        store = MarketStore(tmp_path / "partial-core-position-inventory.sqlite")
-        book = AccountBook(store, deferred=True).install()
-
-        assert store.repair_legacy_core_position_keys(limit=128) is True
-        assert book.project_pending(limit=1) is True
-
-        positions = {
-            row["position_key"]: row
-            for row in book.positions({"status": "open"})["rows"]
-        }
-        assert set(positions) == {raw_key, scoped_key}
-        assert positions[raw_key]["liquidity"] is None
-        assert positions[raw_key]["principal_usd"] is None
-        assert positions[raw_key]["equity_usd"] is None
-        assert positions[raw_key]["coverage"]["qualified"] is False
-        assert int(positions[scoped_key]["liquidity"]) == liquidity
-        partial = book.pool_stats([pool_id])[pool_id]
-        assert partial["open_positions"] == 2
-        assert partial["complete_inventory"] is False
-        assert partial["observed_principal_usd"] == pytest.approx(
-            baseline["observed_principal_usd"],
-        )
-        assert partial["observed_active_tvl_usd"] == pytest.approx(
-            baseline["observed_active_tvl_usd"],
-        )
-
-        assert store.repair_legacy_core_position_keys(limit=128) is True
-        drain_accounting(book)
-
-        repaired_positions = book.positions({"status": "open"})["rows"]
-        assert len(repaired_positions) == 1
-        assert repaired_positions[0]["position_key"] == scoped_key
-        repaired = book.pool_stats([pool_id])[pool_id]
-        assert repaired["open_positions"] == 1
-        assert repaired["complete_inventory"] is True
-        assert repaired["observed_principal_usd"] == pytest.approx(
-            baseline["observed_principal_usd"],
-        )
-        assert repaired["observed_active_tvl_usd"] == pytest.approx(
-            baseline["observed_active_tvl_usd"],
-        )
     finally:
         store.close()
 
@@ -792,276 +579,6 @@ def test_reopen_preserves_durable_counts_and_initializes_only_missing_counts(tmp
         store.close()
 
 
-def test_pending_work_mode_upgrade_preserves_existing_queue(tmp_path):
-    path = tmp_path / "pending-append-upgrade.sqlite"
-    connection = sqlite3.connect(path)
-    connection.executescript("""
-        CREATE TABLE lp_accounting_pending(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            position_key TEXT NOT NULL UNIQUE,
-            generation INTEGER NOT NULL,
-            requested_revision INTEGER NOT NULL,
-            requested_epoch INTEGER NOT NULL,
-            priority_block INTEGER NOT NULL,
-            priority_tx_index INTEGER NOT NULL,
-            priority_log_index INTEGER NOT NULL,
-            identities_ready INTEGER NOT NULL DEFAULT 0,
-            identity_cursor INTEGER NOT NULL DEFAULT 0
-        );
-        INSERT INTO lp_accounting_pending(
-            id,position_key,generation,requested_revision,requested_epoch,
-            priority_block,priority_tx_index,priority_log_index,
-            identities_ready,identity_cursor
-        ) VALUES(41,'existing-position',7,19,3,10,2,5,1,123);
-        PRAGMA user_version=10;
-    """)
-    connection.close()
-
-    with MarketStore(path) as store:
-        assert store.read().execute("PRAGMA user_version").fetchone()[0] == 11
-        assert tuple(store.read().execute(
-            "SELECT id,position_key,generation,append_only,cost_only,"
-            "requested_revision,requested_epoch,priority_block,"
-            "priority_tx_index,priority_log_index,"
-            "identities_ready,identity_cursor "
-            "FROM lp_accounting_pending"
-        ).fetchone()) == (
-            41, "existing-position", 7, 0, 0, 19, 3, 10, 2, 5, 1, 123,
-        )
-
-
-def test_schema_migrations_preserve_durable_accounting_state(tmp_path):
-    path = tmp_path / "schema-migration.sqlite"
-    block = header(10)
-    store = MarketStore(path)
-    try:
-        AccountBook(store).install()
-        store.ingest(
-            [block],
-            [event(block, 0)],
-            cursor={
-                "from_block": 10,
-                "to_block": 10,
-                "block_number": 10,
-                "block_hash": block["hash"],
-            },
-        )
-        cursor = store.cursor("live")
-        accounting_revision = store.read().execute(
-            "SELECT value FROM lp_accounting_meta "
-            "WHERE key='applied_revision'"
-        ).fetchone()[0]
-        with store.transaction() as connection:
-            connection.execute("DROP TABLE lp_accounting_pool_generations")
-            connection.execute(
-                "DROP INDEX lp_accounting_episodes_last_timestamp"
-            )
-            connection.execute(
-                "DROP INDEX lp_accounting_positions_active_inventory"
-            )
-            connection.execute("PRAGMA user_version=4")
-        store.close()
-
-        store = MarketStore(path)
-        reader = store.read()
-        assert [
-            tuple(row) for row in reader.execute(
-                "SELECT block_hash,position_key FROM events"
-            )
-        ] == [(block["hash"], "shared-position")]
-        assert store.cursor("live") == cursor
-        assert [
-            tuple(row) for row in reader.execute(
-                "SELECT lane,start_block,end_block FROM coverage_intervals"
-            )
-        ] == [("live", 10, 10)]
-        assert [
-            tuple(row) for row in reader.execute(
-                "SELECT position_key FROM lp_accounting_positions"
-            )
-        ] == [("shared-position",)]
-        assert [
-            tuple(row) for row in reader.execute(
-                "SELECT position_key FROM lp_accounting_event_keys"
-            )
-        ] == [("shared-position",)]
-        assert reader.execute(
-            "SELECT value FROM lp_accounting_meta "
-            "WHERE key='applied_revision'"
-        ).fetchone()[0] == accounting_revision
-        assert reader.execute(
-            "SELECT COUNT(*) FROM lp_accounting_pool_generations"
-        ).fetchone()[0] == 0
-
-        position_before_v5 = tuple(reader.execute(
-            "SELECT position_key,pool_id,active_episode_id,status,"
-            "history_complete,state_json FROM lp_accounting_positions"
-        ).fetchone())
-        with store.transaction() as connection:
-            connection.execute(
-                "INSERT INTO lp_accounting_pool_generations(pool_id,generation) "
-                "VALUES('preserved-pool',7)"
-            )
-            connection.execute(
-                "DROP INDEX lp_accounting_positions_active_inventory"
-            )
-            connection.execute("PRAGMA user_version=5")
-        store.close()
-
-        store = MarketStore(path)
-        reader = store.read()
-        assert tuple(reader.execute(
-            "SELECT position_key,pool_id,active_episode_id,status,"
-            "history_complete,state_json FROM lp_accounting_positions"
-        ).fetchone()) == position_before_v5
-        assert [
-            tuple(row) for row in reader.execute(
-                "SELECT pool_id,generation FROM lp_accounting_pool_generations"
-            )
-        ] == [("preserved-pool", 7)]
-        assert store.cursor("live") == cursor
-        assert reader.execute(
-            "SELECT value FROM lp_accounting_meta "
-            "WHERE key='applied_revision'"
-        ).fetchone()[0] == accounting_revision
-
-        with store.transaction() as connection:
-            store._queue_enrichment(connection, [{**event(block, 0), "kind": "add"}])
-            connection.execute("DROP INDEX pending_enrichment_financial_order_idx")
-            connection.execute("PRAGMA user_version=6")
-        store.close()
-        store = MarketStore(path)
-        reader = store.read()
-        assert store.pending_enrichments(1)[0]["tx_hash"] == event(block, 0)["tx_hash"]
-        assert store.status()["pending_enrichment"] == 1
-        assert store.cursor("live") == cursor
-        assert tuple(reader.execute(
-            "SELECT position_key,pool_id,active_episode_id,status,"
-            "history_complete,state_json FROM lp_accounting_positions"
-        ).fetchone()) == position_before_v5
-        assert reader.execute(
-            "SELECT value FROM lp_accounting_meta WHERE key='applied_revision'"
-        ).fetchone()[0] == accounting_revision
-
-        with store.transaction() as connection:
-            connection.execute("DELETE FROM lp_accounting_pending")
-            connection.execute(
-                "INSERT INTO lp_accounting_pending("
-                "id,position_key,generation,requested_revision,requested_epoch,"
-                "priority_block,priority_tx_index,priority_log_index"
-                ") VALUES(41,'shared-position',7,19,3,10,2,5)"
-            )
-        def committed_state(connection: sqlite3.Connection) -> dict[str, object]:
-            return {
-                "events": [
-                    tuple(row) for row in connection.execute(
-                        "SELECT id,block_hash,position_key,revision FROM events"
-                    )
-                ],
-                "coverage": [
-                    tuple(row) for row in connection.execute(
-                        "SELECT lane,start_block,end_block,start_hash,end_hash "
-                        "FROM coverage_intervals"
-                    )
-                ],
-                "position": tuple(connection.execute(
-                    "SELECT position_key,pool_id,active_episode_id,status,"
-                    "history_complete,state_json FROM lp_accounting_positions"
-                ).fetchone()),
-                "event_keys": [
-                    tuple(row) for row in connection.execute(
-                        "SELECT event_id,position_key,token_id "
-                        "FROM lp_accounting_event_keys"
-                    )
-                ],
-                "accounting_meta": [
-                    tuple(row) for row in connection.execute(
-                        "SELECT key,value FROM lp_accounting_meta ORDER BY key"
-                    )
-                ],
-                "pool_generations": [
-                    tuple(row) for row in connection.execute(
-                        "SELECT pool_id,generation "
-                        "FROM lp_accounting_pool_generations ORDER BY pool_id"
-                    )
-                ],
-                "pending": tuple(connection.execute(
-                    "SELECT id,position_key,generation,append_only,"
-                    "requested_revision,requested_epoch,priority_block,"
-                    "priority_tx_index,priority_log_index "
-                    "FROM lp_accounting_pending"
-                ).fetchone()),
-            }
-
-        committed_before_v9 = committed_state(reader)
-        with store.transaction() as connection:
-            connection.execute("DROP TABLE lp_accounting_pending_identities")
-            connection.execute(
-                "DROP INDEX lp_accounting_pending_identity_bootstrap"
-            )
-            connection.execute("DROP INDEX lp_accounting_pending_recent")
-            connection.execute(
-                "ALTER TABLE lp_accounting_pending "
-                "RENAME TO lp_accounting_pending_v9"
-            )
-            connection.executescript("""
-                CREATE TABLE lp_accounting_pending(
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    position_key TEXT NOT NULL UNIQUE,
-                    generation INTEGER NOT NULL,
-                    requested_revision INTEGER NOT NULL,
-                    requested_epoch INTEGER NOT NULL,
-                    priority_block INTEGER NOT NULL,
-                    priority_tx_index INTEGER NOT NULL,
-                    priority_log_index INTEGER NOT NULL
-                );
-                INSERT INTO lp_accounting_pending(
-                    id,position_key,generation,requested_revision,requested_epoch,
-                    priority_block,priority_tx_index,priority_log_index
-                )
-                SELECT
-                    id,position_key,generation,requested_revision,requested_epoch,
-                    priority_block,priority_tx_index,priority_log_index
-                FROM lp_accounting_pending_v9;
-                DROP TABLE lp_accounting_pending_v9;
-                CREATE INDEX lp_accounting_pending_recent
-                    ON lp_accounting_pending(
-                        priority_block DESC,priority_tx_index DESC,
-                        priority_log_index DESC,id DESC
-                    );
-                PRAGMA user_version=8;
-            """)
-        store.close()
-
-        store = MarketStore(path)
-        reader = store.read()
-        committed_after_v9 = committed_state(reader)
-        assert committed_after_v9 == committed_before_v9
-        assert store.cursor("live") == cursor
-        assert tuple(reader.execute(
-            "SELECT append_only,identities_ready,identity_cursor "
-            "FROM lp_accounting_pending WHERE position_key='shared-position'"
-        ).fetchone()) == (0, 0, 0)
-
-        with store.transaction() as connection:
-            store._install_accounting_pending_identities(connection)
-            store._install_accounting_pending_identities(connection)
-            connection.execute(
-                "INSERT INTO lp_accounting_pending_identities("
-                "position_key,kind,identity,protocol,pool_id,timestamp"
-                ") VALUES('shared-position','owner','0xowner','v3','',123)"
-            )
-            connection.execute(
-                "DELETE FROM lp_accounting_pending "
-                "WHERE position_key='shared-position'"
-            )
-        assert reader.execute(
-            "SELECT COUNT(*) FROM lp_accounting_pending_identities"
-        ).fetchone()[0] == 0
-    finally:
-        store.close()
-
-
 def test_repeated_search_entities_do_not_duplicate_search_results():
     store = MarketStore(":memory:")
     block = header(10)
@@ -1079,24 +596,41 @@ def test_repeated_search_entities_do_not_duplicate_search_results():
         store.close()
 
 
-def test_reprojection_refreshes_new_position_search_terms():
-    with MarketStore(":memory:") as store:
-        block = header(10)
-        inserted = store.ingest([block], [event(block, 0)])
-        pool_id = "0x" + "33" * 20
-        assert store.search(pool_id) == ([], 0)
+def test_search_batch_skips_noop_updates_and_keeps_late_enrichment():
+    store = MarketStore(":memory:")
+    initial = {
+        "position_key": "late-position",
+        "protocol": "v3",
+        "token_id": None,
+        "pool_id": None,
+    }
+    try:
+        with store.transaction() as connection:
+            store._index_event_search_batch(connection, [initial])
+        changes = store.connection.total_changes
+        with store.transaction() as connection:
+            store._index_event_search_batch(connection, [initial])
+        assert store.connection.total_changes == changes
 
-        def resolve_pool(_connection, events):
-            for row in events:
-                row["pool_id"] = pool_id
+        enriched = {
+            **initial,
+            "token_id": "73",
+            "pool_id": "0x" + "33" * 20,
+        }
+        with store.transaction() as connection:
+            store._index_event_search_batch(connection, [enriched])
 
-        store.register_projection(resolve_pool, lambda _connection, _ancestor: None)
-        store.reproject([inserted[0]["id"]])
-        results, total = store.search(pool_id)
+        results, total = store.search("73")
         assert total == 1
-        assert [(row["kind"], row["id"]) for row in results] == [
-            ("position", "shared-position"),
-        ]
+        assert results == [{
+            "kind": "position",
+            "id": "late-position",
+            "label": "Position 73",
+            "subtitle": "V3 POSITION · late-position",
+            "href": "/lp?q=late-position",
+        }]
+    finally:
+        store.close()
 
 
 def test_search_batch_writes_roll_back_with_the_caller_transaction():
@@ -1328,180 +862,47 @@ def test_pool_metadata_token_tracks_only_committed_material_changes():
     finally:
         store.close()
 
-def test_failed_begin_preserves_atomicity_after_storage_recovery(tmp_path):
-    store = MarketStore(tmp_path / "market.sqlite")
-    connection = store.connection
 
-    class FailingBegin:
-        fail = True
+def test_writer_owned_work_does_not_wait_behind_reader_drain(tmp_path):
+    store = MarketStore(tmp_path / "market.sqlite", checkpoint_on_commit=False)
+    finished = threading.Event()
+    failures = []
+    with store.transaction() as connection:
+        connection.execute("CREATE TABLE nested_reader_probe(value INTEGER)")
+        connection.execute("INSERT INTO nested_reader_probe VALUES(1)")
+    reader = store.read()
+    reader.execute("BEGIN")
+    assert reader.execute("SELECT value FROM nested_reader_probe").fetchone()[0] == 1
 
-        def __getattr__(self, name):
-            return getattr(connection, name)
-
-        def execute(self, statement, *parameters):
-            if statement == "BEGIN IMMEDIATE" and self.fail:
-                self.fail = False
-                raise sqlite3.OperationalError("database or disk is full")
-            return connection.execute(statement, *parameters)
-
-    store.connection = FailingBegin()
-    try:
-        with pytest.raises(sqlite3.OperationalError, match="database or disk is full"):
-            store.update_status(marker="not_started")
-        with pytest.raises(RuntimeError, match="abort work"):
-            with store.transaction():
-                store.update_status(marker="must_roll_back")
-                raise RuntimeError("abort work")
-        assert store.status().get("marker") is None
-
-        store.update_status(marker="recovered")
-        assert store.status()["marker"] == "recovered"
-    finally:
-        store.connection = connection
-        store.close()
-
-
-def test_failed_commit_resets_writer_for_storage_recovery(tmp_path):
-    store = MarketStore(tmp_path / "market.sqlite")
-    connection = store.connection
-
-    class FailingCommit:
-        fail = True
-
-        def __getattr__(self, name):
-            return getattr(connection, name)
-
-        def commit(self):
-            if self.fail:
-                self.fail = False
-                raise sqlite3.OperationalError("database or disk is full")
-            connection.commit()
-
-    store.connection = FailingCommit()
-    try:
-        with pytest.raises(sqlite3.OperationalError, match="database or disk is full"):
-            store.update_status(marker="uncommitted")
-        assert not connection.in_transaction
-
-        store.update_status(marker="recovered")
-        assert store.status()["marker"] == "recovered"
-    finally:
-        store.connection = connection
-        store.close()
-
-
-def test_close_cancels_running_reader_without_losing_committed_data(tmp_path):
-    import sqlite3
-    import threading
-
-    path = tmp_path / "market.sqlite"
-    store = MarketStore(path)
-    block = header(10)
-    store.ingest([block], [event(block, 0)])
-    running = threading.Event()
-    cleanup = threading.Event()
-    closed = threading.Event()
-    errors = []
-
-    def read_forever():
-        connection = store.read()
-
-        def progress():
-            running.set()
-            return int(cleanup.is_set())
-
-        connection.set_progress_handler(progress, 1000)
+    def write():
         try:
-            connection.execute(
-                "WITH RECURSIVE work(n) AS "
-                "(VALUES(0) UNION ALL SELECT n+1 FROM work WHERE n<1000000000) "
-                "SELECT SUM(n) FROM work"
-            ).fetchone()
-        except sqlite3.OperationalError as exc:
-            errors.append(exc.sqlite_errorcode)
+            with store.transaction() as connection:
+                connection.execute("UPDATE nested_reader_probe SET value=2")
+                with store.reader_snapshot() as snapshot:
+                    assert snapshot.execute(
+                        "SELECT value FROM nested_reader_probe"
+                    ).fetchone()[0] == 1
+        except BaseException as exc:
+            failures.append(exc)
         finally:
-            store.close_reader()
+            finished.set()
 
-    def close_store():
-        store.close()
-        closed.set()
-
-    reader = threading.Thread(target=read_forever, daemon=True)
-    closer = threading.Thread(target=close_store, daemon=True)
-    reader.start()
+    writer = threading.Thread(target=write)
     try:
-        assert running.wait(2)
-        closer.start()
-        assert closed.wait(2), "shutdown waited for an abandoned reader"
+        assert store.checkpoint("TRUNCATE", drain_readers=True)["busy"] == 1
+        writer.start()
+        assert finished.wait(0.5), "reader admission stranded an active writer"
+        assert failures == []
+        assert reader.execute(
+            "SELECT value FROM nested_reader_probe"
+        ).fetchone()[0] == 1
+        reader.rollback()
+        assert reader.execute(
+            "SELECT value FROM nested_reader_probe"
+        ).fetchone()[0] == 2
     finally:
-        cleanup.set()
-        reader.join(2)
-        if closer.ident is not None:
-            closer.join(2)
+        store.cancel_checkpoint_drain()
+        reader.rollback()
+        if writer.ident is not None:
+            writer.join(2)
         store.close()
-    assert errors == [sqlite3.SQLITE_INTERRUPT]
-    with MarketStore(path) as reopened:
-        rows = reopened.read().execute(
-            "SELECT block_number,tx_hash FROM events"
-        ).fetchall()
-        assert [tuple(row) for row in rows] == [(10, event(block, 0)["tx_hash"])]
-
-
-def test_rollback_repairs_only_orphan_search_identities(tmp_path):
-    path = tmp_path / "search-reorg.sqlite"
-    with MarketStore(path) as store:
-        first, orphan = header(10), header(11)
-        canonical = event(first, 0)
-        changed = event(orphan, 0)
-        changed.update({"tx_hash": "0x" + "cd" * 32, "token_id": "99"})
-        removed = event(orphan, 1)
-        removed.update({
-            "tx_hash": "0x" + "ef" * 32,
-            "owner": "0x" + "33" * 20,
-            "custody": "0x" + "44" * 20,
-            "position_key": "orphan-position",
-        })
-        store.ingest([first], [canonical])
-        store.ingest([orphan], [changed, removed])
-        store.ensure_search_index()
-        owner_before = store.search(str(canonical["owner"]))
-        store.rollback(10)
-        assert store.search(str(canonical["owner"])) == owner_before
-        for value in (changed["tx_hash"], removed["tx_hash"], removed["owner"],
-                      removed["custody"], removed["position_key"]):
-            assert store.search(str(value)) == ([], 0)
-        position = store.search("shared-position")[0]
-        assert [(row["kind"], row["label"]) for row in position] == [
-            ("position", "Position 7"),
-        ]
-        assert store.search("99") == ([], 0)
-    with MarketStore(path) as reopened:
-        assert reopened.search(str(canonical["owner"])) == owner_before
-        assert reopened.search("orphan-position") == ([], 0)
-
-
-def test_rollback_keeps_shared_tokens_from_unknown_age_cross_protocol_pool():
-    shared_token = "0x" + "55" * 20
-    orphan_token = "0x" + "66" * 20
-    surviving = {
-        "id": "0x" + "77" * 20, "address": "0x" + "77" * 20,
-        "protocol": "v2", "token0": shared_token, "token1": "0x" + "88" * 20,
-        "symbol0": "SHARED", "symbol1": "USDG", "created_block": None,
-    }
-    orphan = {
-        "id": "0x" + "99" * 20, "address": "0x" + "99" * 20,
-        "protocol": "v3", "token0": shared_token, "token1": orphan_token,
-        "symbol0": "SHARED", "symbol1": "ORPHAN", "created_block": 11,
-    }
-    with MarketStore(":memory:") as store:
-        store.upsert_pools([surviving, orphan])
-        store.ensure_search_index()
-        store.rollback(10)
-        assert store.search(orphan["id"]) == ([], 0)
-        assert store.search(orphan_token) == ([], 0)
-        assert store.search("ORPHAN") == ([], 0)
-        shared = store.search(shared_token)[0]
-        assert {(row["kind"], row["id"]) for row in shared} == {
-            ("token", shared_token), ("pool", surviving["id"]),
-        }
-        assert store.search(surviving["id"])[1] == 1

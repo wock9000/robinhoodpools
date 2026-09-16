@@ -7,6 +7,7 @@
   const OWNER_STREAM_LIMIT = 200;
   const REFRESH_MS = 12_000;
   const HISTORY_REFRESH_MS = 15_000;
+  const REQUEST_TIMEOUT_MS = 15_000;
   const FILTER_DELAY_MS = 280;
   const ROBINSCAN = "https://robinscan.io";
   const WINDOW_KEYS = { "1": "1h", "2": "24h", "3": "7d", "4": "30d", "5": "all" };
@@ -1162,7 +1163,8 @@
       return;
     }
     if (!state.poolsEnvelope) {
-      poolsTable.reconcile([], "POOL SUMMARY SYNCING");
+      const failed = state.health.get("pools")?.ok === false;
+      poolsTable.reconcile([], failed ? "POOL DATA UNAVAILABLE · RETRYING" : "POOL SUMMARY SYNCING");
       return;
     }
     const source = Array.isArray(state.poolsEnvelope.rows) ? state.poolsEnvelope.rows : [];
@@ -1785,11 +1787,12 @@
     for (const [key, value] of Object.entries(params || {})) {
       if (value != null && value !== "") query.set(key, String(value));
     }
+    const deadline = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
     const response = await fetch(`${API_ROOT}${path}${query.size ? `?${query.toString()}` : ""}`, {
       method: "GET",
       headers: { Accept: "application/json" },
       cache: "no-store",
-      signal
+      signal: signal ? AbortSignal.any([signal, deadline]) : deadline
     });
     if (!response.ok) {
       let detail = "";
@@ -1921,7 +1924,10 @@
         }
         return payload;
       } catch (error) {
-        if (error.name !== "AbortError" && !controller.signal.aborted && key === poolViewKey()) healthFailure("pools", error);
+        if (error.name !== "AbortError" && !controller.signal.aborted && key === poolViewKey()) {
+          healthFailure("pools", error);
+          scheduleRender("pools", renderPools);
+        }
       } finally {
         if (state.poolRequests.get(key)?.controller === controller) state.poolRequests.delete(key);
         if (key === poolViewKey() && !state.poolRequests.has(key)) byId("pools-table").setAttribute("aria-busy", "false");

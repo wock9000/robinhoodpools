@@ -1,12 +1,11 @@
 """Read-only LP action quoting and unsigned browser-wallet transactions.
 
-Only the canonical chain-4663 Uniswap V3 factory is supported.  Adding
-liquidity uses the byte-for-byte verified MiniRouter2 deployment; positions
-remain keyed to the connected EOA.  Removing liquidity and collecting call the
-pool directly from that EOA: MiniRouter2 cannot burn an EOA-owned position.
+Only the canonical chain-4663 Uniswap V3 factory is supported. MiniRouter2 is
+retired and this service rejects every add-liquidity request. Removing liquidity
+and collecting call the pool directly from the connected EOA.
 
-This module never signs or submits a transaction.  ``prepare`` returns the
-same allowlisted calldata quoted by ``simulate`` only after a fresh chain
+This module never signs or submits a transaction. ``prepare`` returns the same
+allowlisted direct-pool calldata quoted by ``simulate`` only after a fresh chain
 preflight.
 """
 from __future__ import annotations
@@ -23,19 +22,10 @@ from typing import Any
 
 from eth_utils import keccak
 
-from .lp_math import (
-    MAX_SQRT_RATIO, MIN_SQRT_RATIO, amount0_delta, amount1_delta,
-    sqrt_ratio_at_tick, tick_at_sqrt_price_x96,
-)
+from .lp_math import MAX_SQRT_RATIO, MIN_SQRT_RATIO, sqrt_ratio_at_tick, tick_at_sqrt_price_x96
 
 CHAIN_ID = 4663
 V3_FACTORY = "0x1f7d7550b1b028f7571e69a784071f0205fd2efa"
-MINI_ROUTER2 = "0x5295e633dfb504298d4a1896ba0738acb6c89e6a"
-# eth_getCode(0x5295..., chain 4663), verified against
-# contracts/out/MiniRouter2.sol/MiniRouter2.json deployedBytecode.
-MINI_ROUTER2_CODE_HASH = (
-    "0xcd18201e5301c03549d7f4f92d9b6d657bf4a6df29f94add961bf8f46e81671f"
-)
 QUOTE_TTL_S = 120
 MAX_QUOTES = 512
 MIN_TICK = -887272
@@ -43,6 +33,12 @@ MAX_TICK = 887272
 MAX_UINT128 = (1 << 128) - 1
 MAX_UINT256 = (1 << 256) - 1
 ZERO_ADDRESS = "0x" + "00" * 20
+RETIRED_MINI_ROUTER2 = "0x5295e633dfb504298d4a1896ba0738acb6c89e6a"
+ADD_RETIRED_ERROR = (
+    f"adding liquidity through MiniRouter2 {RETIRED_MINI_ROUTER2} is retired because "
+    "the deployment is unsafe; revoke its token allowances and use no transaction "
+    "prepared from an earlier add quote"
+)
 
 _ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 _DECIMAL_RE = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.([0-9]+))?$")
@@ -58,20 +54,14 @@ SEL_TOKEN1 = _selector("token1()")
 SEL_FEE = _selector("fee()")
 SEL_TICK_SPACING = _selector("tickSpacing()")
 SEL_SLOT0 = _selector("slot0()")
-SEL_LIQUIDITY = _selector("liquidity()")
 SEL_GET_POOL = _selector("getPool(address,address,uint24)")
 SEL_DECIMALS = _selector("decimals()")
-SEL_BALANCE_OF = _selector("balanceOf(address)")
-SEL_ALLOWANCE = _selector("allowance(address,address)")
-SEL_APPROVE = _selector("approve(address,uint256)")
 SEL_POSITIONS = _selector("positions(bytes32)")
 SEL_FEE_GROWTH0 = _selector("feeGrowthGlobal0X128()")
 SEL_FEE_GROWTH1 = _selector("feeGrowthGlobal1X128()")
 SEL_TICKS = _selector("ticks(int24)")
-SEL_MINT = _selector("mint(address,int24,int24,uint128)")
 SEL_BURN = _selector("burn(int24,int24,uint128)")
 SEL_COLLECT = _selector("collect(address,int24,int24,uint128,uint128)")
-SEL_GUARD = _selector("guard()")
 
 
 class ActionError(ValueError):
@@ -89,7 +79,6 @@ class _PoolState:
     tick_spacing: int
     sqrt_price_x96: int
     tick: int
-    active_liquidity: int
 
 
 @dataclass(frozen=True)
@@ -235,35 +224,6 @@ def _price_within_bps(old_sqrt: int, new_sqrt: int, bps: int) -> bool:
     return abs(new_squared - old_squared) * 10_000 <= old_squared * bps
 
 
-def _amounts_for_liquidity(sqrt_price: int, sqrt_lower: int, sqrt_upper: int, liquidity: int) -> tuple[int, int]:
-    if sqrt_price <= sqrt_lower:
-        return amount0_delta(sqrt_lower, sqrt_upper, liquidity, round_up=True), 0
-    if sqrt_price < sqrt_upper:
-        return (
-            amount0_delta(sqrt_price, sqrt_upper, liquidity, round_up=True),
-            amount1_delta(sqrt_lower, sqrt_price, liquidity, round_up=True),
-        )
-    return 0, amount1_delta(sqrt_lower, sqrt_upper, liquidity, round_up=True)
-
-
-def _liquidity_for_budgets(
-    sqrt_price: int, sqrt_lower: int, sqrt_upper: int, amount0: int, amount1: int
-) -> int:
-    candidates: list[int] = []
-    if sqrt_price <= sqrt_lower:
-        if amount0 == 0:
-            return 0
-        candidates.append(amount0 * sqrt_lower * sqrt_upper // ((1 << 96) * (sqrt_upper - sqrt_lower)))
-    elif sqrt_price < sqrt_upper:
-        if amount0 == 0 or amount1 == 0:
-            return 0
-        candidates.append(amount0 * sqrt_price * sqrt_upper // ((1 << 96) * (sqrt_upper - sqrt_price)))
-        candidates.append(amount1 * (1 << 96) // (sqrt_price - sqrt_lower))
-    else:
-        if amount1 == 0:
-            return 0
-        candidates.append(amount1 * (1 << 96) // (sqrt_upper - sqrt_lower))
-    return min(min(candidates), MAX_UINT128)
 
 
 def _error_text(exc: Exception) -> str:
@@ -272,7 +232,7 @@ def _error_text(exc: Exception) -> str:
 
 
 class ActionService:
-    """Quote and prepare allowlisted, unsigned canonical-V3 LP operations."""
+    """Quote and prepare direct-pool remove and collect operations."""
 
     _SIMULATE_FIELDS = frozenset(
         {
@@ -328,18 +288,7 @@ class ActionService:
     def _read_uint(self, target: str, data: str, block_tag: str, field: str) -> int:
         return _words(self._eth_call(target, data, block_tag), field)[0]
 
-    def _verify_router(self, block_tag: str) -> None:
-        code = self._rpc("eth_getCode", [MINI_ROUTER2, block_tag])
-        if not isinstance(code, str) or re.fullmatch(r"0x(?:[0-9a-fA-F]{2})+", code) is None:
-            raise ActionError("MiniRouter2 is not deployed at the allowlisted address")
-        digest = "0x" + keccak(bytes.fromhex(code[2:])).hex()
-        if digest != MINI_ROUTER2_CODE_HASH:
-            raise ActionError("MiniRouter2 deployed bytecode does not match the verified implementation")
-        guard = self._read_uint(MINI_ROUTER2, "0x" + SEL_GUARD, block_tag, "MiniRouter2 guard")
-        if guard != 0:
-            raise ActionError("MiniRouter2 is currently busy; rebuild the quote")
-
-    def _load_pool(self, address: str, block_tag: str, *, require_router: bool) -> _PoolState:
+    def _load_pool(self, address: str, block_tag: str) -> _PoolState:
         pool_code = self._rpc("eth_getCode", [address, block_tag])
         if not isinstance(pool_code, str) or pool_code in ("0x", "0x0"):
             raise ActionError("pool_id has no deployed contract code")
@@ -387,9 +336,6 @@ class ActionService:
             raise ActionError("pool tick and sqrt price are inconsistent")
         if slot[6] == 0:
             raise ActionError("pool is currently locked")
-        active = self._read_uint(address, "0x" + SEL_LIQUIDITY, block_tag, "active liquidity")
-        if active > MAX_UINT128:
-            raise ActionError("pool active liquidity exceeds uint128")
 
         decimals: list[int] = []
         for index, token in enumerate((token0, token1)):
@@ -401,8 +347,6 @@ class ActionService:
                 raise ActionError(f"token{index} decimals above 36 are not supported")
             decimals.append(value)
 
-        if require_router:
-            self._verify_router(block_tag)
         return _PoolState(
             address=address,
             token0=token0,
@@ -413,7 +357,6 @@ class ActionService:
             tick_spacing=tick_spacing,
             sqrt_price_x96=sqrt_price,
             tick=tick,
-            active_liquidity=active,
         )
 
     def _position(self, pool: _PoolState, owner: str, lower: int, upper: int, block_tag: str) -> _Position:
@@ -479,13 +422,6 @@ class ActionService:
             position.owed1 + position.liquidity * delta1 // (1 << 128),
         )
 
-    def _balance(self, token: str, owner: str, block_tag: str) -> int:
-        data = _calldata(SEL_BALANCE_OF, _word_address(owner))
-        return self._read_uint(token, data, block_tag, "token balance")
-
-    def _allowance(self, token: str, owner: str, block_tag: str) -> int:
-        data = _calldata(SEL_ALLOWANCE, _word_address(owner), _word_address(MINI_ROUTER2))
-        return self._read_uint(token, data, block_tag, "token allowance")
 
     def _simulate_transaction(
         self, transaction: dict[str, Any], block_tag: str
@@ -542,33 +478,6 @@ class ActionService:
             "simulation": simulation,
         }
 
-    def _approval_step(
-        self,
-        token: str,
-        owner: str,
-        amount: int,
-        index: int,
-        block_tag: str,
-    ) -> dict[str, Any]:
-        transaction = _tx(
-            owner,
-            token,
-            _calldata(SEL_APPROVE, _word_address(MINI_ROUTER2), _word_uint(amount)),
-        )
-        simulation, result = self._simulate_transaction(transaction, block_tag)
-        if simulation["success"] and result not in ("0x", "0x" + _word_uint(1)):
-            simulation = {
-                "success": False,
-                "gas_estimate": simulation["gas_estimate"],
-                "error": "token approve did not return true",
-            }
-        return self._step(
-            f"approve-token{index}",
-            "approval",
-            f"Set token{index} allowance to the exact quoted spend ceiling ({amount} raw units)",
-            transaction,
-            simulation,
-        )
 
     def _base_summary(self, pool: _PoolState, lower: int, upper: int) -> dict[str, Any]:
         return {
@@ -591,11 +500,13 @@ class ActionService:
         if extra:
             raise ActionError("unexpected simulation fields: " + ", ".join(sorted(extra)))
 
+        action = payload["action"]
+        if action == "add":
+            raise ActionError(ADD_RETIRED_ERROR)
+        if action not in ("remove", "collect"):
+            raise ActionError("action must be remove or collect")
         pool_id = _address(payload["pool_id"], "pool_id")
         owner = _address(payload["owner"], "owner")
-        action = payload["action"]
-        if action not in ("add", "remove", "collect"):
-            raise ActionError("action must be add, remove, or collect")
         lower = _integer(payload["tick_lower"], "tick_lower", -(1 << 23), (1 << 23) - 1)
         upper = _integer(payload["tick_upper"], "tick_upper", -(1 << 23), (1 << 23) - 1)
         amount0_text = _decimal_text(payload["amount0"], "amount0")
@@ -609,24 +520,18 @@ class ActionService:
         header = self._header("latest")
         block = header["number"]
         block_tag = hex(block)
-        pool = self._load_pool(pool_id, block_tag, require_router=action == "add")
+        pool = self._load_pool(pool_id, block_tag)
         self._validate_range(lower, upper, pool.tick_spacing)
         amount0_raw = _raw_amount(amount0_text, pool.decimals0, "amount0")
         amount1_raw = _raw_amount(amount1_text, pool.decimals1, "amount1")
-        if action != "add" and (amount0_raw or amount1_raw):
+        if amount0_raw or amount1_raw:
             raise ActionError(
                 "amount0 and amount1 must be zero for direct remove/collect; this pool surface has no on-chain minimum-output parameter"
             )
 
         summary = self._base_summary(pool, lower, upper)
         warnings: list[str] = []
-        if action == "add":
-            warnings.append(
-                "This router has no on-chain deadline or price guard. Exact allowances "
-                "cap token spending; quote expiry and price checks apply before signing, "
-                "not after submission."
-            )
-        elif action == "remove":
+        if action == "remove":
             warnings.append(
                 "Direct pool burns have no on-chain minimum output or deadline. Price "
                 "is checked before signing only; token composition can change before mining."
@@ -634,209 +539,112 @@ class ActionService:
         steps: list[dict[str, Any]] = []
         record_extra: dict[str, Any] = {}
 
-        if action == "add":
-            if amount0_raw == 0 and amount1_raw == 0:
-                raise ActionError("at least one add amount must be positive")
-            sqrt_lower = sqrt_ratio_at_tick(lower)
-            sqrt_upper = sqrt_ratio_at_tick(upper)
-            scale = 10_000 + slippage_bps
-            budget0 = amount0_raw * 10_000 // scale
-            budget1 = amount1_raw * 10_000 // scale
-            liquidity = _liquidity_for_budgets(
-                pool.sqrt_price_x96, sqrt_lower, sqrt_upper, budget0, budget1
-            )
+        position = self._position(pool, owner, lower, upper, block_tag)
+        fees0, fees1 = self._uncollected_fees(
+            pool, position, lower, upper, block_tag
+        )
+        collect_tx = _tx(
+            owner,
+            pool.address,
+            _calldata(
+                SEL_COLLECT,
+                _word_address(owner),
+                _word_int(lower),
+                _word_int(upper),
+                _word_uint(MAX_UINT128),
+                _word_uint(MAX_UINT128),
+            ),
+        )
+        if action == "remove":
+            if position.liquidity == 0:
+                raise ActionError("owner has no liquidity in this exact pool range")
+            liquidity = position.liquidity * liquidity_bps // 10_000
             if liquidity == 0:
-                raise ActionError(
-                    "amounts are too small, or the token required at the current range side has a zero budget"
-                )
-            quoted0, quoted1 = _amounts_for_liquidity(
-                pool.sqrt_price_x96, sqrt_lower, sqrt_upper, liquidity
-            )
-            # User-entered maxima are stable across approval receipts.  Deriving
-            # allowances from the spot quote would change them after every
-            # price move and trap the wallet in an approval/re-simulation loop.
-            # A leg unused at this quote is forced to zero so crossing the range
-            # cannot silently activate a previously broad allowance.
-            ceiling0 = amount0_raw if quoted0 else 0
-            ceiling1 = amount1_raw if quoted1 else 0
-            if quoted0 > ceiling0 or quoted1 > ceiling1:
-                raise ActionError("integer rounding leaves no liquidity inside the requested spend ceilings")
-            balances = (
-                self._balance(pool.token0, owner, block_tag),
-                self._balance(pool.token1, owner, block_tag),
-            )
-            ceilings = (ceiling0, ceiling1)
-            summary.update(
-                amount0=_format_units(quoted0, pool.decimals0),
-                amount1=_format_units(quoted1, pool.decimals1),
-                liquidity=str(liquidity),
-                share_pct=(
-                    round(liquidity / (pool.active_liquidity + liquidity) * 100, 8)
-                    if lower <= pool.tick < upper and pool.active_liquidity + liquidity
-                    else 0.0
-                ),
-            )
-            if any(balance < ceiling for balance, ceiling in zip(balances, ceilings)):
-                missing_tokens = [
-                    f"token{index} balance {balance} is below spend ceiling {ceiling}"
-                    for index, (balance, ceiling) in enumerate(zip(balances, ceilings))
-                    if balance < ceiling
-                ]
-                warnings.extend(missing_tokens)
-            else:
-                allowances = (
-                    self._allowance(pool.token0, owner, block_tag),
-                    self._allowance(pool.token1, owner, block_tag),
-                )
-                for index, (token, allowance, ceiling) in enumerate(
-                    zip((pool.token0, pool.token1), allowances, ceilings)
-                ):
-                    if allowance != ceiling:
-                        steps.append(
-                            self._approval_step(token, owner, ceiling, index, block_tag)
-                        )
-                if steps:
-                    warnings.append(
-                        "Mint is intentionally withheld until every router allowance equals its bounded ceiling; approve, wait for receipts, then re-simulate"
-                    )
-                else:
-                    mint_tx = _tx(
-                        owner,
-                        MINI_ROUTER2,
-                        _calldata(
-                            SEL_MINT,
-                            _word_address(pool.address),
-                            _word_int(lower),
-                            _word_int(upper),
-                            _word_uint(liquidity),
-                        ),
-                    )
-                    simulation, _ = self._simulate_transaction(mint_tx, block_tag)
-                    steps.append(
-                        self._step(
-                            "mint",
-                            "add",
-                            "Mint EOA-owned V3 liquidity through verified MiniRouter2 within exact token allowance ceilings",
-                            mint_tx,
-                            simulation,
-                        )
-                    )
-            record_extra.update(
-                liquidity=liquidity,
-                ceilings=[ceiling0, ceiling1],
-                quoted_amounts=[quoted0, quoted1],
-            )
-        else:
-            position = self._position(pool, owner, lower, upper, block_tag)
-            fees0, fees1 = self._uncollected_fees(
-                pool, position, lower, upper, block_tag
-            )
-            collect_tx = _tx(
+                raise ActionError("liquidity_bps rounds to zero raw liquidity")
+            burn_tx = _tx(
                 owner,
                 pool.address,
                 _calldata(
-                    SEL_COLLECT,
-                    _word_address(owner),
-                    _word_int(lower),
-                    _word_int(upper),
-                    _word_uint(MAX_UINT128),
-                    _word_uint(MAX_UINT128),
+                    SEL_BURN, _word_int(lower), _word_int(upper), _word_uint(liquidity)
                 ),
             )
-            if action == "remove":
-                if position.liquidity == 0:
-                    raise ActionError("owner has no liquidity in this exact pool range")
-                liquidity = position.liquidity * liquidity_bps // 10_000
-                if liquidity == 0:
-                    raise ActionError("liquidity_bps rounds to zero raw liquidity")
-                burn_tx = _tx(
-                    owner,
-                    pool.address,
-                    _calldata(
-                        SEL_BURN, _word_int(lower), _word_int(upper), _word_uint(liquidity)
+            burn_sim, burn_result = self._simulate_transaction(burn_tx, block_tag)
+            burn0 = burn1 = 0
+            if burn_sim["success"] and burn_result is not None:
+                burn_words = _words(burn_result, "burn result", 2)
+                burn0, burn1 = burn_words[0], burn_words[1]
+            collect_sim, _ = self._simulate_transaction(collect_tx, block_tag)
+            steps.extend(
+                (
+                    self._step(
+                        "burn",
+                        "remove",
+                        "Burn EOA-owned liquidity directly on the pool; this also realizes lazy fees into the position",
+                        burn_tx,
+                        burn_sim,
                     ),
-                )
-                burn_sim, burn_result = self._simulate_transaction(burn_tx, block_tag)
-                burn0 = burn1 = 0
-                if burn_sim["success"] and burn_result is not None:
-                    burn_words = _words(burn_result, "burn result", 2)
-                    burn0, burn1 = burn_words[0], burn_words[1]
-                collect_sim, _ = self._simulate_transaction(collect_tx, block_tag)
-                steps.extend(
-                    (
-                        self._step(
-                            "burn",
-                            "remove",
-                            "Burn EOA-owned liquidity directly on the pool; this also realizes lazy fees into the position",
-                            burn_tx,
-                            burn_sim,
-                        ),
-                        self._step(
-                            "collect",
-                            "collect",
-                            "After burn is mined, collect all credited principal and fees directly to the owner",
-                            collect_tx,
-                            collect_sim,
-                        ),
-                    )
-                )
-                summary.update(
-                    amount0=_format_units(burn0 + fees0, pool.decimals0),
-                    amount1=_format_units(burn1 + fees1, pool.decimals1),
-                    liquidity=str(liquidity),
-                    share_pct=round(liquidity / position.liquidity * 100, 8),
-                )
-                record_extra.update(
-                    liquidity=liquidity, ceilings=[0, 0], requires_poke=False
-                )
-            else:
-                if fees0 == 0 and fees1 == 0:
-                    raise ActionError(
-                        "this exact owner range has no accrued or credited fees to collect"
-                    )
-                requires_poke = position.liquidity > 0
-                if requires_poke:
-                    poke_tx = _tx(
-                        owner,
-                        pool.address,
-                        _calldata(
-                            SEL_BURN,
-                            _word_int(lower),
-                            _word_int(upper),
-                            _word_uint(0),
-                        ),
-                    )
-                    poke_sim, _ = self._simulate_transaction(poke_tx, block_tag)
-                    steps.append(
-                        self._step(
-                            "poke",
-                            "poke",
-                            "Realize lazy V3 fee growth with a zero-liquidity burn; position liquidity is unchanged",
-                            poke_tx,
-                            poke_sim,
-                        )
-                    )
-                collect_sim, _ = self._simulate_transaction(collect_tx, block_tag)
-                steps.append(
                     self._step(
                         "collect",
                         "collect",
-                        (
-                            "After poke is mined, collect all credited token0/token1 directly to the owner"
-                            if requires_poke
-                            else "Collect all credited token0/token1 directly to the owner"
-                        ),
+                        "After burn is mined, collect all credited principal and fees directly to the owner",
                         collect_tx,
                         collect_sim,
+                    ),
+                )
+            )
+            summary.update(
+                amount0=_format_units(burn0 + fees0, pool.decimals0),
+                amount1=_format_units(burn1 + fees1, pool.decimals1),
+                liquidity=str(liquidity),
+                share_pct=round(liquidity / position.liquidity * 100, 8),
+            )
+            record_extra.update(liquidity=liquidity, requires_poke=False)
+        else:
+            if fees0 == 0 and fees1 == 0:
+                raise ActionError(
+                    "this exact owner range has no accrued or credited fees to collect"
+                )
+            requires_poke = position.liquidity > 0
+            if requires_poke:
+                poke_tx = _tx(
+                    owner,
+                    pool.address,
+                    _calldata(
+                        SEL_BURN,
+                        _word_int(lower),
+                        _word_int(upper),
+                        _word_uint(0),
+                    ),
+                )
+                poke_sim, _ = self._simulate_transaction(poke_tx, block_tag)
+                steps.append(
+                    self._step(
+                        "poke",
+                        "poke",
+                        "Realize lazy V3 fee growth with a zero-liquidity burn; position liquidity is unchanged",
+                        poke_tx,
+                        poke_sim,
                     )
                 )
-                summary.update(
-                    amount0=_format_units(fees0, pool.decimals0),
-                    amount1=_format_units(fees1, pool.decimals1),
+            collect_sim, _ = self._simulate_transaction(collect_tx, block_tag)
+            steps.append(
+                self._step(
+                    "collect",
+                    "collect",
+                    (
+                        "After poke is mined, collect all credited token0/token1 directly to the owner"
+                        if requires_poke
+                        else "Collect all credited token0/token1 directly to the owner"
+                    ),
+                    collect_tx,
+                    collect_sim,
                 )
-                record_extra.update(
-                    liquidity=0, ceilings=[0, 0], requires_poke=requires_poke
-                )
+            )
+            summary.update(
+                amount0=_format_units(fees0, pool.decimals0),
+                amount1=_format_units(fees1, pool.decimals1),
+            )
+            record_extra.update(liquidity=0, requires_poke=requires_poke)
 
         failed = [step for step in steps if not step["simulation"]["success"]]
         if failed:
@@ -848,7 +656,6 @@ class ActionService:
             or None
         )
         operation_ids = {
-            "add": {"mint"},
             "remove": {"burn", "collect"},
             "collect": (
                 {"poke", "collect"} if record_extra.get("requires_poke") else {"collect"}
@@ -930,9 +737,15 @@ class ActionService:
         canonical = json.dumps(binding, sort_keys=True, separators=(",", ":")).encode()
         if hashlib.sha256(canonical).hexdigest() != record["binding_hash"]:
             raise RuntimeError("stored simulation integrity check failed")
+        if (
+            binding.get("action") == "add"
+            or step_id == "mint"
+            or step_id.startswith("approve-token")
+        ):
+            raise ActionError(ADD_RETIRED_ERROR)
         step = record["steps"].get(step_id)
         if step is None:
-            raise ActionError("step_id is not part of this simulation; rebuild after any approval")
+            raise ActionError("step_id is not part of this simulation; rebuild the quote")
         if not step["simulation"]["success"]:
             raise ActionError(
                 f"step {step_id} was not executable in the quote: {step['simulation']['error']}"
@@ -958,120 +771,67 @@ class ActionService:
             raise ActionError("quoted block was reorganized; rebuild the quote")
         latest = self._header("latest")
         latest_tag = hex(latest["number"])
-        pool = self._load_pool(
-            binding["pool"], latest_tag, require_router=binding["action"] == "add"
-        )
+        pool = self._load_pool(binding["pool"], latest_tag)
         if self._metadata(pool) != binding["pool_metadata"]:
             raise ActionError("pool metadata changed since simulation; rebuild the quote")
 
         step_id = step["id"]
-        if step_id.startswith("approve-token"):
-            index = int(step_id[-1])
-            if index not in (0, 1):
-                raise RuntimeError("stored approval step is malformed")
-            token = (pool.token0, pool.token1)[index]
-            ceiling = binding["ceilings"][index]
+        if step_id == "burn" and not _price_within_bps(
+            int(binding["sqrt_price_x96"]), pool.sqrt_price_x96, binding["slippage_bps"]
+        ):
+            raise ActionError("pool price moved beyond slippage_bps; rebuild the quote")
+        lower, upper = binding["tick_lower"], binding["tick_upper"]
+        self._validate_range(lower, upper, pool.tick_spacing)
+        if step_id == "burn":
+            if binding["action"] != "remove":
+                raise RuntimeError("stored burn action is malformed")
             expected = _tx(
                 owner,
-                token,
-                _calldata(SEL_APPROVE, _word_address(MINI_ROUTER2), _word_uint(ceiling)),
+                pool.address,
+                _calldata(
+                    SEL_BURN,
+                    _word_int(lower),
+                    _word_int(upper),
+                    _word_uint(binding["liquidity"]),
+                ),
             )
-            if step["transaction"] != expected:
-                raise RuntimeError("stored approval transaction is malformed")
+            position = self._position(pool, owner, lower, upper, latest_tag)
+            if position.liquidity < binding["liquidity"]:
+                raise ActionError(
+                    "owner position liquidity is now below the quoted burn amount; rebuild the quote"
+                )
+        elif step_id == "poke":
+            if binding["action"] != "collect" or not binding.get("requires_poke"):
+                raise RuntimeError("stored poke action is malformed")
+            expected = _tx(
+                owner,
+                pool.address,
+                _calldata(
+                    SEL_BURN,
+                    _word_int(lower),
+                    _word_int(upper),
+                    _word_uint(0),
+                ),
+            )
+        elif step_id == "collect":
+            if binding["action"] not in ("remove", "collect"):
+                raise RuntimeError("stored collect action is malformed")
+            expected = _tx(
+                owner,
+                pool.address,
+                _calldata(
+                    SEL_COLLECT,
+                    _word_address(owner),
+                    _word_int(lower),
+                    _word_int(upper),
+                    _word_uint(MAX_UINT128),
+                    _word_uint(MAX_UINT128),
+                ),
+            )
         else:
-            if step_id in ("mint", "burn") and not _price_within_bps(
-                int(binding["sqrt_price_x96"]), pool.sqrt_price_x96, binding["slippage_bps"]
-            ):
-                raise ActionError("pool price moved beyond slippage_bps; rebuild the quote")
-            lower, upper = binding["tick_lower"], binding["tick_upper"]
-            self._validate_range(lower, upper, pool.tick_spacing)
-            if step_id == "mint":
-                if binding["action"] != "add":
-                    raise RuntimeError("stored mint action is malformed")
-                expected = _tx(
-                    owner,
-                    MINI_ROUTER2,
-                    _calldata(
-                        SEL_MINT,
-                        _word_address(pool.address),
-                        _word_int(lower),
-                        _word_int(upper),
-                        _word_uint(binding["liquidity"]),
-                    ),
-                )
-                ceilings = tuple(binding["ceilings"])
-                allowances = (
-                    self._allowance(pool.token0, owner, latest_tag),
-                    self._allowance(pool.token1, owner, latest_tag),
-                )
-                if allowances != ceilings:
-                    raise ActionError(
-                        "router allowances no longer equal the exact spend ceilings; rebuild the quote"
-                    )
-                balances = (
-                    self._balance(pool.token0, owner, latest_tag),
-                    self._balance(pool.token1, owner, latest_tag),
-                )
-                if any(balance < ceiling for balance, ceiling in zip(balances, ceilings)):
-                    raise ActionError("token balance fell below the quoted spend ceiling")
-                current_amounts = _amounts_for_liquidity(
-                    pool.sqrt_price_x96,
-                    sqrt_ratio_at_tick(lower),
-                    sqrt_ratio_at_tick(upper),
-                    binding["liquidity"],
-                )
-                if any(amount > ceiling for amount, ceiling in zip(current_amounts, ceilings)):
-                    raise ActionError("current mint amounts exceed the exact spend ceilings")
-            elif step_id == "burn":
-                if binding["action"] != "remove":
-                    raise RuntimeError("stored burn action is malformed")
-                expected = _tx(
-                    owner,
-                    pool.address,
-                    _calldata(
-                        SEL_BURN,
-                        _word_int(lower),
-                        _word_int(upper),
-                        _word_uint(binding["liquidity"]),
-                    ),
-                )
-                position = self._position(pool, owner, lower, upper, latest_tag)
-                if position.liquidity < binding["liquidity"]:
-                    raise ActionError(
-                        "owner position liquidity is now below the quoted burn amount; rebuild the quote"
-                    )
-            elif step_id == "poke":
-                if binding["action"] != "collect" or not binding.get("requires_poke"):
-                    raise RuntimeError("stored poke action is malformed")
-                expected = _tx(
-                    owner,
-                    pool.address,
-                    _calldata(
-                        SEL_BURN,
-                        _word_int(lower),
-                        _word_int(upper),
-                        _word_uint(0),
-                    ),
-                )
-            elif step_id == "collect":
-                if binding["action"] not in ("remove", "collect"):
-                    raise RuntimeError("stored collect action is malformed")
-                expected = _tx(
-                    owner,
-                    pool.address,
-                    _calldata(
-                        SEL_COLLECT,
-                        _word_address(owner),
-                        _word_int(lower),
-                        _word_int(upper),
-                        _word_uint(MAX_UINT128),
-                        _word_uint(MAX_UINT128),
-                    ),
-                )
-            else:
-                raise RuntimeError("stored operation step is malformed")
-            if step["transaction"] != expected:
-                raise RuntimeError("stored operation transaction is malformed")
+            raise RuntimeError("stored operation step is malformed")
+        if step["transaction"] != expected:
+            raise RuntimeError("stored operation transaction is malformed")
 
         simulation, _ = self._simulate_transaction(step["transaction"], latest_tag)
         if not simulation["success"]:

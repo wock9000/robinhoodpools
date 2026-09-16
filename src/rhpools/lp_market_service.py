@@ -9,8 +9,9 @@ import json
 import math
 import threading
 import time
+import traceback
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -1644,8 +1645,8 @@ class LPMarketService:
         self.claims.close()
         self.indexer.close()
         self.book.close()
-        self._frame_executor.shutdown(wait=True, cancel_futures=True)
         self.store.close()
+        self._frame_executor.shutdown(wait=True, cancel_futures=True)
 
     def _load_status(self) -> dict[str, Any]:
         out = dict(self.store.status())
@@ -1800,11 +1801,12 @@ class LPMarketService:
         events_revision = int(status.get("events_revision") or 0)
 
         def load():
-            rows = self.store.read().execute(
-                f"SELECT pool_id,{_SUM_FIELDS} FROM lp_pool_buckets "
-                f"WHERE {clause} GROUP BY pool_id",
-                args,
-            ).fetchall()
+            with self.store.reader_snapshot() as connection:
+                rows = connection.execute(
+                    f"SELECT pool_id,{_SUM_FIELDS} FROM lp_pool_buckets "
+                    f"WHERE {clause} GROUP BY pool_id",
+                    args,
+                ).fetchall()
             return {
                 str(row["pool_id"]): tuple(
                     row[field] or 0 for field in BUCKET_FIELDS
@@ -1998,12 +2000,8 @@ class LPMarketService:
             owner_revision if capital_sort else None,
             snapshot_pool_metadata_token,
         )
-        def load():
-            conn = self.store.read()
-            bucket_aggregates = (
-                self._bucket_aggregates(status, start, end)
-                if aggregate_fields is not None else None
-            )
+
+        def materialize(conn, bucket_aggregates):
             metric_ctes = []
             if sort == "lps":
                 metric_ctes.append(
@@ -2244,6 +2242,14 @@ class LPMarketService:
                 "epoch": int(status.get("epoch") or 0),
                 "as_of": status["as_of"],
             }
+
+        def load():
+            with self.store.reader_snapshot() as conn:
+                bucket_aggregates = (
+                    self._bucket_aggregates(status, start, end)
+                    if aggregate_fields is not None else None
+                )
+                return materialize(conn, bucket_aggregates)
         return self._cached(
             (
                 "pools", snapshot_revision, snapshot_pool_metadata_token,
@@ -2570,7 +2576,7 @@ class LPMarketService:
                 conditions.append("e.block_number>=?")
                 args.append(window_floor)
 
-        def load():
+        def materialize(connection):
             selected_columns = (
                 "e.id,e.block_number,e.tx_index,e.log_index "
             )
@@ -2598,7 +2604,7 @@ class LPMarketService:
                     "e.log_index DESC LIMIT ?"
                 )
                 query_args = [*args, limit]
-            rows = self.store.read().execute(
+            rows = connection.execute(
                 "WITH selected AS MATERIALIZED (" + selection + ") "
                 "SELECT e.*,p.token0,p.token1,p.symbol0,p.symbol1,"
                 "p.decimals0,p.decimals1,p.protocol AS pool_protocol,"
@@ -2631,6 +2637,10 @@ class LPMarketService:
                 )
                 output.append(event)
             return {"rows": output, "cursor": output[-1]["id"] if output else None}
+
+        def load():
+            with self.store.reader_snapshot() as connection:
+                return materialize(connection)
 
         # Durable event and pool-metadata versions identify when these rows can
         # change. The response still carries the current revision and coverage.
@@ -2776,6 +2786,7 @@ class LPMarketService:
         selected = self.book.decorate_owner_activity(
             rows[offset:offset + limit], params,
         )
+        self.book.decorate_owner_financial_state(selected, params)
         accounting_as_of = candidates.get("accounting_as_of")
         for row in selected:
             if not isinstance(row.get("activity"), Mapping):
@@ -2894,6 +2905,18 @@ class LPMarketService:
         }
 
 
+    def _frame_read_task(self, read: Callable[..., Any], *args, **kwargs):
+        """Release worker-owned cursors even when a Future retains an error."""
+        try:
+            return read(*args, **kwargs)
+        except BaseException as exc:
+            # Futures retain exception frames. Drop their completed locals so
+            # abandoned SQLite cursors cannot keep a closed reader's WAL alive.
+            traceback.clear_frames(exc.__traceback__)
+            raise
+        finally:
+            self.store.close_reader()
+
     def _materialize_owner_projection(
             self, params: Mapping[str, Any],
     ) -> tuple[tuple[int, int, int, int], float | None, dict[str, Any]]:
@@ -2973,6 +2996,7 @@ class LPMarketService:
                                 leader = True
                             else:
                                 pending = self._frame_executor.submit(
+                                    self._frame_read_task,
                                     self._materialize_owner_projection, dict(params),
                                 )
                             self._frame_futures[future_key] = pending
@@ -3093,6 +3117,7 @@ class LPMarketService:
             future = self._frame_futures.get(key)
             if future is None:
                 future = self._frame_executor.submit(
+                    self._frame_read_task,
                     self.frame, dict(params), int(after), int(epoch),
                     _status=status,
                 )

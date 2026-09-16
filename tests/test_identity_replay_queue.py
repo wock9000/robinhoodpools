@@ -7,7 +7,6 @@ def test_migrated_identity_queue_preserves_data_and_ready_order(tmp_path, monkey
     now = 1_700_000_000
     monkeypatch.setattr("rhpools.lp_market_index.time.time", lambda: now)
     path = tmp_path / "market.sqlite"
-    columns = "tx_hash,block_number,block_hash,attempts,next_attempt,last_error,created_at,updated_at"
     store = MarketStore(path)
     with store.transaction() as conn:
         store._set_metadata(conn, "epoch", 7)
@@ -27,7 +26,9 @@ def test_migrated_identity_queue_preserves_data_and_ready_order(tmp_path, monkey
             )
         )
         conn.executemany(
-            f"INSERT INTO pending_enrichment({columns}) VALUES(?,?,?,?,?,?,?,?)", rows,
+            "INSERT INTO pending_enrichment"
+            "(tx_hash,block_number,block_hash,attempts,next_attempt,last_error,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?)", rows,
         )
         # Reconstruct the previous queue schema, then use the ordinary open path.
         conn.execute("DROP INDEX pending_enrichment_identity_immediate_idx")
@@ -37,10 +38,9 @@ def test_migrated_identity_queue_preserves_data_and_ready_order(tmp_path, monkey
             "ON pending_enrichment(block_number,tx_hash,next_attempt) "
             "WHERE last_error GLOB 'pool_identity_pending:*'"
         )
-        conn.execute("ALTER TABLE pending_enrichment DROP COLUMN generation")
         conn.execute("PRAGMA user_version=3")
     before = [tuple(row) for row in store.read().execute(
-        f"SELECT {columns} FROM pending_enrichment ORDER BY block_number,tx_hash"
+        "SELECT * FROM pending_enrichment ORDER BY block_number,tx_hash"
     )]
     store.close()
 
@@ -49,16 +49,12 @@ def test_migrated_identity_queue_preserves_data_and_ready_order(tmp_path, monkey
     indexer.store = store
     try:
         assert [tuple(row) for row in store.read().execute(
-            f"SELECT {columns} FROM pending_enrichment ORDER BY block_number,tx_hash"
+            "SELECT * FROM pending_enrichment ORDER BY block_number,tx_hash"
         )] == before
         status = store.status()
         assert status["epoch"] == 7
         assert status["indexed_head"] == 100
         assert [row["block_number"] for row in indexer._pending_pool_identity_replays(4)] == [18, 19, 20, 21]
-        assert [
-            row["block_number"]
-            for row in indexer._pending_pool_identity_replays(4, newest=True)
-        ] == [23, 21, 20, 19]
         with store.transaction() as conn:
             conn.execute("UPDATE pending_enrichment SET next_attempt=? WHERE tx_hash='tx-018'", (now + 30,))
         assert [row["block_number"] for row in indexer._pending_pool_identity_replays(4)] == [19, 20, 21, 23]

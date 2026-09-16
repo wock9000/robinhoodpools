@@ -138,11 +138,6 @@
     rangeLower: $("range-lower"),
     rangeUpper: $("range-upper"),
     rangePrices: $("range-prices"),
-    amountFields: $("amount-fields"),
-    amount0Label: $("amount0-label"),
-    amount1Label: $("amount1-label"),
-    amount0: $("amount0"),
-    amount1: $("amount1"),
     liquidityControl: $("liquidity-control"),
     liquidityBps: $("liquidity-bps"),
     liquidityOutput: $("liquidity-output"),
@@ -187,7 +182,7 @@
     account: null,
     walletChain: null,
     walletBound: false,
-    action: "add",
+    action: "remove",
     actionRevision: 0,
     simulation: null,
     simulationController: null,
@@ -1142,7 +1137,7 @@
     elements.tickLower.value = String(position.lo);
     elements.tickUpper.value = String(position.hi);
     syncRangesFromTicks();
-    if (state.action === "add") setAction("remove");
+    setAction("remove", { invalidate: false });
     invalidateSimulation("Position changed");
     chart.requestDraw();
     openActionDrawer();
@@ -1376,9 +1371,6 @@
     } else {
       syncRangesFromTicks();
     }
-    const pool = detail.pool || {};
-    text(elements.amount0Label, `${tokenLabel(pool.token0)} amount`);
-    text(elements.amount1Label, `${tokenLabel(pool.token1)} amount`);
     updateRangePrices();
   }
 
@@ -1790,7 +1782,7 @@
     const token0 = tokenLabel(pool.token0);
     const token1 = tokenLabel(pool.token1);
     const positions = Number(plan && plan.actual_positions) || 0;
-    text(elements.allocPositionCount, `${positions} REAL POSITION${positions === 1 ? "" : "S"}`);
+    text(elements.allocPositionCount, `${positions} POSITION BAND${positions === 1 ? "" : "S"}`);
     const split = elements.allocSplit.querySelectorAll("div");
     const totals = plan && plan.totals || {};
     if (split[0]) {
@@ -1818,17 +1810,13 @@
         el("strong", "", `${formatPrice(Math.min(low, high))} ↔ ${formatPrice(Math.max(low, high))} · ${budget}`),
         el("span", "", `ticks ${Number(band.tick_lower).toLocaleString()}…${Number(band.tick_upper).toLocaleString()} · ${side} · ${token0} ${band.amount0 == null ? "—" : formatCompact(band.amount0)} / ${token1} ${band.amount1 == null ? "—" : formatCompact(band.amount1)}`)
       );
-      const load = el("button", "", exactPlan ? "LOAD ACTION" : "VERIFYING");
-      load.type = "button";
-      load.disabled = !exactPlan;
-      if (exactPlan) load.addEventListener("click", () => loadAllocationBand(band));
-      row.append(copy, load);
+      row.append(copy);
       return row;
     }));
     elements.allocStatus.classList.remove("is-error");
     text(elements.allocStatus, statusCopy || (
       exactPlan
-        ? `${positions} exact independent positions · sized at tick ${Number(plan.spot.tick).toLocaleString()} · floor-rounded budgets · analytical only`
+        ? `${positions} exact independent position bands · sized at tick ${Number(plan.spot.tick).toLocaleString()} · floor-rounded budgets · analytical only`
         : plan && plan.capital && plan.capital.valuation_available === false
           ? "Ranges are real, but token budgets are unavailable because this pool has no direct USDG leg."
           : "Immediate browser geometry · server floor-rounded budgets and persisted replay refresh after edits."
@@ -2000,23 +1988,6 @@
     elements.allocPresets.querySelectorAll("button").forEach((button) => button.classList.remove("is-active"));
   }
 
-  function loadAllocationBand(band) {
-    setAction("add");
-    elements.tickLower.value = String(band.tick_lower);
-    elements.tickUpper.value = String(band.tick_upper);
-    elements.amount0.value = band.amount0 == null ? "" : String(band.amount0);
-    elements.amount1.value = band.amount1 == null ? "" : String(band.amount1);
-    syncRangesFromTicks();
-    invalidateSimulation("Allocation band loaded");
-    openActionDrawer();
-    const caps = capabilities();
-    if (caps && caps.add) {
-      setNotice(elements.walletNotice, `Band #${band.index} loaded as one position. Simulate, review and sign this position explicitly; no other band is bundled or sent.`);
-    } else {
-      setNotice(elements.walletNotice, `Band #${band.index} loaded for review, but ADD execution is unavailable for this pool. The analytical preview creates no transaction.`);
-    }
-    chart.requestDraw();
-  }
 
   function capabilities() {
     return state.detail && state.detail.capabilities || null;
@@ -2037,7 +2008,7 @@
       text(elements.capabilityNotice, "ANALYSIS ONLY · EXECUTION DISABLED ON THIS HOST");
     } else {
       const protocol = state.detail.pool && state.detail.pool.protocol || String(state.detail.pool && state.detail.pool.kind || "POOL").toUpperCase();
-      const map = ["add", "remove", "collect"].map((action) => `${action.toUpperCase()} ${caps && caps[action] ? "YES" : "NO"}`).join(" · ");
+      const map = ["remove", "collect"].map((action) => `${action.toUpperCase()} ${caps && caps[action] ? "YES" : "NO"}`).join(" · ");
       const limitation = caps && caps.why ? ` · ${caps.why}` : "";
       text(elements.capabilityNotice, `${protocol} · ${map}${limitation}`);
     }
@@ -2045,14 +2016,13 @@
   }
 
   function setAction(action, { invalidate = true } = {}) {
-    if (!["add", "remove", "collect"].includes(action)) return;
+    if (!["remove", "collect"].includes(action)) return;
     state.action = action;
     elements.actionTabs.querySelectorAll("button[data-action]").forEach((button) => {
       const active = button.dataset.action === action;
       button.classList.toggle("is-active", active);
       button.setAttribute("aria-selected", String(active));
     });
-    elements.amountFields.classList.toggle("is-hidden", action !== "add");
     elements.liquidityControl.classList.toggle("is-hidden", action !== "remove");
     if (invalidate) invalidateSimulation("Action changed");
     updateActionAvailability();
@@ -2078,8 +2048,8 @@
       action: state.action,
       tick_lower: Number(elements.tickLower.value),
       tick_upper: Number(elements.tickUpper.value),
-      amount0: state.action === "add" ? elements.amount0.value.trim() || "0" : "0",
-      amount1: state.action === "add" ? elements.amount1.value.trim() || "0" : "0",
+      amount0: "0",
+      amount1: "0",
       liquidity_bps: state.action === "remove" ? Number(elements.liquidityBps.value) : 0,
       slippage_bps: Number(elements.slippageBps.value)
     };
@@ -2092,10 +2062,6 @@
     if (!ADDRESS_RE.test(payload.owner || "")) return "The owner address is invalid.";
     if (!Number.isInteger(payload.tick_lower) || !Number.isInteger(payload.tick_upper) || payload.tick_lower >= payload.tick_upper) return "Enter a valid range with the lower tick below the upper tick.";
     if (!Number.isInteger(payload.slippage_bps) || payload.slippage_bps < 1 || payload.slippage_bps > 500) return "Slippage must be between 0.01% and 5%.";
-    if (payload.action === "add") {
-      if (!AMOUNT_RE.test(payload.amount0) || !AMOUNT_RE.test(payload.amount1)) return "Amounts must be non-negative decimal token values.";
-      if (Number(payload.amount0) === 0 && Number(payload.amount1) === 0) return "Enter an amount for at least one token.";
-    }
     if (payload.action === "remove" && (!Number.isInteger(payload.liquidity_bps) || payload.liquidity_bps < 1 || payload.liquidity_bps > 10_000)) return "Choose how much position liquidity to remove.";
     return null;
   }
@@ -2141,13 +2107,12 @@
     const summary = simulation.summary || {};
     const pool = state.detail && state.detail.pool || {};
     const action = simulation.action || state.action;
-    const amountLabel = action === "add" ? "supplied" : action === "remove" ? "returned" : "collectible";
+    const amountLabel = action === "remove" ? "returned" : "collectible";
     const values = [
       [`${tokenLabel(pool.token0)} ${amountLabel}`, summary.amount0],
       [`${tokenLabel(pool.token1)} ${amountLabel}`, summary.amount1]
     ];
     if (summary.liquidity != null) values.push(["Liquidity", summary.liquidity]);
-    if (summary.share_pct != null && action === "add") values.push(["Resulting active-pool share", `${summary.share_pct}%`]);
     if (summary.share_pct != null && action === "remove") values.push(["Owned position withdrawn", `${summary.share_pct}%`]);
     const lower = Number(summary.price_lower), upper = Number(summary.price_upper);
     const priceUnit = chart.inverted
@@ -3777,7 +3742,7 @@
     closeCatalog();
     closeActionDrawer();
     updateWalletPresentation();
-    setAction("add", { invalidate: false });
+    setAction("remove", { invalidate: false });
     if (!restoreSelectionFromUrl()) {
       selectPool({ id: DEFAULT_POOL, address: DEFAULT_POOL, kind: "v3", protocol: "v3-compatible", pair: "USDG/NVDA" });
     }
