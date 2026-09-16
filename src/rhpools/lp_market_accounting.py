@@ -4783,7 +4783,9 @@ class AccountBook:
         source = " FROM lp_accounting_episodes"
         args: tuple[Any, ...] = ()
         if cutoff_seconds is not None:
-            source += " INDEXED BY lp_accounting_episodes_last_timestamp"
+            # Covering: the plain last_timestamp index dereferenced every
+            # episode row, which exceeded the reader deadline for 7d and 30d.
+            source += " INDEXED BY lp_accounting_episodes_owner_window_cover"
             where = " WHERE last_timestamp>=?"
             args = (int(time.time()) - cutoff_seconds,)
         with self.store.reader_snapshot() as conn:
