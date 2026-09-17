@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections import OrderedDict, defaultdict, deque
 from collections.abc import Mapping
-from concurrent.futures import Future, ProcessPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from concurrent.futures.process import BrokenProcessPool
 from contextlib import contextmanager
 from functools import lru_cache
@@ -1031,7 +1031,7 @@ class AccountBook:
         waiting: deque[tuple[str, Future[_PreparedProjection | None]]] = deque()
         try:
             while True:
-                while len(waiting) < self._preparation_workers * 2:
+                while len(waiting) < self._preparation_workers * 3:
                     row = next(source, None)
                     if row is None:
                         break
@@ -1042,30 +1042,35 @@ class AccountBook:
                     ))
                 if not waiting:
                     break
-                position_key, future = waiting.popleft()
-                try:
-                    prepared = future.result()
-                except Exception as exc:
-                    if not _snapshot_deadline_error(exc) and not isinstance(
-                        exc, BrokenProcessPool,
-                    ):
-                        raise
-                    if isinstance(exc, BrokenProcessPool):
-                        for queued_key, queued_future in waiting:
-                            queued_future.cancel()
-                            self._defer_position(queued_key)
-                        waiting.clear()
-                        if self._preparation_pool is not None:
-                            self._preparation_pool.shutdown(
-                                wait=False, cancel_futures=True,
-                            )
-                            self._preparation_pool = None
-                    self._defer_position(position_key)
-                    yield None
-                    continue
-                if prepared is not None:
-                    self._release_position(position_key)
-                yield prepared
+                done, _pending_futures = wait(
+                    [future for _key, future in waiting], return_when=FIRST_COMPLETED,
+                )
+                finished = [entry for entry in waiting if entry[1] in done]
+                waiting = deque(entry for entry in waiting if entry[1] not in done)
+                for position_key, future in finished:
+                    try:
+                        prepared = future.result()
+                    except Exception as exc:
+                        if not _snapshot_deadline_error(exc) and not isinstance(
+                            exc, BrokenProcessPool,
+                        ):
+                            raise
+                        if isinstance(exc, BrokenProcessPool):
+                            for queued_key, queued_future in waiting:
+                                queued_future.cancel()
+                                self._defer_position(queued_key)
+                            waiting.clear()
+                            if self._preparation_pool is not None:
+                                self._preparation_pool.shutdown(
+                                    wait=False, cancel_futures=True,
+                                )
+                                self._preparation_pool = None
+                        self._defer_position(position_key)
+                        yield None
+                        continue
+                    if prepared is not None:
+                        self._release_position(position_key)
+                    yield prepared
         finally:
             for _queued_key, future in waiting:
                 future.cancel()
