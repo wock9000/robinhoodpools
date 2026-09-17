@@ -756,6 +756,10 @@ class _PreparationReader:
         )
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA query_only=ON")
+        # Position replays sort 50k-115k events; the default 2 MiB cache
+        # spilled every one of them and re-read pages without the mmap.
+        self._connection.execute("PRAGMA cache_size=-262144")
+        self._connection.execute("PRAGMA mmap_size=34359738368")
 
     def read(self) -> sqlite3.Connection:
         return self._connection
