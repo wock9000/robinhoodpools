@@ -1172,7 +1172,6 @@ class LPMarketService:
         self._search_stop = threading.Event()
         self._search_error: str | None = None
         self._search_thread: threading.Thread | None = None
-        self._warm_thread: threading.Thread | None = None
         self._catalog_source_cache = None
         self._catalog_discovered_ids: set[str] = set()
         self._catalog_discovery_marker = None
@@ -1204,10 +1203,6 @@ class LPMarketService:
                 daemon=True,
             )
             self._search_thread.start()
-            self._warm_thread = threading.Thread(
-                target=self._warm_run, name="lp-market-warm", daemon=True,
-            )
-            self._warm_thread.start()
         else:
             self.store.ensure_search_index()
 
@@ -1700,48 +1695,10 @@ class LPMarketService:
                 self._search_error = str(exc)[:500]
                 self._search_stop.wait(1.0)
 
-    def _warm_run(self):
-        # Every key the terminal requests by default, so a visitor never pays a
-        # cold aggregate; _cached serves stale and refreshes past ttl, so this
-        # loop costs one recompute per key per ttl at most.
-        self._search_stop.wait(15.0)
-        while not self._search_stop.is_set():
-            for window in WINDOWS:
-                if self._search_stop.is_set():
-                    return
-                page = {"window": window, "limit": "100", "offset": "0"}
-                for call in (
-                    lambda: self.overview({"window": window}),
-                    lambda: self.pools({**page, "sort": "fees", "order": "desc"}),
-                    lambda: self.pools({**page, "sort": "flow", "order": "desc"}),
-                    lambda: self.pools({**page, "sort": "created", "order": "desc"}),
-                    lambda: self._owner_projection({
-                        "window": window, "sort": "activity", "limit": "200",
-                        "identity_scope": "wallets",
-                    }, wait=False),
-                ):
-                    try:
-                        call()
-                    except Exception:
-                        pass
-                    finally:
-                        self.store.close_reader()
-            try:
-                self.dislocations({
-                    "min_bps": "25", "min_depth_usd": "100", "max_age_s": "3600",
-                    "max_stale_s": "86400", "sort": "net", "limit": "100",
-                })
-            except Exception:
-                pass
-            finally:
-                self.store.close_reader()
-            self._search_stop.wait(2.0)
-
     def close(self):
         self._search_stop.set()
-        for thread in (self._search_thread, self._warm_thread):
-            if thread is not None:
-                thread.join()
+        if self._search_thread is not None:
+            self._search_thread.join()
         self.claims.close()
         self.indexer.close()
         self.book.close()
