@@ -66,7 +66,7 @@ HISTORY_MAX_CHUNK = 32_768
 # Live catch-up must amortize fixed commit costs across all available blocks.
 # Background history uses a shorter writer target so financial lanes can run.
 MAX_INTERVAL_STORE_SECONDS = 2.0
-HISTORY_MAX_INTERVAL_STORE_SECONDS = 0.2
+HISTORY_MAX_INTERVAL_STORE_SECONDS = 2.0
 ENRICH_BATCH = 8
 ENRICHMENT_CAPABILITY_RECHECK_S = 300.0
 ENRICH_TRACE_BATCH = 8
