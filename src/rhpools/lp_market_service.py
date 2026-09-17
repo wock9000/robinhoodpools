@@ -1121,7 +1121,7 @@ class LPMarketService:
         self.store = MarketStore(path, checkpoint_on_commit=not start)
         self.prices = PriceProjection(self.store)
         self.book = AccountBook(
-            self.store, deferred=start, preparation_workers=2 if start else 0,
+            self.store, deferred=start, preparation_workers=6 if start else 0,
         )
         self.book.install()
         self._current_activity_lock = threading.RLock()
