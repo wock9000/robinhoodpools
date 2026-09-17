@@ -237,14 +237,20 @@ class MarketStore:
         connection.row_factory = sqlite3.Row
         connection.execute(f"PRAGMA busy_timeout={0 if checkpoint else 5000}")
         connection.execute("PRAGMA foreign_keys=ON")
-        # The writer benefits from a large projection working set.  Reader
-        # pages are also available through the shared mmap, so keep each
-        # thread-local private cache small under concurrent HTTP traffic.
-        connection.execute(f"PRAGMA cache_size=-{1048576 if writer else 1024}")
+        # The writer benefits from a large projection working set. Reader pages
+        # come through the shared mmap, but the private cache is also the
+        # sorter's memory budget: at 1 MiB every window aggregate and owner
+        # projection spilled sort runs to /var/tmp (75 GB of cancelled writes
+        # in 40 minutes, measured). Readers are per-thread and closed after
+        # each request, at most api_slots of them.
+        connection.execute(f"PRAGMA cache_size=-{1048576 if writer else 131072}")
         connection.execute("PRAGMA mmap_size=34359738368")
         if writer:
             connection.execute("PRAGMA journal_mode=WAL")
-            connection.execute("PRAGMA synchronous=FULL")
+            # NORMAL fsyncs the WAL at checkpoint rather than every commit. A
+            # power loss can drop the most recent commits; the file stays
+            # consistent and the indexer re-derives them from the chain.
+            connection.execute("PRAGMA synchronous=NORMAL")
             # Managed services use their dedicated maintenance lane, including
             # for a large inherited WAL, rather than checkpointing before HTTP
             # startup. Standalone stores retain automatic checkpoint fallback.
