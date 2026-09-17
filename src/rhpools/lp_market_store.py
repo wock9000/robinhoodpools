@@ -2314,8 +2314,21 @@ class MarketStore:
 
     def _queue_enrichment(
         self, connection: sqlite3.Connection, events: Iterable[Mapping[str, Any]],
+        *, defer: bool = False,
     ) -> None:
         now = time.time()
+        if defer:
+            # The archive lane must not pour its whole backlog of receipts
+            # into the shared enrichment queue: it is already multi-million
+            # deep and the lane is RPC-bound. Queue only enough to keep the
+            # recent covered edge enriched; older receipts are recoverable
+            # on demand and rate-limited by this cap.
+            row = connection.execute(
+                "SELECT value FROM metadata WHERE key='pending_enrichment'",
+            ).fetchone()
+            pending = int(row[0]) if row is not None else 0
+            if pending > 4_000_000:
+                return
         seen: set[str] = set()
         rows: list[tuple[Any, ...]] = []
         for event in events:
@@ -2369,8 +2382,15 @@ class MarketStore:
         lane: str = "live",
         cursor: Mapping[str, Any] | None = None,
         transactions: Iterable[Mapping[str, Any]] = (),
+        project: bool = True,
     ) -> list[dict[str, Any]]:
-        """Commit an entire fetched interval, cursor, events, and projections."""
+        """Commit an entire fetched interval, cursor, events, and projections.
+
+        ``project=False`` skips inline price/bucket projections and queues every
+        inserted event into ``pending_reprojection`` instead. The archive lane
+        uses it so raw history stays a fast INSERT-only writer grab; the
+        reprojection lane replays the same projections at its own bounded pace.
+        """
         if not lane:
             raise ValueError("lane must be non-empty")
         supplied_headers = list(headers.values()) if isinstance(headers, Mapping) else list(headers)
@@ -2487,7 +2507,9 @@ class MarketStore:
             if inserted_events:
                 self._bump(connection, "indexed_events", len(inserted_events))
                 self._set_metadata(connection, "events_revision", revision)
-                self._queue_enrichment(connection, inserted_events)
+                self._queue_enrichment(connection, inserted_events, defer=(
+                    lane == "history" and not project
+                ))
                 if lane == "live":
                     self._set_metadata(connection, "live_revision", revision)
             self._upsert_transactions(connection, supplied_transactions)
@@ -2500,16 +2522,35 @@ class MarketStore:
                 self._set_metadata(connection, f"cursor:{lane}", stored_cursor)
             search_rows = inserted_rows
             if inserted_events:
+                if not project:
+                    queued = 0
+                    if inserted_events:
+                        before = connection.total_changes
+                        connection.executemany(
+                            "INSERT OR IGNORE INTO pending_reprojection"
+                            "(event_id,block_number,tx_index,log_index,attempts,next_attempt,last_error) "
+                            "VALUES(?,?,?,?,0,0,NULL)",
+                            (
+                                (int(event["id"]), int(event["block_number"]),
+                                 int(event["tx_index"]), int(event["log_index"]))
+                                for event in inserted_events
+                            ),
+                        )
+                        queued = connection.total_changes - before
+                    if queued:
+                        self._bump(connection, "pending_reprojection", queued)
                 for apply, _rollback, _persists_events in self._projections:
-                    apply(connection, inserted_events)
-                if any(not item[2] for item in self._projections):
-                    search_rows = self._persist_projection_mutations(
-                        connection, inserted_events, revision,
-                    )
-                else:
-                    search_rows = [
-                        self._event_row(event, revision) for event in inserted_events
-                    ]
+                    if project:
+                        apply(connection, inserted_events)
+                if project:
+                    if any(not item[2] for item in self._projections):
+                        search_rows = self._persist_projection_mutations(
+                            connection, inserted_events, revision,
+                        )
+                    else:
+                        search_rows = [
+                            self._event_row(event, revision) for event in inserted_events
+                        ]
             self._index_event_search_batch(connection, search_rows)
             return inserted_events
 
