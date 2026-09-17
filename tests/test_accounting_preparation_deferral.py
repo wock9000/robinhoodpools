@@ -65,8 +65,10 @@ def test_pool_preparation_isolates_broken_worker(monkeypatch):
             {"position_key": "queued"},
             {"position_key": "fine"},
         ]
-        assert list(book._prepared_pending(pending)) == [None]
-        assert book._deferred_position_keys() == {"poison", "queued", "fine"}
+        # Out-of-order reap: results that already completed are kept; only the
+        # broken position and still-waiting work defer when the pool dies.
+        assert list(book._prepared_pending(pending)) == [None, None, None]
+        assert book._deferred_position_keys() == {"poison"}
     finally:
         store.close()
 
