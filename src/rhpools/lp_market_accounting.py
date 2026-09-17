@@ -314,6 +314,8 @@ CREATE TABLE IF NOT EXISTS lp_accounting_tx_costs (
 );
 CREATE INDEX IF NOT EXISTS lp_accounting_tx_costs_owner
     ON lp_accounting_tx_costs(owner, block_number);
+CREATE INDEX IF NOT EXISTS lp_accounting_tx_costs_gas_cover
+    ON lp_accounting_tx_costs(tx_hash, owner, gas_usd);
 
 CREATE TABLE IF NOT EXISTS lp_accounting_pending (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4514,9 +4516,10 @@ class AccountBook:
             "ON fx.episode_id=ep.id LEFT JOIN pools p ON p.id=ep.pool_id "
             "WHERE " + predicate + " AND ep.gas_usd IS NULL),"
             "owner_costs(owner,tx_hash,gas_usd) AS ("
-            "SELECT s.owner,s.tx_hash,c.gas_usd FROM scoped s "
-            "LEFT JOIN lp_accounting_tx_costs c ON c.tx_hash=s.tx_hash "
-            "AND c.owner=s.owner) "
+            "SELECT s.owner,s.tx_hash,c.gas_usd FROM scoped s LEFT JOIN "
+            "lp_accounting_tx_costs c "
+            "INDEXED BY lp_accounting_tx_costs_gas_cover "
+            "ON c.tx_hash=s.tx_hash AND c.owner=s.owner) "
             "SELECT owner,CASE WHEN COUNT(gas_usd)<>COUNT(tx_hash) "
             "THEN NULL ELSE SUM(gas_usd) END AS gas_usd "
             "FROM owner_costs GROUP BY owner",
