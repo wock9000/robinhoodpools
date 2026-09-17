@@ -4994,7 +4994,7 @@ class MarketIndexer:
                 connection, logs, events,
             )
             inserted = self.store.ingest(
-                headers, events, lane="history",
+                headers, events, lane="history", project=False,
                 cursor={
                     **cursor,
                     "from_block": start, "to_block": end,
