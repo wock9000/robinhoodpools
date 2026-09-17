@@ -250,6 +250,8 @@ class PriceProjection:
         CREATE INDEX IF NOT EXISTS lp_buckets_pool ON lp_pool_buckets(pool_id,resolution,bucket);
         CREATE INDEX IF NOT EXISTS lp_buckets_hour_window ON lp_pool_buckets
             (resolution,bucket,pool_id,{window_columns}) WHERE resolution=3600;
+        CREATE INDEX IF NOT EXISTS lp_buckets_day_window ON lp_pool_buckets
+            (resolution,bucket,pool_id,{window_columns}) WHERE resolution=86400;
         CREATE INDEX IF NOT EXISTS lp_events_time ON events(timestamp,block_number,tx_index,log_index);
         CREATE INDEX IF NOT EXISTS lp_pools_pair ON pools(token0,token1);
         CREATE INDEX IF NOT EXISTS lp_events_pool_order ON events(pool_id,block_number,tx_index,log_index);
@@ -277,6 +279,17 @@ class PriceProjection:
                 store._set_metadata(
                     conn, "price_projection_version", PRICE_PROJECTION_VERSION,
                 )
+            if int(store._metadata(conn, "day_buckets_backfilled", 0)) < 1:
+                columns = ",".join(BUCKET_FIELDS)
+                conn.execute(
+                    "INSERT OR REPLACE INTO lp_pool_buckets"
+                    f"(resolution,bucket,pool_id,{columns},max_block) "
+                    "SELECT 86400,bucket/86400*86400,pool_id,"
+                    + ",".join(f"SUM({name})" for name in BUCKET_FIELDS)
+                    + ",MAX(max_block) FROM lp_pool_buckets "
+                    "WHERE resolution=3600 GROUP BY bucket/86400,pool_id"
+                )
+                store._set_metadata(conn, "day_buckets_backfilled", 1)
         store.register_projection(
             self.apply, self.rollback, persists_events=True,
         )
@@ -717,26 +730,33 @@ class PriceProjection:
         ).fetchone()
         values = [row[name] or 0 for name in BUCKET_FIELDS]
         max_block = row["max_block"] or 0
+        delta = None
         if row["events"]:
             placeholders = ",".join("?" for _ in range(len(values) + 4))
             conn.execute(f"INSERT OR REPLACE INTO lp_pool_buckets VALUES({placeholders})",
                          (60, minute, pool_id, *values, max_block))
+            delta = [value - (old[name] if old else 0) for name, value in zip(BUCKET_FIELDS, values)]
         else:
             conn.execute("DELETE FROM lp_pool_buckets WHERE resolution=60 AND bucket=? AND pool_id=?",
                          (minute, pool_id))
-        delta = [value - (old[name] if old else 0) for name, value in zip(BUCKET_FIELDS, values)]
-        hour = minute // 3600 * 3600
+            if old is not None:
+                delta = [-old[name] for name in BUCKET_FIELDS]
+        if delta is None:
+            return
         columns = ",".join(BUCKET_FIELDS)
         update = ",".join(f"{name}={name}+excluded.{name}" for name in BUCKET_FIELDS)
         placeholders = ",".join("?" for _ in range(len(delta) + 4))
-        conn.execute(
-            f"INSERT INTO lp_pool_buckets(resolution,bucket,pool_id,{columns},max_block) "
-            f"VALUES({placeholders}) ON CONFLICT(resolution,bucket,pool_id) DO UPDATE SET "
-            f"{update},max_block=MAX(max_block,excluded.max_block)",
-            (3600, hour, pool_id, *delta, max_block),
-        )
-        conn.execute("DELETE FROM lp_pool_buckets WHERE resolution=3600 AND bucket=? AND pool_id=? AND events<=0",
-                     (hour, pool_id))
+        for resolution, key in ((3600, minute // 3600 * 3600), (86400, minute // 86400 * 86400)):
+            conn.execute(
+                f"INSERT INTO lp_pool_buckets(resolution,bucket,pool_id,{columns},max_block) "
+                f"VALUES({placeholders}) ON CONFLICT(resolution,bucket,pool_id) DO UPDATE SET "
+                f"{update},max_block=MAX(max_block,excluded.max_block)",
+                (resolution, key, pool_id, *delta, max_block),
+            )
+            conn.execute(
+                "DELETE FROM lp_pool_buckets WHERE resolution=? AND bucket=? AND pool_id=? AND events<=0",
+                (resolution, key, pool_id),
+            )
 
     @staticmethod
     def _buckets(conn, keys):
@@ -782,8 +802,8 @@ class PriceProjection:
                 aggregates[(row["pool_id"], row["bucket"])] = row
         minute_rows = []
         missing = []
-        hour_deltas = {}
-        hour_max = {}
+        rollup_deltas = {}
+        rollup_max = {}
         for pool_id, minute in ordered:
             row = aggregates.get((pool_id, minute))
             values = [row[name] or 0 for name in BUCKET_FIELDS] if row else [
@@ -799,11 +819,12 @@ class PriceProjection:
                 value - (old[name] if old else 0)
                 for name, value in zip(BUCKET_FIELDS, values)
             ]
-            hour_key = (pool_id, minute // 3600 * 3600)
-            totals = hour_deltas.setdefault(hour_key, [0 for _name in BUCKET_FIELDS])
-            for index, value in enumerate(delta):
-                totals[index] += value
-            hour_max[hour_key] = max(hour_max.get(hour_key, 0), max_block)
+            for resolution in (3600, 86400):
+                key = (resolution, pool_id, minute // resolution * resolution)
+                totals = rollup_deltas.setdefault(key, [0 for _name in BUCKET_FIELDS])
+                for index, value in enumerate(delta):
+                    totals[index] += value
+                rollup_max[key] = max(rollup_max.get(key, 0), max_block)
         placeholders = ",".join("?" for _ in range(len(BUCKET_FIELDS) + 4))
         conn.executemany(
             f"INSERT OR REPLACE INTO lp_pool_buckets VALUES({placeholders})",
@@ -820,14 +841,14 @@ class PriceProjection:
             f"VALUES({placeholders}) ON CONFLICT(resolution,bucket,pool_id) DO UPDATE SET "
             f"{update},max_block=MAX(max_block,excluded.max_block)",
             (
-                (3600, hour, pool_id, *delta, hour_max[(pool_id, hour)])
-                for (pool_id, hour), delta in hour_deltas.items()
+                (resolution, bucket, pool_id, *delta, rollup_max[(resolution, pool_id, bucket)])
+                for (resolution, pool_id, bucket), delta in rollup_deltas.items()
             ),
         )
         conn.executemany(
-            "DELETE FROM lp_pool_buckets WHERE resolution=3600 "
-            "AND bucket=? AND pool_id=? AND events<=0",
-            ((hour, pool_id) for pool_id, hour in hour_deltas),
+            "DELETE FROM lp_pool_buckets WHERE resolution=? AND bucket=? AND pool_id=? "
+            "AND events<=0",
+            ((resolution, bucket, pool_id) for resolution, pool_id, bucket in rollup_deltas),
         )
 
     def _queue_successors(self, conn, sources, revision):
@@ -1876,7 +1897,8 @@ class LPMarketService:
         # covering index and cold multi-day scans became random page reads.
         # Without ANALYZE statistics the planner prefers that covering range
         # scan even under an outer pool_id filter, so page totals pin the
-        # per-pool index.
+        # per-pool index. Multi-day windows roll whole days up front and keep
+        # hours only at the boundaries.
         columns = "pool_id," + ",".join(BUCKET_FIELDS)
         table = "lp_pool_buckets" + (" INDEXED BY lp_buckets_pool" if by_pool else "")
         low_minute, high_minute = start // 60 * 60, end // 60 * 60
@@ -1888,11 +1910,21 @@ class LPMarketService:
         )
         if low_hour >= high_hour:
             return f"({minutes})", [low_minute, high_minute]
+        hours = f"SELECT {columns} FROM {table} WHERE resolution=3600 AND bucket>=? AND bucket<?"
+        low_day = (low_hour + 86399) // 86400 * 86400
+        high_day = high_hour // 86400 * 86400
+        if by_pool or high_day - low_day < 2 * 86400:
+            return (
+                f"({hours} UNION ALL {minutes} UNION ALL {minutes})",
+                [low_hour, high_hour, low_minute, low_hour - 60, high_hour, high_minute],
+            )
         return (
-            f"(SELECT {columns} FROM {table} "
-            "WHERE resolution=3600 AND bucket>=? AND bucket<? "
+            f"(SELECT {columns} FROM {table} WHERE resolution=86400 AND bucket>=? AND bucket<? "
+            f"UNION ALL {hours} UNION ALL {hours} "
             f"UNION ALL {minutes} UNION ALL {minutes})",
-            [low_hour, high_hour, low_minute, low_hour - 60, high_hour, high_minute],
+            [low_day, high_day,
+             low_hour, low_day, high_day, high_hour,
+             low_minute, low_hour - 60, high_hour, high_minute],
         )
 
     def _bucket_aggregates(self, status, start, end):

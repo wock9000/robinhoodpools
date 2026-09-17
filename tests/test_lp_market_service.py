@@ -160,7 +160,7 @@ def test_multi_day_window_scans_stay_inside_covering_index(tmp_path):
                 [
                     (resolution, bucket, pool, *values)
                     for pool in (V3, V4)
-                    for resolution, step in ((3600, 3600), (60, 900))
+                    for resolution, step in ((86400, 86400), (3600, 3600), (60, 900))
                     for bucket in range(now - 40 * 86_400, now, step)
                 ],
             )
@@ -184,13 +184,17 @@ def test_multi_day_window_scans_stay_inside_covering_index(tmp_path):
             low_minute, high_minute = start // 60 * 60, end // 60 * 60
             low_hour = (low_minute + 3599) // 3600 * 3600
             high_hour = high_minute // 3600 * 3600
+            low_day = (low_hour + 86399) // 86400 * 86400
+            high_day = high_hour // 86400 * 86400
             expected = connection.execute(
                 "SELECT SUM(events) FROM lp_pool_buckets WHERE pool_id=? AND "
-                "((resolution=3600 AND bucket>=? AND bucket<?) OR (resolution=60 AND "
-                "((bucket>=? AND bucket<?) OR (bucket>=? AND bucket<=?))))",
-                (V3, low_hour, high_hour, low_minute, low_hour, high_hour, high_minute),
+                "((resolution=86400 AND bucket>=? AND bucket<?) OR "
+                "(resolution=3600 AND ((bucket>=? AND bucket<?) OR (bucket>=? AND bucket<?))) OR "
+                "(resolution=60 AND ((bucket>=? AND bucket<?) OR (bucket>=? AND bucket<=?))))",
+                (V3, low_day, high_day, low_hour, low_day, high_day, high_hour,
+                 low_minute, low_hour, high_hour, high_minute),
             ).fetchone()[0]
-        assert any("COVERING INDEX lp_buckets_hour_window" in step for step in aggregate_plan)
+        assert any("COVERING INDEX lp_buckets_day_window" in step for step in aggregate_plan)
         assert all(
             "lp_buckets_pool" in step for step in page_plan if "SEARCH lp_pool_buckets" in step
         )
