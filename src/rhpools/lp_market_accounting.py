@@ -314,8 +314,11 @@ CREATE TABLE IF NOT EXISTS lp_accounting_tx_costs (
 );
 CREATE INDEX IF NOT EXISTS lp_accounting_tx_costs_owner
     ON lp_accounting_tx_costs(owner, block_number);
-CREATE INDEX IF NOT EXISTS lp_accounting_tx_costs_gas_cover
-    ON lp_accounting_tx_costs(tx_hash, owner, gas_usd);
+-- Owner-first: the owners gas probe walks scoped (owner,tx_hash) pairs in
+-- sorted order, so a tx_hash-first key degenerates into random probes.
+CREATE INDEX IF NOT EXISTS lp_accounting_tx_costs_owner_gas_cover
+    ON lp_accounting_tx_costs(owner, tx_hash, gas_usd);
+DROP INDEX IF EXISTS lp_accounting_tx_costs_gas_cover;
 
 CREATE TABLE IF NOT EXISTS lp_accounting_pending (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4517,17 +4520,21 @@ class AccountBook:
         # Resolve each scoped transaction once. The old correlated query walked
         # the same episode/effect paths once per owner and exceeded the reader
         # deadline when most recent owners had one not-yet-attributed episode.
+        # GROUP BY dedupes like DISTINCT but also emits (owner,tx_hash) in key
+        # order, so the owner-first tx_costs covering index is walked nearly
+        # sequentially instead of one random probe per pair.
         rows = conn.execute(
             "WITH scoped(owner,tx_hash) AS MATERIALIZED ("
-            "SELECT DISTINCT ep.owner,fx.tx_hash FROM " + episode_source + " "
+            "SELECT ep.owner,fx.tx_hash FROM " + episode_source + " "
             "JOIN lp_accounting_effects fx "
             "INDEXED BY lp_accounting_effects_episode "
             "ON fx.episode_id=ep.id LEFT JOIN pools p ON p.id=ep.pool_id "
-            "WHERE " + predicate + " AND ep.gas_usd IS NULL),"
+            "WHERE " + predicate + " AND ep.gas_usd IS NULL "
+            "GROUP BY ep.owner,fx.tx_hash),"
             "owner_costs(owner,tx_hash,gas_usd) AS ("
             "SELECT s.owner,s.tx_hash,c.gas_usd FROM scoped s LEFT JOIN "
             "lp_accounting_tx_costs c "
-            "INDEXED BY lp_accounting_tx_costs_gas_cover "
+            "INDEXED BY lp_accounting_tx_costs_owner_gas_cover "
             "ON c.tx_hash=s.tx_hash AND c.owner=s.owner) "
             "SELECT owner,CASE WHEN COUNT(gas_usd)<>COUNT(tx_hash) "
             "THEN NULL ELSE SUM(gas_usd) END AS gas_usd "
