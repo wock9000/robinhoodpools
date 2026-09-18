@@ -983,3 +983,24 @@ def test_unprojected_ingest_rolls_activity_into_buckets_exactly_once(tmp_path):
         assert after[0]["volume_usd"] > 0
     finally:
         app.close()
+
+
+def test_unprojected_ingest_catalogs_identities_without_descriptive_terms():
+    store = MarketStore(":memory:")
+    try:
+        block = header(4_500_000)
+        archive = event(block, 0) | {"tx_hash": "0x" + "cd" * 32}
+        live = event(header(4_500_001), 0)
+        store.ingest([block], [archive], lane="history", project=False)
+        store.ingest([header(4_500_001)], [live], lane="live")
+        assert [row["id"] for row in store.search("0x" + "cd" * 32)[0]] == ["0x" + "cd" * 32]
+        assert [row["id"] for row in store.search("0x" + "11" * 20)[0]] == ["0x" + "11" * 20]
+        assert [row["id"] for row in store.search("7")[0]] == ["shared-position"]
+        by_block = {row["id"] for row in store.search("block 45000")[0]}
+        assert by_block == {"0x" + "ab" * 32}
+        assert store.read().execute(
+            "SELECT COUNT(*) FROM lp_search_terms WHERE kind='transaction' AND id=?",
+            ("0x" + "cd" * 32,),
+        ).fetchone()[0] == 1
+    finally:
+        store.close()

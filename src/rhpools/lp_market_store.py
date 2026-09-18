@@ -1149,7 +1149,11 @@ class MarketStore:
     def _put_search_entities(
         cls, connection: sqlite3.Connection,
         entities: Iterable[tuple[str, str, str, str, str, int, Iterable[Any]]],
+        *, descriptive_terms: bool = True,
     ) -> None:
+        """Upsert catalog entities; ``descriptive_terms=False`` indexes only
+        each entity's identity terms (hash, address, key, token id), not the
+        words of its label and subtitle."""
         entity_rows: list[tuple[str, str, str, str, str, int]] = []
         term_rows: list[tuple[str, str, str, int]] = []
         for kind, entity_id, label, subtitle, href, rank, terms in entities:
@@ -1162,8 +1166,10 @@ class MarketStore:
                 kind, normalized_id, str(label)[:512], str(subtitle)[:1000],
                 str(href)[:1500], int(rank),
             ))
-            normalized_terms = cls._search_tokens(
-                normalized_id, label, subtitle, *terms,
+            normalized_terms = (
+                cls._search_tokens(normalized_id, label, subtitle, *terms)
+                if descriptive_terms
+                else cls._search_tokens(normalized_id, *terms)
             )
             term_rows.extend(
                 (term, kind, normalized_id, 0 if term == normalized_id else 10)
@@ -1332,6 +1338,7 @@ class MarketStore:
     @classmethod
     def _index_event_search_batch(
         cls, connection: sqlite3.Connection, rows: Iterable[Mapping[str, Any]],
+        *, descriptive_terms: bool = True,
     ) -> None:
         entities: dict[tuple[str, str], dict[str, Any]] = {}
         for row in rows:
@@ -1370,7 +1377,9 @@ class MarketStore:
             for key in sorted(entities)
             for search_entity in cls._event_search_entities(entities[key])
         )
-        cls._put_search_entities(connection, search_entities)
+        cls._put_search_entities(
+            connection, search_entities, descriptive_terms=descriptive_terms,
+        )
 
 
     def ensure_search_index(self) -> None:
@@ -2612,7 +2621,11 @@ class MarketStore:
                         search_rows = [
                             self._event_row(event, revision) for event in inserted_events
                         ]
-            self._index_event_search_batch(connection, search_rows)
+            # Raw archive ingests catalog identities only: the descriptive
+            # words of a transaction subtitle cost four term rows per event.
+            self._index_event_search_batch(
+                connection, search_rows, descriptive_terms=project,
+            )
             return inserted_events
 
     def _current_event(self, connection: sqlite3.Connection, event: Mapping[str, Any]) -> dict[str, Any] | None:
