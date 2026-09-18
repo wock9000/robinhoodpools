@@ -3025,7 +3025,7 @@ class MarketStore:
             )
 
     def pending_reprojections(self, limit: int = 128) -> list[dict[str, Any]]:
-        limit = max(1, min(int(limit), 512))
+        limit = max(1, min(int(limit), 2048))
         historical = max(1, limit // 4)
         due = time.time()
         rows = self.read().execute(
