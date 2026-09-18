@@ -38,6 +38,35 @@ catch-up shared the endpoint; with Goldsky first, a 66-block scan spent 0.100 s
 on boundary headers and 0.053 s on event headers. Single-scan samples under
 live contention, not percentiles.
 
+### Archive source for the history lane
+
+`LP_RPC_ARCHIVE_URLS` and `LP_RPC_ARCHIVE_URL_FILES` name log and header sources
+for the history (archive backfill) lane only. The list is opt-in: no public
+provider joins it, `RHP_RPC_URLS` does not feed it, and without it the history
+lane keeps the provider log sources above. The intended entry is the local Nitro
+node, which answers `eth_getLogs` for any archive range without a quota:
+
+```
+[Service]
+Environment=LP_RPC_ARCHIVE_URLS=http://127.0.0.1:8547
+```
+
+With an archive source the lane fetches each interval as concurrent pages sized
+from the observed log density (eight workers against a local host; a page that
+reaches the 10k-log safety cap splits in half and retries). Live ingest still
+uses the provider sources, and canonical safety holds: interval boundary
+headers and the post-log end re-read come from the provider header source,
+the archive's own headers for both boundaries must match them, and every log's
+block hash must match its event header. A local node whose head is behind the
+requested range is skipped for that page rather than trusted.
+
+Archive chunks are sized by events per transaction, not by the 10k-log page:
+raw history inserts cost per event, and one large sorted transaction touches far
+fewer cold index pages than many small ones. `history_scan.source` reports
+`archive` or `provider`; `recent_catchup_lag_seconds` joins the existing lag
+fields. The lane yields the writer to live catch-up only when live debt is
+deeper than four live batches and older than thirty seconds.
+
 For routed HTTP `eth_call` and `eth_estimateGas`, an EVM execution revert is a
 contract outcome, not a provider outage. The caller receives the RPC error and
 the provider remains available for other calls. Transport failures, malformed
