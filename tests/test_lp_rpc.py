@@ -399,7 +399,7 @@ def test_rpc_transport_traceback_does_not_expose_url_credentials(monkeypatch, en
 def test_archive_sources_are_explicit_only_and_route_archive_lane_reads(monkeypatch):
     monkeypatch.setenv("LP_RPC_ARCHIVE_URLS", "http://127.0.0.1:8547")
     monkeypatch.setenv("LP_RPC_LOG_URLS", "https://provider.test/logs")
-    monkeypatch.setenv("LP_RPC_HEAD_URLS", "https://provider.test/head")
+    monkeypatch.setenv("LP_RPC_HEAD_URLS", "https://provider.test/head,http://127.0.0.1:8547")
     monkeypatch.setenv("RHP_RPC_URLS", "https://generic.test/rpc")
     monkeypatch.setenv("LP_RPC_DISABLE_ALCHEMY", "1")
     monkeypatch.setattr(lp_rpc, "head_subscription_urls", lambda: ())
@@ -407,6 +407,8 @@ def test_archive_sources_are_explicit_only_and_route_archive_lane_reads(monkeypa
     posted = []
 
     def post(_client, source, payload):
+        if isinstance(payload, list):
+            return [post(_client, source, item) for item in payload]
         posted.append((source.name, payload["method"]))
         if payload["method"] == "eth_blockNumber":
             return {"jsonrpc": "2.0", "id": payload["id"], "result": "0x1000"}
@@ -422,11 +424,18 @@ def test_archive_sources_are_explicit_only_and_route_archive_lane_reads(monkeypa
         assert factory("archive").call("eth_getLogs", query) == []
         assert factory("archive").call("eth_getBlockByNumber", ["0x10", False]) == []
         assert factory("history").call("eth_getLogs", query) == []
+        header = ("eth_getBlockByNumber", ["0x10", False])
+        assert factory("history").call(*header) == []
+        assert factory("canonical").call(*header) == []
+        assert factory("canonical").batch([header]) == [[]]
         assert posted == [
             ("configured-archive-1", "eth_blockNumber"),
             ("configured-archive-1", "eth_getLogs"),
             ("configured-archive-1", "eth_getBlockByNumber"),
             ("configured-logs-1", "eth_getLogs"),
+            ("configured-head-2", "eth_getBlockByNumber"),
+            ("configured-head-1", "eth_getBlockByNumber"),
+            ("configured-head-1", "eth_getBlockByNumber"),
         ]
         assert lp_rpc._gate("http://127.0.0.1:8547").slots._initial_value == (
             lp_rpc.LOCAL_SOURCE_CONCURRENCY

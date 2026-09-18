@@ -421,6 +421,7 @@ class _Registry:
 
     def candidates(
         self, capability: str, *, prefer_local: bool = False,
+        allow_local: bool = True,
     ) -> tuple[_Source, ...]:
         sources = self.sources[capability]
         now = time.monotonic()
@@ -428,6 +429,7 @@ class _Registry:
             available = tuple(
                 source for source in sources
                 if self._states[(capability, source.name)].retry_at <= now
+                and (allow_local or not _local(source.url))
             )
         if prefer_local:
             return tuple(sorted(available, key=lambda source: not _local(source.url)))
@@ -737,6 +739,9 @@ class RoutedRpc:
         self._request_id = 0
         self._lock = threading.Lock()
         self._closed = False
+        # The canonical lane frames a local archive source, so its headers
+        # must come from a provider that is not that same local node.
+        self._allow_local = lane != "canonical"
 
     def _error(self, message: str, *, code: int | None = None) -> Exception:
         try:
@@ -1026,6 +1031,7 @@ class RoutedRpc:
         sources = self._registry.candidates(
             capability,
             prefer_local=_explicit_block_header(method, values),
+            allow_local=self._allow_local,
         )
         if not sources and not self._registry.sources[capability]:
             raise self._error(
@@ -1176,6 +1182,7 @@ class RoutedRpc:
         )
         sources = self._registry.candidates(
             capability, prefer_local=explicit_headers,
+            allow_local=self._allow_local,
         )
         if not sources and not self._registry.sources[capability]:
             failure = self._error(

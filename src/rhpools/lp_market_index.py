@@ -445,10 +445,13 @@ class MarketIndexer:
             self._clients["history_header"] = self._rpc_factory("history")
             # A factory answers "archive" with None when no archive source is
             # configured; the history lane then keeps its provider log sources.
+            # With one, its boundary headers move to the remote-only canonical
+            # lane so a local node never verifies its own logs.
             archive = self._rpc_factory("archive")
             if archive is not None:
                 self._clients["archive"] = archive
                 self._clients["archive_header"] = self._rpc_factory("archive")
+                self._clients["history_header"] = self._rpc_factory("canonical")
         else:
             self._clients["live_header"] = self._clients["live"]
             self._clients["history_header"] = self._clients["history"]
