@@ -6,6 +6,7 @@ import time
 
 import pytest
 
+import rhpools.lp_market_service as market_service_module
 import rhpools.lp_market_store as market_store_module
 from rhpools.lp_market_protocols import (
     TRANSFER_TOPIC, V3_POOL_CREATED_TOPIC, V3_SWAP_TOPIC,
@@ -1277,6 +1278,140 @@ def test_completed_wallet_projection_is_deliverable_during_live_changes(
             assert TOKEN in {row["owner"] for row in result["rows"]}
     finally:
         release.set()
+        app.close()
+
+
+def test_stale_owners_are_served_while_refresh_runs_past_reader_cap(
+        tmp_path, monkeypatch):
+    app = service(tmp_path / "market.sqlite")
+    params = {
+        "window": "30d", "owner_sort": "activity", "owner_limit": 200,
+        "identity_scope": "wallets",
+    }
+    view_key = app._owner_view_key(app._owner_projection_params(params))
+    entered = threading.Event()
+    original = app.book.owner_candidates
+
+    def invalidate_owners():
+        with app.book._cache_lock:
+            app.book._owners_generation += 1
+        app._owner_last_started.pop(view_key, None)
+
+    def wait_failed_refresh():
+        pending = app._frame_futures.get(("owners", view_key))
+        if pending is not None:
+            with pytest.raises(market_store_module.MarketStoreError):
+                pending.result(3)
+
+    try:
+        app.store.upsert_pools(pools())
+        block = header(100, int(time.time()) - 60)
+        event = lp_effect(
+            block, "v4", "add", 1_000, (1_000_000, 1_000_000),
+            position_state(0), position_state(1_000),
+        )
+        app.observe_current_block(block)
+        app.observe_current_events(block, (event,))
+        monkeypatch.setattr(market_store_module, "_READER_SNAPSHOT_SECONDS", 0.0)
+        monkeypatch.setattr(market_store_module, "_READER_PROGRESS_STEPS", 1)
+        cold = app.owners(params)
+        assert [row["owner"] for row in cold["rows"]] == [TOKEN]
+
+        def slow(candidate_params):
+            entered.set()
+            time.sleep(1.0)
+            return original(candidate_params)
+
+        monkeypatch.setattr(app.book, "owner_candidates", slow)
+        invalidate_owners()
+        started = time.monotonic()
+        stale = app.owners(params)
+        assert time.monotonic() - started < 0.05
+        assert stale["revision"] == cold["revision"]
+        assert entered.wait(1)
+        app._frame_futures[("owners", view_key)].result(3)
+        assert app.owners(params)["revision"] == cold["revision"] + 1
+
+        def failing(_params):
+            raise market_store_module.MarketStoreError(
+                "reader snapshot exceeded its deadline",
+            )
+
+        monkeypatch.setattr(app.book, "owner_candidates", failing)
+        invalidate_owners()
+        assert app.owners(params)["revision"] == cold["revision"] + 1
+        wait_failed_refresh()
+        assert app.poll_owners(params)["revision"] == cold["revision"] + 1
+        assert app.owners(params)["revision"] == cold["revision"] + 1
+    finally:
+        app.close()
+
+
+def test_warmer_skips_while_paused_and_fills_gaps_one_at_a_time(
+        tmp_path, monkeypatch):
+    app = service(tmp_path / "market.sqlite")
+    monkeypatch.setattr(market_service_module, "_WARM_PAUSE_SECONDS", 0.0)
+    real_status = app.status
+    paused = {"value": True}
+    monkeypatch.setattr(
+        app, "status",
+        lambda: {
+            **real_status(),
+            "bulk_work": "paused" if paused["value"] else "running",
+        },
+    )
+    loads = {"count": 0, "threads": set()}
+    gate = threading.Lock()
+
+    def counted(loader):
+        def run(*args, **kwargs):
+            with gate:
+                loads["count"] += 1
+                loads["threads"].add(threading.get_ident())
+            return loader(*args, **kwargs)
+        return run
+
+    monkeypatch.setattr(app, "_load_cached", counted(app._load_cached))
+    monkeypatch.setattr(
+        app, "_materialize_owner_projection",
+        counted(app._materialize_owner_projection),
+    )
+
+    def cycle():
+        warmed = {}
+        app._warm_thread = threading.Thread(
+            target=lambda: warmed.setdefault("keys", app._warm_cycle()),
+        )
+        app._warm_thread.start()
+        app._warm_thread.join(30)
+        return warmed["keys"]
+
+    try:
+        app.store.upsert_pools(pools())
+        assert cycle() == 0
+        assert loads["count"] == 0
+
+        paused["value"] = False
+        assert cycle() == len(market_service_module._WARM_KEYS)
+        filled = loads["count"]
+        assert filled >= len(market_service_module._WARM_KEYS)
+        assert loads["threads"] == {app._warm_thread.ident}
+        assert len(app._owner_results) == 5
+        assert {key[1] for key in app._cache} >= {
+            "overview", "pools", "dislocations",
+        }
+
+        with app._cache_lock:
+            for key, (_at, value) in list(app._cache.items()):
+                app._cache[key] = (0.0, value)
+        with app.book._cache_lock:
+            app.book._owners_generation += 1
+        assert cycle() == len(market_service_module._WARM_KEYS)
+        assert loads["count"] == filled
+        assert not app._cache_refreshing
+        assert not any(key[0] == "owners" for key in app._frame_futures)
+    finally:
+        app._warm_thread = None
         app.close()
 
 

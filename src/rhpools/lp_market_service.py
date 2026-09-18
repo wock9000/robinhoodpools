@@ -32,6 +32,42 @@ _SUM_FIELDS = ",".join(f"SUM({name}) AS {name}" for name in BUCKET_FIELDS)
 _BUCKET_INDEX = {name: index for index, name in enumerate(BUCKET_FIELDS)}
 
 _MISSING = object()
+# Owner projections scan a month of episodes; the request path serves the last
+# completed envelope, so the materialization keeps its snapshot until a
+# checkpoint drain evicts it rather than dying at the shared 15 s reader cap.
+_OWNER_SNAPSHOT_SECONDS = 900.0
+_WARM_PAUSE_SECONDS = 3.0
+_WARM_IDLE_SECONDS = 5.0
+_WARM_ACCOUNTING_LATENCY_LIMIT_SECONDS = 30.0
+# The terminal's default requests, in the exact parameter shape lp_terminal.js
+# sends, so a warmed entry is the entry the first visitor hits.
+_WARM_KEYS: tuple[tuple[str, dict[str, Any]], ...] = (
+    *(("overview", {"window": window}) for window in WINDOWS),
+    *(
+        (
+            "pools",
+            {"window": window, "sort": sort, "order": "desc", "limit": 100, "offset": 0},
+        )
+        for sort in ("fees", "flow", "created") for window in WINDOWS
+    ),
+    *(
+        (
+            "owners",
+            {
+                "window": window, "owner_sort": "activity", "owner_limit": 200,
+                "identity_scope": "wallets",
+            },
+        )
+        for window in WINDOWS
+    ),
+    (
+        "dislocations",
+        {
+            "min_bps": 25, "min_depth_usd": 100, "max_age_s": 3600,
+            "max_stale_s": 86_400, "sort": "net", "limit": 100,
+        },
+    ),
+)
 # A pool swept to a tick limit reports the boundary sqrt price (MIN/MAX_SQRT_RATIO
 # plus the one-unit step a limit swap lands on). That is empty-pool geometry,
 # not a market, even when a later same-block add covers the limit tick.
@@ -1208,6 +1244,9 @@ class LPMarketService:
         ] = OrderedDict()
         self._owner_last_started: dict[tuple[Any, ...], float] = {}
         self._owner_result_revision = 0
+        self._warm_stop = threading.Event()
+        self._warm_thread: threading.Thread | None = None
+        self._warm_error: str | None = None
         self._current_view_lock = threading.Lock()
         # Direct-mapped publication makes the overwhelmingly common feed-cache
         # hit lock-free while retaining a strict memory bound. A miss is still
@@ -1224,6 +1263,10 @@ class LPMarketService:
                 daemon=True,
             )
             self._search_thread.start()
+            self._warm_thread = threading.Thread(
+                target=self._warm_run, name="lp-market-warm", daemon=True,
+            )
+            self._warm_thread.start()
         else:
             self.store.ensure_search_index()
 
@@ -1716,14 +1759,67 @@ class LPMarketService:
                 self._search_error = str(exc)[:500]
                 self._search_stop.wait(1.0)
 
+    def _warming(self) -> bool:
+        return threading.current_thread() is self._warm_thread
+
+    def _writer_idle(self) -> bool:
+        if not self.store.lock.acquire(blocking=False):
+            return False
+        self.store.lock.release()
+        return True
+
+    def _warm_allowed(self) -> bool:
+        status = self.status()
+        if status.get("bulk_work") == "paused":
+            return False
+        latency = status.get("latency") or {}
+        if float(latency.get("accounting") or 0.0) > _WARM_ACCOUNTING_LATENCY_LIMIT_SECONDS:
+            return False
+        with self._cache_lock:
+            if self._cache_refreshing or self._cache_futures:
+                return False
+        with self._frame_lock:
+            if any(not future.done() for future in self._frame_futures.values()):
+                return False
+        return self._writer_idle()
+
+    def _warm_cycle(self) -> int:
+        """Fill missing default terminal keys one at a time; bail while busy."""
+        warmed = 0
+        for route, params in _WARM_KEYS:
+            if self._warm_stop.is_set() or not self._warm_allowed():
+                break
+            started = time.monotonic()
+            try:
+                getattr(self, route)(dict(params))
+            finally:
+                self.store.close_reader()
+            warmed += 1
+            self._warm_stop.wait(
+                max(_WARM_PAUSE_SECONDS, time.monotonic() - started),
+            )
+        return warmed
+
+    def _warm_run(self):
+        while not self._warm_stop.is_set():
+            try:
+                self._warm_cycle()
+                self._warm_error = None
+            except Exception as exc:
+                self._warm_error = str(exc)[:500]
+            self._warm_stop.wait(_WARM_IDLE_SECONDS)
+
     def close(self):
         self._search_stop.set()
+        self._warm_stop.set()
         if self._search_thread is not None:
             self._search_thread.join()
         self.claims.close()
         self.indexer.close()
         self.book.close()
         self.store.close()
+        if self._warm_thread is not None:
+            self._warm_thread.join()
         self._frame_executor.shutdown(wait=True, cancel_futures=True)
         self._cache_executor.shutdown(wait=True, cancel_futures=True)
 
@@ -1756,6 +1852,7 @@ class LPMarketService:
         providers = self.indexer.source_status()
         out["providers"] = providers
         out["current_claims"] = self.claims.status()
+        out["warm_error"] = self._warm_error
         trace = providers.get("trace") or {}
         out["source_coverage"] = {
             "head": "independent newHeads subscription with bounded public-RPC gap reconciliation",
@@ -1815,7 +1912,10 @@ class LPMarketService:
                 self._cache.move_to_end(key)
                 return cached[1]
             stale = cached[1] if cached is not None else _MISSING
-            refresh = stale is not _MISSING and key not in self._cache_refreshing
+            refresh = (
+                stale is not _MISSING and key not in self._cache_refreshing
+                and not self._warming()
+            )
             if refresh:
                 self._cache_refreshing.add(key)
         if refresh:
@@ -3231,7 +3331,8 @@ class LPMarketService:
     def _materialize_owner_projection(
             self, params: Mapping[str, Any],
     ) -> tuple[tuple[int, int, int, int], float | None, dict[str, Any]]:
-        version, valid_until, envelope = self._owners_result(params)
+        with self.store.reader_snapshot(_OWNER_SNAPSHOT_SECONDS):
+            version, valid_until, envelope = self._owners_result(params)
         view_key = self._owner_view_key(params)
         with self._frame_lock:
             self._owner_result_revision += 1
@@ -3271,47 +3372,39 @@ class LPMarketService:
                         ready = pending.result()
                     except BaseException as exc:
                         failure = exc
-                    else:
-                        pending = None
-                if failure is None:
-                    cached = self._owner_results.get(view_key)
-                    if ready is None and cached is not None:
-                        version, valid_until, envelope = cached
-                        if (
-                            version[2:] == target[2:]
-                            and (
-                                not wait
-                                or (
-                                    version == target
-                                    and (
-                                        valid_until is None
-                                        or wall_now < valid_until
-                                    )
-                                )
-                            )
-                        ):
-                            self._owner_results.move_to_end(view_key)
-                            ready = cached
+                    pending = None
+                cached = self._owner_results.get(view_key)
+                if (
+                    ready is None and cached is not None
+                    and cached[0][2:] == target[2:]
+                ):
+                    self._owner_results.move_to_end(view_key)
+                    ready = cached
+                # A completed same-epoch envelope outranks a failed refresh:
+                # the caller gets the last good rows and the next pass retries.
+                if ready is not None:
+                    failure = None
+                needs_refresh = (
+                    ready is None or ready[0] != target
+                    or (ready[1] is not None and wall_now >= ready[1])
+                )
+                if (
+                    needs_refresh and pending is None and failure is None
+                    and not (ready is not None and self._warming())
+                ):
+                    earliest = self._owner_last_started.get(view_key, 0.0) + 1.0
+                    delay = max(0.0, earliest - now)
+                    if delay == 0.0:
+                        if wait and ready is None:
+                            pending = Future()
+                            leader = True
                         else:
-                            ready = None
-                    needs_refresh = (
-                        ready is None or ready[0] != target
-                        or (ready[1] is not None and wall_now >= ready[1])
-                    )
-                    if needs_refresh and pending is None:
-                        earliest = self._owner_last_started.get(view_key, 0.0) + 1.0
-                        delay = max(0.0, earliest - now)
-                        if delay == 0.0:
-                            if wait and ready is None:
-                                pending = Future()
-                                leader = True
-                            else:
-                                pending = self._frame_executor.submit(
-                                    self._frame_read_task,
-                                    self._materialize_owner_projection, dict(params),
-                                )
-                            self._frame_futures[future_key] = pending
-                            self._owner_last_started[view_key] = now
+                            pending = self._frame_executor.submit(
+                                self._frame_read_task,
+                                self._materialize_owner_projection, dict(params),
+                            )
+                        self._frame_futures[future_key] = pending
+                        self._owner_last_started[view_key] = now
             if failure is not None:
                 raise failure
             if leader:
