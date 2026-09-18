@@ -75,6 +75,37 @@ _REPLAY_EVENTS_SQL = (
     "WHERE x.position_key=lp_accounting_pending.position_key "
     f"LIMIT {_PASS_EVENT_BUDGET + 1})) ELSE 0 END END"
 )
+_OWNER_ACTIVITY_WINDOWS = ("1h", "24h", "7d", "30d", "all")
+_OWNER_ACTIVITY_PROTOCOLS = ("", "v2", "v3", "v4")
+_OWNER_ACTIVITY_INTERVAL_SECONDS = 600.0
+_OWNER_ACTIVITY_SNAPSHOT_SECONDS = 1_800.0
+# Each finished view holds one row dict per identity; six is every window
+# for the default protocol plus one.
+_OWNER_ACTIVITY_VIEW_LIMIT = 6
+# Component sums per (identity, protocol, tier). Nullable sums stay None when
+# no episode contributed, matching SQL SUM over an all-NULL group.
+_OWNER_ACTIVITY_FIELDS = (
+    "episodes", "closed", "gross_null", "gross_sum", "gas_sum", "gas_null",
+    "fee_incomplete", "fees_null", "fees_sum", "observed_fees",
+    "observed_fee_episodes", "complete_fee_episodes", "pricing_incomplete",
+    "deposit_null", "proceeds_null", "volume_sum", "closed_gross_null", "wins",
+    "complete_episodes", "activity_at", "retention_at", "positions",
+    "open_positions",
+)
+_CUSTODY_ACTIVITY_FIELDS = (
+    "episodes", "closed", "pricing_incomplete", "deposit_null",
+    "proceeds_null", "volume_sum", "activity_at", "retention_at",
+    "owner_present", "positions", "open_positions",
+)
+_GAS_ACTIVITY_FIELDS = ("pairs", "known", "gas_sum")
+_ACTIVITY_NULLABLE_SUMS = frozenset({
+    "gross_sum", "gas_sum", "fees_sum", "observed_fees", "volume_sum",
+})
+_ACTIVITY_FIELDS_BY_KIND = {
+    "owner": _OWNER_ACTIVITY_FIELDS,
+    "custody": _CUSTODY_ACTIVITY_FIELDS,
+    "gas": _GAS_ACTIVITY_FIELDS,
+}
 
 
 class PreparationDeadlineError(RuntimeError):
@@ -370,6 +401,18 @@ CREATE TABLE IF NOT EXISTS lp_accounting_meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- Owner aggregates rolled up off the writer. One row per identity, episode
+-- protocol and recency tier; a window sums the tiers inside it. Gas rows
+-- count (owner, transaction) pairs of episodes still awaiting attribution.
+CREATE TABLE IF NOT EXISTS lp_accounting_owner_activity (
+    kind TEXT NOT NULL,
+    identity TEXT NOT NULL,
+    protocol TEXT NOT NULL,
+    tier INTEGER NOT NULL,
+    values_json TEXT NOT NULL,
+    PRIMARY KEY(kind,identity,protocol,tier)
+) WITHOUT ROWID;
 
 """
 
@@ -762,6 +805,10 @@ class _PublishedProjection(NamedTuple):
     refresh_position: bool
 
 
+# Finished owner rows paired with the moment each leaves its window.
+_RollupRows = tuple[tuple[dict[str, Any], int | None], ...]
+
+
 class _PreparedIdentityHints(NamedTuple):
     position_key: str
     cursor: int
@@ -833,6 +880,12 @@ def _prepare_in_worker(
     if _preparation_book is None:
         raise RuntimeError("accounting preparation worker is not initialized")
     return _preparation_book._prepare_pending(position_key, budget_scale)
+
+
+def _owner_activity_in_worker(now: int) -> dict[str, Any]:
+    if _preparation_book is None:
+        raise RuntimeError("accounting preparation worker is not initialized")
+    return _preparation_book._owner_activity_snapshot(now)
 
 
 def _batches(values: Sequence[Any], size: int = 500) -> Iterable[Sequence[Any]]:
@@ -952,6 +1005,15 @@ def _token_value(amount0: int, amount1: int, price0: Any, price1: Any,
     return value if math.isfinite(value) else None
 
 
+def _sql_sum(left: float | None, right: float | None) -> float | None:
+    """Add like SQL SUM: NULL contributes nothing and an all-NULL sum is NULL."""
+    if left is None:
+        return right
+    if right is None:
+        return left
+    return left + right
+
+
 def _nullable_sum(values: Iterable[float | None]) -> float | None:
     items = list(values)
     if not items:
@@ -1023,13 +1085,26 @@ class AccountBook:
         self._owner_activity_cache: OrderedDict[
             tuple[Any, ...], dict[str, Any] | None
         ] = OrderedDict()
+        # The rollup keeps its own single worker so a build never takes a
+        # preparation slot from the backlog.
+        self._rollup_pool: ProcessPoolExecutor | None = None
+        self._rollup_future: Future[dict[str, Any]] | None = None
+        self._rollup_started = -math.inf
+        self._rollup_generation = -1
+        self._rollup_partials: dict[
+            tuple[str, str, str, int], list[Any]
+        ] | None = None
+        self._rollup_meta: dict[str, Any] = {}
+        self._rollup_views: OrderedDict[tuple[int, str, str], _RollupRows] = OrderedDict()
 
     def close(self) -> None:
         """Join preparation after the accounting coordinator has stopped."""
         with self._projection_lock:
-            if self._preparation_pool is not None:
-                self._preparation_pool.shutdown(wait=True, cancel_futures=True)
-                self._preparation_pool = None
+            for name in ("_preparation_pool", "_rollup_pool"):
+                pool = getattr(self, name)
+                if pool is not None:
+                    pool.shutdown(wait=True, cancel_futures=True)
+                    setattr(self, name, None)
 
     def _prepare_position(self, position_key: str):
         try:
@@ -2103,6 +2178,8 @@ class AccountBook:
         bounded = max(1, min(int(limit), 128))
         with self._projection_lock:
             worked = self._resume_bootstrap(bounded)
+            if self._preparation_workers:
+                worked = self._advance_rollup() or worked
             pending = self._pending_rows(bounded)
             if pending:
                 worked = True
@@ -4913,6 +4990,126 @@ class AccountBook:
             ).fetchone()
         return int(row[0] or 0)
 
+    @staticmethod
+    def _finish_owner_rows(
+        beneficial: list[dict[str, Any]], custody_rows: list[dict[str, Any]],
+        gas_by_owner: Mapping[str, float | None],
+        financial_state: tuple[Any, ...], window: str,
+        cutoff_seconds: int | None,
+    ) -> tuple[list[dict[str, Any]], int | None]:
+        """Shape aggregate rows the way the owners endpoint publishes them."""
+        valid_until: int | None = None
+        rows = beneficial
+        (
+            through_order, through_as_of, pending_owners,
+            pending_custodies, mapping_complete,
+        ) = financial_state
+        for group in (beneficial, custody_rows):
+            for row in group:
+                owner = _address(row.get("owner"))
+                custody = _address(row.get("custody"))
+                pending = (
+                    not mapping_complete
+                    or owner is not None and owner in pending_owners
+                    or custody is not None and custody in pending_custodies
+                )
+                row["financial_pending"] = pending
+                row["financial_through_order"] = (
+                    None if pending or through_order is None
+                    else dict(through_order)
+                )
+                row["financial_through_as_of"] = (
+                    None if pending else through_as_of
+                )
+        for row in rows:
+            timestamp = row.pop("_retention_timestamp", None)
+            if cutoff_seconds is not None and timestamp is not None:
+                expires = int(timestamp) + cutoff_seconds + 1
+                valid_until = expires if valid_until is None else min(valid_until, expires)
+            qualified = row.get("gross_pnl_usd") is not None
+            owner = str(row["owner"])
+            observed_gas = _finite_float(
+                row.pop("_observed_gas_usd", None)
+            )
+            missing_gas_episodes = int(
+                row.pop("_missing_gas_episodes", 0) or 0
+            )
+            unresolved_gas = gas_by_owner.get(owner, ...)
+            if missing_gas_episodes and unresolved_gas is None:
+                row["gas_usd"] = None
+            elif unresolved_gas is ...:
+                row["gas_usd"] = observed_gas
+            else:
+                row["gas_usd"] = (
+                    (observed_gas or 0.0) + float(unresolved_gas)
+                )
+            row["net_pnl_usd"] = (
+                row["gross_pnl_usd"] - row["gas_usd"]
+                if row.get("gross_pnl_usd") is not None
+                and row.get("gas_usd") is not None else None
+            )
+            episodes = int(row.pop("episodes") or 0)
+            observed_fee_episodes = int(row.pop("observed_fee_episodes") or 0)
+            complete_fee_episodes = int(row.pop("complete_fee_episodes") or 0)
+            row["coverage"] = {
+                "qualified": qualified,
+                "cost_qualified": row.get("net_pnl_usd") is not None,
+                "complete_episodes": int(row.pop("complete_episodes") or 0),
+                "episodes": episodes,
+                "window": window,
+                "episode_selection": (
+                    "last_activity_within_window"
+                    if cutoff_seconds is not None else "all_indexed_episodes"
+                ),
+                "financial_scope": "lifetime_of_selected_episodes",
+                "observed_collected_fees": {
+                    "unit": "USDG_quote",
+                    "episodes": observed_fee_episodes,
+                    "history_complete_episodes": complete_fee_episodes,
+                    "total_episodes": episodes,
+                    "complete": (
+                        episodes > 0 and complete_fee_episodes == episodes
+                    ),
+                },
+                "reasons": (
+                    [] if qualified else ["incomplete_or_unpriced_episodes"]
+                ),
+            }
+        for row in custody_rows:
+            timestamp = row.pop("_retention_timestamp", None)
+            if cutoff_seconds is not None and timestamp is not None:
+                expires = int(timestamp) + cutoff_seconds + 1
+                valid_until = expires if valid_until is None else min(valid_until, expires)
+            episodes = int(row.pop("episodes") or 0)
+            row["gross_pnl_usd"] = None
+            row["net_pnl_usd"] = None
+            row["gas_usd"] = None
+            row["fees_usd"] = None
+            row["observed_collected_fees_usd"] = None
+            row["win_rate"] = None
+            row["coverage"] = {
+                "qualified": False, "cost_qualified": False,
+                "complete_episodes": 0,
+                "episodes": episodes,
+                "window": window,
+                "episode_selection": (
+                    "last_activity_within_window"
+                    if cutoff_seconds is not None else "all_indexed_episodes"
+                ),
+                "financial_scope": "not_attributed_to_custody",
+                "observed_collected_fees": {
+                    "unit": "USDG_quote", "episodes": 0,
+                    "history_complete_episodes": 0,
+                    "total_episodes": episodes, "complete": False,
+                },
+                "reasons": [row["identity_basis"], "not_beneficial_owner"],
+            }
+            row.pop("observed_fee_episodes", None)
+            row.pop("complete_fee_episodes", None)
+            row.pop("complete_episodes", None)
+            rows.append(row)
+        return rows, valid_until
+
     def owner_candidates(
             self, params: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
@@ -5098,115 +5295,10 @@ class AccountBook:
                     if cutoff_seconds is not None else None,
                     (),
                 )
-            rows = beneficial
-            (
-                through_order, through_as_of, pending_owners,
-                pending_custodies, mapping_complete,
-            ) = financial_state
-            for group in (beneficial, custody_rows):
-                for row in group:
-                    owner = _address(row.get("owner"))
-                    custody = _address(row.get("custody"))
-                    pending = (
-                        not mapping_complete
-                        or owner is not None and owner in pending_owners
-                        or custody is not None and custody in pending_custodies
-                    )
-                    row["financial_pending"] = pending
-                    row["financial_through_order"] = (
-                        None if pending or through_order is None
-                        else dict(through_order)
-                    )
-                    row["financial_through_as_of"] = (
-                        None if pending else through_as_of
-                    )
-            for row in rows:
-                timestamp = row.pop("_retention_timestamp", None)
-                if cutoff_seconds is not None and timestamp is not None:
-                    expires = int(timestamp) + cutoff_seconds + 1
-                    valid_until = expires if valid_until is None else min(valid_until, expires)
-                qualified = row.get("gross_pnl_usd") is not None
-                owner = str(row["owner"])
-                observed_gas = _finite_float(
-                    row.pop("_observed_gas_usd", None)
-                )
-                missing_gas_episodes = int(
-                    row.pop("_missing_gas_episodes", 0) or 0
-                )
-                unresolved_gas = gas_by_owner.get(owner, ...)
-                if missing_gas_episodes and unresolved_gas is None:
-                    row["gas_usd"] = None
-                elif unresolved_gas is ...:
-                    row["gas_usd"] = observed_gas
-                else:
-                    row["gas_usd"] = (
-                        (observed_gas or 0.0) + float(unresolved_gas)
-                    )
-                row["net_pnl_usd"] = (
-                    row["gross_pnl_usd"] - row["gas_usd"]
-                    if row.get("gross_pnl_usd") is not None
-                    and row.get("gas_usd") is not None else None
-                )
-                episodes = int(row.pop("episodes") or 0)
-                observed_fee_episodes = int(row.pop("observed_fee_episodes") or 0)
-                complete_fee_episodes = int(row.pop("complete_fee_episodes") or 0)
-                row["coverage"] = {
-                    "qualified": qualified,
-                    "cost_qualified": row.get("net_pnl_usd") is not None,
-                    "complete_episodes": int(row.pop("complete_episodes") or 0),
-                    "episodes": episodes,
-                    "window": window,
-                    "episode_selection": (
-                        "last_activity_within_window"
-                        if cutoff_seconds is not None else "all_indexed_episodes"
-                    ),
-                    "financial_scope": "lifetime_of_selected_episodes",
-                    "observed_collected_fees": {
-                        "unit": "USDG_quote",
-                        "episodes": observed_fee_episodes,
-                        "history_complete_episodes": complete_fee_episodes,
-                        "total_episodes": episodes,
-                        "complete": (
-                            episodes > 0 and complete_fee_episodes == episodes
-                        ),
-                    },
-                    "reasons": (
-                        [] if qualified else ["incomplete_or_unpriced_episodes"]
-                    ),
-                }
-            for row in custody_rows:
-                timestamp = row.pop("_retention_timestamp", None)
-                if cutoff_seconds is not None and timestamp is not None:
-                    expires = int(timestamp) + cutoff_seconds + 1
-                    valid_until = expires if valid_until is None else min(valid_until, expires)
-                episodes = int(row.pop("episodes") or 0)
-                row["gross_pnl_usd"] = None
-                row["net_pnl_usd"] = None
-                row["gas_usd"] = None
-                row["fees_usd"] = None
-                row["observed_collected_fees_usd"] = None
-                row["win_rate"] = None
-                row["coverage"] = {
-                    "qualified": False, "cost_qualified": False,
-                    "complete_episodes": 0,
-                    "episodes": episodes,
-                    "window": window,
-                    "episode_selection": (
-                        "last_activity_within_window"
-                        if cutoff_seconds is not None else "all_indexed_episodes"
-                    ),
-                    "financial_scope": "not_attributed_to_custody",
-                    "observed_collected_fees": {
-                        "unit": "USDG_quote", "episodes": 0,
-                        "history_complete_episodes": 0,
-                        "total_episodes": episodes, "complete": False,
-                    },
-                    "reasons": [row["identity_basis"], "not_beneficial_owner"],
-                }
-                row.pop("observed_fee_episodes", None)
-                row.pop("complete_fee_episodes", None)
-                row.pop("complete_episodes", None)
-                rows.append(row)
+            rows, valid_until = self._finish_owner_rows(
+                beneficial, custody_rows, gas_by_owner, financial_state,
+                window, cutoff_seconds,
+            )
             if query:
                 identity_matches = [
                     row for row in rows
@@ -5228,6 +5320,434 @@ class AccountBook:
             "accounting_as_of": coverage.get("history_to"),
             "accounting_revision": generation,
             "valid_until": valid_until,
+        }
+
+    @staticmethod
+    def _activity_tier_sql(column: str) -> str:
+        return (
+            f"CASE WHEN {column}>=? THEN 0 WHEN {column}>=? THEN 1 "
+            f"WHEN {column}>=? THEN 2 WHEN {column}>=? THEN 3 ELSE 4 END"
+        )
+
+    @staticmethod
+    def _merge_activity(
+        fields: Sequence[str], total: list[Any], values: Sequence[Any],
+    ) -> None:
+        if not any(total):
+            total[:] = values
+            return
+        for index, name in enumerate(fields):
+            if name == "activity_at":
+                total[index] = max(total[index], values[index])
+            elif name == "retention_at":
+                total[index] = min(total[index], values[index])
+            elif name in _ACTIVITY_NULLABLE_SUMS:
+                total[index] = _sql_sum(total[index], values[index])
+            else:
+                total[index] += values[index]
+
+    def _owner_activity_snapshot(self, now: int) -> dict[str, Any]:
+        """Roll every episode up by identity, protocol and recency tier.
+
+        Five covering-index scans on one read snapshot replace the per-request
+        window scans. The tiers nest like the windows, so a window is the sum
+        of the tiers at or above its cutoff as of ``now``.
+        """
+        cuts = tuple(now - _cutoff({"window": window}) for window in _OWNER_ACTIVITY_WINDOWS[:4])
+        tier = self._activity_tier_sql("last_timestamp")
+        partials: dict[tuple[str, str, str, int], list[Any]] = {}
+        source = (
+            " FROM lp_accounting_episodes "
+            "INDEXED BY lp_accounting_episodes_owner_window_cover "
+        )
+        with self.store.reader_snapshot(_OWNER_ACTIVITY_SNAPSHOT_SECONDS) as conn:
+            epoch = self._store_metadata_int(conn, "epoch")
+            for kind, fields, components in (
+                ("owner", _OWNER_ACTIVITY_FIELDS, (
+                    "COUNT(*),SUM(status='complete'),"
+                    "SUM(gross_pnl_usd IS NULL),SUM(gross_pnl_usd),"
+                    "SUM(gas_usd),SUM(gas_usd IS NULL),"
+                    "SUM(NOT(history_complete AND fees_complete AND pricing_complete)),"
+                    "SUM(fees_usd IS NULL),SUM(fees_usd),"
+                    "SUM(CASE WHEN fees_complete AND pricing_complete "
+                    "AND fees_usd IS NOT NULL THEN fees_usd END),"
+                    "SUM(fees_complete AND pricing_complete AND fees_usd IS NOT NULL),"
+                    "SUM(history_complete AND fees_complete AND pricing_complete "
+                    "AND fees_usd IS NOT NULL),"
+                    "SUM(NOT(history_complete AND pricing_complete)),"
+                    "SUM(deposit_usd IS NULL),SUM(proceeds_usd IS NULL),"
+                    "SUM(deposit_usd+proceeds_usd),"
+                    "SUM(status='complete' AND gross_pnl_usd IS NULL),"
+                    "COALESCE(SUM(status='complete' AND gross_pnl_usd>0),0),"
+                    "SUM(gross_pnl_usd IS NOT NULL),"
+                    "MAX(last_timestamp),MIN(last_timestamp)"
+                )),
+                ("custody", _CUSTODY_ACTIVITY_FIELDS, (
+                    "COUNT(*),SUM(status='complete'),"
+                    "SUM(NOT(history_complete AND pricing_complete)),"
+                    "SUM(deposit_usd IS NULL),SUM(proceeds_usd IS NULL),"
+                    "SUM(deposit_usd+proceeds_usd),"
+                    "MAX(last_timestamp),MIN(last_timestamp),"
+                    "SUM(owner IS NOT NULL)"
+                )),
+            ):
+                blank = [0] * len(fields)
+                for name in _ACTIVITY_NULLABLE_SUMS:
+                    if name in fields:
+                        blank[fields.index(name)] = None
+                # Rows keyed '' sum every protocol. They are stored rather
+                # than derived because a position's episodes can span
+                # protocols, so its all-protocol position count is not the
+                # sum of its per-protocol counts.
+                for row in conn.execute(
+                    f"SELECT {kind},COALESCE(protocol,'?'),{tier},{components}"
+                    + source + f"WHERE {kind} IS NOT NULL GROUP BY 1,2,3",
+                    cuts,
+                ):
+                    values = list(row[3:]) + [0, 0]
+                    partials[(kind, str(row[0]), str(row[1]), int(row[2]))] = values
+                    every = partials.setdefault(
+                        (kind, str(row[0]), "", int(row[2])), list(blank),
+                    )
+                    self._merge_activity(fields, every, values)
+                positions_at = fields.index("positions")
+                open_at = fields.index("open_positions")
+                for row in conn.execute(
+                    "WITH p(identity,protocol,position_key,max_ts,open_ts) "
+                    "AS MATERIALIZED ("
+                    f"SELECT {kind},COALESCE(protocol,'?'),position_key,"
+                    "MAX(last_timestamp),"
+                    "MAX(CASE WHEN closed_at IS NULL THEN last_timestamp END)"
+                    + source + f"WHERE {kind} IS NOT NULL "
+                    "GROUP BY 1,2,position_key),"
+                    "q(identity,max_ts,open_ts) AS MATERIALIZED ("
+                    "SELECT identity,MAX(max_ts),MAX(open_ts) FROM p "
+                    "GROUP BY identity,position_key) "
+                    "SELECT identity,protocol,"
+                    + self._activity_tier_sql("max_ts")
+                    + ",COUNT(*),0 FROM p GROUP BY 1,2,3 "
+                    "UNION ALL SELECT identity,protocol,"
+                    + self._activity_tier_sql("open_ts")
+                    + ",0,COUNT(*) FROM p WHERE open_ts IS NOT NULL GROUP BY 1,2,3 "
+                    "UNION ALL SELECT identity,'',"
+                    + self._activity_tier_sql("max_ts")
+                    + ",COUNT(*),0 FROM q GROUP BY 1,2,3 "
+                    "UNION ALL SELECT identity,'',"
+                    + self._activity_tier_sql("open_ts")
+                    + ",0,COUNT(*) FROM q WHERE open_ts IS NOT NULL GROUP BY 1,2,3",
+                    cuts * 4,
+                ):
+                    key = (kind, str(row[0]), str(row[1]), int(row[2]))
+                    values = partials.setdefault(key, list(blank))
+                    values[positions_at] += int(row[3])
+                    values[open_at] += int(row[4])
+            gas_tiers = ",".join(
+                f"CASE WHEN ts_{protocol or 'all'} IS NULL THEN 5 ELSE "
+                + self._activity_tier_sql(f"ts_{protocol or 'all'}") + " END"
+                for protocol in _OWNER_ACTIVITY_PROTOCOLS
+            )
+            for row in conn.execute(
+                "WITH pairs(owner,tx_hash,ts_all,ts_v2,ts_v3,ts_v4) AS MATERIALIZED ("
+                "SELECT ep.owner,fx.tx_hash,MAX(ep.last_timestamp),"
+                "MAX(CASE WHEN ep.protocol='v2' THEN ep.last_timestamp END),"
+                "MAX(CASE WHEN ep.protocol='v3' THEN ep.last_timestamp END),"
+                "MAX(CASE WHEN ep.protocol='v4' THEN ep.last_timestamp END) "
+                "FROM lp_accounting_episodes ep "
+                "INDEXED BY lp_accounting_episodes_owner_window_cover "
+                "JOIN lp_accounting_effects fx "
+                "INDEXED BY lp_accounting_effects_episode ON fx.episode_id=ep.id "
+                "WHERE ep.owner IS NOT NULL AND ep.gas_usd IS NULL "
+                "GROUP BY ep.owner,fx.tx_hash),"
+                "costed AS (SELECT p.owner,p.ts_all,p.ts_v2,p.ts_v3,p.ts_v4,"
+                "c.gas_usd FROM pairs p LEFT JOIN lp_accounting_tx_costs c "
+                "INDEXED BY lp_accounting_tx_costs_owner_gas_cover "
+                "ON c.owner=p.owner AND c.tx_hash=p.tx_hash) "
+                f"SELECT owner,{gas_tiers},COUNT(*),COUNT(gas_usd),SUM(gas_usd) "
+                "FROM costed GROUP BY 1,2,3,4,5",
+                cuts * len(_OWNER_ACTIVITY_PROTOCOLS),
+            ):
+                owner = str(row[0])
+                for index, protocol in enumerate(_OWNER_ACTIVITY_PROTOCOLS):
+                    scope_tier = int(row[1 + index])
+                    if scope_tier > 4:
+                        continue
+                    values = partials.setdefault(
+                        ("gas", owner, protocol, scope_tier), [0, 0, None],
+                    )
+                    values[0] += int(row[5])
+                    values[1] += int(row[6])
+                    values[2] = _sql_sum(values[2], row[7])
+            through_order, through_as_of, _owners, _custodies, complete = (
+                self._scoped_owner_financial_state(conn, {}, None, ())
+            )
+        return {
+            "built_at": int(now), "epoch": epoch,
+            "financial": [through_order, through_as_of, complete],
+            "rows": [(*key, values) for key, values in partials.items()],
+        }
+
+    def _load_rollup(self, conn: sqlite3.Connection) -> None:
+        meta = _json(self._accounting_meta(conn, "owner_activity", "{}"))
+        partials: dict[tuple[str, str, str, int], list[Any]] = {}
+        if meta:
+            for row in conn.execute(
+                "SELECT kind,identity,protocol,tier,values_json "
+                "FROM lp_accounting_owner_activity",
+            ):
+                partials[(str(row[0]), str(row[1]), str(row[2]), int(row[3]))] = (
+                    json.loads(row[4])
+                )
+        with self._cache_lock:
+            self._rollup_partials = partials
+            self._rollup_meta = meta
+            self._rollup_views.clear()
+
+    def _publish_owner_activity(self, snapshot: Mapping[str, Any]) -> bool:
+        """Replace the rollup atomically; changed rows only, same epoch only."""
+        rows = {
+            (str(kind), str(identity), str(protocol), int(tier)): list(values)
+            for kind, identity, protocol, tier, values in snapshot["rows"]
+        }
+        with self.store.transaction() as conn:
+            if self._store_metadata_int(conn, "epoch") != int(snapshot["epoch"]):
+                return False
+            if self._rollup_partials is None:
+                self._load_rollup(conn)
+            previous = self._rollup_partials or {}
+            conn.executemany(
+                "DELETE FROM lp_accounting_owner_activity "
+                "WHERE kind=? AND identity=? AND protocol=? AND tier=?",
+                sorted(previous.keys() - rows.keys()),
+            )
+            conn.executemany(
+                "INSERT OR REPLACE INTO lp_accounting_owner_activity("
+                "kind,identity,protocol,tier,values_json) VALUES(?,?,?,?,?)",
+                (
+                    (*key, json.dumps(values, separators=(",", ":")))
+                    for key, values in sorted(rows.items())
+                    if previous.get(key) != values
+                ),
+            )
+            meta = {
+                "build": int(self._rollup_meta.get("build") or 0) + 1,
+                "built_at": int(snapshot["built_at"]),
+                "epoch": int(snapshot["epoch"]),
+                "financial": list(snapshot["financial"]),
+            }
+            self._set_accounting_meta(conn, "owner_activity", json.dumps(meta))
+            self._invalidate_cache(conn, ())
+        with self._cache_lock:
+            self._rollup_partials = rows
+            self._rollup_meta = meta
+            self._rollup_views.clear()
+            self._rollup_generation = self._owners_generation
+        return True
+
+    def _advance_rollup(self) -> bool:
+        """Publish a finished build, or start one when the ledger has moved."""
+        future = self._rollup_future
+        if future is not None:
+            if not future.done():
+                return False
+            self._rollup_future = None
+            try:
+                snapshot = future.result()
+            except BrokenProcessPool:
+                if self._rollup_pool is not None:
+                    self._rollup_pool.shutdown(wait=False, cancel_futures=True)
+                    self._rollup_pool = None
+                return False
+            except Exception as exc:
+                if not _snapshot_deadline_error(exc):
+                    raise
+                return False
+            return self._publish_owner_activity(snapshot)
+        now = time.monotonic()
+        if (
+            self.owners_revision == self._rollup_generation
+            or now - self._rollup_started < _OWNER_ACTIVITY_INTERVAL_SECONDS
+        ):
+            return False
+        self._rollup_started = now
+        if self._rollup_pool is None:
+            self._rollup_pool = ProcessPoolExecutor(
+                max_workers=1,
+                mp_context=multiprocessing.get_context("spawn"),
+                initializer=_initialize_preparation_worker,
+                initargs=(str(self.store.path),),
+            )
+        self._rollup_future = self._rollup_pool.submit(
+            _owner_activity_in_worker, int(time.time()),
+        )
+        return False
+
+    def _rollup_view(
+        self, window: str, protocol: str,
+    ) -> tuple[_RollupRows, dict[str, Any]] | None:
+        with self._cache_lock:
+            if self._rollup_partials is None:
+                self._load_rollup(self.store.read())
+            partials = self._rollup_partials or {}
+            meta = self._rollup_meta
+            if not meta:
+                return None
+            build = int(meta.get("build") or 0)
+            cached = self._rollup_views.get((build, window, protocol))
+            if cached is not None:
+                self._rollup_views.move_to_end((build, window, protocol))
+                return cached, meta
+        depth = _OWNER_ACTIVITY_WINDOWS.index(window)
+        cutoff_seconds = _cutoff({"window": window})
+        sums: dict[tuple[str, str], list[Any]] = {}
+        for (kind, identity, scope, tier), values in partials.items():
+            if tier > depth or scope != protocol:
+                continue
+            total = sums.get((kind, identity))
+            if total is None:
+                sums[(kind, identity)] = list(values)
+            else:
+                self._merge_activity(_ACTIVITY_FIELDS_BY_KIND[kind], total, values)
+        beneficial: list[dict[str, Any]] = []
+        custody_rows: list[dict[str, Any]] = []
+        gas_by_owner: dict[str, float | None] = {}
+        for (kind, identity), total in sums.items():
+            if kind == "gas":
+                pairs, known, gas_sum = total
+                gas_by_owner[identity] = gas_sum if known == pairs else None
+                continue
+            value = dict(zip(
+                _OWNER_ACTIVITY_FIELDS if kind == "owner"
+                else _CUSTODY_ACTIVITY_FIELDS,
+                total,
+            ))
+            closed = int(value["closed"])
+            row: dict[str, Any] = {
+                "positions": value["positions"],
+                "open_positions": value["open_positions"],
+                "closed_episodes": closed,
+                "volume_usd": (
+                    value["volume_sum"]
+                    if not value["pricing_incomplete"]
+                    and not value["deposit_null"] and not value["proceeds_null"]
+                    else None
+                ),
+                "episodes": value["episodes"],
+                "_activity_at": value["activity_at"],
+            }
+            if cutoff_seconds is not None:
+                row["_retention_timestamp"] = value["retention_at"]
+            if kind == "custody":
+                row = {
+                    "owner": None, "custody": identity,
+                    "identity_basis": (
+                        "custody_aggregate" if value["owner_present"] > 0
+                        else "custody_only"
+                    ),
+                    **row,
+                }
+                custody_rows.append(row)
+                continue
+            row = {
+                "owner": identity, "custody": None,
+                "identity_basis": "verified_owner",
+                **row,
+                "gross_pnl_usd": (
+                    value["gross_sum"] if not value["gross_null"] else None
+                ),
+                "_observed_gas_usd": value["gas_sum"],
+                "_missing_gas_episodes": value["gas_null"],
+                "fees_usd": (
+                    value["fees_sum"]
+                    if not value["fee_incomplete"] and not value["fees_null"]
+                    else None
+                ),
+                "observed_collected_fees_usd": value["observed_fees"],
+                "observed_fee_episodes": value["observed_fee_episodes"],
+                "complete_fee_episodes": value["complete_fee_episodes"],
+                "win_rate": (
+                    100.0 * value["wins"] / closed
+                    if closed > 0 and not value["closed_gross_null"] else None
+                ),
+                "complete_episodes": value["complete_episodes"],
+            }
+            beneficial.append(row)
+        through_order, through_as_of, complete = meta["financial"]
+        expiries = tuple(
+            None if cutoff_seconds is None
+            else int(row["_retention_timestamp"]) + cutoff_seconds + 1
+            for row in (*beneficial, *custody_rows)
+        )
+        rows, _valid_until = self._finish_owner_rows(
+            beneficial, custody_rows, gas_by_owner,
+            (through_order, through_as_of, set(), set(), bool(complete)),
+            window, cutoff_seconds,
+        )
+        frozen = tuple(zip(rows, expiries))
+        with self._cache_lock:
+            if self._rollup_meta is meta:
+                self._rollup_views[(build, window, protocol)] = frozen
+                while len(self._rollup_views) > _OWNER_ACTIVITY_VIEW_LIMIT:
+                    self._rollup_views.popitem(last=False)
+        return frozen, meta
+
+    def owner_activity(
+        self, window: str, *, protocol: str = "", identity_scope: str = "all",
+    ) -> dict[str, Any] | None:
+        """Serve owner aggregates from the rollup; None until one is built.
+
+        Same rows and envelope as :meth:`owner_candidates` for a request
+        without pool or text filters, as of the build's read snapshot.
+        """
+        window = str(window or "all").lower()
+        if window not in _OWNER_ACTIVITY_WINDOWS:
+            window = "all"
+        protocol = str(protocol or "").lower()
+        if protocol not in _OWNER_ACTIVITY_PROTOCOLS:
+            raise ValueError("protocol must be v2, v3 or v4")
+        identity_scope = str(identity_scope or "all").lower()
+        if identity_scope not in {"all", "wallets", "custody"}:
+            raise ValueError("identity_scope must be all, wallets or custody")
+        view = self._rollup_view(window, protocol)
+        if view is None:
+            return None
+        frozen, meta = view
+        if int(meta.get("epoch") or 0) != self._store_metadata_int(
+            self.store.read(), "epoch",
+        ):
+            return None
+        # A row whose every episode left the window since the build is gone
+        # already; partial aging waits for the next build.
+        now = int(time.time())
+        selected = [
+            (row, expires) for row, expires in frozen
+            if (expires is None or expires > now)
+            and (
+                identity_scope == "all"
+                or (identity_scope == "wallets") == (row.get("owner") is not None)
+            )
+        ]
+        rows = [row for row, _expires in selected]
+        valid_until = min(
+            (expires for _row, expires in selected if expires is not None),
+            default=None,
+        )
+        coverage = self._status_coverage()
+        cutoff_seconds = _cutoff({"window": window})
+        coverage.update({
+            "window": window,
+            "episode_selection": (
+                "last_activity_within_window"
+                if cutoff_seconds is not None else "all_indexed_episodes"
+            ),
+            "financial_scope": "lifetime_of_selected_episodes",
+            "fee_value_unit": "USDG_quote",
+        })
+        return {
+            "rows": rows, "total": len(rows), "coverage": coverage,
+            "accounting_as_of": coverage.get("history_to"),
+            "accounting_revision": self.owners_revision,
+            "valid_until": valid_until,
+            "built_at": int(meta.get("built_at") or 0),
         }
 
     @staticmethod
