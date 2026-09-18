@@ -1,0 +1,23 @@
+{
+  "rules": [
+    {
+      "description": "rhpools: cache API responses per origin Cache-Control",
+      "expression": "(starts_with(http.request.uri.path, \"/api/lp/\") or starts_with(http.request.uri.path, \"/api/v1/\")) and not ends_with(http.request.uri.path, \"/stream\")",
+      "action": "set_cache_settings",
+      "action_parameters": {
+        "cache": true,
+        "origin_cache_control": true,
+        "edge_ttl": {"mode": "bypass_by_default"},
+        "browser_ttl": {"mode": "respect_origin"},
+        "cache_key": {"ignore_query_strings_order": true},
+        "serve_stale": {"disable_stale_while_updating": false}
+      }
+    },
+    {
+      "description": "rhpools: never cache event streams",
+      "expression": "ends_with(http.request.uri.path, \"/stream\")",
+      "action": "set_cache_settings",
+      "action_parameters": {"cache": false}
+    }
+  ]
+}
