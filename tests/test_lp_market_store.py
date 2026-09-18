@@ -906,3 +906,80 @@ def test_writer_owned_work_does_not_wait_behind_reader_drain(tmp_path):
         if writer.ident is not None:
             writer.join(2)
         store.close()
+
+
+def test_unprojected_ingest_rolls_activity_into_buckets_exactly_once(tmp_path):
+    from rhpools.lp_market_service import BUCKET_FIELDS, LPMarketService, PriceProjection
+    from rhpools.workbench_market import USDG
+
+    app = LPMarketService(None, "http://127.0.0.1:1", tmp_path / "market.sqlite", start=False)
+    pool = "0x" + "23" * 20
+    try:
+        app.store.upsert_pools([{
+            "id": pool, "address": pool, "protocol": "v3",
+            "token0": "0x" + "12" * 20, "token1": USDG,
+            "symbol0": "ASSET", "symbol1": "USDG", "decimals0": 6, "decimals1": 6,
+            "tick_spacing": 1, "hook": None,
+            "factory": "0x1f7d7550b1b028f7571e69a784071f0205fd2efa",
+            "created_block": 1, "source": "factory-live",
+        }])
+        # Two archive intervals share the minute at 1_700_000_100..159:
+        # block 118 (swap) lands in the first, block 100..117 in the second.
+        blocks = {number: header(number) for number in (100, 105, 118)}
+
+        def archive_event(number, kind, index):
+            row = event(blocks[number], index)
+            row.update({
+                "pool_id": pool, "kind": kind, "position_key": None,
+                "owner": None, "custody": None, "token_id": None,
+                "tx_hash": "0x" + f"{number * 10 + index:064x}",
+                "sqrt_price_x96": str(1 << 96), "liquidity": "1000",
+                "amount0": "-100", "amount1": "101",
+            })
+            return row
+
+        newer = [archive_event(118, "swap", 0)]
+        older = [
+            archive_event(100, "swap", 0), archive_event(100, "add", 1),
+            archive_event(105, "remove", 0), archive_event(105, "swap", 1),
+        ]
+        app.store.ingest([blocks[118]], newer, lane="history", project=False)
+        app.store.ingest([blocks[100], blocks[105]], older, lane="history", project=False)
+        app.store.ingest([blocks[100], blocks[105]], older, lane="history", project=False)
+        columns = ",".join(BUCKET_FIELDS)
+        counted = ("events", "swaps", "adds", "removes", "flows")
+
+        def buckets():
+            return [
+                dict(row) for row in app.store.read().execute(
+                    f"SELECT resolution,bucket,pool_id,{columns},max_block "
+                    "FROM lp_pool_buckets ORDER BY resolution,bucket",
+                ).fetchall()
+            ]
+
+        rolled = buckets()
+        minute = 1_700_000_100 // 60 * 60
+        assert [
+            (row["resolution"], row["bucket"], *(row[name] for name in counted), row["max_block"])
+            for row in rolled
+        ] == [
+            (60, minute, 5, 3, 1, 1, 2, 118),
+            (3600, minute // 3600 * 3600, 5, 3, 1, 1, 2, 118),
+            (86400, minute // 86400 * 86400, 5, 3, 1, 1, 2, 118),
+        ]
+        # The per-event recompute of the same minute finds nothing to change.
+        with app.store.transaction() as connection:
+            PriceProjection._bucket(connection, pool, minute)
+        assert buckets() == rolled
+        # Pricing later adds only USD to the rolled counts.
+        priced = app.store.pending_reprojections(1)
+        app.store.reproject([int(priced[0]["id"])])
+        after = buckets()
+        assert [
+            [row[name] for name in counted] for row in after
+        ] == [
+            [row[name] for name in counted] for row in rolled
+        ]
+        assert after[0]["volume_usd"] > 0
+    finally:
+        app.close()
