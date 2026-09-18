@@ -1415,6 +1415,73 @@ def test_warmer_skips_while_paused_and_fills_gaps_one_at_a_time(
         app.close()
 
 
+def test_owner_rollup_is_used_when_built_and_live_aggregate_otherwise(
+        tmp_path, monkeypatch):
+    app = service(tmp_path / "market.sqlite")
+    rollup_owner = "0x" + "78" * 20
+    built = {"value": None}
+    asked = []
+
+    def owner_activity(window, *, protocol="", identity_scope="all"):
+        asked.append((window, protocol, identity_scope))
+        return built["value"]
+
+    try:
+        app.store.upsert_pools(pools())
+        durable_time = int(time.time()) - 3_600
+        block = header(90, durable_time)
+        durable = lp_effect(
+            block, "v3", "add", 1_000, (1_000_000, 1_000_000),
+            position_state(0), position_state(1_000), key="durable",
+        )
+        durable["custody"] = MANAGER
+        ingest_effects(app, [block], [durable])
+        app.store.ingest([block], [], cursor={
+            "from_block": 90, "to_block": 90, "block_number": 90,
+            "block_hash": block["hash"], "timestamp": durable_time,
+        })
+        live = app.book.owner_candidates({"window": "7d"})
+        assert [row["owner"] for row in live["rows"] if row["owner"]] == [TOKEN]
+        monkeypatch.setattr(app.book, "owner_activity", owner_activity, raising=False)
+
+        fallback = app.owners({"window": "7d", "sort": "activity", "limit": 20})
+        assert asked == [("7d", "", "all")]
+        fallback_owners = {row["owner"] for row in fallback["rows"]}
+        assert TOKEN in fallback_owners and rollup_owner not in fallback_owners
+
+        stamped = app.book.owners_revision - 1
+        built["value"] = {
+            **live,
+            "rows": [{
+                **next(row for row in live["rows"] if row["owner"] == TOKEN),
+                "owner": rollup_owner, "custody": rollup_owner,
+            }],
+            "accounting_revision": stamped,
+        }
+        with app.book._cache_lock:
+            app.book._owners_generation += 1
+        app._owner_last_started.clear()
+        params = {"window": "7d", "sort": "activity", "limit": 20}
+        stale = app.owners(params)
+        view_key = app._owner_view_key(app._owner_projection_params(params))
+        app._frame_futures[("owners", view_key)].result(3)
+        rolled = app.owners(params)
+        assert rolled["revision"] == stale["revision"] + 1
+        assert {row["owner"] for row in rolled["rows"]} == {rollup_owner}
+        assert rolled["financial_revision"] == stamped
+        assert app.poll_owners(params, after_revision=rolled["revision"]) is None
+        assert not any(
+            not future.done() for key, future in app._frame_futures.items()
+            if key[0] == "owners"
+        )
+
+        searched = app.owners({"window": "7d", "q": TOKEN, "limit": 20})
+        assert [row["owner"] for row in searched["rows"]] == [TOKEN]
+        assert len(asked) == 2
+    finally:
+        app.close()
+
+
 def test_current_transfer_updates_both_beneficial_owners_without_moving_financials(
         tmp_path):
     app = service(tmp_path / "market.sqlite")
