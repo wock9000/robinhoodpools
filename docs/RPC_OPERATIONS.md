@@ -60,9 +60,9 @@ the archive's own headers for both boundaries must match them, and every log's
 block hash must match its event header. A local node whose head is behind the
 requested range is skipped for that page rather than trusted.
 
-Archive chunks are sized by events per transaction, not by the 10k-log page:
-raw history inserts cost per event, and one large sorted transaction touches far
-fewer cold index pages than many small ones. `history_scan.source` reports
+Archive chunks are sized by events per transaction (10k), not by the 10k-log page:
+raw history inserts cost per event, and a transaction that outgrows the writer
+page cache spills and slows down. `history_scan.source` reports
 `archive` or `provider`; `recent_catchup_lag_seconds` joins the existing lag
 fields. The lane yields the writer to live catch-up only when live debt is
 deeper than four live batches and older than thirty seconds.

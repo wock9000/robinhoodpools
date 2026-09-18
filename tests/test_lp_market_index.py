@@ -1098,7 +1098,7 @@ def test_archive_chunk_grows_toward_the_event_budget_not_the_page_cap():
             scanner._history_chunk = 1_000
             scanner._resize_after_success("history", 8_000, 1.0, 1_000)
         assert provider._history_chunk == 1_000
-        assert archive._history_chunk == 2_000
+        assert archive._history_chunk == 1_250
         archive._history_chunk = ARCHIVE_MAX_CHUNK
         archive._resize_after_success("history", 0, 0.5, ARCHIVE_MAX_CHUNK)
         assert archive._history_chunk == ARCHIVE_MAX_CHUNK

@@ -68,11 +68,11 @@ HISTORY_MAX_CHUNK = 32_768
 MAX_INTERVAL_STORE_SECONDS = 2.0
 HISTORY_MAX_INTERVAL_STORE_SECONDS = 2.0
 # An archive source (the local node) has no page quota, so the archive chunk is
-# sized by events per transaction: raw inserts cost per event, and one large
-# sorted transaction touches far fewer cold index pages than many small ones.
+# sized by events per transaction: raw inserts cost per event, and a 10k-event
+# transaction stays inside the writer page cache; larger ones spill and slow down.
 ARCHIVE_MAX_CHUNK = 262_144
-ARCHIVE_TARGET_EVENTS = 50_000
-ARCHIVE_MAX_STORE_SECONDS = 10.0
+ARCHIVE_TARGET_EVENTS = 10_000
+ARCHIVE_MAX_STORE_SECONDS = 4.0
 ARCHIVE_PAGE_LOGS = MAX_LOGS_PER_RESPONSE * 4 // 5
 ARCHIVE_FETCH_WORKERS = 8
 # The archive lane yields the writer to live catch-up only for real debt, not
