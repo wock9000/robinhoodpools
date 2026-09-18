@@ -3138,14 +3138,33 @@ class LPMarketService:
             "offset": offset,
         }
 
+    def _owner_candidates(
+            self, params: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], int]:
+        """Prefer the accounting lane's rollup; fall back to the live aggregate.
 
+        A rollup envelope is versioned by the book revision it was read at,
+        not the lagging revision it was built from, so it stays fresh until
+        the book publishes again.
+        """
+        rollup = getattr(self.book, "owner_activity", None)
+        if rollup is not None and not params["pool"] and not params["q"]:
+            revision = int(self.book.owners_revision)
+            candidates = rollup(
+                params["window"], protocol=params["protocol"],
+                identity_scope=params["identity_scope"],
+            )
+            if candidates is not None:
+                return candidates, revision
+        candidates = self.book.owner_candidates(params)
+        return candidates, int(candidates["accounting_revision"])
 
     def _owners_result(
             self, params: Mapping[str, Any],
     ) -> tuple[tuple[int, int, int, int], float | None, dict[str, Any]]:
-        candidates = self.book.owner_candidates(params)
+        candidates, financial_version = self._owner_candidates(params)
         current = self._current_owner_snapshot(params)
-        rows = candidates["rows"]
+        rows = list(candidates["rows"])
         by_identity: dict[
             tuple[str | None, str | None], list[int]
         ] = {}
@@ -3278,7 +3297,7 @@ class LPMarketService:
             default=None,
         )
         version = (
-            int(candidates["accounting_revision"]), int(current["revision"]),
+            financial_version, int(current["revision"]),
             int(activity_status["epoch"]), int(coverage.get("epoch") or 0),
         )
         return version, valid_until, envelope
