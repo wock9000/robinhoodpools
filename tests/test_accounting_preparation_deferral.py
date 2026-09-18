@@ -93,7 +93,7 @@ def test_pending_selection_skips_deferred_positions():
         store.close()
 
 
-def test_pending_selection_caps_heavy_positions_and_submits_them_last():
+def test_pending_selection_spends_the_pass_budget_on_cheap_replays_first():
     store = MarketStore(":memory:")
     book = AccountBook(store, deferred=True).install()
     try:
@@ -125,9 +125,72 @@ def test_pending_selection_caps_heavy_positions_and_submits_them_last():
             )
         keys = [row["position_key"] for row in book._pending_rows(8)]
         heavies = [key for key in keys if key.startswith("heavy")]
-        assert len(heavies) == 2
-        assert keys[-2:] == heavies
+        assert heavies == ["heavy-0"]
+        assert keys[-1] == "heavy-0"
         assert all(key in keys for key in ("cheap-a", "cheap-g"))
+        again = [row["position_key"] for row in book._pending_rows(8)]
+        assert not [key for key in again if key.startswith("heavy")]
+    finally:
+        store.close()
+
+
+def test_append_only_rows_cost_their_unprojected_tail():
+    store = MarketStore(":memory:")
+    book = AccountBook(store, deferred=True).install()
+    try:
+        with store.transaction() as connection:
+            connection.execute(
+                "INSERT INTO lp_accounting_pending("
+                "position_key,generation,append_only,requested_revision,"
+                "requested_epoch,priority_block,priority_tx_index,"
+                "priority_log_index) VALUES('tail',0,1,0,0,1,0,0)",
+            )
+            connection.executemany(
+                "INSERT INTO lp_accounting_event_keys("
+                "event_id,position_key,token_id) VALUES(?,'tail',NULL)",
+                ((event_id,) for event_id in range(1, 3_001)),
+            )
+            connection.executemany(
+                "INSERT INTO lp_accounting_effects(event_id,position_key,"
+                "tx_hash,block_number,tx_index,log_index,timestamp,kind,"
+                "exact,basis) VALUES(?,'tail','0xab',1,0,0,1,'add',1,'exact')",
+                ((event_id,) for event_id in range(1, 2_998)),
+            )
+        rows = book._pending_rows(8)
+        assert [row["position_key"] for row in rows] == ["tail"]
+        assert rows[0]["replay_events"] == 3
+    finally:
+        store.close()
+
+
+def test_expensive_replays_cool_down_after_preparation():
+    store = MarketStore(":memory:")
+    book = AccountBook(store, deferred=True).install()
+    try:
+        with store.transaction() as connection:
+            for key, priority in (("whale", 2), ("minnow", 1)):
+                connection.execute(
+                    "INSERT INTO lp_accounting_pending("
+                    "position_key,generation,requested_revision,requested_epoch,"
+                    "priority_block,priority_tx_index,priority_log_index"
+                    ") VALUES(?,0,0,0,?,0,0)",
+                    (key, priority),
+                )
+            connection.executemany(
+                "INSERT INTO lp_accounting_event_keys("
+                "event_id,position_key,token_id) VALUES(?,'whale',NULL)",
+                ((event_id,) for event_id in range(1, 2_001)),
+            )
+        rows = book._pending_rows(8)
+        assert [row["position_key"] for row in rows] == ["minnow", "whale"]
+        book._prepare_pending = lambda key, scale=1.0: object()
+        list(book._prepared_pending(rows))
+        assert book._cooled_position_keys() == {"whale"}
+        assert [row["position_key"] for row in book._pending_rows(8)] == [
+            "minnow",
+        ]
+        book.prioritize_positions(["whale"])
+        assert "whale" in [row["position_key"] for row in book._pending_rows(8)]
     finally:
         store.close()
 

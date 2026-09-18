@@ -51,8 +51,30 @@ _PREPARATION_EVENTS_PER_SECOND = 2_000.0
 _DEFER_RETRY_BASE_SECONDS = 60.0
 _DEFER_RETRY_MAX_SECONDS = 3_600.0
 _DEFER_REGISTRY_LIMIT = 4_096
-_HEAVY_POSITION_EVENTS = 10_000
-_HEAVY_POSITIONS_PER_PASS = 2
+# Prepare cost is dominated by random event reads: a 10k-event replay costs
+# about as much as a thousand typical positions. A pass admits cheap replays
+# first and spends at most this many events on the rest, so a churning whale
+# cannot occupy the workers pass after pass while the backlog waits.
+_PASS_EVENT_BUDGET = 4_000
+_OVER_BUDGET_INTERVAL_SECONDS = 120.0
+_EXPENSIVE_POSITION_EVENTS = 1_000
+_REPLAY_COOLDOWN_SECONDS_PER_EVENT = 0.1
+_REPLAY_COOLDOWN_MAX_SECONDS = 3_600.0
+_REPLAY_COST_CACHE_LIMIT = 8_192
+# Replay cost is the number of events a prepare re-reads. Appends only re-read
+# their unprojected tail and cost-only rows re-read nothing. Counting stops one
+# past the budget: a 70k-event history is over budget whether it has 5k or 70k
+# events, and counting it exactly every pass cost more than the pass itself.
+_REPLAY_EVENTS_SQL = (
+    "CASE WHEN cost_only THEN 0 ELSE ("
+    "SELECT COUNT(*) FROM (SELECT 1 FROM lp_accounting_event_keys k "
+    "WHERE k.position_key=lp_accounting_pending.position_key "
+    f"LIMIT {_PASS_EVENT_BUDGET + 1}))"
+    "-CASE WHEN append_only THEN ("
+    "SELECT COUNT(*) FROM (SELECT 1 FROM lp_accounting_effects x "
+    "WHERE x.position_key=lp_accounting_pending.position_key "
+    f"LIMIT {_PASS_EVENT_BUDGET + 1})) ELSE 0 END END"
+)
 
 
 class PreparationDeadlineError(RuntimeError):
@@ -986,6 +1008,9 @@ class AccountBook:
         self._priority_lock = threading.Lock()
         self._priority_positions: OrderedDict[str, float] = OrderedDict()
         self._deferred_positions: OrderedDict[str, tuple[float, int]] = OrderedDict()
+        self._cooled_positions: dict[str, float] = {}
+        self._over_budget_at = -math.inf
+        self._replay_cost_cache: OrderedDict[str, tuple[int, int]] = OrderedDict()
         self._pool_cache: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
         self._pool_inventory_cache: OrderedDict[
             str, tuple[int, _PoolInventory]
@@ -1026,11 +1051,15 @@ class AccountBook:
                 prepared = self._prepare_position(position_key)
                 if prepared is not None:
                     self._release_position(position_key)
+                    self._cool_position(
+                        position_key, int(row.get("replay_events") or 0),
+                    )
                 yield prepared
             return
         if not pending:
             return
         source = iter(pending)
+        replay_events: dict[str, int] = {}
         waiting: deque[tuple[str, Future[_PreparedProjection | None]]] = deque()
         try:
             while True:
@@ -1039,6 +1068,7 @@ class AccountBook:
                     if row is None:
                         break
                     position_key = str(row["position_key"])
+                    replay_events[position_key] = int(row.get("replay_events") or 0)
                     waiting.append((
                         position_key,
                         self._submit_preparation(position_key),
@@ -1073,6 +1103,9 @@ class AccountBook:
                         continue
                     if prepared is not None:
                         self._release_position(position_key)
+                        self._cool_position(
+                            position_key, replay_events.get(position_key, 0),
+                        )
                     yield prepared
         finally:
             for _queued_key, future in waiting:
@@ -1132,6 +1165,26 @@ class AccountBook:
                 for key, (retry_at, _failures) in self._deferred_positions.items()
                 if retry_at > now
             }
+
+    def _cool_position(self, position_key: str, replay_events: int) -> None:
+        if replay_events < _EXPENSIVE_POSITION_EVENTS:
+            return
+        seconds = min(
+            _REPLAY_COOLDOWN_MAX_SECONDS,
+            replay_events * _REPLAY_COOLDOWN_SECONDS_PER_EVENT,
+        )
+        with self._priority_lock:
+            self._cooled_positions[position_key] = time.monotonic() + seconds
+
+    def _cooled_position_keys(self) -> set[str]:
+        now = time.monotonic()
+        with self._priority_lock:
+            self._cooled_positions = {
+                key: until
+                for key, until in self._cooled_positions.items()
+                if until > now
+            }
+            return set(self._cooled_positions)
 
     @property
     def owners_revision(self) -> int:
@@ -1781,7 +1834,8 @@ class AccountBook:
             "WHERE h.position_key=lp_accounting_pending.position_key AND h.kind='scope')))"
         )
         now = time.monotonic()
-        excluded = self._deferred_position_keys()
+        deferred = self._deferred_position_keys()
+        excluded = deferred | self._cooled_position_keys()
         with self._priority_lock:
             while self._priority_positions:
                 _key, expires_at = next(iter(self._priority_positions.items()))
@@ -1802,6 +1856,7 @@ class AccountBook:
                     batch,
                 ))
             })
+        self._replay_costs(conn, list(interested_pending.values()))
         absent = interests.keys() - interested_pending.keys()
         if absent:
             with self._priority_lock:
@@ -1813,49 +1868,92 @@ class AccountBook:
             interested_pending[position_key]
             for position_key in reversed(interests)
             if position_key in interested_pending
-            and position_key not in excluded
+            and position_key not in deferred
         ][:requested_capacity]
         seen = {str(row["position_key"]) for row in selected}
+        budget_left = _PASS_EVENT_BUDGET
+        over_budget: dict[str, Any] | None = None
+
+        def admit(candidates: list[dict[str, Any]], capacity: int) -> None:
+            nonlocal budget_left, over_budget
+            self._replay_costs(conn, candidates)
+            candidates = sorted(
+                (
+                    row for row in candidates
+                    if str(row["position_key"]) not in seen
+                    and str(row["position_key"]) not in excluded
+                ),
+                key=lambda row: row["replay_events"],
+            )
+            for row in candidates:
+                cost = row["replay_events"]
+                if len(selected) >= capacity or cost > budget_left:
+                    if cost > budget_left and (
+                        over_budget is None
+                        or cost < over_budget["replay_events"]
+                    ):
+                        over_budget = row
+                    continue
+                budget_left -= cost
+                selected.append(row)
+                seen.add(str(row["position_key"]))
+
         recent_capacity = max(0, limit - historical - len(selected))
         if recent_capacity:
-            recent = _dict_rows(conn.execute(
-                "SELECT *, (SELECT COUNT(*) FROM lp_accounting_event_keys k "
-                "WHERE k.position_key=lp_accounting_pending.position_key"
-                ") AS event_count FROM lp_accounting_pending "
-                f"WHERE {eligible} "
+            admit(_dict_rows(conn.execute(
+                f"SELECT * FROM lp_accounting_pending WHERE {eligible} "
                 "ORDER BY priority_block DESC,priority_tx_index DESC,"
                 "priority_log_index DESC,id DESC LIMIT ?",
                 ((recent_capacity + len(seen) + len(excluded)) * 4,),
-            ))
-            heavy: list[dict[str, Any]] = []
-            for row in recent:
-                position_key = str(row["position_key"])
-                if position_key in seen or position_key in excluded:
-                    continue
-                if int(row["event_count"] or 0) > _HEAVY_POSITION_EVENTS:
-                    if len(heavy) < _HEAVY_POSITIONS_PER_PASS:
-                        heavy.append(row)
-                    continue
-                selected.append(row)
-                seen.add(position_key)
-                if len(selected) >= limit - historical:
-                    break
-        else:
-            heavy = []
-        oldest = _dict_rows(conn.execute(
-            f"SELECT * FROM lp_accounting_pending WHERE {eligible} ORDER BY id LIMIT ?",
+            )), limit - historical)
+        admit(_dict_rows(conn.execute(
+            f"SELECT * FROM lp_accounting_pending WHERE {eligible} "
+            "ORDER BY id LIMIT ?",
             (historical + len(seen) + len(excluded),),
-        ))
-        for row in oldest:
-            position_key = str(row["position_key"])
-            if position_key not in seen and position_key not in excluded:
-                selected.append(row)
-                seen.add(position_key)
-                if len(selected) >= limit:
-                    break
-        for row in heavy:
-            selected.append(row)
+        )), limit)
+        # One replay beyond the budget per interval keeps the largest histories
+        # converging while cheap rows drain around it. It is prepared last so
+        # the rest of the pass publishes while it runs.
+        if (
+            over_budget is not None
+            and now - self._over_budget_at >= _OVER_BUDGET_INTERVAL_SECONDS
+        ):
+            self._over_budget_at = now
+            if not over_budget["append_only"]:
+                over_budget["replay_events"] = self._position_event_count(
+                    str(over_budget["position_key"]),
+                )
+            selected.append(over_budget)
         return selected
+
+    def _replay_costs(
+        self, conn: sqlite3.Connection, rows: list[dict[str, Any]],
+    ) -> None:
+        """Attach each pending row's replay cost, counted once per generation."""
+        cache = self._replay_cost_cache
+        missing: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            position_key = str(row["position_key"])
+            cached = cache.get(position_key)
+            if cached is not None and cached[0] == int(row["generation"]):
+                row["replay_events"] = cached[1]
+                cache.move_to_end(position_key)
+            else:
+                missing[position_key] = row
+        for batch in _batches(sorted(missing)):
+            marks = ",".join("?" for _ in batch)
+            for position_key, cost in conn.execute(
+                f"SELECT position_key,{_REPLAY_EVENTS_SQL} "
+                f"FROM lp_accounting_pending WHERE position_key IN ({marks})",
+                batch,
+            ).fetchall():
+                row = missing[str(position_key)]
+                row["replay_events"] = max(0, int(cost or 0))
+                cache[str(position_key)] = (
+                    int(row["generation"]), row["replay_events"],
+                )
+        while len(cache) > _REPLAY_COST_CACHE_LIMIT:
+            cache.popitem(last=False)
 
 
     def _position_event_count(self, position_key: str) -> int:
