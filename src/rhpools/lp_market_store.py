@@ -41,6 +41,33 @@ FLOAT_EVENT_COLUMNS = frozenset({
     "price0_usd", "price1_usd", "volume_usd", "fees_usd", "deposit_usd",
     "withdrawal_usd",
 })
+# Activity rollup of one ingested revision into lp_pool_buckets, mirroring the
+# per-minute recompute in lp_market_service.PriceProjection._bucket. Counts are
+# exact at ingest; the USD sums fill in when per-event pricing replays later
+# and the per-event path adds only that delta to the same rows.
+LP_FLOW_KIND = (
+    "(kind IN ('add','remove','collect') "
+    "OR (kind='checkpoint' AND position_key IS NOT NULL))"
+)
+BUCKET_ROLLUP_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("events", "COUNT(*)"),
+    ("swaps", "SUM(kind='swap')"),
+    ("adds", "SUM(kind='add')"),
+    ("removes", "SUM(kind='remove')"),
+    ("collects", "SUM(kind='collect')"),
+    ("volume_usd", "COALESCE(SUM(CASE WHEN kind='swap' THEN volume_usd END),0)"),
+    ("fees_usd", "COALESCE(SUM(CASE WHEN kind='swap' THEN fees_usd END),0)"),
+    ("deposit_usd", "COALESCE(SUM(deposit_usd),0)"),
+    ("withdrawal_usd", "COALESCE(SUM(withdrawal_usd),0)"),
+    ("priced_swaps", "SUM(kind='swap' AND volume_usd IS NOT NULL)"),
+    ("priced_fees", "SUM(kind='swap' AND fees_usd IS NOT NULL)"),
+    (
+        "priced_flows",
+        f"SUM({LP_FLOW_KIND} AND deposit_usd IS NOT NULL AND withdrawal_usd IS NOT NULL)",
+    ),
+    ("flows", f"SUM({LP_FLOW_KIND})"),
+)
+BUCKET_ROLLUP_RESOLUTIONS = (60, 3600, 86400)
 ADDRESS_EVENT_COLUMNS = frozenset({"owner", "custody"})
 REQUIRED_EVENT_COLUMNS = (
     "block_number", "block_hash", "tx_hash", "tx_index", "log_index",
@@ -211,6 +238,7 @@ class MarketStore:
         self._financial_interest_lock = threading.Lock()
         self._financial_interest: dict[str, float] = {}
         self._checkpoint_on_commit = checkpoint_on_commit
+        self._bucket_rollup_ready = False
         if str(path) == ":memory:":
             self._database = f"file:lp-market-{id(self):x}?mode=memory&cache=shared"
             self._uri = True
@@ -1121,7 +1149,11 @@ class MarketStore:
     def _put_search_entities(
         cls, connection: sqlite3.Connection,
         entities: Iterable[tuple[str, str, str, str, str, int, Iterable[Any]]],
+        *, descriptive_terms: bool = True,
     ) -> None:
+        """Upsert catalog entities; ``descriptive_terms=False`` indexes only
+        each entity's identity terms (hash, address, key, token id), not the
+        words of its label and subtitle."""
         entity_rows: list[tuple[str, str, str, str, str, int]] = []
         term_rows: list[tuple[str, str, str, int]] = []
         for kind, entity_id, label, subtitle, href, rank, terms in entities:
@@ -1134,8 +1166,10 @@ class MarketStore:
                 kind, normalized_id, str(label)[:512], str(subtitle)[:1000],
                 str(href)[:1500], int(rank),
             ))
-            normalized_terms = cls._search_tokens(
-                normalized_id, label, subtitle, *terms,
+            normalized_terms = (
+                cls._search_tokens(normalized_id, label, subtitle, *terms)
+                if descriptive_terms
+                else cls._search_tokens(normalized_id, *terms)
             )
             term_rows.extend(
                 (term, kind, normalized_id, 0 if term == normalized_id else 10)
@@ -1304,6 +1338,7 @@ class MarketStore:
     @classmethod
     def _index_event_search_batch(
         cls, connection: sqlite3.Connection, rows: Iterable[Mapping[str, Any]],
+        *, descriptive_terms: bool = True,
     ) -> None:
         entities: dict[tuple[str, str], dict[str, Any]] = {}
         for row in rows:
@@ -1342,7 +1377,9 @@ class MarketStore:
             for key in sorted(entities)
             for search_entity in cls._event_search_entities(entities[key])
         )
-        cls._put_search_entities(connection, search_entities)
+        cls._put_search_entities(
+            connection, search_entities, descriptive_terms=descriptive_terms,
+        )
 
 
     def ensure_search_index(self) -> None:
@@ -2356,6 +2393,39 @@ class MarketStore:
         if inserted:
             self._bump(connection, "pending_enrichment", inserted)
 
+    def _rollup_buckets(self, connection: sqlite3.Connection, revision: int) -> int:
+        """Add one unprojected revision's activity counts to the pool buckets.
+
+        Runs in the ingest transaction over ``events.revision``, so a replayed
+        interval whose rows hit ``DO NOTHING`` contributes nothing twice, and
+        a crash before commit leaves neither rows nor counts.
+        """
+        if not self._bucket_rollup_ready:
+            self._bucket_rollup_ready = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lp_pool_buckets'",
+            ).fetchone() is not None
+            if not self._bucket_rollup_ready:
+                return 0
+        names = ",".join(name for name, _expression in BUCKET_ROLLUP_COLUMNS)
+        expressions = ",".join(expression for _name, expression in BUCKET_ROLLUP_COLUMNS)
+        additions = ",".join(
+            f"{name}={name}+excluded.{name}" for name, _expression in BUCKET_ROLLUP_COLUMNS
+        )
+        resolutions = " UNION ALL ".join(
+            f"SELECT {resolution} AS resolution" for resolution in BUCKET_ROLLUP_RESOLUTIONS
+        )
+        return connection.execute(
+            f"INSERT INTO lp_pool_buckets(resolution,bucket,pool_id,{names},max_block) "
+            f"SELECT r.resolution,e.timestamp/r.resolution*r.resolution,e.pool_id,"
+            f"{expressions},MAX(e.block_number) "
+            f"FROM events e JOIN ({resolutions}) r "
+            "WHERE e.revision=? AND e.pool_id IS NOT NULL "
+            "GROUP BY r.resolution,e.timestamp/r.resolution*r.resolution,e.pool_id "
+            "ON CONFLICT(resolution,bucket,pool_id) DO UPDATE SET "
+            f"{additions},max_block=MAX(max_block,excluded.max_block)",
+            (revision,),
+        ).rowcount
+
     def _persist_projection_mutations(
         self, connection: sqlite3.Connection,
         events: list[dict[str, Any]], revision: int,
@@ -2523,22 +2593,22 @@ class MarketStore:
             search_rows = inserted_rows
             if inserted_events:
                 if not project:
-                    queued = 0
-                    if inserted_events:
-                        before = connection.total_changes
-                        connection.executemany(
-                            "INSERT OR IGNORE INTO pending_reprojection"
-                            "(event_id,block_number,tx_index,log_index,attempts,next_attempt,last_error) "
-                            "VALUES(?,?,?,?,0,0,NULL)",
-                            (
-                                (int(event["id"]), int(event["block_number"]),
-                                 int(event["tx_index"]), int(event["log_index"]))
-                                for event in inserted_events
-                            ),
-                        )
-                        queued = connection.total_changes - before
+                    before = connection.total_changes
+                    _insert_rows(
+                        connection,
+                        "INSERT OR IGNORE INTO pending_reprojection"
+                        "(event_id,block_number,tx_index,log_index,attempts,next_attempt,last_error)",
+                        (
+                            (int(event["id"]), int(event["block_number"]),
+                             int(event["tx_index"]), int(event["log_index"]), 0, 0, None)
+                            for event in inserted_events
+                        ),
+                        columns=7,
+                    )
+                    queued = connection.total_changes - before
                     if queued:
                         self._bump(connection, "pending_reprojection", queued)
+                    self._rollup_buckets(connection, revision)
                 for apply, _rollback, _persists_events in self._projections:
                     if project:
                         apply(connection, inserted_events)
@@ -2551,7 +2621,11 @@ class MarketStore:
                         search_rows = [
                             self._event_row(event, revision) for event in inserted_events
                         ]
-            self._index_event_search_batch(connection, search_rows)
+            # Raw archive ingests catalog identities only: the descriptive
+            # words of a transaction subtitle cost four term rows per event.
+            self._index_event_search_batch(
+                connection, search_rows, descriptive_terms=project,
+            )
             return inserted_events
 
     def _current_event(self, connection: sqlite3.Connection, event: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -2964,7 +3038,7 @@ class MarketStore:
             )
 
     def pending_reprojections(self, limit: int = 128) -> list[dict[str, Any]]:
-        limit = max(1, min(int(limit), 512))
+        limit = max(1, min(int(limit), 2048))
         historical = max(1, limit // 4)
         due = time.time()
         rows = self.read().execute(

@@ -23,6 +23,9 @@ from .lp_chain import CHAIN_ID
 MAX_RPC_RESPONSE_BYTES = 64 * 1024 * 1024
 MAX_BATCH_CALLS = 100
 MAX_SOURCE_CONCURRENCY = 4
+# A local node has no provider quota; the archive lane fans log pages out to it.
+LOCAL_SOURCE_CONCURRENCY = 16
+CAPABILITIES = ("head", "state", "history_state", "logs", "receipts", "trace", "archive")
 _PUBLIC = "https://rpc.mainnet.chain.robinhood.com"
 _PUBLICNODE = "https://robinhood-rpc.publicnode.com"
 _ARROW = "https://rpc.arrowrpc.com"
@@ -112,11 +115,17 @@ _GATES_LOCK = threading.Lock()
 _GATES: dict[str, _SourceGate] = {}
 
 
+def _source_concurrency(url: str) -> int:
+    return LOCAL_SOURCE_CONCURRENCY if _local(url) else MAX_SOURCE_CONCURRENCY
+
+
 def _gate(url: str) -> _SourceGate:
     with _GATES_LOCK:
         gate = _GATES.get(url)
         if gate is None:
-            gate = _SourceGate()
+            gate = _SourceGate(
+                slots=threading.BoundedSemaphore(_source_concurrency(url)),
+            )
             _GATES[url] = gate
         return gate
 
@@ -204,6 +213,7 @@ def _source_list(primary_url: str, capability: str) -> tuple[_Source, ...]:
         "logs": "LP_RPC_LOG_URLS",
         "receipts": "LP_RPC_RECEIPT_URLS",
         "trace": "LP_RPC_TRACE_URLS",
+        "archive": "LP_RPC_ARCHIVE_URLS",
     }[capability]
     explicit = _split_urls(os.environ.get(env_name, ""))
     explicit.extend(_file_urls(env_name.removesuffix("URLS") + "URL_FILES"))
@@ -250,6 +260,11 @@ def _source_list(primary_url: str, capability: str) -> tuple[_Source, ...]:
 
     for index, url in enumerate(explicit, 1):
         add(f"configured-{capability}-{index}", url)
+    if capability == "archive":
+        # Archive sources are opt-in only: no public default may serve
+        # multi-thousand-block log pages, and the boundary headers are still
+        # cross-checked against the canonical header sources.
+        return tuple(sources)
     if alchemy:
         add("configured-alchemy", alchemy)
 
@@ -301,6 +316,8 @@ def _block_tag(method: str, params: Sequence[Any]) -> Any:
 def _capability(method: str, params: Sequence[Any], lane: str) -> str:
     if method.startswith("debug_") or method.startswith("trace_") or method.startswith("arbtrace_"):
         return "trace"
+    if lane == "archive" and method in {"eth_getLogs", "eth_getBlockByNumber"}:
+        return "archive"
     if method == "eth_getLogs":
         return "logs"
     if method in {
@@ -341,7 +358,7 @@ class _Registry:
         self.error_type = error_type
         self.sources = {
             capability: _source_list(primary_url, capability)
-            for capability in ("head", "state", "history_state", "logs", "receipts", "trace")
+            for capability in CAPABILITIES
         }
         self._states = {
             (capability, source.name): _SourceState()
@@ -373,7 +390,8 @@ class _Registry:
                     **dict(source.headers),
                 })
                 adapter = HTTPAdapter(
-                    pool_connections=2, pool_maxsize=MAX_SOURCE_CONCURRENCY,
+                    pool_connections=2,
+                    pool_maxsize=_source_concurrency(source.url),
                     max_retries=0, pool_block=True,
                 )
                 session.mount("http://", adapter)
@@ -403,6 +421,7 @@ class _Registry:
 
     def candidates(
         self, capability: str, *, prefer_local: bool = False,
+        allow_local: bool = True,
     ) -> tuple[_Source, ...]:
         sources = self.sources[capability]
         now = time.monotonic()
@@ -410,6 +429,7 @@ class _Registry:
             available = tuple(
                 source for source in sources
                 if self._states[(capability, source.name)].retry_at <= now
+                and (allow_local or not _local(source.url))
             )
         if prefer_local:
             return tuple(sorted(available, key=lambda source: not _local(source.url)))
@@ -719,6 +739,9 @@ class RoutedRpc:
         self._request_id = 0
         self._lock = threading.Lock()
         self._closed = False
+        # The canonical lane frames a local archive source, so its headers
+        # must come from a provider that is not that same local node.
+        self._allow_local = lane != "canonical"
 
     def _error(self, message: str, *, code: int | None = None) -> Exception:
         try:
@@ -1008,6 +1031,7 @@ class RoutedRpc:
         sources = self._registry.candidates(
             capability,
             prefer_local=_explicit_block_header(method, values),
+            allow_local=self._allow_local,
         )
         if not sources and not self._registry.sources[capability]:
             raise self._error(
@@ -1022,7 +1046,7 @@ class RoutedRpc:
             try:
                 self._ensure_chain(source)
                 if (
-                    capability == "logs"
+                    method == "eth_getLogs"
                     and not self._local_log_range_eligible(
                         source, [(method, values)],
                     )
@@ -1158,6 +1182,7 @@ class RoutedRpc:
         )
         sources = self._registry.candidates(
             capability, prefer_local=explicit_headers,
+            allow_local=self._allow_local,
         )
         if not sources and not self._registry.sources[capability]:
             failure = self._error(
@@ -1220,7 +1245,7 @@ class RoutedRpc:
                 try:
                     self._ensure_chain(source)
                     if (
-                        capability == "logs"
+                        all(method == "eth_getLogs" for method, _params in attempted_specs)
                         and not self._local_log_range_eligible(
                             source, attempted_specs,
                         )
@@ -1333,11 +1358,16 @@ class RpcFactory:
         self._wss_urls = head_subscription_urls()
 
     def __call__(self, lane: str) -> Any:
+        """Return the lane client, or None for an archive lane with no source."""
+        if lane == "archive" and not self._registry.sources["archive"]:
+            return None
         timeout = 15.0 if lane == "live" else 30.0
         if lane in {"workbench", "state"}:
             timeout = 6.0
         elif lane in {"backfill", "maintenance"}:
             timeout = 20.0
+        elif lane == "archive":
+            timeout = 120.0
         routed = RoutedRpc(self._registry, lane, timeout)
         if lane in {"workbench", "receipt"} and self._wss_urls:
             return _WssPreferredRpc(

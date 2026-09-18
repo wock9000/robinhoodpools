@@ -67,6 +67,18 @@ HISTORY_MAX_CHUNK = 32_768
 # Background history uses a shorter writer target so financial lanes can run.
 MAX_INTERVAL_STORE_SECONDS = 2.0
 HISTORY_MAX_INTERVAL_STORE_SECONDS = 2.0
+# An archive source (the local node) has no page quota, so the archive chunk is
+# sized by events per transaction: raw inserts cost per event, and a 10k-event
+# transaction stays inside the writer page cache; larger ones spill and slow down.
+ARCHIVE_MAX_CHUNK = 262_144
+ARCHIVE_TARGET_EVENTS = 10_000
+ARCHIVE_MAX_STORE_SECONDS = 4.0
+ARCHIVE_PAGE_LOGS = MAX_LOGS_PER_RESPONSE * 4 // 5
+ARCHIVE_FETCH_WORKERS = 8
+# The archive lane yields the writer to live catch-up only for real debt, not
+# for the one-batch jitter of a live worker trailing a moving tip.
+RECENT_CATCHUP_YIELD_CHUNKS = 4
+RECENT_CATCHUP_YIELD_SECONDS = 30.0
 ENRICH_BATCH = 8
 ENRICHMENT_CAPABILITY_RECHECK_S = 300.0
 ENRICH_TRACE_BATCH = 8
@@ -76,8 +88,8 @@ ENRICH_REGULAR_INFLIGHT_LIMIT = ENRICH_BATCH * ENRICH_WORKERS
 ENRICH_TRACE_INFLIGHT_LIMIT = ENRICH_TRACE_BATCH * ENRICH_TRACE_WORKERS
 REPROJECT_MIN_BATCH = 1
 REPROJECT_INITIAL_BATCH = 128
-REPROJECT_MAX_BATCH = 512
-REPROJECT_MAX_STORE_SECONDS = 0.2
+REPROJECT_MAX_BATCH = 2048
+REPROJECT_MAX_STORE_SECONDS = 1.0
 TOKEN_METADATA_INVALID_PREFIX = "token_metadata_invalid:"
 TOKEN_METADATA_INVALID_RECHECK_S = 24 * 60 * 60
 TOKEN_METADATA_FAILURE_STATUS_LIMIT = 128
@@ -431,6 +443,15 @@ class MarketIndexer:
             # cannot serialize the canonical checks that frame that response.
             self._clients["live_header"] = self._rpc_factory("live")
             self._clients["history_header"] = self._rpc_factory("history")
+            # A factory answers "archive" with None when no archive source is
+            # configured; the history lane then keeps its provider log sources.
+            # With one, its boundary headers move to the remote-only canonical
+            # lane so a local node never verifies its own logs.
+            archive = self._rpc_factory("archive")
+            if archive is not None:
+                self._clients["archive"] = archive
+                self._clients["archive_header"] = self._rpc_factory("archive")
+                self._clients["history_header"] = self._rpc_factory("canonical")
         else:
             self._clients["live_header"] = self._clients["live"]
             self._clients["history_header"] = self._clients["history"]
@@ -465,6 +486,9 @@ class MarketIndexer:
         self._cache_lock = threading.Lock()
         self._live_chunk = LIVE_INITIAL_CHUNK
         self._history_chunk = HISTORY_INITIAL_CHUNK
+        # Logs per block observed by the last history scan; it sizes the
+        # concurrent archive pages so each stays under the response cap.
+        self._history_density = 8.0
         self._reproject_batch = REPROJECT_INITIAL_BATCH
         self._metadata_failures: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._threads: list[threading.Thread] = []
@@ -526,6 +550,10 @@ class MarketIndexer:
         )
         self._header_executor = ThreadPoolExecutor(
             max_workers=2, thread_name_prefix="lp-market-headers",
+        )
+        self._archive_executor = ThreadPoolExecutor(
+            max_workers=ARCHIVE_FETCH_WORKERS,
+            thread_name_prefix="lp-archive-fetch",
         )
         self._market_observer_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="lp-current-observer",
@@ -2375,6 +2403,9 @@ class MarketIndexer:
                 self._header_executor.shutdown(
                     wait=True, cancel_futures=True,
                 )
+                self._archive_executor.shutdown(
+                    wait=True, cancel_futures=True,
+                )
                 self._market_observer_executor.shutdown(
                     wait=True, cancel_futures=True,
                 )
@@ -2509,16 +2540,77 @@ class MarketIndexer:
             )
         return [dict(log) for log in result]
 
+    def _archive_source(self, lane: str) -> bool:
+        return lane == "history" and "archive" in self._clients
+
+    def _archive_logs(self, start: int, end: int) -> list[dict[str, Any]]:
+        """Fetch one archive interval as concurrent pages sized by density."""
+        page_blocks = max(1, min(
+            end - start + 1,
+            int(ARCHIVE_PAGE_LOGS / max(self._history_density, 1e-3)),
+        ))
+        queries: list[tuple[tuple[str, ...], tuple[str, ...] | None]] = [
+            (tuple(EVENT_TOPICS), None),
+        ]
+        if NFT_MANAGER_ADDRESSES and NFT_EVENT_TOPICS:
+            queries.append((tuple(NFT_EVENT_TOPICS), tuple(NFT_MANAGER_ADDRESSES)))
+
+        def page(low: int, high: int, topics, addresses) -> list[dict[str, Any]]:
+            try:
+                return self._log_query("archive", low, high, topics, addresses)
+            except RpcError as exc:
+                if low < high and exc.range_too_large:
+                    middle = (low + high) // 2
+                    return (
+                        page(low, middle, topics, addresses)
+                        + page(middle + 1, high, topics, addresses)
+                    )
+                raise
+
+        futures = [
+            self._archive_executor.submit(
+                page, low, min(low + page_blocks - 1, end), topics, addresses,
+            )
+            for low in range(start, end + 1, page_blocks)
+            for topics, addresses in queries
+        ]
+        wait(futures)
+        logs: list[dict[str, Any]] = []
+        for future in futures:
+            logs.extend(future.result())
+        return logs
+
+    def _archive_headers(self, numbers: Sequence[int]) -> list[Any]:
+        """Read archive headers as concurrent bounded batches."""
+        calls = [("eth_getBlockByNumber", [hex(number), False]) for number in numbers]
+        futures = [
+            self._archive_executor.submit(
+                self._rpc_batch, "archive_header",
+                calls[offset:offset + MAX_BATCH_CALLS],
+            )
+            for offset in range(0, len(calls), MAX_BATCH_CALLS)
+        ]
+        wait(futures)
+        results: list[Any] = []
+        for future in futures:
+            results.extend(future.result())
+        return results
+
     def _fetch_interval(
         self, lane: str, start: int, end: int,
     ) -> tuple[list[dict[str, Any]], dict[int, dict[str, Any]]]:
         if start < 0 or end < start:
             raise ValueError("invalid inclusive log interval")
         fetch_started = time.monotonic()
+        archive = self._archive_source(lane)
+        log_lane = "archive" if archive else lane
+        # Boundary headers and the post-log end confirmation always come from
+        # the canonical header sources; an archive source only supplies logs
+        # and event headers, and its boundary hashes must agree with them.
         header_lane = f"{lane}_header"
         if header_lane not in self._clients:
             header_lane = lane
-        overlap = self._clients[header_lane] is not self._clients[lane]
+        overlap = self._clients[header_lane] is not self._clients[log_lane]
         boundary_future = (
             self._header_executor.submit(
                 self._timed_blocks, header_lane, (start, end),
@@ -2531,12 +2623,15 @@ class MarketIndexer:
             )
         logs_started = time.monotonic()
         try:
-            logs = self._log_query(lane, start, end, tuple(EVENT_TOPICS))
-            if NFT_MANAGER_ADDRESSES and NFT_EVENT_TOPICS:
-                logs.extend(self._log_query(
-                    lane, start, end, tuple(NFT_EVENT_TOPICS),
-                    tuple(NFT_MANAGER_ADDRESSES),
-                ))
+            if archive:
+                logs = self._archive_logs(start, end)
+            else:
+                logs = self._log_query(lane, start, end, tuple(EVENT_TOPICS))
+                if NFT_MANAGER_ADDRESSES and NFT_EVENT_TOPICS:
+                    logs.extend(self._log_query(
+                        lane, start, end, tuple(NFT_EVENT_TOPICS),
+                        tuple(NFT_MANAGER_ADDRESSES),
+                    ))
         except BaseException:
             if boundary_future is not None:
                 try:
@@ -2573,29 +2668,45 @@ class MarketIndexer:
         # one ordered wave. The duplicate end read still occurs after both log
         # queries, but no longer waits behind a second RPC admission interval.
         event_headers_started = time.monotonic()
-        post_log_calls = [
-            ("eth_getBlockByNumber", [hex(number), False])
-            for number in missing
-        ]
-        post_log_calls.append(
-            ("eth_getBlockByNumber", [hex(end), False]),
-        )
-        post_log_headers = self._rpc_batch(header_lane, post_log_calls)
         headers = dict(boundaries)
-        headers.update({
-            number: _header(raw, number)
-            for number, raw in zip(missing, post_log_headers[:-1])
-        })
-        event_headers_s = time.monotonic() - event_headers_started
+        if archive:
+            archive_headers = self._archive_headers([*missing, start, end])
+            headers.update({
+                number: _header(raw, number)
+                for number, raw in zip(missing, archive_headers)
+            })
+            for number, raw in zip((start, end), archive_headers[len(missing):]):
+                if _header(raw, number)["hash"] != boundaries[number]["hash"]:
+                    raise CanonicalConflict(
+                        f"archive source disagrees with canonical header {number}"
+                    )
+            event_headers_s = time.monotonic() - event_headers_started
+            verify_started = time.monotonic()
+            verified_end = self._block(header_lane, end)
+            verify_s = time.monotonic() - verify_started
+        else:
+            post_log_calls = [
+                ("eth_getBlockByNumber", [hex(number), False])
+                for number in missing
+            ]
+            post_log_calls.append(
+                ("eth_getBlockByNumber", [hex(end), False]),
+            )
+            post_log_headers = self._rpc_batch(header_lane, post_log_calls)
+            headers.update({
+                number: _header(raw, number)
+                for number, raw in zip(missing, post_log_headers[:-1])
+            })
+            event_headers_s = time.monotonic() - event_headers_started
+            verify_started = time.monotonic()
+            verified_end = _header(post_log_headers[-1], end)
+            verify_s = time.monotonic() - verify_started
         for log in logs:
             number = _hex_int(log["blockNumber"], "log block number")
             observed_hash = _lower(log.get("blockHash"))
             if observed_hash and observed_hash != headers[number]["hash"]:
                 raise CanonicalConflict(f"log block {number} changed during interval fetch")
             log["blockHash"] = headers[number]["hash"]
-        verify_started = time.monotonic()
-        verified_end = _header(post_log_headers[-1], end)
-        verify_s = time.monotonic() - verify_started
         if verified_end["hash"] != boundaries[end]["hash"]:
             raise CanonicalConflict(f"interval end block {end} changed during fetch")
         with self._status_lock:
@@ -2607,8 +2718,9 @@ class MarketIndexer:
                 "end_verify_seconds": round(verify_s, 6),
                 "header_log_overlap": overlap,
                 "event_header_count": len(missing),
-                "post_log_header_calls": len(missing) + 1,
-                "end_verify_batched": True,
+                "post_log_header_calls": len(missing) + (3 if archive else 1),
+                "end_verify_batched": not archive,
+                "source": "archive" if archive else "provider",
             }
         return logs, headers
 
@@ -4305,17 +4417,29 @@ class MarketIndexer:
             worked = True
         return worked
 
+    def _chunk_policy(self, lane: str) -> tuple[int, int, float, int]:
+        """Return (minimum, maximum, store target seconds, target logs) for a lane."""
+        if lane == "live":
+            return (
+                LIVE_MIN_CHUNK, LIVE_MAX_CHUNK, MAX_INTERVAL_STORE_SECONDS,
+                MAX_LOGS_PER_RESPONSE * 4 // 5,
+            )
+        if self._archive_source(lane):
+            return (
+                HISTORY_MIN_CHUNK, ARCHIVE_MAX_CHUNK, ARCHIVE_MAX_STORE_SECONDS,
+                ARCHIVE_TARGET_EVENTS,
+            )
+        return (
+            HISTORY_MIN_CHUNK, HISTORY_MAX_CHUNK,
+            HISTORY_MAX_INTERVAL_STORE_SECONDS, MAX_LOGS_PER_RESPONSE * 4 // 5,
+        )
+
     def _resize_after_success(
         self, lane: str, log_count: int, store_seconds: float = 0.0,
         scanned_blocks: int | None = None,
     ) -> None:
         current = self._live_chunk if lane == "live" else self._history_chunk
-        minimum = LIVE_MIN_CHUNK if lane == "live" else HISTORY_MIN_CHUNK
-        maximum = LIVE_MAX_CHUNK if lane == "live" else HISTORY_MAX_CHUNK
-        store_target = (
-            MAX_INTERVAL_STORE_SECONDS if lane == "live"
-            else HISTORY_MAX_INTERVAL_STORE_SECONDS
-        )
+        minimum, maximum, store_target, target_logs = self._chunk_policy(lane)
         sample_blocks = max(
             1, current if scanned_blocks is None else int(scanned_blocks),
         )
@@ -4338,17 +4462,14 @@ class MarketIndexer:
             else:
                 self._history_chunk = resized
             return
-        # Size by measured density and leave 20% response headroom. This grows
-        # dense ranges substantially without bouncing between a blind doubling
-        # and the provider's bounded 10k-log rejection.
+        # Size by measured density toward the lane's log target: 20% headroom
+        # under a provider's 10k-log page, or the archive's per-transaction
+        # event budget where pages are fetched concurrently.
         count = max(0, int(log_count))
         if count == 0:
             candidate = current * 2
         else:
-            candidate = min(
-                current * 2,
-                sample_blocks * (MAX_LOGS_PER_RESPONSE * 4 // 5) // count,
-            )
+            candidate = min(current * 2, sample_blocks * target_logs // count)
         if store_seconds > 0:
             candidate = min(candidate, max(
                 minimum, int(sample_blocks * store_target / store_seconds),
@@ -4878,16 +4999,31 @@ class MarketIndexer:
         with self._feed_condition:
             observed = self._observed_last_header
             observed_number = _number(observed) if observed is not None else 0
+            observed_timestamp = _timestamp(observed) if observed is not None else 0
         with self._status_lock:
             head = max(observed_number, int(self._runtime_status.get("head") or 0))
+            head_timestamp = max(
+                observed_timestamp,
+                int(self._runtime_status.get("head_timestamp") or 0),
+            )
             lag = max(0, head - int(cursor["block_number"]))
-            # The live worker normally trails a continuously advancing tip.
-            # Reserve recent-gap priority for debt larger than one adaptive
-            # live batch; exact-tip admission can starve history indefinitely.
-            pending = lag > self._live_chunk
+            cursor_timestamp = cursor.get("timestamp")
+            lag_seconds = (
+                max(0, head_timestamp - int(cursor_timestamp))
+                if head_timestamp and cursor_timestamp is not None else None
+            )
+            # The live worker normally trails a continuously advancing tip and
+            # its adaptive batch shrinks on any store hiccup. Reserve recent-gap
+            # priority for debt that is both several live batches deep and
+            # older than a real wall-clock window, so a one-batch stumble
+            # cannot pre-empt the archive's writer window every interval.
+            pending = lag > RECENT_CATCHUP_YIELD_CHUNKS * self._live_chunk and (
+                lag_seconds is None or lag_seconds > RECENT_CATCHUP_YIELD_SECONDS
+            )
             self._runtime_status.update({
                 "recent_catchup_priority": pending,
                 "recent_catchup_lag_blocks": lag,
+                "recent_catchup_lag_seconds": lag_seconds,
                 "history_scheduling": "recent_gap_first" if pending else "concurrent",
             })
         return pending
@@ -5018,6 +5154,8 @@ class MarketIndexer:
         )
         elapsed = time.monotonic() - started
         blocks = end - start + 1
+        if logs:
+            self._history_density = len(logs) / blocks
         with self._status_lock:
             fetch_detail = dict(self._fetch_metrics.get("history", {}))
         phases = {
@@ -5054,6 +5192,7 @@ class MarketIndexer:
             "bottleneck_seconds": round(max(phases.values()), 6),
             "remaining_blocks": max(0, start - target),
             "queue_policy": "raw_history_independent",
+            "source": "archive" if self._archive_source("history") else "provider",
             "fetch": fetch_detail,
         }
         self._set_runtime(
@@ -6367,6 +6506,9 @@ class MarketIndexer:
                     wait=True, cancel_futures=True,
                 )
                 self._header_executor.shutdown(
+                    wait=True, cancel_futures=True,
+                )
+                self._archive_executor.shutdown(
                     wait=True, cancel_futures=True,
                 )
                 self._market_observer_executor.shutdown(

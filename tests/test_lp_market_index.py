@@ -16,6 +16,7 @@ from rhpools.lp_market_index import (
     TICK_SPACING_SELECTOR,
     TOKEN0_SELECTOR,
     TOKEN1_SELECTOR,
+    MAX_LOGS_PER_RESPONSE,
     REPROJECT_MAX_STORE_SECONDS,
     TOKEN_METADATA_INVALID_PREFIX,
     TOKEN_METADATA_INVALID_RECHECK_S,
@@ -505,9 +506,9 @@ def test_history_progress_is_independent_of_unrunnable_enrichment(monkeypatch):
         store.close()
 
 
-def test_recent_ledger_gap_yields_history_until_live_progresses():
+def test_history_yields_only_to_live_debt_deeper_than_several_batches():
     store = MarketStore(":memory:")
-    scanner = indexer(store, StaticRpc(1_100))
+    scanner = indexer(store, StaticRpc(5_000))
     scanner._history_verified = True
     anchor = header(500)
     store.ingest([anchor], [], lane="history", cursor={
@@ -520,15 +521,27 @@ def test_recent_ledger_gap_yields_history_until_live_progresses():
         "block_number": 500, "block_hash": anchor["hash"],
         "timestamp": int(anchor["timestamp"], 16),
     })
-    scanner._set_runtime("head", head=1_100)
     try:
-        assert scanner._scan_history_once() is False
-        assert store.cursor("history")["next_to"] == 499
-        assert scanner._scan_live_once() is True
-        assert store.cursor("live")["block_number"] > 500
+        # Trailing the tip by a little over one adaptive live batch is the
+        # normal steady state, not debt: the archive keeps its writer window.
+        scanner._set_runtime(
+            "head", head=500 + scanner._live_chunk + 100,
+            head_timestamp=int(header(500 + scanner._live_chunk + 100)["timestamp"], 16),
+        )
         assert scanner._scan_history_once() is True
         assert store.cursor("history")["next_to"] < 499
-        assert store.cursor("history")["complete"] is False
+        assert scanner.runtime_status()["recent_catchup_priority"] is False
+        # A gap several batches deep and older than the wall-clock window
+        # hands the writer to live until it catches up.
+        scanner._set_runtime(
+            "head", head=5_000, head_timestamp=int(header(5_000)["timestamp"], 16),
+        )
+        before = store.cursor("history")["next_to"]
+        assert scanner._scan_history_once() is False
+        assert store.cursor("history")["next_to"] == before
+        assert scanner.runtime_status()["recent_catchup_priority"] is True
+        assert scanner._scan_live_once() is True
+        assert store.cursor("live")["block_number"] > 500
     finally:
         scanner.close()
         store.close()
@@ -980,6 +993,125 @@ def test_event_headers_and_end_recheck_share_one_ordered_post_log_batch():
     finally:
         scanner.close()
         store.close()
+
+
+def archive_factory(created: dict[str, list], *, fork_at: int | None = None):
+    """Lane clients: the archive answers logs and event headers, providers answer boundaries."""
+
+    class LaneRpc(StaticRpc):
+        def __init__(self, lane: str) -> None:
+            super().__init__(head=10_000)
+            self.lane = lane
+            self.log_queries = []
+
+        def call(self, method, params):
+            if method == "eth_getLogs":
+                assert self.lane == "archive", "provider log sources must stay idle"
+                low, high = int(params[0]["fromBlock"], 16), int(params[0]["toBlock"], 16)
+                self.log_queries.append((low, high))
+                if params[0].get("address"):
+                    return []
+                if high - low + 1 > 4:
+                    # A page over the safety cap must be split, not trusted.
+                    return [{"blockNumber": hex(low)}] * MAX_LOGS_PER_RESPONSE
+                return [
+                    {
+                        "blockNumber": hex(number),
+                        "blockHash": header(number)["hash"],
+                        "transactionHash": "0x" + f"{number:064x}",
+                        "transactionIndex": "0x0",
+                        "logIndex": "0x0",
+                    }
+                    for number in range(low, high + 1)
+                ]
+            if method == "eth_getBlockByNumber" and self.lane == "archive":
+                number = int(params[0], 16)
+                if number == fork_at:
+                    return header(number, parent=header(number - 1)["hash"]) | {
+                        "hash": "0x" + "ff" * 32,
+                    }
+            return super().call(method, params)
+
+        def batch(self, calls):
+            return [self.call(method, params) for method, params in calls]
+
+        def close(self):
+            pass
+
+    def factory(lane: str):
+        client = LaneRpc(lane)
+        created.setdefault(lane, []).append(client)
+        return client
+
+    return factory
+
+
+def test_archive_interval_pages_logs_locally_and_frames_them_with_canonical_headers():
+    created: dict[str, list] = {}
+    store = MarketStore(":memory:")
+    scanner = indexer(store, archive_factory(created))
+    # 1000 logs per block sizes pages at 8 blocks; the fake overflows any page
+    # wider than 4 blocks, so each page splits once more.
+    scanner._history_density = 1_000.0
+    try:
+        logs, headers = scanner._fetch_interval("history", 100, 115)
+        assert [int(log["blockNumber"], 16) for log in logs] == list(range(100, 116))
+        assert set(headers) == set(range(100, 116))
+        pages = sorted(
+            query for client in created["archive"] for query in client.log_queries
+        )
+        assert pages == sorted([
+            (100, 107), (108, 115), (100, 107), (108, 115),
+            (100, 103), (104, 107), (108, 111), (112, 115),
+        ])
+        assert all(not client.log_queries for client in created["history"])
+        metrics = scanner._fetch_metrics["history"]
+        assert metrics["source"] == "archive"
+        assert metrics["event_header_count"] == 14
+    finally:
+        scanner.close()
+        store.close()
+
+
+def test_archive_interval_rejects_a_boundary_the_canonical_source_disputes():
+    created: dict[str, list] = {}
+    store = MarketStore(":memory:")
+    scanner = indexer(store, archive_factory(created, fork_at=115))
+    try:
+        with pytest.raises(CanonicalConflict, match="canonical header 115"):
+            scanner._fetch_interval("history", 100, 115)
+    finally:
+        scanner.close()
+        store.close()
+
+
+def test_archive_chunk_grows_toward_the_event_budget_not_the_page_cap():
+    from rhpools.lp_market_index import ARCHIVE_MAX_CHUNK, ARCHIVE_TARGET_EVENTS
+
+    created: dict[str, list] = {}
+    store = MarketStore(":memory:")
+    provider_store = MarketStore(":memory:")
+    archive = indexer(store, archive_factory(created))
+    provider = indexer(provider_store)
+    try:
+        for scanner in (archive, provider):
+            scanner._history_chunk = 1_000
+            scanner._resize_after_success("history", 8_000, 1.0, 1_000)
+        assert provider._history_chunk == 1_000
+        assert archive._history_chunk == 1_250
+        archive._history_chunk = ARCHIVE_MAX_CHUNK
+        archive._resize_after_success("history", 0, 0.5, ARCHIVE_MAX_CHUNK)
+        assert archive._history_chunk == ARCHIVE_MAX_CHUNK
+        archive._history_chunk = 4_000
+        archive._resize_after_success(
+            "history", ARCHIVE_TARGET_EVENTS * 4, 1.0, 4_000,
+        )
+        assert archive._history_chunk == 4_000
+    finally:
+        archive.close()
+        provider.close()
+        store.close()
+        provider_store.close()
 
 
 def test_interval_end_is_rechecked_after_logs_before_commit():
