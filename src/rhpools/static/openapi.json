@@ -1086,7 +1086,7 @@
       },
       "FlowProvenance": {
         "type": "object",
-        "required": ["publisher", "source_id", "upstream_origin", "canonical_origin", "upstream_endpoint", "upstream_contract", "access", "retrieved_at", "upstream_read_at", "upstream_evidence_through", "evidence_time_basis"],
+        "required": ["publisher", "source_id", "upstream_origin", "canonical_origin", "upstream_endpoint", "upstream_contract", "access", "retrieved_at", "upstream_read_at", "upstream_evidence_through", "evidence_time_basis", "stale", "stale_reason"],
         "properties": {
           "publisher": {"type": "string"},
           "source_id": {"type": "string", "enum": ["apollo", "rhtrenches"]},
@@ -1100,7 +1100,9 @@
           "upstream_read_at": {"type": "string", "format": "date-time"},
           "upstream_evidence_through": {"type": ["string", "null"], "format": "date-time"},
           "evidence_time_basis": {"type": "string"},
-          "attribution": {"type": "string"}
+          "attribution": {"type": "string"},
+          "stale": {"type": "boolean", "description": "True when the page is the last successfully fetched one for this query and the current refresh failed; retrieved_at is the original read time."},
+          "stale_reason": {"type": ["string", "null"]}
         },
         "additionalProperties": false
       },
@@ -1136,6 +1138,18 @@
         },
         "additionalProperties": false
       },
+      "FlowPublisherCircuit": {
+        "type": "object",
+        "required": ["state", "consecutive_failures", "open_until", "retry_after_seconds", "last_error"],
+        "properties": {
+          "state": {"type": "string", "const": "open"},
+          "consecutive_failures": {"type": "integer", "minimum": 3},
+          "open_until": {"type": "string", "format": "date-time"},
+          "retry_after_seconds": {"type": "integer", "minimum": 0},
+          "last_error": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
       "PoolAttribution": {
         "type": "object",
         "required": ["state", "reason"],
@@ -1147,7 +1161,7 @@
       },
       "FlowCoverage": {
         "type": "object",
-        "required": ["supported_chains", "full_chain_complete", "requested_chain", "upstream_page_items", "returned_items", "items_filtered_by_chain", "identity_scope", "cursor_scope", "publisher_status", "rows_omitted", "pool_attribution"],
+        "required": ["supported_chains", "full_chain_complete", "requested_chain", "upstream_page_items", "returned_items", "items_filtered_by_chain", "identity_scope", "cursor_scope", "publisher_status", "publisher_circuit", "rows_omitted", "pool_attribution"],
         "properties": {
           "supported_chains": {"type": "array", "items": {"type": "string", "enum": ["solana", "base", "robinhood"]}},
           "full_chain_complete": {"type": "boolean", "const": false},
@@ -1159,6 +1173,7 @@
           "identity_scope": {"type": "string"},
           "cursor_scope": {"type": "string"},
           "publisher_status": {"anyOf": [{"$ref": "#/components/schemas/FlowPublisherStatus"}, {"type": "null"}]},
+          "publisher_circuit": {"anyOf": [{"$ref": "#/components/schemas/FlowPublisherCircuit"}, {"type": "null"}], "description": "Open breaker for the selected publisher after three consecutive failed refreshes; upstream is skipped until open_until."},
           "rows_omitted": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
           "pool_attribution": {"$ref": "#/components/schemas/PoolAttribution"}
         },

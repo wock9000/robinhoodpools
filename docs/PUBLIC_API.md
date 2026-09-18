@@ -236,6 +236,14 @@ exact same-transaction pool route, so trades are not attributed as LP activity.
 Use `occurred_at` and, when available, `observed_at` as evidence times.
 `read_at` is server read time and is not evidence time.
 
+Pages are cached for 30 seconds per query. When a refresh fails after one
+retry, the last successfully fetched page for that query is served with
+`provenance.stale: true`, `provenance.stale_reason`, and its original
+`provenance.retrieved_at`. After three consecutive failures the publisher's
+upstream is skipped for 60 seconds and `coverage.publisher_circuit` reports
+the open breaker; it is `null` otherwise. A `503` is returned only when no last-good page
+exists for the query.
+
 ## Freshness and completeness
 
 For pool and asset responses, the service obtains the Robinhood Chain head,
