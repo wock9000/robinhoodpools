@@ -2,12 +2,17 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 
 import pytest
+import requests
 
+from rhpools import lp_fomo_flow
 from rhpools.lp_fomo_flow import (
     FomoFlowContractError,
     FomoFlowService,
+    FomoFlowUnavailable,
     PUBLIC_APOLLO_ORIGIN,
     PUBLIC_RHTRENCHES_ORIGIN,
 )
@@ -298,11 +303,11 @@ def test_rhtrenches_projects_raw_robinhood_evidence_and_omits_derived_rows_and_f
         "not a real buy", "derived-pair",
     ):
         assert excluded not in serialized
-    assert [call[0] for call in session.calls] == [
-        f"{PUBLIC_RHTRENCHES_ORIGIN}/api/tape",
-        f"{PUBLIC_RHTRENCHES_ORIGIN}/api/status",
-    ]
-    assert session.calls[0][1]["params"] == {"limit": "100", "stocks": "true"}
+    calls = {url: kwargs["params"] for url, kwargs in session.calls}
+    assert calls == {
+        f"{PUBLIC_RHTRENCHES_ORIGIN}/api/tape": {"limit": "100", "stocks": "true"},
+        f"{PUBLIC_RHTRENCHES_ORIGIN}/api/status": {},
+    }
 
 
 def test_rhtrenches_rejects_cross_chain_verified_and_cursor_queries_before_fetch():
@@ -316,3 +321,170 @@ def test_rhtrenches_rejects_cross_chain_verified_and_cursor_queries_before_fetch
     with pytest.raises(ValueError, match="does not accept cursor"):
         service.flow({"source": "rhtrenches", "cursor": "YWJj"})
     assert session.calls == []
+
+
+class _Clock:
+    def __init__(self):
+        self.now = 1000.0
+        self.slept = []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.slept.append(seconds)
+
+
+class _ScriptedSession:
+    """Serves per-path scripts of payloads, `_Response`s, or exceptions; the last entry repeats."""
+
+    def __init__(self, **scripts):
+        self.scripts = {f"/{name}": list(script) for name, script in scripts.items()}
+        self.calls = []
+        self.gate = None
+
+    def get(self, url, **kwargs):
+        self.calls.append(url)
+        if self.gate is not None and url.endswith("/v1/copy/flow"):
+            self.gate.wait()
+        path = next(path for path in self.scripts if url.endswith(path))
+        script = self.scripts[path]
+        step = script.pop(0) if len(script) > 1 else script[0]
+        if isinstance(step, BaseException):
+            raise step
+        return step if isinstance(step, _Response) else _Response(step)
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    fake = _Clock()
+    monkeypatch.setattr(lp_fomo_flow, "time", fake)
+    return fake
+
+
+def test_connection_errors_and_gateway_statuses_retry_once(clock):
+    good = _page([_event()])
+    flaky = _ScriptedSession(**{"v1/copy/flow": [requests.ConnectionError("reset"), good]})
+    assert len(FomoFlowService(session=flaky).flow({})["items"]) == 1
+    assert len(flaky.calls) == 2 and clock.slept == [0.5]
+
+    gateway = _ScriptedSession(**{"v1/copy/flow": [_Response({}, 502), good]})
+    assert len(FomoFlowService(session=gateway).flow({})["items"]) == 1
+    assert len(gateway.calls) == 2
+
+    twice = _ScriptedSession(**{"v1/copy/flow": [_Response({}, 503)]})
+    with pytest.raises(FomoFlowUnavailable):
+        FomoFlowService(session=twice).flow({})
+    assert len(twice.calls) == 2
+
+    hard = _ScriptedSession(**{"v1/copy/flow": [_Response({}, 500), good]})
+    with pytest.raises(FomoFlowUnavailable):
+        FomoFlowService(session=hard).flow({})
+    assert len(hard.calls) == 1
+
+    bad_cursor = _ScriptedSession(**{"v1/copy/flow": [_Response({}, 400), good]})
+    with pytest.raises(ValueError):
+        FomoFlowService(session=bad_cursor).flow({"cursor": "abc"})
+    assert len(bad_cursor.calls) == 1
+
+
+def test_expired_page_is_served_stale_when_refresh_fails(clock):
+    session = _ScriptedSession(**{"v1/copy/flow": [_page([_event()]), _Response({}, 500)]})
+    service = FomoFlowService(session=session)
+
+    first = service.flow({})
+    clock.now += 31
+    stale = service.flow({})
+
+    assert first["provenance"]["stale"] is False
+    assert stale["provenance"]["stale"] is True
+    assert "HTTP 500" in stale["provenance"]["stale_reason"]
+    assert stale["provenance"]["retrieved_at"] == first["provenance"]["retrieved_at"]
+    assert stale["items"] == first["items"]
+    assert stale["coverage"]["publisher_circuit"] is None
+    assert len(session.calls) == 2
+
+
+def test_page_failing_its_contract_never_replaces_last_good(clock):
+    drifted = _page([_event()])
+    drifted["evidenceThrough"] = "2026-09-06T13:00:00.000Z"
+    session = _ScriptedSession(**{"v1/copy/flow": [_page([_event()]), drifted]})
+    service = FomoFlowService(session=session)
+
+    first = service.flow({})
+    clock.now += 31
+    stale = service.flow({})
+
+    assert stale["provenance"]["stale"] is True
+    assert stale["items"] == first["items"]
+
+
+def test_circuit_opens_after_three_failures_and_serves_stale_without_upstream(clock):
+    session = _ScriptedSession(**{"v1/copy/flow": [_page([_event()]), _Response({}, 500)]})
+    service = FomoFlowService(session=session)
+    service.flow({})
+
+    responses = []
+    for _ in range(3):
+        clock.now += 31
+        responses.append(service.flow({}))
+    assert [r["coverage"]["publisher_circuit"] for r in responses[:2]] == [None, None]
+    circuit = responses[2]["coverage"]["publisher_circuit"]
+    assert circuit["state"] == "open" and circuit["consecutive_failures"] == 3
+    assert "HTTP 500" in circuit["last_error"]
+    calls_before = len(session.calls)
+
+    clock.now += 31
+    held = service.flow({})
+    assert held["provenance"]["stale"] is True
+    assert held["coverage"]["publisher_circuit"]["retry_after_seconds"] <= 29
+    assert len(session.calls) == calls_before
+
+    session.scripts["/v1/copy/flow"] = [_page([_event(), _event("base")])]
+    clock.now += 30
+    recovered = service.flow({})
+    assert recovered["provenance"]["stale"] is False
+    assert recovered["coverage"]["publisher_circuit"] is None
+    assert len(recovered["items"]) == 2
+    assert len(session.calls) == calls_before + 1
+
+
+def test_open_circuit_with_no_last_good_page_is_unavailable(clock):
+    session = _ScriptedSession(**{"v1/copy/flow": [requests.ConnectionError("down")]})
+    service = FomoFlowService(session=session)
+    for _ in range(3):
+        with pytest.raises(FomoFlowUnavailable):
+            service.flow({})
+    calls_before = len(session.calls)
+
+    with pytest.raises(FomoFlowUnavailable, match="circuit open"):
+        service.flow({})
+    assert len(session.calls) == calls_before
+
+
+def test_stalled_apollo_read_does_not_block_rhtrenches():
+    session = _ScriptedSession(**{
+        "v1/copy/flow": [_page([_event()])],
+        "api/tape": [[_rh_row()]],
+        "api/status": [_rh_status()],
+    })
+    session.gate = threading.Event()
+    service = FomoFlowService(session=session)
+    apollo = threading.Thread(target=service.flow, args=({},), daemon=True)
+    apollo.start()
+    for _ in range(200):
+        if any(url.endswith("/v1/copy/flow") for url in session.calls):
+            break
+        time.sleep(0.005)
+
+    results = []
+    rhtrenches = threading.Thread(
+        target=lambda: results.append(service.flow({"source": "rhtrenches"})), daemon=True,
+    )
+    rhtrenches.start()
+    rhtrenches.join(timeout=2)
+    session.gate.set()
+    assert not rhtrenches.is_alive(), "rhtrenches read waited on the stalled Apollo read"
+    assert len(results[0]["items"]) == 1
+    apollo.join(timeout=5)
+    assert not apollo.is_alive()

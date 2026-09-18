@@ -146,11 +146,21 @@
       `Evidence basis: ${provenance.evidence_time_basis || "publisher contract"}.${sourceHealth}`,
     ].join(" ");
 
-    const warnings = [
+    const warnings = [];
+    if (provenance.stale) {
+      const circuit = coverage.publisher_circuit;
+      warnings.push(
+        `STALE · LAST GOOD PAGE RETRIEVED ${formatTime(provenance.retrieved_at)} · REFRESH FAILED: ${provenance.stale_reason || "unknown"}`,
+      );
+      if (circuit?.state === "open") {
+        warnings.push(`PUBLISHER CIRCUIT OPEN AFTER ${circuit.consecutive_failures} FAILURES · NEXT UPSTREAM READ IN ${circuit.retry_after_seconds}S`);
+      }
+    }
+    warnings.push(
       data.query?.source === "rhtrenches"
         ? "RH TRENCHES · ROBINHOOD TRACKED-WALLET SNAPSHOT ONLY"
         : "APOLLO SUPPORTED SET ONLY · NOT ALL-CHAIN COVERAGE",
-    ];
+    );
     if (coverage.items_filtered_by_chain > 0) {
       warnings.push(`${coverage.items_filtered_by_chain} UPSTREAM PAGE EVENTS OUTSIDE THE SELECTED CHAIN WERE NOT RETURNED`);
     }
@@ -351,7 +361,8 @@
       state.history = history;
       render(data);
       updateLocation();
-      setRequest("SNAPSHOT", `${data.items.length} observations · refresh 15s`);
+      if (data.provenance.stale) setRequest("STALE", "Last good page served; upstream refresh failed · retry 15s", "loading");
+      else setRequest("SNAPSHOT", `${data.items.length} observations · refresh 15s`);
     } catch (error) {
       if (error.name === "AbortError") return;
       elements.errorMessage.textContent = String(error.message || error);
@@ -387,6 +398,7 @@
     resetAndLoad();
   });
   elements.source.addEventListener("change", () => {
+    elements.chain.value = elements.source.value === "rhtrenches" ? "robinhood" : "";
     syncSourceControls();
     renderSourcePresentation(elements.source.value);
     if (state.data && state.data.query?.source !== elements.source.value) {

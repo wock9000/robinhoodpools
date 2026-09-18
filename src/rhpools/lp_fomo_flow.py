@@ -3,10 +3,11 @@ from __future__ import annotations
 
 from collections import Counter, OrderedDict
 from collections.abc import Mapping
-from concurrent.futures import Future, TimeoutError as FutureTimeoutError
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from functools import partial
 import ipaddress
 import json
 import os
@@ -26,12 +27,16 @@ RHTRENCHES_STATUS_PATH = "/api/status"
 SUPPORTED_CHAINS = ("solana", "base", "robinhood")
 ENABLED_SOURCES = ("apollo", "rhtrenches")
 
-_CACHE_TTL_SECONDS = 10.0
+_CACHE_TTL_SECONDS = 30.0
 _RHTRENCHES_FETCH_LIMIT = 100
 _MAX_CACHE_ENTRIES = 64
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 _CONNECT_TIMEOUT_SECONDS = 2.5
 _READ_TIMEOUT_SECONDS = 6.0
+_RETRY_BACKOFF_SECONDS = 0.5
+_RETRY_STATUSES = frozenset({502, 503, 504})
+_CIRCUIT_FAILURE_THRESHOLD = 3
+_CIRCUIT_OPEN_SECONDS = 60.0
 _CURSOR_RE = re.compile(r"[A-Za-z0-9_-]{1,4096}\Z")
 _DECIMAL_RE = re.compile(r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?\Z")
 _EVM_ADDRESS_RE = re.compile(r"0x[0-9a-fA-F]{40}\Z")
@@ -87,6 +92,54 @@ class _UpstreamPage:
     payload: Any
     status: Mapping[str, Any] | None
     retrieved_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class _Served:
+    page: _UpstreamPage
+    stale_reason: str | None
+    circuit: dict[str, Any] | None
+
+
+@dataclass(slots=True)
+class _Circuit:
+    """Consecutive-failure breaker for one publisher; guarded by the service lock."""
+
+    failures: int = 0
+    open_until: float = 0.0
+    open_until_at: str | None = None
+    last_error: str | None = None
+
+    def record_failure(self, now: float, error: str) -> None:
+        self.failures += 1
+        self.last_error = error
+        if self.failures >= _CIRCUIT_FAILURE_THRESHOLD:
+            self.open_until = now + _CIRCUIT_OPEN_SECONDS
+            self.open_until_at = (
+                (datetime.now(timezone.utc) + timedelta(seconds=_CIRCUIT_OPEN_SECONDS))
+                .isoformat(timespec="milliseconds")
+                .replace("+00:00", "Z")
+            )
+
+    def record_success(self) -> None:
+        self.failures = 0
+        self.open_until = 0.0
+        self.open_until_at = None
+        self.last_error = None
+
+    def is_open(self, now: float) -> bool:
+        return now < self.open_until
+
+    def describe(self, now: float) -> dict[str, Any] | None:
+        if not self.is_open(now):
+            return None
+        return {
+            "state": "open",
+            "consecutive_failures": self.failures,
+            "open_until": self.open_until_at,
+            "retry_after_seconds": max(0, int(self.open_until - now)),
+            "last_error": self.last_error,
+        }
 
 
 def _utc_now() -> str:
@@ -587,7 +640,7 @@ class FomoFlowService:
         self.max_cache_entries = int(max_cache_entries)
         self.max_response_bytes = int(max_response_bytes)
         self.timeout = (float(connect_timeout), float(read_timeout))
-        self._wait_timeout = float(connect_timeout + read_timeout + 1)
+        self._wait_timeout = float(2 * (connect_timeout + read_timeout) + _RETRY_BACKOFF_SECONDS + 1)
         self._session = session if session is not None else requests.Session()
         self._owns_session = session is None
         if self._owns_session:
@@ -603,7 +656,8 @@ class FomoFlowService:
             tuple[str, str | None, int, bool], Future[_UpstreamPage]
         ] = {}
         self._lock = threading.Lock()
-        self._network_lock = threading.Lock()
+        self._source_locks = {source: threading.Lock() for source in ENABLED_SOURCES}
+        self._circuits = {source: _Circuit() for source in ENABLED_SOURCES}
         self._closed = False
 
     def close(self) -> None:
@@ -614,8 +668,13 @@ class FomoFlowService:
             self._closed = True
             self._cache.clear()
         if self._owns_session:
-            with self._network_lock:
+            for lock in self._source_locks.values():
+                lock.acquire()
+            try:
                 self._session.close()
+            finally:
+                for lock in self._source_locks.values():
+                    lock.release()
 
     @staticmethod
     def _bounded_body(response: requests.Response, maximum: int, publisher: str) -> bytes:
@@ -651,10 +710,38 @@ class FomoFlowService:
         bad_request_is_query: bool = False,
     ) -> Any:
         publisher = "Apollo" if source == "apollo" else "RH Trenches"
+        request = partial(
+            self._request_once,
+            publisher=publisher,
+            url=f"{self.origins[source]}{path}",
+            params=params,
+            bad_request_is_query=bad_request_is_query,
+        )
+        try:
+            return request()
+        except requests.ConnectionError:
+            pass
+        except FomoFlowUnavailable as exc:
+            if exc.upstream_status not in _RETRY_STATUSES:
+                raise
+        time.sleep(_RETRY_BACKOFF_SECONDS)
+        try:
+            return request()
+        except requests.ConnectionError as exc:
+            raise FomoFlowUnavailable(f"{publisher} public flow endpoint is unavailable") from exc
+
+    def _request_once(
+        self,
+        *,
+        publisher: str,
+        url: str,
+        params: Mapping[str, str],
+        bad_request_is_query: bool,
+    ) -> Any:
         response: requests.Response | None = None
         try:
             response = self._session.get(
-                f"{self.origins[source]}{path}",
+                url,
                 params=dict(params),
                 timeout=self.timeout,
                 allow_redirects=False,
@@ -676,7 +763,7 @@ class FomoFlowService:
                     f"{publisher} public flow endpoint returned a non-JSON response"
                 )
             body = self._bounded_body(response, self.max_response_bytes, publisher)
-        except (FomoFlowError, ValueError):
+        except (FomoFlowError, ValueError, requests.ConnectionError):
             raise
         except requests.RequestException as exc:
             raise FomoFlowUnavailable(f"{publisher} public flow endpoint is unavailable") from exc
@@ -689,7 +776,7 @@ class FomoFlowService:
             raise FomoFlowContractError(f"{publisher} public flow endpoint returned invalid JSON") from exc
 
     def _fetch(self, query: _FlowQuery) -> _UpstreamPage:
-        with self._network_lock:
+        with self._source_locks[query.source]:
             with self._lock:
                 if self._closed:
                     raise FomoFlowUnavailable("Fomo flow service is closed")
@@ -710,16 +797,19 @@ class FomoFlowService:
                         self.origins["apollo"], payload, None, _utc_now(),
                     )
 
-                tape = self._request_json(
-                    source="rhtrenches",
-                    path=RHTRENCHES_TAPE_PATH,
-                    params={"limit": str(_RHTRENCHES_FETCH_LIMIT), "stocks": "true"},
-                )
-                status = self._request_json(
-                    source="rhtrenches",
-                    path=RHTRENCHES_STATUS_PATH,
-                    params={},
-                )
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    status_future = pool.submit(
+                        self._request_json,
+                        source="rhtrenches",
+                        path=RHTRENCHES_STATUS_PATH,
+                        params={},
+                    )
+                    tape = self._request_json(
+                        source="rhtrenches",
+                        path=RHTRENCHES_TAPE_PATH,
+                        params={"limit": str(_RHTRENCHES_FETCH_LIMIT), "stocks": "true"},
+                    )
+                    status = status_future.result()
                 return _UpstreamPage(
                     self.origins["rhtrenches"],
                     tape,
@@ -730,7 +820,16 @@ class FomoFlowService:
                 if self._owns_session:
                     self._session.cookies.clear()
 
-    def _page(self, query: _FlowQuery) -> _UpstreamPage:
+    def _last_good(self, key: tuple[str, str | None, int, bool], exc: BaseException) -> _Served:
+        """Serve the last successful page for `key` after a failed refresh, or re-raise."""
+        with self._lock:
+            cached = self._cache.get(key)
+            circuit = self._circuits[key[0]].describe(time.monotonic())
+        if cached is None:
+            raise exc
+        return _Served(cached[1], str(exc), circuit)
+
+    def _page(self, query: _FlowQuery) -> _Served:
         key = (
             (query.source, None, _RHTRENCHES_FETCH_LIMIT, False)
             if query.source == "rhtrenches"
@@ -744,7 +843,17 @@ class FomoFlowService:
             cached = self._cache.get(key)
             if cached is not None and now - cached[0] < self.cache_ttl:
                 self._cache.move_to_end(key)
-                return cached[1]
+                return _Served(cached[1], None, None)
+            circuit = self._circuits[query.source]
+            if circuit.is_open(now):
+                described = circuit.describe(now)
+                if cached is not None:
+                    return _Served(cached[1], f"publisher circuit open: {circuit.last_error}", described)
+                raise FomoFlowUnavailable(
+                    f"publisher circuit open after {circuit.failures} consecutive failures: "
+                    f"{circuit.last_error}",
+                    retry_after=str(described["retry_after_seconds"]) if described else None,
+                )
             future = self._pending.get(key)
             if future is None:
                 if len(self._pending) >= self.max_cache_entries:
@@ -754,26 +863,36 @@ class FomoFlowService:
                 leader = True
         if not leader:
             try:
-                return future.result(timeout=self._wait_timeout)
-            except FutureTimeoutError as exc:
-                raise FomoFlowUnavailable("timed out waiting for the shared public flow read") from exc
+                return _Served(future.result(timeout=self._wait_timeout), None, None)
+            except FutureTimeoutError:
+                return self._last_good(
+                    key, FomoFlowUnavailable("timed out waiting for the shared public flow read"),
+                )
+            except FomoFlowError as exc:
+                return self._last_good(key, exc)
 
         try:
             page = self._fetch(query)
+            self._project(query, page)
         except BaseException as exc:
             with self._lock:
                 self._pending.pop(key, None)
+                if isinstance(exc, FomoFlowError):
+                    self._circuits[query.source].record_failure(time.monotonic(), str(exc))
             future.set_exception(exc)
+            if isinstance(exc, FomoFlowError):
+                return self._last_good(key, exc)
             raise
         with self._lock:
             self._pending.pop(key, None)
+            self._circuits[query.source].record_success()
             if not self._closed:
                 self._cache[key] = (time.monotonic(), page)
                 self._cache.move_to_end(key)
                 while len(self._cache) > self.max_cache_entries:
                     self._cache.popitem(last=False)
         future.set_result(page)
-        return page
+        return _Served(page, None, None)
 
     @staticmethod
     def _apollo_response(query: _FlowQuery, upstream: _UpstreamPage) -> dict[str, Any]:
@@ -955,17 +1074,18 @@ class FomoFlowService:
             ],
         }
 
+    def _project(self, query: _FlowQuery, page: _UpstreamPage) -> dict[str, Any]:
+        if query.source == "apollo":
+            return self._apollo_response(query, page)
+        return self._rh_response(query, page)
+
     def flow(self, params: Mapping[str, Any]) -> dict[str, Any]:
         """Return one bounded, evidence-qualified public Fomo flow projection."""
         if not isinstance(params, Mapping):
             raise ValueError("Fomo flow query must be a parameter mapping")
         query = _query(params)
-        upstream = self._page(query)
-        projected = (
-            self._apollo_response(query, upstream)
-            if query.source == "apollo"
-            else self._rh_response(query, upstream)
-        )
+        served = self._page(query)
+        projected = self._project(query, served.page)
         return {
             "schema_version": "fomo-flow.v1",
             "query": {
@@ -979,8 +1099,14 @@ class FomoFlowService:
             },
             "sources": _source_catalog(query.source),
             **projected,
+            "provenance": {
+                **projected["provenance"],
+                "stale": served.stale_reason is not None,
+                "stale_reason": served.stale_reason,
+            },
             "coverage": {
                 **projected["coverage"],
+                "publisher_circuit": served.circuit,
                 "pool_attribution": {
                     "state": "not-provided",
                     "reason": (
