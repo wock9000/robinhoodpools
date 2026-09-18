@@ -14,6 +14,7 @@ import time
 import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import NamedTuple
 from urllib.parse import parse_qs, urlsplit
 
 STATIC = Path(__file__).resolve().parent / "static"
@@ -41,17 +42,55 @@ for _name in (
         "text/css; charset=utf-8" if _name.endswith(".css") else "application/javascript; charset=utf-8",
     )
 
-_GET_METHODS = {
-    "/api/lp/" + name: ("lp", name)
-    for name in ("status", "search", "overview", "pools", "tape", "owners", "closed", "owner", "dislocations")
+
+class Route(NamedTuple):
+    resource: str | None
+    method: str
+    lane: str
+    freshness: tuple[int, int] | dict[str, tuple[int, int]]
+
+
+# (max-age, stale-while-revalidate) seconds. Window entries mirror
+# lp_market_service.WINDOW_CACHE_TTL so the edge never outlives the service cache.
+_WINDOW_FRESHNESS = {"1h": (3, 30), "24h": (3, 30), "7d": (30, 120), "30d": (120, 600), "all": (120, 600)}
+_ROUTES = {
+    "/api/lp/status": Route("lp", "status", "fast", (1, 2)),
+    "/api/lp/search": Route("lp", "search", "fast", (5, 30)),
+    "/api/lp/overview": Route("lp", "overview", "fast", _WINDOW_FRESHNESS),
+    "/api/lp/pools": Route("lp", "pools", "fast", _WINDOW_FRESHNESS),
+    "/api/lp/tape": Route("lp", "tape", "fast", (2, 10)),
+    "/api/lp/dislocations": Route("lp", "dislocations", "fast", (2, 10)),
+    "/api/lp/owners": Route("lp", "owners", "slow", (5, 60)),
+    "/api/lp/closed": Route("lp", "closed", "slow", (15, 60)),
+    "/api/lp/owner": Route("lp", "owner", "slow", (5, 60)),
+    "/api/v1/pools": Route("public", "pools", "slow", (2, 10)),
+    "/api/v1/assets": Route("public", "assets", "slow", (2, 10)),
+    "/api/v1/research/owner": Route("research", "owner", "slow", (5, 60)),
+    "/api/v1/fomo/flow": Route("flow", "flow", "slow", (10, 60)),
+    "/api/workbench/pools": Route("market", "catalog", "fast", (5, 30)),
+    "/api/workbench/pool": Route(None, "_workbench_detail", "slow", (2, 10)),
 }
-_GET_METHODS.update({
-    "/api/v1/pools": ("public", "pools"),
-    "/api/v1/assets": ("public", "assets"),
-    "/api/v1/research/owner": ("research", "owner"),
-    "/api/v1/fomo/flow": ("flow", "flow"),
-    "/api/workbench/pools": ("market", "catalog"),
-})
+_LANE_SHARE = {"fast": 1.0, "slow": 0.5}
+DEFAULT_API_SLOTS = 4 * (getattr(os, "process_cpu_count", os.cpu_count)() or 1)
+
+
+def lane_slots(total: int) -> dict[str, threading.BoundedSemaphore]:
+    return {
+        lane: threading.BoundedSemaphore(max(1, int(total * share)))
+        for lane, share in _LANE_SHARE.items()
+    }
+
+
+def freshness(route: Route, query: dict[str, str]) -> tuple[int, int]:
+    policy = route.freshness
+    if isinstance(policy, dict):
+        return policy[str(query.get("window") or "24h")]
+    return policy
+
+
+def _etag(key, body: bytes) -> str:
+    identity = repr(key).encode() if key is not None else body
+    return 'W/"' + hashlib.blake2b(identity, digest_size=8).hexdigest() + '"'
 
 
 _body_cache = [None] * 16
@@ -85,11 +124,12 @@ def _publication_key(path, query, payload):
     if revision is None or path == "/api/lp/status":
         return None
     activity = payload.get("current_activity") or {}
+    # status.as_of is the wall clock at publication, not part of the identity.
     return (
         path, tuple(sorted(query.items())), revision,
         payload.get("epoch", status.get("epoch")),
         payload.get("financial_revision"), payload.get("accounting_as_of"),
-        payload.get("as_of", status.get("as_of")), payload.get("block_hash"),
+        payload.get("block_hash"),
         tuple(activity.get(k) for k in ("revision", "epoch", "head", "observed_from")),
     )
 
@@ -169,11 +209,18 @@ class Runtime:
 class LPHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    # socketserver's default backlog of 5 drops SYNs under any burst; each
+    # drop costs the client a 1 s retransmit before the request even arrives.
+    request_queue_size = 1024
 
 
 class Handler(BaseHTTPRequestHandler):
     runtime: Runtime
-    api_slots = threading.BoundedSemaphore(64)
+    # Keep-alive lets cloudflared reuse origin connections instead of paying a
+    # handshake and a new thread per poll. Every response carries Content-Length
+    # or closes the connection.
+    protocol_version = "HTTP/1.1"
+    api_slots = lane_slots(DEFAULT_API_SLOTS)
     lp_streams = threading.BoundedSemaphore(512)
     workbench_streams = threading.BoundedSemaphore(128)
 
@@ -193,15 +240,25 @@ class Handler(BaseHTTPRequestHandler):
         match = re.search(r"(?:^|,)\s*gzip(?:\s*;\s*q=([01](?:\.\d+)?))?\s*(?:,|$)", str(self.headers.get("Accept-Encoding") or "").lower())
         return match is not None and float(match.group(1) or "1") > 0
 
-    def _json(self, status: int, payload: object, *, retry: int | None = None, key=None) -> None:
+    def _json(
+            self, status: int, payload: object, *,
+            retry: int | None = None, key=None, fresh: tuple[int, int] | None = None,
+    ) -> None:
         body = _json_bytes(payload, key)
-        compressed = len(body) >= 1024 and self._gzip_ok()
+        etag = _etag(key, body) if status == 200 and fresh is not None else None
+        if etag is not None and etag in self._client_etags():
+            status, body = 304, b""
+        compressed = status != 304 and len(body) >= 1024 and self._gzip_ok()
         if compressed:
             build = lambda: zlib.compress(body, level=1, wbits=31)
             body = build() if key is None else _memoized_body(("gzip", *key), build)
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Cache-Control", "no-store")
+        if etag is None:
+            self.send_header("Cache-Control", "no-store")
+        else:
+            self.send_header("Cache-Control", f"public, max-age={fresh[0]}, stale-while-revalidate={fresh[1]}")
+            self.send_header("ETag", etag)
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Vary", "Accept-Encoding")
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -209,10 +266,16 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Encoding", "gzip")
         if retry is not None:
             self.send_header("Retry-After", str(retry))
-        self.send_header("Content-Length", str(len(body)))
+        if status != 304:
+            self.send_header("Content-Length", str(len(body)))
+        if self.close_connection:
+            self.send_header("Connection", "close")
         self.end_headers()
-        if self.command != "HEAD":
+        if status != 304 and self.command != "HEAD":
             self.wfile.write(body)
+
+    def _client_etags(self) -> set[str]:
+        return {tag.strip() for tag in str(self.headers.get("If-None-Match") or "").split(",")}
 
     def _asset(self, path: str, head: bool = False) -> bool:
         item = self.runtime.assets.get(path)
@@ -256,25 +319,29 @@ class Handler(BaseHTTPRequestHandler):
             for key, values in parse_qs(parsed.query, max_num_fields=64).items()
         }
 
-    def _bounded(self, call, path="", query=None) -> None:
-        if not self.api_slots.acquire(False):
+    def _bounded(self, route: Route, path: str, query: dict[str, str]) -> None:
+        slots = self.api_slots[route.lane]
+        if not slots.acquire(False):
             self._json(503, {"error": "API request capacity reached"}, retry=1)
             return
         try:
+            owner = self if route.resource is None else getattr(self.runtime, route.resource)
+            method = getattr(owner, route.method)
             try:
-                payload = call()
+                payload = method() if path == "/api/lp/status" else method(query)
             finally:
                 self.runtime.lp.store.close_reader()
-            key = _publication_key(path, query or {}, payload) if isinstance(payload, dict) else None
-            self._json(200, payload, key=key)
+            key = _publication_key(path, query, payload) if isinstance(payload, dict) else None
+            self._json(200, payload, key=key, fresh=freshness(route, query))
         finally:
-            self.api_slots.release()
+            slots.release()
 
     def _start_event_stream(self):
         compressor = zlib.compressobj(level=1, wbits=31) if self._gzip_ok() else None
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache,no-transform")
+        self.send_header("Connection", "close")
+        self.send_header("Cache-Control", "no-store,no-transform")
         self.send_header("X-Accel-Buffering", "no")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Vary", "Accept-Encoding")
@@ -451,19 +518,12 @@ class Handler(BaseHTTPRequestHandler):
         if self._asset(path):
             return
         try:
-            target = _GET_METHODS.get(path)
-            if target is not None:
-                resource, method_name = target
-                method = getattr(getattr(self.runtime, resource), method_name)
-                call = method if path == "/api/lp/status" else lambda: method(query)
-                return self._bounded(call, path, query)
+            route = _ROUTES.get(path)
+            if route is not None:
+                return self._bounded(route, path, query)
             if path == "/api/workbench/capabilities":
                 local = self._loopback()
                 return self._json(200, {"allocation_preview": True, "simulate": local, "prepare": local and self.runtime.enable_prepare, "broadcast": False, "server_signing": False})
-            if path == "/api/workbench/pool":
-                return self._bounded(
-                    lambda: self._workbench_detail(query), path, query,
-                )
             if path == "/api/lp/stream":
                 return self._sse(False, query)
             if path == "/api/workbench/stream":
@@ -481,9 +541,7 @@ class Handler(BaseHTTPRequestHandler):
             path, _query = self._query()
         except ValueError as exc:
             return self._json(400, {"error": str(exc)})
-        if path not in _GET_METHODS and path not in {
-            "/api/v1/openapi.json", "/api/workbench/pool", "/api/workbench/capabilities",
-        }:
+        if path not in _ROUTES and path not in {"/api/v1/openapi.json", "/api/workbench/capabilities"}:
             return self._json(404, {"error": "Not found"})
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -506,6 +564,8 @@ class Handler(BaseHTTPRequestHandler):
         return origin in self.runtime.origins and urlsplit(origin).netloc == host
 
     def do_POST(self) -> None:
+        # A rejected POST leaves its body unread; closing keeps it out of the next request.
+        self.close_connection = True
         try:
             path, _query = self._query()
         except ValueError as exc:
@@ -520,7 +580,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(403, {"error": "Transaction preparation is disabled"})
         if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
             return self._json(415, {"error": "Expected application/json"})
-        if not self.api_slots.acquire(False):
+        if not self.api_slots["slow"].acquire(False):
             return self._json(503, {"error": "API request capacity reached"}, retry=1)
         try:
             size = int(self.headers.get("Content-Length", "0"))
@@ -546,7 +606,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(503, {"error": "Upstream data is temporarily unavailable"}, retry=2)
         finally:
             self.runtime.lp.store.close_reader()
-            self.api_slots.release()
+            self.api_slots["slow"].release()
 
     def do_HEAD(self) -> None:
         self.do_GET()
@@ -570,6 +630,7 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--disk-reserve-gib", type=float, default=float(os.environ.get("LP_DISK_RESERVE_GIB", "4")))
     ap.add_argument("--public-origin", action="append", default=[])
     ap.add_argument("--enable-transaction-prepare", action="store_true")
+    ap.add_argument("--api-slots", type=int, default=int(os.environ.get("RHP_API_SLOTS", DEFAULT_API_SLOTS)))
     return ap
 
 
@@ -588,6 +649,7 @@ def main() -> None:
         server.server_close()
         raise
     Handler.runtime = runtime
+    Handler.api_slots = lane_slots(args.api_slots)
     def halt(_signum=None, _frame=None):
         runtime.stopping.set()
         threading.Thread(target=server.shutdown, daemon=True).start()

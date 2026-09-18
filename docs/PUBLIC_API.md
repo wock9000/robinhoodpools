@@ -264,6 +264,30 @@ Coverage dimensions are independent:
 
 Preserve nulls and these qualifications in derived data.
 
+### HTTP caching
+
+Every successful JSON response carries `Cache-Control: public, max-age=N,
+stale-while-revalidate=M`, a weak `ETag`, and `Vary: Accept-Encoding`. `N`
+equals the service's own response cache lifetime for that route, so a shared
+cache in front of the origin never serves data older than the origin itself
+would. A request with a matching `If-None-Match` receives `304 Not Modified`
+with no body.
+
+| Route | `max-age` | `stale-while-revalidate` |
+| --- | ---: | ---: |
+| `/api/lp/status` | 1 | 2 |
+| `/api/lp/overview`, `/api/lp/pools` with `window=1h` or `24h` | 3 | 30 |
+| `/api/lp/overview`, `/api/lp/pools` with `window=7d` | 30 | 120 |
+| `/api/lp/overview`, `/api/lp/pools` with `window=30d` or `all` | 120 | 600 |
+| `/api/lp/tape`, `/api/lp/dislocations` | 2 | 10 |
+| `/api/lp/owners`, `/api/lp/owner`, `/api/v1/research/owner` | 5 | 60 |
+| `/api/lp/search`, `/api/workbench/pools` | 5 | 30 |
+| `/api/lp/closed` | 15 | 60 |
+| `/api/v1/pools`, `/api/v1/assets` | 2 | 10 |
+| `/api/v1/fomo/flow` | 10 | 60 |
+
+Error responses and the `/api/lp/stream` event stream are `no-store`.
+
 ### Cross-pool dislocations
 
 `GET /api/lp/dislocations` compares the last indexed price of every pool
@@ -343,7 +367,10 @@ All errors use a JSON object with an `error` string.
 A canonical block changing before publication is `503`; retry the whole request.
 No result from that attempt is published. Individual pool contract-call
 failures remain a `200` response with explicit per-pool nulls and reasons.
-Capacity errors may include `Retry-After`.
+Capacity errors include `Retry-After`. The origin bounds concurrent requests in
+two lanes so a burst of slow owner and research reads cannot starve the
+status, overview, pool, and tape routes. The lane sizes derive from the
+`--api-slots` option (default four per CPU; the slow lane holds half).
 
 Deployment edge limits may additionally return `429`. Clients should honor
 `Retry-After`, use exponential backoff, and avoid aggressive polling.

@@ -6,20 +6,23 @@ import threading
 import time
 from types import SimpleNamespace
 
-from rhpools.lp_server import Handler, LPHTTPServer, _load_assets
+from rhpools.lp_server import Handler, LPHTTPServer, _load_assets, lane_slots
 from test_lp_market_service import (
-    TOKEN, header, lp_effect, pools, position_state, service,
+    TOKEN, V3, header, lp_effect, pools, position_state, service, swap,
 )
 
 
 @contextmanager
-def serving(app, **resources):
+def serving(app, slots=None, **resources):
     runtime = SimpleNamespace(
         lp=app, stopping=threading.Event(), assets=_load_assets(),
         origins=frozenset({"https://rhpools.lol"}), enable_prepare=False,
         **resources,
     )
-    handler = type("TestHandler", (Handler,), {"runtime": runtime})
+    attrs = {"runtime": runtime}
+    if slots is not None:
+        attrs["api_slots"] = lane_slots(slots)
+    handler = type("TestHandler", (Handler,), attrs)
     server = LPHTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -170,4 +173,98 @@ def test_cold_workbench_route_waits_for_bounded_index_publication(tmp_path):
         indexer.thread.join(1)
         assert indexer.calls == [(pool_id, "0xfeed")]
     finally:
+        app.close()
+
+
+CACHE_MATRIX = {
+    "/api/lp/status": "public, max-age=1, stale-while-revalidate=2",
+    "/api/lp/overview?window=24h": "public, max-age=3, stale-while-revalidate=30",
+    "/api/lp/overview?window=7d": "public, max-age=30, stale-while-revalidate=120",
+    "/api/lp/pools?window=30d": "public, max-age=120, stale-while-revalidate=600",
+    "/api/lp/pools": "public, max-age=3, stale-while-revalidate=30",
+    "/api/lp/tape?window=24h&kind=lp": "public, max-age=2, stale-while-revalidate=10",
+    "/api/lp/dislocations?min_bps=25": "public, max-age=2, stale-while-revalidate=10",
+    "/api/lp/owners?window=24h": "public, max-age=5, stale-while-revalidate=60",
+    "/api/lp/search?q=asset": "public, max-age=5, stale-while-revalidate=30",
+}
+
+
+def test_public_routes_publish_edge_cache_headers(tmp_path):
+    app = service(tmp_path / "market.sqlite")
+    try:
+        app.store.upsert_pools(pools())
+        block = header(100, int(time.time()) - 30)
+        app.store.ingest([block], [swap(block, V3, "v3")])
+        with serving(app) as connection:
+            for target, cache_control in CACHE_MATRIX.items():
+                connection.request("GET", target)
+                response = connection.getresponse()
+                response.read()
+                assert response.status == 200, target
+                assert response.getheader("Cache-Control") == cache_control, target
+                assert response.getheader("ETag", "").startswith('W/"'), target
+                assert response.getheader("Vary") == "Accept-Encoding", target
+
+            connection.request("GET", "/api/lp/overview?window=24h")
+            first = connection.getresponse()
+            first.read()
+            connection.request("GET", "/api/lp/overview?window=24h", headers={
+                "If-None-Match": 'W/"stale", ' + first.getheader("ETag"),
+            })
+            revalidated = connection.getresponse()
+            assert revalidated.status == 304
+            assert revalidated.read() == b""
+            assert revalidated.getheader("ETag") == first.getheader("ETag")
+            assert revalidated.getheader("Cache-Control") == CACHE_MATRIX["/api/lp/overview?window=24h"]
+
+            connection.request("GET", "/api/lp/overview?window=never")
+            rejected = connection.getresponse()
+            rejected.read()
+            assert rejected.status == 400
+            assert rejected.getheader("Cache-Control") == "no-store"
+            assert rejected.getheader("ETag") is None
+
+            connection.request("GET", "/api/lp/stream?view=terminal&current_only=1")
+            stream = connection.getresponse()
+            assert stream.status == 200
+            assert stream.getheader("Cache-Control") == "no-store,no-transform"
+            stream.close()
+    finally:
+        app.close()
+
+
+def test_slow_lane_exhaustion_leaves_fast_routes_answering(tmp_path):
+    app = service(tmp_path / "market.sqlite")
+    release = threading.Event()
+    entered = threading.Event()
+
+    def blocked_owners(_query):
+        entered.set()
+        release.wait(5)
+        return {"rows": [], "revision": 1, "epoch": 0}
+
+    try:
+        app.owners = blocked_owners
+        with serving(app, slots=2) as connection:
+            holder = http.client.HTTPConnection(connection.host, connection.port, timeout=10)
+            holder.request("GET", "/api/lp/owners?window=24h")
+            assert entered.wait(3)
+
+            connection.request("GET", "/api/lp/owners?window=7d")
+            shed = connection.getresponse()
+            shed.read()
+            assert shed.status == 503
+            assert shed.getheader("Retry-After") == "1"
+            assert shed.getheader("Cache-Control") == "no-store"
+
+            connection.request("GET", "/api/lp/status")
+            status = connection.getresponse()
+            status.read()
+            assert status.status == 200
+
+            release.set()
+            assert holder.getresponse().status == 200
+            holder.close()
+    finally:
+        release.set()
         app.close()
