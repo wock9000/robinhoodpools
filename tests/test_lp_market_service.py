@@ -652,6 +652,62 @@ def test_older_quote_anchor_reprices_cross_pool_successor(tmp_path):
         app.close()
 
 
+def test_separated_backfilled_anchors_only_repair_their_valid_windows(tmp_path):
+    app = service(tmp_path / "market.sqlite")
+    try:
+        cross = {**pools()[0], "id": "0x" + "45" * 20, "address": "0x" + "45" * 20,
+                 "token1": "0x" + "56" * 20, "symbol1": "OTHER"}
+        app.store.upsert_pools([*pools(), cross])
+        consumers = [header(n, stamp) for n, stamp in (
+            (100, 1001), (150, 1500), (200, 2001), (201, 2300), (202, 2301),
+        )]
+        app.store.ingest(consumers, [swap(h, cross["id"], "v3") for h in consumers])
+        anchors = [header(99, 1000), header(199, 2000)]
+        app.store.ingest(anchors, [
+            {**swap(h, V3, "v3"), "sqrt_price_x96": str(2 << 96)}
+            for h in anchors
+        ], lane="backfill")
+        pending = app.store.pending_reprojections()
+        # The gap and the event just after expiry have no changed price input.
+        assert {row["block_number"] for row in pending} == {100, 200, 201}
+        app.store.reproject([row["id"] for row in pending])
+        rows = app.store.read().execute(
+            "SELECT block_number,volume_usd FROM events WHERE pool_id=? ORDER BY block_number",
+            (cross["id"],),
+        ).fetchall()
+        assert dict(rows) == {100: 404, 150: None, 200: 404, 201: 404, 202: None}
+    finally:
+        app.close()
+
+
+def test_separated_pool_prices_do_not_repair_across_unchanged_sample(tmp_path):
+    app = service(tmp_path / "market.sqlite")
+    try:
+        app.store.upsert_pools(pools())
+        blocks = [header(n, n * 10) for n in (100, 150, 151, 200)]
+        events = [
+            {**swap(h, V3, "v3"), "kind": "add", "sqrt_price_x96": None,
+             "cashflow0": "-1000000", "cashflow1": "0"}
+            for h in blocks
+        ]
+        events[1] = {**swap(blocks[1], V3, "v3"), "sqrt_price_x96": str(2 << 96)}
+        app.store.ingest(blocks, events)
+        anchors = [header(99, 990), header(199, 1990)]
+        app.store.ingest(anchors, [
+            {**swap(h, V3, "v3"), "sqrt_price_x96": str(multiplier << 96)}
+            for h, multiplier in zip(anchors, (1, 3))
+        ], lane="backfill")
+        pending = app.store.pending_reprojections()
+        assert {row["block_number"] for row in pending} == {100, 200}
+        app.store.reproject([row["id"] for row in pending])
+        values = app.store.read().execute(
+            "SELECT block_number,deposit_usd FROM events WHERE kind='add' ORDER BY block_number",
+        ).fetchall()
+        assert dict(values) == {100: 1, 151: 4, 200: 9}
+    finally:
+        app.close()
+
+
 def test_v2_reserve_checkpoint_prices_token_input_and_inventory(tmp_path):
     app = service(tmp_path / "market.sqlite")
     try:

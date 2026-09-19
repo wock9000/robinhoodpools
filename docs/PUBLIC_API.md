@@ -300,7 +300,7 @@ recommends a trade.
 | `min_bps` | `30` | Minimum `spread_bps` (max pool price over min pool price, in basis points) |
 | `min_depth_usd` | `100` | Minimum `depth_usd`; `0` keeps pairs whose depth cannot be priced |
 | `max_age_s` | `3600` | A pair qualifies when at least one of its pools has indexed state this recent; clamped to 60–86400 |
-| `max_stale_s` | `0` | When positive, drops pairs whose older buy or sell leg exceeds this age |
+| `max_stale_s` | `86400` | Excludes older pool states before selecting buy/sell legs; `0` explicitly disables this cutoff |
 | `protocol` | | `v2`, `v3`, or `v4`; compares only pools of that protocol |
 | `token` | | 20-byte address; keeps pairs containing it |
 | `q` | | Substring over pool id, token addresses, and symbols |
