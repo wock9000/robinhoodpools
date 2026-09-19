@@ -56,9 +56,10 @@
     filterControl: byId("filter-control"),
     ownerSort: byId("owner-sort"),
     ownerScope: byId("owner-scope"),
-    ownersAccountingReadout: byId("owners-accounting-readout"),
     tabs: byId("pool-tabs"),
     poolPanel: byId("pool-panel"),
+    poolsWrap: byId("pools-wrap"),
+    dislocationsWrap: byId("dislocations-wrap"),
     tapeScroll: byId("tape-scroll"),
     tapeArrivals: byId("tape-arrivals"),
     footer: byId("footer-state"),
@@ -1161,35 +1162,8 @@
     return output;
   }
 
-  function renderOwnerFreshness() {
-    const envelope = state.ownersEnvelope || {};
-    const current = envelope.current_activity && typeof envelope.current_activity === "object"
-      ? envelope.current_activity : {};
-    const accountingDate = toDate(envelope.accounting_as_of);
-    const accountingAge = accountingDate
-      ? formatAge(Math.max(0, (Date.now() - accountingDate.getTime()) / 1000))
-      : null;
-    const qualification = String(current.qualification || "").replaceAll("_", " ");
-    const label = !state.ownersReady
-      ? "Loading wallet activity…"
-      : `${ownerSourceRows().length} ${state.ownerScope === "wallets" ? "wallets" : "custody rows"} · ${accountingDate ? `accounting ${accountingAge} behind` : "accounting unavailable"} · — = not verified`;
-    if (elements.ownersAccountingReadout.textContent !== label) {
-      elements.ownersAccountingReadout.textContent = label;
-    }
-    elements.ownersAccountingReadout.title = [
-      accountingDate
-        ? `Financial totals are historical accounting as of ${formatStamp(accountingDate)} (${accountingAge} old)`
-        : "Historical accounting timestamp unavailable; financial values are not current-stream values",
-      "Latest activity is a separate wallet freshness indicator, not part of the financial totals",
-      current.head != null ? `Current activity head #${formats.integer.format(current.head)}` : null,
-      current.observed_from != null ? `Current activity observed from block #${formats.integer.format(current.observed_from)}` : null,
-      qualification ? `Current activity qualification: ${qualification}` : null,
-      envelope.coverage ? describeCoverage(envelope.coverage) : null
-    ].filter(Boolean).join("\n");
-  }
 
   function renderOwners() {
-    renderOwnerFreshness();
     if (!state.ownersReady) {
       ownersTable.reconcile([], ownersPanelActive() ? "Loading indexed wallet activity and positions…" : "Wallet activity paused while hidden");
       return;
@@ -1200,10 +1174,6 @@
   }
 
   function renderPools() {
-    if (!state.poolsVisible) {
-      poolsTable.reconcile([], "POOL SUMMARY LOADS WHEN VISIBLE");
-      return;
-    }
     if (!state.poolsEnvelope) {
       const failed = state.health.get("pools")?.ok === false;
       poolsTable.reconcile([], failed ? "POOL DATA UNAVAILABLE · RETRYING" : "POOL SUMMARY SYNCING");
@@ -1232,8 +1202,8 @@
     dislocationsTable.reconcile(rows, `NO PAIR DISLOCATED ≥${DISLOCATION_PARAMS.min_bps}bp WITH ≥${formatUsd(DISLOCATION_PARAMS.min_depth_usd)} DEPTH`);
   }
 
-  async function refreshDislocations() {
-    if (!poolPanelActive() || state.tab !== "disloc") return;
+  async function refreshDislocations(force = false) {
+    if (state.tab !== "disloc" || !poolPanelAvailable() || (!force && !state.poolsVisible)) return;
     const scope = JSON.stringify([state.q, state.protocol]);
     if (scope !== state.dislocationsScope) {
       state.dislocations = null;
@@ -1247,16 +1217,20 @@
     byId("dislocations-table").setAttribute("aria-busy", "true");
     try {
       const payload = await api("/dislocations", { ...DISLOCATION_PARAMS, q: state.q, protocol: state.protocol }, controller.signal);
-      if (controller.signal.aborted || scope !== state.dislocationsScope) return;
+      if (controller.signal.aborted || scope !== state.dislocationsScope || state.tab !== "disloc") return;
       state.dislocations = payload;
       state.dislocationsAt = Date.now();
       healthSuccess("dislocations");
     } catch (error) {
-      if (error.name !== "AbortError" && !controller.signal.aborted) healthFailure("dislocations", error);
+      if (error.name !== "AbortError" && !controller.signal.aborted && scope === state.dislocationsScope && state.tab === "disloc") {
+        healthFailure("dislocations", error);
+      }
     } finally {
-      if (state.dislocationsController === controller) state.dislocationsController = null;
-      byId("dislocations-table").setAttribute("aria-busy", "false");
-      scheduleRender("dislocations", renderDislocations);
+      if (state.dislocationsController === controller) {
+        state.dislocationsController = null;
+        byId("dislocations-table").setAttribute("aria-busy", "false");
+        scheduleRender("dislocations", renderDislocations);
+      }
     }
   }
 
@@ -1282,7 +1256,6 @@
     state.ownersReady = false;
     state.ownerViewCache.clear();
     byId("owners-table").setAttribute("aria-busy", String(ownersPanelActive()));
-    elements.ownersAccountingReadout.title = reason || "Waiting for a fresh wallet summary";
     scheduleRender("owners", renderOwners);
   }
 
@@ -1918,8 +1891,12 @@
     return !state.hidden && state.ownersVisible && elements.modal.hidden && elements.poolInspector.hidden;
   }
 
+  function poolPanelAvailable() {
+    return !state.hidden && elements.modal.hidden && elements.poolInspector.hidden;
+  }
+
   function poolPanelActive() {
-    return !state.hidden && state.poolsVisible && elements.modal.hidden && elements.poolInspector.hidden;
+    return poolPanelAvailable() && state.poolsVisible;
   }
 
   function syncOwnerProjection(reason) {
@@ -1963,7 +1940,7 @@
       }
       if (ownerVisibilityChanged) syncOwnerProjection("Wallet summary visibility changed");
       if (poolBecameVisible) refreshPools();
-      if (!poolPanelActive()) abortPoolRequests();
+      if (!poolPanelActive()) abortMarketRequests();
     }, { root: elements.terminalMain, threshold: 0.01 });
     state.summaryObserver.observe(ownersSection);
     state.summaryObserver.observe(poolsSection);
@@ -1973,9 +1950,16 @@
     return JSON.stringify([state.window, state.q, state.protocol, sort, order]);
   }
 
-  function abortPoolRequests() {
+  function abortMarketRequests() {
     for (const request of state.poolRequests.values()) request.controller.abort();
     state.poolRequests.clear();
+    if (state.dislocationsController) {
+      const controller = state.dislocationsController;
+      state.dislocationsController = null;
+      controller.abort();
+    }
+    byId("pools-table").setAttribute("aria-busy", "false");
+    byId("dislocations-table").setAttribute("aria-busy", "false");
   }
 
   function activatePoolView() {
@@ -2017,12 +2001,12 @@
     return promise;
   }
 
-  async function refreshPools() {
-    if (!poolPanelActive()) return;
-    if (state.tab === "disloc") return refreshDislocations();
+  async function refreshPools(force = false) {
+    if (!poolPanelAvailable() || (!force && !state.poolsVisible)) return;
+    if (state.tab === "disloc") return refreshDislocations(force);
     const scope = JSON.stringify([state.window, state.q, state.protocol]);
     if (scope !== state.poolScope) {
-      abortPoolRequests();
+      abortMarketRequests();
       state.poolViews.clear();
       state.poolScope = scope;
     }
@@ -2248,17 +2232,20 @@
 
   function setPoolSort(key, toggle = true) {
     if (!Object.hasOwn(POOL_SORT_FIELDS, key)) return;
-    state.poolOrder = toggle && state.poolSort === key && state.poolOrder === "desc" ? "asc" : "desc";
+    const order = toggle && state.poolSort === key && state.poolOrder === "desc" ? "asc" : "desc";
+    if (state.poolSort !== key || state.poolOrder !== order) abortMarketRequests();
     state.poolSort = key;
-    byId("pools-table").parentElement.scrollTop = 0;
+    state.poolOrder = order;
+    elements.poolsWrap.scrollTop = 0;
     activatePoolView();
     updatePoolSortControls();
-    refreshPools();
+    refreshPools(true);
   }
 
   function setTab(next, focus = false, load = true) {
     if (!Object.prototype.hasOwnProperty.call(POOL_SORT, next)) return;
     const changed = state.tab !== next;
+    if (changed) abortMarketRequests();
     state.tab = next;
     if (changed) [state.poolSort, state.poolOrder] = POOL_SORT[next];
     const tabs = Array.from(elements.tabs.querySelectorAll("[role=tab]"));
@@ -2273,13 +2260,15 @@
     });
     updatePoolSortControls();
     const dislocated = next === "disloc";
-    byId("pools-table").parentElement.hidden = dislocated;
-    byId("dislocations-wrap").hidden = !dislocated;
+    elements.poolsWrap.hidden = dislocated;
+    elements.dislocationsWrap.hidden = !dislocated;
     if (changed) {
-      byId("pools-table").parentElement.scrollTop = 0;
-      activatePoolView();
-      if (load) refreshPools();
+      elements.poolsWrap.scrollTop = 0;
+      elements.dislocationsWrap.scrollTop = 0;
     }
+    if (dislocated) scheduleRender("dislocations", renderDislocations);
+    else activatePoolView();
+    if (load) refreshPools(true);
   }
 
   function refreshNow(reason) {
@@ -2296,7 +2285,7 @@
       state.aggregateController.abort();
       state.aggregateController = null;
     }
-    abortPoolRequests();
+    abortMarketRequests();
     if (state.tapeController) {
       state.tapeGeneration += 1;
       state.tapeController.abort();
@@ -2311,6 +2300,12 @@
   function queueFilterRefresh() {
     clearTimeout(state.filterTimer);
     abortForFilter();
+    if (state.tab === "disloc") {
+      state.dislocations = null;
+      state.dislocationsAt = 0;
+      state.dislocationsScope = "";
+      scheduleRender("dislocations", renderDislocations);
+    }
     renderAllTables();
     state.filterTimer = setTimeout(() => refreshNow("filter"), FILTER_DELAY_MS);
   }
@@ -2596,7 +2591,7 @@
     state.ownerPaused = false;
     elements.modal.hidden = false;
     syncOwnerProjection("Owner detail opened");
-    abortPoolRequests();
+    abortMarketRequests();
     elements.modalTitle.textContent = "LP DETAIL";
     elements.context.textContent = `LP ${shortIdentifier(normalized, 7, 5)}`;
     elements.context.title = normalized;
@@ -2704,7 +2699,7 @@
     elements.poolInspectorNewTab.href = urls.external.href;
     elements.poolInspector.hidden = false;
     syncOwnerProjection("Pool inspector opened");
-    abortPoolRequests();
+    abortMarketRequests();
     if (state.aggregateController) state.aggregateController.abort();
     if (elements.poolInspectorFrame.src !== urls.embedded.href) {
       elements.poolInspectorFrame.src = urls.embedded.href;
@@ -2789,7 +2784,6 @@
     elements.clock.textContent = formatTime(now, true);
     elements.clock.dateTime = now.toISOString();
     renderLiveBlockAge();
-    renderOwnerFreshness();
     const ageTick = Math.floor(now.getTime() / 15_000);
     if (ageTick !== state.lastTapeAgeTick) {
       state.lastTapeAgeTick = ageTick;
@@ -2828,7 +2822,7 @@
         state.statusController.abort();
         state.statusController = null;
       }
-      abortPoolRequests();
+      abortMarketRequests();
       if (state.tapeController) state.tapeController.abort();
       if (state.ownerController) {
         state.ownerController.abort();

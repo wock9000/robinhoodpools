@@ -162,9 +162,6 @@
         <div class="owners-heading">
           <h1 id="owners-title">LP WALLETS</h1>
           <span class="wallet-description">Who is providing liquidity, and where? Select a wallet for positions and accounting.</span>
-          <div class="owner-qualification" role="status" aria-live="polite">
-            <span id="owners-accounting-readout">Loading wallet activity…</span>
-          </div>
         </div>
         <div class="tools">
           <label for="owner-scope" class="sr-only">Wallet identity scope</label>
@@ -222,7 +219,7 @@
         <button id="mobile-pool-order" type="button" aria-label="Reverse pool sort order">↓</button>
       </div>
       <div id="pool-panel" role="tabpanel" aria-labelledby="tab-pools">
-        <div class="table-wrap pool-wrap" tabindex="0" aria-label="Pools table, horizontally scrollable">
+        <div class="table-wrap pool-wrap" id="pools-wrap" tabindex="0" aria-label="Pools table, horizontally scrollable">
           <table class="terminal-table" id="pools-table" role="table">
             <thead><tr><th>pair</th><th>proto</th><th class="numeric"><button type="button" data-pool-sort="fee">fee</button></th><th class="numeric"><button type="button" data-pool-sort="tvl">TVL</button></th><th class="numeric desktop-column"><button type="button" data-pool-sort="active_tvl">active TVL</button></th><th class="numeric desktop-column"><button type="button" data-pool-sort="observed_active_tvl">observed active</button></th><th class="numeric"><button type="button" data-pool-sort="volume">volume</button></th><th class="numeric"><button type="button" data-pool-sort="fees">fees</button></th><th class="numeric"><button type="button" data-pool-sort="flow">net flow</button></th><th class="numeric desktop-column"><button type="button" data-pool-sort="swaps">swaps</button></th><th class="numeric desktop-column"><button type="button" data-pool-sort="adds">adds</button></th><th class="numeric desktop-column"><button type="button" data-pool-sort="removes">removes</button></th><th class="numeric"><button type="button" data-pool-sort="lps">LPs</button></th><th class="numeric desktop-column"><button type="button" data-pool-sort="price">price t1/t0</button></th><th class="numeric desktop-column"><button type="button" data-pool-sort="change">change</button></th></tr></thead>
             <tbody id="pools-body"></tbody>
@@ -261,7 +258,7 @@
     </div>
   </section>
 
-  <footer class="terminal-footer"><span id="footer-state">index —</span><a class="sponsor-link" href="https://www.quicknode.com/" target="_blank" rel="noopener noreferrer">Powered by Quicknode</a><span>READ ONLY · <a class="source-link" href="https://github.com/wock9000/robinhoodpools#license" target="_blank" rel="noopener noreferrer" title="Copyright 2026 RobinhoodPools contributors · AGPL-3.0-only · no warranty · corresponding source">SOURCE</a></span></footer>
+  <footer class="terminal-footer"><span id="footer-state">index —</span><a class="sponsor-link" href="https://www.quicknode.com/" target="_blank" rel="noopener noreferrer">Powered by Quicknode</a><span class="footer-meta"><span class="read-only-label">READ ONLY · </span><a class="source-link" href="https://github.com/wock9000/robinhoodpools" target="_blank" rel="noopener noreferrer" title="RobinhoodPools on GitHub · Copyright 2026 RobinhoodPools contributors · AGPL-3.0-only · no warranty">GITHUB</a></span></footer>
   <div id="copy-status" class="sr-only" role="status" aria-live="polite"></div>
   <script src="/static/lp_terminal.js" defer></script>
 </body>

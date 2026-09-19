@@ -891,51 +891,61 @@ class PriceProjection:
         """Repair old consumers, never rows just priced in this delivery."""
         token_bounds = {}
         for pool, changes in sources.values():
-            low, high = min(changes, key=_order), max(changes, key=_order)
             table = "lp_v2_reserve_samples" if pool["protocol"] == "v2" else "lp_price_samples"
-            following = conn.execute(
-                f"SELECT block_number,tx_index,log_index FROM {table} WHERE pool_id=? AND "
-                "(block_number,tx_index,log_index)>(?,?,?) ORDER BY block_number,tx_index,log_index LIMIT 1",
-                (pool["id"], *_order(high)),
-            ).fetchone()
-            upper = tuple(following) if following else (2**63 - 1, 0, 0)
-            queued = conn.execute(
-                "INSERT OR IGNORE INTO pending_reprojection"
-                "(event_id,block_number,tx_index,log_index) "
-                "SELECT id,block_number,tx_index,log_index FROM events "
-                "WHERE pool_id=? AND (block_number,tx_index,log_index)>(?,?,?) "
-                "AND (block_number,tx_index,log_index)<(?,?,?) AND revision<>?",
-                (pool["id"], *_order(low), *upper, revision),
-            ).rowcount
-            if queued:
-                self.store._bump(conn, "pending_reprojection", queued)
+            for change in changes:
+                low = _order(change)
+                following = conn.execute(
+                    f"SELECT block_number,tx_index,log_index FROM {table} WHERE pool_id=? AND "
+                    "(block_number,tx_index,log_index)>(?,?,?) ORDER BY block_number,tx_index,log_index LIMIT 1",
+                    (pool["id"], *low),
+                ).fetchone()
+                upper = tuple(following) if following else (2**63 - 1, 0, 0)
+                queued = conn.execute(
+                    "INSERT OR IGNORE INTO pending_reprojection"
+                    "(event_id,block_number,tx_index,log_index) "
+                    "SELECT id,block_number,tx_index,log_index FROM events "
+                    "WHERE pool_id=? AND (block_number,tx_index,log_index)>(?,?,?) "
+                    "AND (block_number,tx_index,log_index)<(?,?,?) AND revision<>?",
+                    (pool["id"], *low, *upper, revision),
+                ).rowcount
+                if queued:
+                    self.store._bump(conn, "pending_reprojection", queued)
             token = self._anchor_token(pool)
             if token is not None:
                 token_bounds.setdefault(token, []).extend(changes)
         for token, changes in token_bounds.items():
-            low, high = min(changes, key=_order), max(changes, key=_order)
-            following = conn.execute(
-                "SELECT block_number,tx_index,log_index FROM lp_price_marks WHERE token=? AND "
-                "(block_number,tx_index,log_index)>(?,?,?) ORDER BY block_number,tx_index,log_index LIMIT 1",
-                (token, *_order(high)),
-            ).fetchone()
-            upper = tuple(following) if following else (2**63 - 1, 0, 0)
             # WETH anchors also value gas on pools with neither native token leg.
             gas_clause = (" OR EXISTS(SELECT 1 FROM transactions t WHERE t.tx_hash=e.tx_hash "
                           "AND t.gas_native IS NOT NULL)") if token == WETH else ""
-            queued = conn.execute(
-                "INSERT OR IGNORE INTO pending_reprojection"
-                "(event_id,block_number,tx_index,log_index) "
-                "SELECT e.id,e.block_number,e.tx_index,e.log_index FROM events e "
-                "JOIN pools p ON p.id=e.pool_id WHERE (e.block_number,e.tx_index,e.log_index)>(?,?,?) "
-                "AND (e.block_number,e.tx_index,e.log_index)<(?,?,?) AND e.timestamp<=? AND e.revision<>? "
-                "AND ((p.token0<>? AND p.token1<>? AND (p.token0 IN (?,?) OR p.token1 IN (?,?)))"
-                + gas_clause + ")",
-                (*_order(low), *upper, int(high["timestamp"]) + 300, revision, USDG, USDG,
-                 token, NATIVE if token == WETH else token, token, NATIVE if token == WETH else token),
-            ).rowcount
-            if queued:
-                self.store._bump(conn, "pending_reprojection", queued)
+            for change in changes:
+                low = _order(change)
+                following = conn.execute(
+                    "SELECT block_number,tx_index,log_index,timestamp FROM lp_price_marks WHERE token=? AND "
+                    "(block_number,tx_index,log_index)>(?,?,?) ORDER BY block_number,tx_index,log_index LIMIT 1",
+                    (token, *low),
+                ).fetchone()
+                upper = tuple(following[:3]) if following else (2**63 - 1, 0, 0)
+                timestamp = int(change["timestamp"])
+                until = min(timestamp + 300, int(following[3])) if following else timestamp + 300
+                # A USD anchor expires after 300 seconds. Seek that time window
+                # rather than scanning from an old block to the chain tip while
+                # holding the sole writer. Separate marks must not bridge an
+                # unaffected historical gap into one enormous repair range.
+                queued = conn.execute(
+                    "INSERT OR IGNORE INTO pending_reprojection"
+                    "(event_id,block_number,tx_index,log_index) "
+                    "SELECT e.id,e.block_number,e.tx_index,e.log_index "
+                    "FROM events e INDEXED BY lp_events_time "
+                    "JOIN pools p ON p.id=e.pool_id WHERE e.timestamp>=? AND e.timestamp<=? "
+                    "AND (e.block_number,e.tx_index,e.log_index)>(?,?,?) "
+                    "AND (e.block_number,e.tx_index,e.log_index)<(?,?,?) AND e.revision<>? "
+                    "AND ((p.token0<>? AND p.token1<>? AND (p.token0 IN (?,?) OR p.token1 IN (?,?)))"
+                    + gas_clause + ")",
+                    (timestamp, until, *low, *upper, revision, USDG, USDG,
+                     token, NATIVE if token == WETH else token, token, NATIVE if token == WETH else token),
+                ).rowcount
+                if queued:
+                    self.store._bump(conn, "pending_reprojection", queued)
 
     def apply(self, conn, events):
         ordered = sorted(events, key=_order)
@@ -1056,7 +1066,9 @@ class PriceProjection:
             old_anchor = old_anchors.get((token, int(event["id"]))) if token else None
             sqrt, ratio, new_anchor = self._price(
                 conn, pool, event, persist_event=False,
-                pool_state=state_heads[pool_id], old_anchor=old_anchor,
+                # Backfilled samples can invalidate the cached current price.
+                pool_state=state_heads[pool_id] if forward else _MISSING,
+                old_anchor=old_anchor,
                 anchor_heads=anchor_heads, sample_rows=sample_rows,
                 reserve_rows=reserve_rows, mark_rows=mark_rows,
             )
@@ -2564,7 +2576,8 @@ class LPMarketService:
             min_bps = float(params.get("min_bps") or 30)
             min_depth_usd = float(params.get("min_depth_usd") or 100)
             max_age_s = int(params.get("max_age_s") or 3600)
-            max_stale_s = int(params.get("max_stale_s") or 0)
+            raw_stale = params.get("max_stale_s")
+            max_stale_s = 86_400 if raw_stale in (None, "") else int(raw_stale)
         except (TypeError, ValueError) as exc:
             raise ValueError("min_bps and min_depth_usd must be numbers, max_age_s and max_stale_s integers") from exc
         if not 0 <= min_bps <= 100_000:
@@ -2616,6 +2629,11 @@ class LPMarketService:
                         groups.setdefault((row["token0"], row["token1"]), []).append(row)
                 rows = []
                 for pools in groups.values():
+                    if max_stale_s:
+                        pools = [
+                            row for row in pools
+                            if head_timestamp - int(row["timestamp"]) <= max_stale_s
+                        ]
                     if len(pools) < 2:
                         continue
                     buy = min(pools, key=lambda row: row["price"])
@@ -2629,8 +2647,6 @@ class LPMarketService:
                     depths = (buy["depth_usd"], sell["depth_usd"])
                     depth = min(depths) if None not in depths else None
                     if min_depth_usd and (depth is None or depth < min_depth_usd):
-                        continue
-                    if max_stale_s and head_timestamp - min(int(buy["timestamp"]), int(sell["timestamp"])) > max_stale_s:
                         continue
                     fees = (buy["current_fee"], sell["current_fee"])
                     fee_bps = sum(fees) / 100 if None not in fees else None
@@ -2674,7 +2690,8 @@ class LPMarketService:
                         "pricing_basis": PRICING_BASIS,
                         "pair_selection": "pairs with at least one priced pool state since since_block; "
                                           "pools with zero active liquidity or reserves are excluded; "
-                                          "max_stale_s bounds the older of the buy and sell legs",
+                                          "legs whose last indexed state is older than max_stale_s "
+                                          "(default 86400) are excluded before buy/sell selection",
                     },
                 }
         return self._cached(

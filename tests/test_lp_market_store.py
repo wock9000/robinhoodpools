@@ -43,6 +43,56 @@ def event(block: dict[str, str], log_index: int) -> dict[str, object]:
     }
 
 
+def test_live_writer_admission_precedes_queued_background():
+    store = MarketStore(":memory:")
+    holder_entered = threading.Event()
+    release_holder = threading.Event()
+    order = []
+    failures = []
+
+    def writer(priority, label, hold=False):
+        try:
+            with store.writer_priority(priority):
+                with store.transaction():
+                    if hold:
+                        holder_entered.set()
+                        release_holder.wait(2)
+                    else:
+                        order.append(label)
+        except BaseException as exc:
+            failures.append(exc)
+
+    holder = threading.Thread(
+        target=writer, args=("background", "holder", True),
+    )
+    background = threading.Thread(
+        target=writer, args=("background", "background"),
+    )
+    live = threading.Thread(target=writer, args=("live", "live"))
+    try:
+        holder.start()
+        assert holder_entered.wait(1)
+        background.start()
+        live.start()
+        with store._writer_condition:
+            assert store._writer_condition.wait_for(
+                lambda: len(store._writer_waiters) == 2,
+                timeout=1,
+            )
+        release_holder.set()
+        holder.join(2)
+        background.join(2)
+        live.join(2)
+        assert failures == []
+        assert order == ["live", "background"]
+    finally:
+        release_holder.set()
+        for thread in (holder, background, live):
+            if thread.ident is not None:
+                thread.join(2)
+        store.close()
+
+
 def test_checkpoint_recovers_after_external_reader_releases_snapshot(tmp_path):
     path = tmp_path / "market.sqlite"
     store = MarketStore(path, checkpoint_on_commit=False)

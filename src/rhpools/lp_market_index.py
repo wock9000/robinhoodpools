@@ -60,6 +60,10 @@ MAX_LOGS_PER_RESPONSE = 10_000
 LIVE_MIN_CHUNK = 1
 LIVE_INITIAL_CHUNK = 256
 LIVE_MAX_CHUNK = 2_048
+# Dense live intervals are committed at a whole-block boundary near this log
+# target. Fetches may be larger; their untouched suffix is retried from the
+# durable cursor instead of extending one non-preemptible writer transaction.
+LIVE_MAX_STORE_LOGS = 2_000
 HISTORY_MIN_CHUNK = 1
 HISTORY_INITIAL_CHUNK = 8
 HISTORY_MAX_CHUNK = 32_768
@@ -2159,13 +2163,13 @@ class MarketIndexer:
         if not persist:
             return
         try:
-            if not self.store.lock.acquire(blocking=False):
-                return
-            try:
+            with self.store.transaction(
+                priority="background", blocking=False,
+            ) as connection:
+                if connection is None:
+                    return
                 # Operational health must never queue behind ledger writers.
                 self.store.update_status(**payload)
-            finally:
-                self.store.lock.release()
         except Exception as exc:
             with self._status_lock:
                 self._runtime_persistence_error = str(exc)[:1000]
@@ -2271,6 +2275,12 @@ class MarketIndexer:
         self._sync_market_reorg()
         return head_number, head, time.monotonic() - started
 
+    def _run_with_writer_priority(
+        self, priority: str, worker: Callable[[], None],
+    ) -> None:
+        with self.store.writer_priority(priority):
+            worker()
+
     def start(self, *, deferred: bool = False) -> "MarketIndexer":
         with self._lifecycle_lock:
             if self._started:
@@ -2325,44 +2335,61 @@ class MarketIndexer:
                         name="lp-market-maintenance",
                         daemon=True,
                     ),
-                    threading.Thread(target=self._live_run, name="lp-market-live", daemon=True),
-                    threading.Thread(target=self._history_run, name="lp-market-history", daemon=True),
                     threading.Thread(
-                        target=self._enrichment_run,
+                        target=self._run_with_writer_priority,
+                        args=("live", self._live_run),
+                        name="lp-market-live",
+                        daemon=True,
+                    ),
+                    threading.Thread(
+                        target=self._run_with_writer_priority,
+                        args=("background", self._history_run),
+                        name="lp-market-history",
+                        daemon=True,
+                    ),
+                    threading.Thread(
+                        target=self._run_with_writer_priority,
+                        args=("background", self._enrichment_run),
                         name="lp-market-enrichment",
                         daemon=True,
                     ),
                     threading.Thread(
-                        target=self._projection_run,
+                        target=self._run_with_writer_priority,
+                        args=("background", self._projection_run),
                         name="lp-market-projection",
                         daemon=True,
                     ),
                     threading.Thread(
-                        target=self._metadata_run,
+                        target=self._run_with_writer_priority,
+                        args=("background", self._metadata_run),
                         name="lp-market-metadata",
                         daemon=True,
                     ),
                     threading.Thread(
-                        target=self._source_repair_run,
+                        target=self._run_with_writer_priority,
+                        args=("background", self._source_repair_run),
                         name="lp-market-repair",
                         daemon=True,
                     ),
                 ]
                 if self.v3_balances:
                     self._threads.append(threading.Thread(
-                        target=self._balance_run,
+                        target=self._run_with_writer_priority,
+                        args=("background", self._balance_run),
                         name="lp-market-balances",
                         daemon=True,
                     ))
                 if self._accounting_projector is not None:
                     self._threads.append(threading.Thread(
-                        target=self._accounting_run,
+                        target=self._run_with_writer_priority,
+                        args=("background", self._accounting_run),
                         name="lp-market-accounting",
                         daemon=True,
                     ))
                 if self._accounting_recovery is not None:
                     self._threads.append(threading.Thread(
-                        target=self._accounting_recovery_run,
+                        target=self._run_with_writer_priority,
+                        args=("background", self._accounting_recovery_run),
                         name="lp-market-identity-recovery",
                         daemon=True,
                     ))
@@ -2927,10 +2954,14 @@ class MarketIndexer:
 
         # A complete stored identity is a read-only lookup and must not queue
         # behind the long projection transaction of either scanner lane. Only
-        # legacy normalization repair needs the writer lock. Re-read under that
-        # lock so a concurrent repair cannot be overwritten with stale data.
-        with self.store.lock:
-            current = self.store.pool(candidate) or dict(stored)
+        # legacy normalization repair needs a writer transaction. Re-read
+        # inside it so a concurrent repair cannot be overwritten with stale
+        # data, and verify the uncommitted repair on that same connection.
+        with self.store.transaction() as connection:
+            current_row = connection.execute(
+                "SELECT * FROM pools WHERE id=?", (candidate,),
+            ).fetchone()
+            current = dict(current_row) if current_row is not None else dict(stored)
             decoded = self._stored_pool(current)
             normalized = self._normalize_pool(decoded)
             if normalized is None or not self._identity_verified(normalized):
@@ -2939,11 +2970,15 @@ class MarketIndexer:
                 # Publish only after the complete, hash-qualified identity is
                 # durable. This is independent of a chain checkpoint: the
                 # missing legacy word is proven by the pool id itself.
-                self.store.upsert_pools([normalized])
-                durable = self.store.pool(candidate)
-                if durable is None:
+                self.store.upsert_pools([normalized], conn=connection)
+                durable_row = connection.execute(
+                    "SELECT * FROM pools WHERE id=?", (candidate,),
+                ).fetchone()
+                if durable_row is None:
                     raise RuntimeError("recovered V4 pool persistence was lost")
-                normalized = self._normalize_pool(self._stored_pool(durable))
+                normalized = self._normalize_pool(
+                    self._stored_pool(dict(durable_row)),
+                )
                 if normalized is None or not self._identity_verified(normalized):
                     raise RuntimeError("persisted V4 pool identity is not canonical")
             return normalized
@@ -4422,7 +4457,7 @@ class MarketIndexer:
         if lane == "live":
             return (
                 LIVE_MIN_CHUNK, LIVE_MAX_CHUNK, MAX_INTERVAL_STORE_SECONDS,
-                MAX_LOGS_PER_RESPONSE * 4 // 5,
+                LIVE_MAX_STORE_LOGS,
             )
         if self._archive_source(lane):
             return (
@@ -4655,6 +4690,10 @@ class MarketIndexer:
                 - int(cursor.get("timestamp") or _timestamp(head)),
             ),
         )
+        # History is not the only observer of recent debt. Refresh scheduling
+        # from the head/cursor pair the live worker just measured so a blocked
+        # history writer cannot leave this state stale for subsequent work.
+        self._recent_catchup_pending()
         # A lagging provider is not reorg evidence. Keep the durable cursor and
         # retry until this provider can show either the cursor or its child.
         if head_number < current_number:
@@ -4688,6 +4727,37 @@ class MarketIndexer:
             fetch_started = time.monotonic()
             logs, headers = self._fetch_interval("live", start, end)
             fetch_s = time.monotonic() - fetch_started
+            fetched_end = end
+            fetched_logs = len(logs)
+            if fetched_logs > LIVE_MAX_STORE_LOGS:
+                counts_by_block: dict[int, int] = {}
+                for log in logs:
+                    number = _hex_int(
+                        log.get("blockNumber"), "log block number",
+                    )
+                    counts_by_block[number] = counts_by_block.get(number, 0) + 1
+                kept_logs = 0
+                bounded_end = start
+                for number, count in counts_by_block.items():
+                    # A single dense block is indivisible: include it even if
+                    # it alone exceeds the target, then stop before the next.
+                    if kept_logs and kept_logs + count > LIVE_MAX_STORE_LOGS:
+                        break
+                    bounded_end = number
+                    kept_logs += count
+                end = min(end, bounded_end)
+                logs = [
+                    log for log in logs
+                    if _hex_int(log.get("blockNumber"), "log block number") <= end
+                ]
+                headers = {
+                    number: header for number, header in headers.items()
+                    if start <= number <= end
+                }
+                self._live_chunk = max(
+                    LIVE_MIN_CHUNK,
+                    min(self._live_chunk, end - start + 1),
+                )
             if headers[start]["parentHash"] != current_hash:
                 self._recover_reorg(
                     cursor,
@@ -4702,7 +4772,7 @@ class MarketIndexer:
             decode_s = time.monotonic() - decode_started
             interval_end = headers[end]
             store_started = time.monotonic()
-            with self.store.transaction() as connection:
+            with self.store.transaction(priority="live") as connection:
                 store_acquired = time.monotonic()
                 store_wait_s = store_acquired - store_started
                 deferred_identities = self._queue_deferred_pool_identities(
@@ -4773,6 +4843,9 @@ class MarketIndexer:
             "store_seconds": round(store_s, 6),
             "store_lock_wait_seconds": round(store_wait_s, 6),
             "postprocess_seconds": round(postprocess_s, 6),
+            "fetched_to_block": fetched_end,
+            "fetched_logs": fetched_logs,
+            "store_log_cap": LIVE_MAX_STORE_LOGS,
             "blocks_per_second": round(blocks / max(elapsed, 1e-9), 3),
             "events_per_second": round(
                 len(events) / max(elapsed, 1e-9), 3,
@@ -4789,6 +4862,7 @@ class MarketIndexer:
             lag_s=max(0, _timestamp(head) - _timestamp(interval_end)),
             live_scan=scan,
         )
+        self._recent_catchup_pending()
         return True
 
     def _bulk_work_allowed(self) -> bool:
@@ -5012,14 +5086,16 @@ class MarketIndexer:
                 max(0, head_timestamp - int(cursor_timestamp))
                 if head_timestamp and cursor_timestamp is not None else None
             )
-            # The live worker normally trails a continuously advancing tip and
-            # its adaptive batch shrinks on any store hiccup. Reserve recent-gap
-            # priority for debt that is both several live batches deep and
-            # older than a real wall-clock window, so a one-batch stumble
-            # cannot pre-empt the archive's writer window every interval.
-            pending = lag > RECENT_CATCHUP_YIELD_CHUNKS * self._live_chunk and (
-                lag_seconds is None or lag_seconds > RECENT_CATCHUP_YIELD_SECONDS
-            )
+            # A block threshold tracks adaptive transaction capacity while the
+            # wall-clock threshold catches a large chunk whose block count
+            # would otherwise permit minutes of stale current data.
+            if lag_seconds is None:
+                pending = lag > self._live_chunk
+            else:
+                pending = (
+                    lag > RECENT_CATCHUP_YIELD_CHUNKS * self._live_chunk
+                    or lag_seconds > RECENT_CATCHUP_YIELD_SECONDS
+                )
             self._runtime_status.update({
                 "recent_catchup_priority": pending,
                 "recent_catchup_lag_blocks": lag,
@@ -5123,9 +5199,14 @@ class MarketIndexer:
         decode_s = time.monotonic() - decode_started
         complete = start <= target
         store_started = time.monotonic()
-        with self.store.transaction() as connection:
+        with self.store.transaction(priority="background") as connection:
             store_acquired = time.monotonic()
             store_wait_s = store_acquired - store_started
+            # Admission itself may wait behind an in-flight transaction. Do
+            # not publish this prepared archive interval if live debt became
+            # urgent during that wait.
+            if self._recent_catchup_pending():
+                return False
             deferred_identities = self._queue_deferred_pool_identities(
                 connection, logs, events,
             )
@@ -5730,11 +5811,20 @@ class MarketIndexer:
             timeout=0.05,
             return_when=FIRST_COMPLETED,
         )
-        jobs = [
-            self._enrichment_jobs.pop(key)
-            for key, job in tuple(self._enrichment_jobs.items())
-            if job[1].done()
-        ]
+        # Publish one completed fetch job per writer turn. Fetch concurrency is
+        # retained, but a wave of completed RPC jobs cannot become one
+        # unbounded enrichment transaction ahead of live ingestion.
+        completed = next(
+            (
+                key for key, job in self._enrichment_jobs.items()
+                if job[1].done()
+            ),
+            None,
+        )
+        jobs = (
+            [self._enrichment_jobs.pop(completed)]
+            if completed is not None else []
+        )
         if not jobs:
             return False
         started = min(job[2] for job in jobs)

@@ -17,6 +17,7 @@ from rhpools.lp_market_index import (
     TOKEN0_SELECTOR,
     TOKEN1_SELECTOR,
     MAX_LOGS_PER_RESPONSE,
+    LIVE_MAX_STORE_LOGS,
     REPROJECT_MAX_STORE_SECONDS,
     TOKEN_METADATA_INVALID_PREFIX,
     TOKEN_METADATA_INVALID_RECHECK_S,
@@ -133,6 +134,53 @@ def test_dense_live_interval_grows_and_reports_scan_work(monkeypatch):
         assert status["to_block"] == 355
         assert status["blocks_per_second"] > 0
         assert set(("fetch_seconds", "decode_seconds", "store_seconds")) <= set(status)
+    finally:
+        scanner.close()
+        store.close()
+
+
+def test_dense_live_fetch_commits_a_bounded_whole_block_prefix(monkeypatch):
+    store = MarketStore(":memory:")
+    scanner = indexer(store, StaticRpc(355))
+    anchor = header(99)
+    store.ingest(
+        [anchor], [], lane="live",
+        cursor={
+            "block_number": 99,
+            "block_hash": anchor["hash"],
+            "timestamp": int(anchor["timestamp"], 16),
+        },
+    )
+    per_block = LIVE_MAX_STORE_LOGS // 2
+    logs = [
+        {"blockNumber": hex(number)}
+        for number in (100, 101, 102)
+        for _ in range(per_block)
+    ]
+    headers = {
+        number: header(number)
+        for number in (100, 101, 102, 355)
+    }
+    monkeypatch.setattr(
+        scanner,
+        "_fetch_interval",
+        lambda _lane, _start, _end: (logs, headers),
+    )
+    monkeypatch.setattr(scanner, "_decode", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        scanner,
+        "_queue_deferred_pool_identities",
+        lambda *_args, **_kwargs: 0,
+    )
+    try:
+        assert scanner._scan_live_once() is True
+        scan = scanner.runtime_status()["live_scan"]
+        assert store.cursor("live")["block_number"] == 101
+        assert scan["to_block"] == 101
+        assert scan["logs"] == LIVE_MAX_STORE_LOGS
+        assert scan["fetched_to_block"] == 355
+        assert scan["fetched_logs"] == 3 * per_block
+        assert scan["next_chunk"] == 2
     finally:
         scanner.close()
         store.close()
@@ -506,7 +554,7 @@ def test_history_progress_is_independent_of_unrunnable_enrichment(monkeypatch):
         store.close()
 
 
-def test_history_yields_only_to_live_debt_deeper_than_several_batches():
+def test_history_yields_to_urgent_live_debt_and_runs_near_head():
     store = MarketStore(":memory:")
     scanner = indexer(store, StaticRpc(5_000))
     scanner._history_verified = True
@@ -522,11 +570,10 @@ def test_history_yields_only_to_live_debt_deeper_than_several_batches():
         "timestamp": int(anchor["timestamp"], 16),
     })
     try:
-        # Trailing the tip by a little over one adaptive live batch is the
-        # normal steady state, not debt: the archive keeps its writer window.
+        # A ten-second gap leaves room for archive progress.
         scanner._set_runtime(
-            "head", head=500 + scanner._live_chunk + 100,
-            head_timestamp=int(header(500 + scanner._live_chunk + 100)["timestamp"], 16),
+            "head", head=510,
+            head_timestamp=int(header(510)["timestamp"], 16),
         )
         assert scanner._scan_history_once() is True
         assert store.cursor("history")["next_to"] < 499

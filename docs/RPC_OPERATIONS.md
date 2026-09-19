@@ -64,8 +64,8 @@ Archive chunks are sized by events per transaction (10k), not by the 10k-log pag
 raw history inserts cost per event, and a transaction that outgrows the writer
 page cache spills and slows down. `history_scan.source` reports
 `archive` or `provider`; `recent_catchup_lag_seconds` joins the existing lag
-fields. The lane yields the writer to live catch-up only when live debt is
-deeper than four live batches and older than thirty seconds.
+fields. The lane yields to live catch-up when debt exceeds four live batches
+or thirty seconds, and rechecks after obtaining writer admission.
 
 For routed HTTP `eth_call` and `eth_estimateGas`, an EVM execution revert is a
 contract outcome, not a provider outage. The caller receives the RPC error and
@@ -200,14 +200,23 @@ SQLite's variable limit. This avoids handing the Python interpreter to competing
 valuation workers between every inserted row. The outer durable transaction
 preserves the raw event/cursor/job boundary.
 
-Adaptive scan sizing uses separate writer targets: two seconds for live
-catch-up and 200 ms for background history. Growth is capped by measured store
-throughput and log density; history starts with eight blocks before adapting.
-History yields when the recent gap exceeds one adaptive live batch, rather than
-requiring the durable cursor to equal a continuously advancing head. Exact-tip
-admission starved history even while live ingestion stayed only a few blocks
-behind. The adaptive batch is the amount the live worker can commit next, not
-an unrelated fixed lag allowance.
+Adaptive scan sizing targets two seconds of live writer work and 200 ms of
+provider-history work; the archive source targets four seconds. Growth uses
+measured store throughput and log density. Live commits stop at a whole-block
+boundary near 2,000 logs; an indivisible block may exceed the target. The cursor
+never advances across a fetched but uncommitted suffix.
+Writer admission is FIFO within live, normal, and background priorities. Live
+work wins the next available transaction, with one background turn after eight
+foreground admissions while background work is queued. Enrichment publishes one
+completed fetch job per writer turn. History yields above four live batches or
+thirty seconds of debt, including a recheck after waiting for the writer.
+Price-anchor repair seeks each changed mark's own timestamp window through the
+earlier of its next mark or 300-second expiry. It uses the existing timestamp
+index rather than scanning from a historical block to the current tip under
+the writer. Separated changed marks do not bridge unaffected historical gaps.
+Pool-price repairs likewise stop at each changed sample's next price sample.
+Replays read canonical samples instead of reusing a current-state price that
+the backfill may have invalidated.
 A new block can arrive during an in-flight transaction; the reported gap
 remains the actual head-minus-cursor difference, without rounding it to zero.
 These are feedback targets, not hard transaction deadlines; indivisible block

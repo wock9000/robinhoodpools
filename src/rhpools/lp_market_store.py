@@ -101,6 +101,12 @@ _CHECKPOINT_BUSY_TIMEOUT_MS = 100
 _READER_SNAPSHOT_SECONDS = 15.0
 _READER_PROGRESS_STEPS = 1_000
 
+# Writer admission is strict by urgency, with one background turn after a
+# bounded foreground burst. SQLite transactions remain non-preemptive, so this
+# gate decides which prepared transaction starts next without weakening atomicity.
+_WRITER_PRIORITIES = {"live": 0, "normal": 1, "background": 2}
+_WRITER_MAX_FOREGROUND_BURST = 8
+
 
 class MarketStoreError(RuntimeError):
     """Base class for durable market-store failures."""
@@ -230,6 +236,11 @@ class MarketStore:
         self._reader_drain_deadline: float | None = None
         self._reader_drain_retry_after = 0.0
         self._local = threading.local()
+        self._writer_condition = threading.Condition()
+        self._writer_active = False
+        self._writer_waiters: dict[int, int] = {}
+        self._writer_ticket = 0
+        self._writer_foreground_streak = 0
         self._readers: dict[int, sqlite3.Connection] = {}
         self._projections: list[tuple[ProjectionApply, ProjectionRollback, bool]] = []
         self._closed = False
@@ -1041,19 +1052,112 @@ class MarketStore:
                 reader_drain_pending=reader_drain_pending,
             )
 
+    def _writer_rank(self, priority: str | None) -> int:
+        selected = (
+            getattr(self._local, "writer_priority", "normal")
+            if priority is None else priority
+        )
+        try:
+            return _WRITER_PRIORITIES[str(selected)]
+        except KeyError as exc:
+            choices = ", ".join(_WRITER_PRIORITIES)
+            raise ValueError(f"writer priority must be one of {choices}") from exc
+
+    def _next_writer_locked(self) -> int | None:
+        if not self._writer_waiters:
+            return None
+        background = [
+            ticket
+            for ticket, rank in self._writer_waiters.items()
+            if rank == _WRITER_PRIORITIES["background"]
+        ]
+        if (
+            background
+            and self._writer_foreground_streak >= _WRITER_MAX_FOREGROUND_BURST
+        ):
+            return min(background)
+        return min(
+            self._writer_waiters,
+            key=lambda ticket: (self._writer_waiters[ticket], ticket),
+        )
+
+    def _acquire_writer_turn(
+        self, priority: str | None, *, blocking: bool,
+    ) -> bool:
+        rank = self._writer_rank(priority)
+        with self._writer_condition:
+            ticket = self._writer_ticket
+            self._writer_ticket += 1
+            self._writer_waiters[ticket] = rank
+            try:
+                if not blocking and (
+                    self._writer_active or self._next_writer_locked() != ticket
+                ):
+                    return False
+                while (
+                    self._writer_active or self._next_writer_locked() != ticket
+                ):
+                    self._writer_condition.wait()
+                self._writer_active = True
+                background_waiting = any(
+                    waiting_rank == _WRITER_PRIORITIES["background"]
+                    for waiting_rank in self._writer_waiters.values()
+                )
+                if rank == _WRITER_PRIORITIES["background"]:
+                    self._writer_foreground_streak = 0
+                elif background_waiting:
+                    self._writer_foreground_streak += 1
+                else:
+                    self._writer_foreground_streak = 0
+                return True
+            finally:
+                removed = self._writer_waiters.pop(ticket, None)
+                if removed is not None and not self._writer_active:
+                    self._writer_condition.notify_all()
+
+    def _release_writer_turn(self) -> None:
+        with self._writer_condition:
+            self._writer_active = False
+            self._writer_condition.notify_all()
+
     @contextlib.contextmanager
-    def transaction(self) -> Iterator[sqlite3.Connection]:
-        """Serialize a writer transaction; nested calls share the outer commit."""
+    def writer_priority(self, priority: str) -> Iterator[None]:
+        """Set the default admission priority for writes in this thread."""
+        self._writer_rank(priority)
+        previous = getattr(self._local, "writer_priority", None)
+        self._local.writer_priority = priority
+        try:
+            yield
+        finally:
+            if previous is None:
+                del self._local.writer_priority
+            else:
+                self._local.writer_priority = previous
+
+    @contextlib.contextmanager
+    def transaction(
+        self, *, priority: str | None = None, blocking: bool = True,
+    ) -> Iterator[sqlite3.Connection | None]:
+        """Serialize one prioritized writer; nested calls share its commit."""
         if self._closed:
             raise MarketStoreError("market store is closed")
-        with self.lock:
-            depth = getattr(self._local, "write_depth", 0)
-            if depth:
-                self._local.write_depth = depth + 1
-                try:
-                    yield self.connection
-                finally:
-                    self._local.write_depth -= 1
+        depth = getattr(self._local, "write_depth", 0)
+        if depth:
+            self._local.write_depth = depth + 1
+            try:
+                yield self.connection
+            finally:
+                self._local.write_depth -= 1
+            return
+        admitted = self._acquire_writer_turn(priority, blocking=blocking)
+        if not admitted:
+            yield None
+            return
+        acquired = False
+        try:
+            acquired = self.lock.acquire(blocking=blocking)
+            if not acquired:
+                yield None
                 return
             self._local.write_depth = 1
             self._local.pool_metadata_dirty = False
@@ -1081,6 +1185,10 @@ class MarketStore:
             finally:
                 self._local.write_depth = 0
                 self._local.pool_metadata_dirty = False
+        finally:
+            if acquired:
+                self.lock.release()
+            self._release_writer_turn()
 
     @property
     def change_token(self) -> int:
