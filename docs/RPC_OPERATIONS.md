@@ -49,13 +49,23 @@ live contention, not percentiles.
 `LP_RPC_ARCHIVE_URLS` and `LP_RPC_ARCHIVE_URL_FILES` name log and header sources
 for the history (archive backfill) lane only. The list is opt-in: no public
 provider joins it, `RHP_RPC_URLS` does not feed it, and without it the history
-lane keeps the provider log sources above. The intended entry is the local Nitro
-node, which answers `eth_getLogs` for any archive range without a quota:
+lane keeps the provider log sources above. Prefer the local Nitro node where
+it retains block bodies, but do not equate state/archive capability or readable
+headers with unlimited historical log retention. Configure a separately
+qualified historical log provider as a fallback:
 
 ```
 [Service]
 Environment=LP_RPC_ARCHIVE_URLS=http://127.0.0.1:8547
+Environment=LP_RPC_ARCHIVE_URL_FILES=%h/.config/robinhoodpools/goldsky.url
 ```
+
+Qualification must cover the actual backfill boundary and target, not only
+recent logs. Production local reads stopped at `block body not found` just
+before block 52,491,468. Goldsky returned five PoolManager logs at 52,491,467;
+its header hash matched the durable cursor's parent. It also returned three
+logs at the history target, block 29,120,565. This provider remains opt-in;
+receipt/state fallbacks do not implicitly enter the archive-only list.
 
 With an archive source the lane fetches each interval as concurrent pages sized
 from the observed log density (eight workers against a local host; a page that
