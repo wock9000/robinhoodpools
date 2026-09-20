@@ -646,6 +646,12 @@ It no longer restarts at the first overview key whenever ingestion interrupts
 it. Failed keys advance the rotation too and retry after the other default
 views have had an opportunity; warming still obeys storage and latency guards.
 
+Published terminal frames use a separate 64-entry cache from the 16-entry cache
+of snapshot-versioned pool-filter and sort intermediates. New metadata revisions
+cannot evict otherwise usable terminal responses. Canonical epoch/revision keys
+and same-key load coalescing remain in place; complete frames keep their original
+`as_of` while a request-triggered refresh runs.
+
 Browser pool requests have a 15-second deadline, including response-body reads.
 An initial failed request displays `POOL DATA UNAVAILABLE · RETRYING`, not
 indefinite syncing. Completed cached views remain available during refresh.
@@ -678,6 +684,14 @@ For an offline window, stop `robinhoodpools-healthcheck.timer` and its active
 one-shot service before stopping the application; otherwise the watchdog
 restarts it. Keep free-space checks active, preserve all SQLite sidecars, and
 resume the application and any paused supervision timers afterward.
+
+The approved September 20 offline pass completed from the 99 GiB offset to EOF
+in 3,707.818 seconds. The 544,497,786,880-byte file retained its size, all 32
+sampled 1 MiB SHA-256 digests, and the durable cursor/epoch digest. Bounded FIEMAP
+samples found single large extents at the beginning and midpoint and three
+extents in the final 64 MiB. The application and both supervision timers were
+restored. These checks establish sampled byte preservation, not a full-file
+integrity check or database backup.
 
 If a durable commit fails because storage is full or unavailable, the store
 rolls the failed transaction back before the worker retries. Runtime-status
