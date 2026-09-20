@@ -190,6 +190,53 @@ def test_dense_live_fetch_commits_a_bounded_whole_block_prefix(monkeypatch):
         scanner.close()
         store.close()
 
+@pytest.mark.parametrize("counts,first_low", [((2, 2, 2), 101), ((2, 2, 5), 102)])
+def test_dense_history_commits_whole_suffix_without_skipping_older_blocks(
+    monkeypatch, counts, first_low,
+):
+    import rhpools.lp_market_index as module
+
+    monkeypatch.setattr(module, "HISTORY_MAX_STORE_LOGS", 4)
+    store = MarketStore(":memory:")
+    scanner = indexer(store, StaticRpc(355))
+    store.ingest([header(355)], [], lane="live", cursor={
+        "block_number": 355, "block_hash": header(355)["hash"],
+    })
+    store.ingest([header(103)], [], lane="history", cursor={
+        "next_to": 102, "target_block": 100, "complete": False,
+    })
+    scanner._history_chunk = 3
+    logs = [
+        {"blockNumber": hex(number)}
+        for number, count in zip((100, 101, 102), counts)
+        for _ in range(count)
+    ]
+    monkeypatch.setattr(scanner, "_fetch_interval", lambda _lane, start, end: (
+        [log for log in logs if start <= int(log["blockNumber"], 16) <= end],
+        {number: header(number) for number in range(start, end + 1)},
+    ))
+    monkeypatch.setattr(scanner, "_decode", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        scanner, "_queue_deferred_pool_identities", lambda *_args, **_kwargs: 0,
+    )
+    try:
+        assert scanner._scan_history_once() is True
+        assert store.cursor("history")["low_block"] == first_low
+        assert store.cursor("history")["next_to"] == first_low - 1
+        assert store.cursor("history")["complete"] is False
+        for _ in range(2):
+            if store.cursor("history")["complete"]:
+                break
+            scanner._scan_history_once()
+        cursor = store.cursor("history")
+        assert cursor["next_to"] == 99
+        assert cursor["complete"] is True
+        coverage = store.status()["coverage"]["history"]
+        assert (coverage["from_block"], coverage["to_block"]) == (100, 102)
+    finally:
+        scanner.close()
+        store.close()
+
 def test_live_chunk_sizing_excludes_writer_lock_wait(tmp_path, monkeypatch):
     store = MarketStore(tmp_path / "market.sqlite")
     scanner = indexer(store, StaticRpc(355))
@@ -1399,33 +1446,6 @@ def test_archive_interval_rejects_a_boundary_the_canonical_source_disputes():
         store.close()
 
 
-def test_archive_chunk_grows_toward_the_event_budget_not_the_page_cap():
-    from rhpools.lp_market_index import ARCHIVE_MAX_CHUNK, ARCHIVE_TARGET_EVENTS
-
-    created: dict[str, list] = {}
-    store = MarketStore(":memory:")
-    provider_store = MarketStore(":memory:")
-    archive = indexer(store, archive_factory(created))
-    provider = indexer(provider_store)
-    try:
-        for scanner in (archive, provider):
-            scanner._history_chunk = 1_000
-            scanner._resize_after_success("history", 8_000, 1.0, 1_000)
-        assert provider._history_chunk == 1_000
-        assert archive._history_chunk == 1_250
-        archive._history_chunk = ARCHIVE_MAX_CHUNK
-        archive._resize_after_success("history", 0, 0.5, ARCHIVE_MAX_CHUNK)
-        assert archive._history_chunk == ARCHIVE_MAX_CHUNK
-        archive._history_chunk = 4_000
-        archive._resize_after_success(
-            "history", ARCHIVE_TARGET_EVENTS * 4, 1.0, 4_000,
-        )
-        assert archive._history_chunk == 4_000
-    finally:
-        archive.close()
-        provider.close()
-        store.close()
-        provider_store.close()
 
 
 def test_interval_end_is_rechecked_after_logs_before_commit():

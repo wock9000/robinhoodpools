@@ -60,9 +60,10 @@ the archive's own headers for both boundaries must match them, and every log's
 block hash must match its event header. A local node whose head is behind the
 requested range is skipped for that page rather than trusted.
 
-Archive chunks are sized by events per transaction (10k), not by the 10k-log page:
-raw history inserts cost per event, and a transaction that outgrows the writer
-page cache spills and slows down. `history_scan.source` reports
+Archive fetch pages retain their 10k-log safety limit, but history commits stop
+at a whole-block boundary near 2,000 logs. History walks backward, so it commits
+the newest suffix and leaves the older prefix behind its durable cursor for the
+next scan. A single dense block remains indivisible. `history_scan.source` reports
 `archive` or `provider`; `recent_catchup_lag_seconds` joins the existing lag
 fields. The lane yields to live catch-up when debt exceeds four live batches
 or thirty seconds, and rechecks after obtaining writer admission.
@@ -223,11 +224,11 @@ SQLite's variable limit. This avoids handing the Python interpreter to competing
 valuation workers between every inserted row. The outer durable transaction
 preserves the raw event/cursor/job boundary.
 
-Adaptive scan sizing targets two seconds of live writer work and 200 ms of
-provider-history work; the archive source targets four seconds. Growth uses
-measured store throughput and log density. Live commits stop at a whole-block
-boundary near 2,000 logs; an indivisible block may exceed the target. The cursor
-never advances across a fetched but uncommitted suffix.
+Adaptive scan sizing targets two seconds of live or provider-history writer
+work; the archive source targets four seconds. Growth uses measured store
+throughput and log density. Live and historical commits stop at a whole-block
+boundary near 2,000 logs; an indivisible block may exceed the target. Their
+cursors never advance across a fetched but uncommitted portion of the interval.
 Writer admission is FIFO within live, normal, and background priorities. Live
 work wins the next available transaction, with one background turn after eight
 foreground admissions while background work is queued. Enrichment publishes one

@@ -75,11 +75,11 @@ HISTORY_MAX_CHUNK = 32_768
 # Background history uses a shorter writer target so financial lanes can run.
 MAX_INTERVAL_STORE_SECONDS = 2.0
 HISTORY_MAX_INTERVAL_STORE_SECONDS = 2.0
-# An archive source (the local node) has no page quota, so the archive chunk is
-# sized by events per transaction: raw inserts cost per event, and a 10k-event
-# transaction stays inside the writer page cache; larger ones spill and slow down.
+# Archive fetches may span large ranges, but their durable commits use the same
+# bounded log budget as provider history. Density estimates alone cannot bound
+# a newly encountered dense interval's non-preemptible writer transaction.
 ARCHIVE_MAX_CHUNK = 262_144
-ARCHIVE_TARGET_EVENTS = 10_000
+HISTORY_MAX_STORE_LOGS = 2_000
 ARCHIVE_MAX_STORE_SECONDS = 4.0
 ARCHIVE_PAGE_LOGS = MAX_LOGS_PER_RESPONSE * 4 // 5
 ARCHIVE_FETCH_WORKERS = 8
@@ -4848,12 +4848,31 @@ class MarketIndexer:
         if self._archive_source(lane):
             return (
                 HISTORY_MIN_CHUNK, ARCHIVE_MAX_CHUNK, ARCHIVE_MAX_STORE_SECONDS,
-                ARCHIVE_TARGET_EVENTS,
+                HISTORY_MAX_STORE_LOGS,
             )
         return (
             HISTORY_MIN_CHUNK, HISTORY_MAX_CHUNK,
-            HISTORY_MAX_INTERVAL_STORE_SECONDS, MAX_LOGS_PER_RESPONSE * 4 // 5,
+            HISTORY_MAX_INTERVAL_STORE_SECONDS, HISTORY_MAX_STORE_LOGS,
         )
+
+    @staticmethod
+    def _store_log_boundary(
+        logs: Sequence[Mapping[str, Any]], limit: int, *, newest_first: bool = False,
+    ) -> int:
+        counts: dict[int, int] = {}
+        for log in logs:
+            number = _hex_int(log.get("blockNumber"), "log block number")
+            counts[number] = counts.get(number, 0) + 1
+        kept = 0
+        boundary = -1
+        for number in sorted(counts, reverse=newest_first):
+            count = counts[number]
+            # A block is indivisible, including a first block over the budget.
+            if kept and kept + count > limit:
+                break
+            boundary = number
+            kept += count
+        return boundary
 
     def _resize_after_success(
         self, lane: str, log_count: int, store_seconds: float = 0.0,
@@ -4883,9 +4902,8 @@ class MarketIndexer:
             else:
                 self._history_chunk = resized
             return
-        # Size by measured density toward the lane's log target: 20% headroom
-        # under a provider's 10k-log page, or the archive's per-transaction
-        # event budget where pages are fetched concurrently.
+        # Fetch toward the lane's whole-block commit budget. A density jump is
+        # bounded again after fetching, before taking the writer.
         count = max(0, int(log_count))
         if count == 0:
             candidate = current * 2
@@ -5116,22 +5134,7 @@ class MarketIndexer:
             fetched_end = end
             fetched_logs = len(logs)
             if fetched_logs > LIVE_MAX_STORE_LOGS:
-                counts_by_block: dict[int, int] = {}
-                for log in logs:
-                    number = _hex_int(
-                        log.get("blockNumber"), "log block number",
-                    )
-                    counts_by_block[number] = counts_by_block.get(number, 0) + 1
-                kept_logs = 0
-                bounded_end = start
-                for number, count in counts_by_block.items():
-                    # A single dense block is indivisible: include it even if
-                    # it alone exceeds the target, then stop before the next.
-                    if kept_logs and kept_logs + count > LIVE_MAX_STORE_LOGS:
-                        break
-                    bounded_end = number
-                    kept_logs += count
-                end = min(end, bounded_end)
+                end = min(end, self._store_log_boundary(logs, LIVE_MAX_STORE_LOGS))
                 logs = [
                     log for log in logs
                     if _hex_int(log.get("blockNumber"), "log block number") <= end
@@ -5550,6 +5553,23 @@ class MarketIndexer:
             if exc.range_too_large and self._shrink("history"):
                 return True
             raise
+        fetched_start = start
+        fetched_logs = len(logs)
+        if fetched_logs > HISTORY_MAX_STORE_LOGS:
+            start = max(start, self._store_log_boundary(
+                logs, HISTORY_MAX_STORE_LOGS, newest_first=True,
+            ))
+            logs = [
+                log for log in logs
+                if _hex_int(log.get("blockNumber"), "log block number") >= start
+            ]
+            headers = {
+                number: header for number, header in headers.items()
+                if start <= number <= end
+            }
+            self._history_chunk = max(
+                HISTORY_MIN_CHUNK, min(self._history_chunk, end - start + 1),
+            )
         # The live head can advance while archive RPC work is in flight. Do
         # not take the shared writer after that work creates recent live debt.
         if self._recent_catchup_pending():
@@ -5638,6 +5658,9 @@ class MarketIndexer:
             "to_block": end,
             "blocks": blocks,
             "logs": len(logs),
+            "fetched_from_block": fetched_start,
+            "fetched_logs": fetched_logs,
+            "store_log_cap": HISTORY_MAX_STORE_LOGS,
             "decoded_events": len(events),
             "inserted_events": len(inserted),
             "deferred_pool_identity_transactions": deferred_identities,
