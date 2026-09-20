@@ -134,8 +134,8 @@ def _value(raw: Any, decimals: Any, price: float | None) -> float | None:
 
 
 def _basket(raw0, raw1, pool, price0, price1):
-    value0 = _value(raw0, pool["decimals0"], price0)
-    value1 = _value(raw1, pool["decimals1"], price1)
+    value0 = _value(raw0, pool.get("decimals0"), price0)
+    value1 = _value(raw1, pool.get("decimals1"), price1)
     return value0 + value1 if value0 is not None and value1 is not None else None
 
 
@@ -377,7 +377,7 @@ class PriceProjection:
     def _anchor_token(pool):
         if pool["protocol"] != "v3" or USDG not in (pool["token0"], pool["token1"]):
             return None
-        if pool["factory"] != UNISWAP_V3_FACTORY and pool["id"] != WETH_USDG_POOL:
+        if pool.get("factory") != UNISWAP_V3_FACTORY and pool["id"] != WETH_USDG_POOL:
             return None
         token = pool["token1"] if pool["token0"] == USDG else pool["token0"]
         return None if token == WETH and pool["id"] != WETH_USDG_POOL else token
@@ -1229,7 +1229,7 @@ class LPMarketService:
         self._cache = OrderedDict()
         self._query_cache = OrderedDict()
         self._cache_lock = threading.Lock()
-        self._cache_futures: dict[tuple[Any, ...], Future] = {}
+        self._cache_futures: dict[tuple[Any, ...], tuple[Future, bool]] = {}
         self._cache_refreshing: set[tuple[Any, ...]] = set()
         self._cache_executor = ThreadPoolExecutor(
             max_workers=2, thread_name_prefix="lp-market-cache",
@@ -1448,11 +1448,6 @@ class LPMarketService:
             if changed:
                 self._current_activity_revision += 1
 
-    def _pool_metadata_revision(self) -> int:
-        return int(getattr(
-            self.store, "pool_metadata_token",
-            getattr(self.market, "pool_publication_revision", 0),
-        ))
 
     def _current_pool_metadata(
             self, event: Mapping[str, Any],
@@ -1470,7 +1465,9 @@ class LPMarketService:
                 "decimals0", "decimals1",
             )
         )
-        if not incomplete:
+        if not incomplete and (
+            pool.get("protocol") != "v3" or pool.get("factory") is not None
+        ):
             return pool
         if cache is not None and pool_id in cache:
             stored = cache[pool_id]
@@ -1491,10 +1488,10 @@ class LPMarketService:
             return pool
         for key in (
             "id", "protocol", "token0", "token1", "symbol0", "symbol1",
-            "decimals0", "decimals1", "fee_ppm",
+            "decimals0", "decimals1", "fee_ppm", "factory",
         ):
-            if pool.get(key) is None and stored.get(key) is not None:
-                pool[key] = stored[key]
+            if pool.get(key) is None:
+                pool[key] = stored.get(key)
         return pool
 
     @staticmethod
@@ -1542,7 +1539,7 @@ class LPMarketService:
         seconds = WINDOWS[window]
         snapshot_key = (window, protocol, pool_id, query)
         now = time.time()
-        metadata_revision = self._pool_metadata_revision()
+        metadata_revision = self.store.pool_metadata_token
         with self._current_activity_lock:
             revision = self._current_activity_revision
             cached = self._current_owner_snapshots.get(snapshot_key)
@@ -1721,18 +1718,19 @@ class LPMarketService:
         if source is None or lock is None:
             return
         with lock:
-            discovered = tuple(getattr(self.market, "_discovered", {}).values())
+            published = getattr(self.market, "_discovered", {})
             marker = (
                 int(getattr(self.market, "_checkpoint_revision", 0)),
-                len(discovered),
+                len(published),
             )
             if marker == self._catalog_discovery_marker:
                 return
             tokens = self.market.universe.tokens
-            additions = tuple(
-                pool for pool in discovered
-                if str(pool.id).lower() not in self._catalog_discovered_ids
-            )
+            discovered = tuple(published.values())
+        additions = tuple(
+            pool for pool in discovered
+            if str(pool.id).lower() not in self._catalog_discovered_ids
+        )
         for offset in range(0, len(additions), 250):
             if self._search_stop.is_set():
                 return
@@ -1974,21 +1972,30 @@ class LPMarketService:
     def _load_cached(self, key, loader, *, cache=None):
         cache = self._cache if cache is None else cache
         leader = False
-        future = None
         with self._cache_lock:
-            future = self._cache_futures.get(key)
-            if future is None and len(self._cache_futures) < 64:
-                future = Future()
-                self._cache_futures[key] = future
+            pending = self._cache_futures.get(key)
+            if pending is None and len(self._cache_futures) < 64:
+                pending = (Future(), self.store.reader_snapshot_active)
+                self._cache_futures[key] = pending
                 leader = True
+        future = pending[0] if pending is not None else None
         if future is not None and not leader:
+            if (
+                not pending[1] and self.store.reader_snapshot_active
+                and not future.done()
+            ):
+                # A producer without a snapshot may be waiting for admission.
+                # Holding our snapshot while waiting for it pins the very drain
+                # that must finish before it can run. Read our own snapshot
+                # instead; do not publish over the other producer's result.
+                return loader()
             return future.result()
         try:
             value = loader()
         except BaseException as exc:
             if future is not None:
                 with self._cache_lock:
-                    if self._cache_futures.get(key) is future:
+                    if self._cache_futures.get(key) is pending:
                         self._cache_futures.pop(key, None)
                 future.set_exception(exc)
             raise
@@ -1999,7 +2006,7 @@ class LPMarketService:
             limit = 16 if cache is self._query_cache else 64
             while len(cache) > limit:
                 cache.popitem(last=False)
-            if future is not None and self._cache_futures.get(key) is future:
+            if future is not None and self._cache_futures.get(key) is pending:
                 self._cache_futures.pop(key, None)
         if future is not None:
             future.set_result(value)
@@ -2081,18 +2088,18 @@ class LPMarketService:
 
         epoch = int(status.get("epoch") or 0)
         cache_key = ("bucket-aggregates", events_revision, *args)
-        aggregates = self._cached(
-            cache_key, load, ttl=float("inf"), epoch=epoch,
+        aggregates = self._cached_query(
+            cache_key, load, epoch=epoch,
         )
         # These values are much larger than ordinary response-cache entries.
-        # Keep enough for every public window without retaining 64 revisions.
+        # Keep every public window without crowding out smaller queries.
         with self._cache_lock:
             keys = [
-                key for key in self._cache
+                key for key in self._query_cache
                 if len(key) > 1 and key[1] == "bucket-aggregates"
             ]
             for key in keys[:-8]:
-                self._cache.pop(key, None)
+                self._query_cache.pop(key, None)
         return aggregates
 
     @staticmethod
@@ -2302,12 +2309,12 @@ class LPMarketService:
             def metric_rows():
                 if bucket_aggregates is not None:
                     def load_pool_ids():
-                        return tuple(sorted(
-                            str(row["id"])
-                            for row in conn.execute(
-                                f"SELECT p.id FROM pools p WHERE {where}", filters,
-                            ).fetchall()
-                        ))
+                        # One result avoids a GIL handoff for every catalog row.
+                        encoded = conn.execute(
+                            f"SELECT json_group_array(p.id) FROM pools p WHERE {where}",
+                            filters,
+                        ).fetchone()[0]
+                        return tuple(sorted(json.loads(encoded)))
                     pool_ids = self._cached_query(
                         (
                             "pool-filter-base", snapshot_pool_metadata_token,
@@ -2875,7 +2882,7 @@ class LPMarketService:
         key = (
             str(data.get("feed_epoch") or ""),
             int(item.get("sequence") or data.get("sequence") or 0),
-            self._pool_metadata_revision(),
+            self.store.pool_metadata_token,
         )
         slot = key[1] % len(self._current_view_cache)
         entry = self._current_view_cache[slot]
@@ -3019,11 +3026,13 @@ class LPMarketService:
             conditions.append("e.timestamp>=?")
             args.append(start)
             if floor is None:
-                conditions.append("0")
-            else:
-                window_floor = int(floor["block_number"])
-                conditions.append("e.block_number>=?")
-                args.append(window_floor)
+                return {
+                    "rows": [], "cursor": None, "coverage": coverage,
+                    "revision": snapshot_revision, "epoch": snapshot_epoch,
+                }
+            window_floor = int(floor["block_number"])
+            conditions.append("e.block_number>=?")
+            args.append(window_floor)
 
         def materialize(connection):
             selected_columns = (
@@ -3093,12 +3102,12 @@ class LPMarketService:
 
         # Durable event and pool-metadata versions identify when these rows can
         # change. The response still carries the current revision and coverage.
-        materialized = self._cached(
+        materialized = self._cached_query(
             (
                 "tape", snapshot_events_revision, snapshot_pool_metadata_token,
                 name, *conditions, *cache_args, window_floor, limit,
             ),
-            load, ttl=float("inf"), epoch=snapshot_epoch,
+            load, epoch=snapshot_epoch,
         )
         return {
             **materialized, "coverage": coverage, "revision": snapshot_revision,

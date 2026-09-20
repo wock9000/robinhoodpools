@@ -1802,15 +1802,20 @@ class MarketIndexer:
         )
         return len(selected)
 
-    def _publish_enriched_current_events(
-        self, events: Sequence[Mapping[str, Any]], *, source: str,
+    def _publish_canonical_current_events(
+        self,
+        events: Sequence[Mapping[str, Any]],
+        *,
+        source: str,
+        add_unseen: bool = False,
     ) -> None:
-        """Replace still-current provisional rows with canonical enrichment."""
+        """Merge canonical durable facts into matching current-branch rows."""
         by_block: dict[int, list[Mapping[str, Any]]] = {}
         for event in events:
             by_block.setdefault(int(event["block_number"]), []).append(event)
         for number, block_events in sorted(by_block.items()):
             updates: list[dict[str, Any]] = []
+            fresh: list[dict[str, Any]] = []
             with self._feed_condition:
                 current = self._observed_blocks.get(number)
                 if current is None:
@@ -1820,22 +1825,38 @@ class MarketIndexer:
                     self._current_event_key(event): index
                     for index, event in enumerate(current_events)
                 }
-                for enriched in sorted(block_events, key=lambda row: (
+                for canonical in sorted(block_events, key=lambda row: (
                     int(row["tx_index"]), int(row["log_index"]),
                 )):
-                    if _lower(enriched.get("block_hash")) != header["hash"]:
+                    if _lower(canonical.get("block_hash")) != header["hash"]:
                         continue
-                    index = indexes.get(self._current_event_key(enriched))
+                    key = self._current_event_key(canonical)
+                    index = indexes.get(key)
                     if index is None:
+                        if not add_unseen:
+                            continue
+                        merged = dict(canonical)
+                        current_events.append(merged)
+                        indexes[key] = len(current_events) - 1
+                        fresh.append(dict(merged))
+                        updates.append(dict(merged))
                         continue
                     previous = current_events[index]
-                    merged = {**previous, **dict(enriched)}
+                    merged = dict(previous)
+                    for field, value in canonical.items():
+                        if value is not None or merged.get(field) is None:
+                            merged[field] = value
                     previous_data = previous.get("data")
-                    enriched_data = enriched.get("data")
-                    merged["data"] = {
-                        **(dict(previous_data) if isinstance(previous_data, Mapping) else {}),
-                        **(dict(enriched_data) if isinstance(enriched_data, Mapping) else {}),
-                    }
+                    canonical_data = canonical.get("data")
+                    merged_data = (
+                        dict(previous_data)
+                        if isinstance(previous_data, Mapping) else {}
+                    )
+                    if isinstance(canonical_data, Mapping):
+                        for field, value in canonical_data.items():
+                            if value is not None or merged_data.get(field) is None:
+                                merged_data[field] = value
+                    merged["data"] = merged_data
                     if (
                         merged.get("position_key") is not None
                         and merged.get("cashflow0") is not None
@@ -1846,12 +1867,16 @@ class MarketIndexer:
                         merged["flow_qualification"] = (
                             merged.get("accounting_basis") or "event_exact"
                         )
+                    if merged == previous:
+                        continue
                     current_events[index] = merged
                     updates.append(dict(merged))
                 if updates:
                     self._emit_current_activity(
                         header, updates, source=source, late=True,
                     )
+            if fresh:
+                self._schedule_current_receipts(header, fresh, source=source)
 
     def _publish_current_block(
         self, header: Mapping[str, Any], logs: Sequence[Mapping[str, Any]],
@@ -5226,6 +5251,12 @@ class MarketIndexer:
             self._publish_event_pools(inserted)
         except Exception as exc:
             self._set_runtime("metadata", error=exc)
+        with self._reorg_lock:
+            _, publish_epoch = self.store.cursor_state("live")
+            if publish_epoch == cursor_epoch:
+                self._publish_canonical_current_events(
+                    inserted, source="live-index", add_unseen=True,
+                )
         postprocess_s = time.monotonic() - postprocess_started
         self._resize_after_success(
             "live", len(logs), store_s, end - start + 1,
@@ -6343,6 +6374,7 @@ class MarketIndexer:
             self._set_runtime("enrichment", error=exc)
 
         if transactions:
+            _, enrichment_epoch = self.store.cursor_state("live")
             try:
                 with self.store.transaction() as conn:
                     # Identity replay may have added canonical inputs while
@@ -6387,9 +6419,12 @@ class MarketIndexer:
                     )
                 self._set_runtime("enrichment", error=exc)
             else:
-                self._publish_enriched_current_events(
-                    events, source="enrichment",
-                )
+                with self._reorg_lock:
+                    _, publish_epoch = self.store.cursor_state("live")
+                    if publish_epoch == enrichment_epoch:
+                        self._publish_canonical_current_events(
+                            events, source="enrichment",
+                        )
                 if batch_error is None:
                     self._set_runtime(
                         "enrichment",

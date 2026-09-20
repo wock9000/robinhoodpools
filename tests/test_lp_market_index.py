@@ -57,6 +57,27 @@ def header(number: int, *, parent: str | None = None) -> dict[str, str]:
     }
 
 
+def activity_event(
+    block: dict[str, str],
+    *,
+    tx_hash: str = "0x" + "ab" * 32,
+    log_index: int = 0,
+) -> dict[str, object]:
+    return {
+        "block_number": int(block["number"], 16),
+        "block_hash": block["hash"],
+        "tx_hash": tx_hash,
+        "tx_index": 0,
+        "log_index": log_index,
+        "timestamp": int(block["timestamp"], 16),
+        "pool_id": None,
+        "protocol": "v3",
+        "kind": "add",
+        "owner": "0x" + "11" * 20,
+        "data": {},
+    }
+
+
 class StaticRpc:
     def __init__(self, head: int = 0) -> None:
         self.head = head
@@ -310,6 +331,246 @@ def test_live_parent_mismatch_never_advances_cursor(monkeypatch):
         assert scanner._scan_live_once() is True
         assert recovered == ["block 100 does not extend live cursor"]
         assert store.cursor("live")["block_number"] == 99
+    finally:
+        scanner.close()
+        store.close()
+
+
+def test_live_commit_publishes_activity_without_wss_logs(monkeypatch):
+    store = MarketStore(":memory:")
+    scanner = indexer(store, StaticRpc(100))
+    anchor = header(99)
+    block = header(100)
+    event = activity_event(block)
+    store.ingest([anchor], [], lane="live", cursor={
+        "block_number": 99,
+        "block_hash": anchor["hash"],
+        "timestamp": int(anchor["timestamp"], 16),
+    })
+    scanner._publish_current_block(block, (), source="wss-head")
+    cursor = scanner.feed_updates()
+    raw_log = {
+        "blockNumber": block["number"],
+        "blockHash": block["hash"],
+    }
+    monkeypatch.setattr(
+        scanner,
+        "_fetch_interval",
+        lambda *_args: ([raw_log], {100: block}),
+    )
+    monkeypatch.setattr(scanner, "_decode", lambda *_args, **_kwargs: [event])
+    monkeypatch.setattr(
+        scanner,
+        "_queue_deferred_pool_identities",
+        lambda *_args, **_kwargs: 0,
+    )
+    monkeypatch.setattr(
+        scanner, "_schedule_current_pool_resolutions",
+        lambda *_args, **_kwargs: None,
+    )
+    try:
+        assert scanner._scan_live_once() is True
+        delivered = scanner.feed_updates(
+            cursor["sequence"], cursor["feed_epoch"],
+        )
+        rows = [
+            row
+            for item in delivered["events"] if item["event"] == "activity"
+            for row in item["data"]["rows"]
+        ]
+        assert len(rows) == 1
+        assert (
+            rows[0]["block_hash"],
+            rows[0]["tx_hash"],
+            rows[0]["log_index"],
+        ) == (block["hash"], event["tx_hash"], 0)
+        assert rows[0]["id"] > 0
+
+        duplicate_cursor = scanner.feed_updates()
+        monkeypatch.setattr(
+            scanner, "_decode_current",
+            lambda *_args, **_kwargs: [dict(event)],
+        )
+        assert scanner._publish_late_current_logs(
+            100, [raw_log], source="wss-logs",
+        ) == 1
+        duplicate = scanner.feed_updates(
+            duplicate_cursor["sequence"], duplicate_cursor["feed_epoch"],
+        )
+        assert [
+            item for item in duplicate["events"]
+            if item["event"] == "activity"
+        ] == []
+    finally:
+        scanner.close()
+        store.close()
+
+
+def test_live_commit_does_not_publish_after_concurrent_reset(monkeypatch):
+    store = MarketStore(":memory:")
+    scanner = indexer(store, StaticRpc(100))
+    anchor = header(99)
+    block = header(100)
+    event = activity_event(block)
+    store.ingest([anchor], [], lane="live", cursor={
+        "block_number": 99,
+        "block_hash": anchor["hash"],
+        "timestamp": int(anchor["timestamp"], 16),
+    })
+    scanner._publish_current_block(block, (), source="wss-head")
+    cursor = scanner.feed_updates()
+    monkeypatch.setattr(
+        scanner,
+        "_fetch_interval",
+        lambda *_args: (
+            [{"blockNumber": block["number"], "blockHash": block["hash"]}],
+            {100: block},
+        ),
+    )
+    monkeypatch.setattr(scanner, "_decode", lambda *_args, **_kwargs: [event])
+    monkeypatch.setattr(
+        scanner,
+        "_queue_deferred_pool_identities",
+        lambda *_args, **_kwargs: 0,
+    )
+    monkeypatch.setattr(
+        scanner,
+        "_publish_event_pools",
+        lambda _events: store.rollback(99, header=anchor),
+    )
+    try:
+        assert scanner._scan_live_once() is True
+        delivered = scanner.feed_updates(
+            cursor["sequence"], cursor["feed_epoch"],
+        )
+        assert [
+            item for item in delivered["events"]
+            if item["event"] == "activity"
+        ] == []
+        assert store.cursor("live")["block_number"] == 99
+    finally:
+        scanner.close()
+        store.close()
+
+
+def test_canonical_current_merge_keeps_stronger_receipt_facts(monkeypatch):
+    store = MarketStore(":memory:")
+    scanner = indexer(store)
+    block = header(100)
+    strong = {
+        **activity_event(block),
+        "transaction_transfers": [{
+            "token": "0x" + "22" * 20,
+            "from": "0x" + "33" * 20,
+            "to": "0x" + "44" * 20,
+            "amount": "25",
+        }],
+        "transaction_transfers_truncated": False,
+        "transaction_flow0": "-25",
+        "transaction_flow1": "0",
+        "flow_scope": "transaction",
+        "flow_complete": True,
+        "flow_qualification": "verified_receipt_transfer_logs",
+        "data": {"receipt_checked": True},
+    }
+    monkeypatch.setattr(
+        scanner, "_decode_current", lambda *_args, **_kwargs: [strong],
+    )
+    monkeypatch.setattr(
+        scanner, "_schedule_current_receipts",
+        lambda *_args, **_kwargs: None,
+    )
+    try:
+        scanner._publish_current_block(block, [{
+            "blockNumber": block["number"],
+            "blockHash": block["hash"],
+        }], source="wss-logs")
+        cursor = scanner.feed_updates()
+        canonical = {
+            **activity_event(block),
+            "id": 17,
+            "transaction_transfers": None,
+            "transaction_transfers_truncated": None,
+            "transaction_flow0": None,
+            "transaction_flow1": None,
+            "flow_scope": None,
+            "flow_complete": None,
+            "flow_qualification": None,
+            "data": {"receipt_checked": None, "trace_complete": True},
+        }
+        scanner._publish_canonical_current_events(
+            [canonical], source="live-index", add_unseen=True,
+        )
+        delivered = scanner.feed_updates(
+            cursor["sequence"], cursor["feed_epoch"],
+        )
+        rows = [
+            row
+            for item in delivered["events"] if item["event"] == "activity"
+            for row in item["data"]["rows"]
+        ]
+        assert len(rows) == 1
+        assert rows[0]["id"] == 17
+        assert rows[0]["transaction_flow0"] == "-25"
+        assert rows[0]["transaction_transfers"] == strong["transaction_transfers"]
+        assert rows[0]["flow_complete"] is True
+        assert rows[0]["data"] == {
+            "receipt_checked": True,
+            "trace_complete": True,
+        }
+
+        duplicate_cursor = scanner.feed_updates()
+        scanner._publish_canonical_current_events(
+            [canonical], source="live-index", add_unseen=True,
+        )
+        duplicate = scanner.feed_updates(
+            duplicate_cursor["sequence"], duplicate_cursor["feed_epoch"],
+        )
+        assert [
+            item for item in duplicate["events"]
+            if item["event"] == "activity"
+        ] == []
+    finally:
+        scanner.close()
+        store.close()
+
+
+def test_canonical_current_publication_rejects_wrong_historical_or_evicted_rows():
+    store = MarketStore(":memory:")
+    scanner = indexer(store)
+    observed = header(100)
+    replacement = {
+        **observed,
+        "hash": "0x" + "ff" * 32,
+    }
+    scanner._publish_current_block(observed, (), source="wss-head")
+    cursor = scanner.feed_updates()
+    try:
+        scanner._publish_canonical_current_events(
+            [activity_event(replacement)],
+            source="live-index",
+            add_unseen=True,
+        )
+        scanner._publish_canonical_current_events(
+            [activity_event(observed)],
+            source="history-enrichment",
+        )
+        for number in range(101, 101 + HEAD_REPLAY_LIMIT * 2):
+            scanner._publish_current_block(
+                header(number), (), source="wss-head",
+            )
+        scanner._publish_canonical_current_events(
+            [activity_event(observed)],
+            source="live-index",
+            add_unseen=True,
+        )
+        delivered = scanner.feed_updates(
+            cursor["sequence"], cursor["feed_epoch"],
+        )
+        assert [
+            item for item in delivered["events"]
+            if item["event"] == "activity"
+        ] == []
     finally:
         scanner.close()
         store.close()

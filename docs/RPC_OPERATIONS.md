@@ -231,10 +231,31 @@ Retiring duplicates already covered by the durable cursor records discard
 metrics without declaring a new failure. An ordinary pending tail does not
 extend a recovery target; only an uncovered queue beyond the bound does.
 
-The browser refreshes durable index status on its one-second heartbeat,
-independently of the slower overview refresh. Requests do not overlap and
-are aborted while the page is hidden. The moving chain head is no longer
-compared against an index cursor held back by a twelve-second overview timer.
+The live scanner also publishes committed events into the current activity feed
+for retained, hash-matched observed blocks. Publication follows the transaction
+and checks the canonical epoch under the reorg lock. It does not depend on a
+timely WSS log notification. Block hash, transaction hash and log index identify
+one event across both sources; late canonical enrichment preserves stronger
+receipt facts. Historical enrichment updates existing observed rows rather than
+introducing historical activity as a new live event.
+
+Current valuation resolves verified factory metadata as well as token metadata.
+Missing decimals remain unknown, not zero; incomplete metadata cannot break the
+stream through a missing dictionary field. A feed reset discards the previous
+sequence cursor before emitting new IDs. Retaining a higher cursor from the old
+process otherwise forces repeated head-only snapshots until the new sequence
+catches up, even though the durable index and HTTP endpoints keep advancing.
+
+The browser refreshes durable index status on a one-second heartbeat and visible
+aggregate views on an independent three-second timer. A pending overview does
+not delay pool or dislocation refreshes. Requests for the same view do not
+overlap, cached rows remain visible during refresh, and hidden pages stop their
+requests. Aggregate health uses indexed coverage time when available, then frame
+time; receiving an old response now does not make its data fresh.
+
+Verify chain-to-screen age on newly displayed rows, not just HTTP duration or a
+moving head counter. Exercise a still-open browser across an application restart
+and a WAL reader-drain cycle; confirm activity delivery, not just reconnection.
 
 The running service commits raw events, cursors, balance jobs, and coalesced
 accounting jobs atomically. A separate accounting worker replays each affected
@@ -647,10 +668,21 @@ it. Failed keys advance the rotation too and retry after the other default
 views have had an opportunity; warming still obeys storage and latency guards.
 
 Published terminal frames use a separate 64-entry cache from the 16-entry cache
-of snapshot-versioned pool-filter and sort intermediates. New metadata revisions
-cannot evict otherwise usable terminal responses. Canonical epoch/revision keys
-and same-key load coalescing remain in place; complete frames keep their original
-`as_of` while a request-triggered refresh runs.
+of snapshot-versioned pool filters, sorts, bucket aggregates and tape rows.
+Obsolete query generations cannot evict otherwise usable terminal responses.
+Canonical epoch/revision keys and same-key load coalescing remain in place;
+complete frames keep their original `as_of` while a request-triggered refresh
+runs.
+
+An admitted snapshot does not wait on a shared query whose producer has not yet
+acquired its snapshot: that producer may be blocked by the WAL admission gate.
+It reads its own snapshot instead without replacing the other producer's
+publication, breaking the snapshot/Future/drain wait cycle.
+
+Pool-ID scans use SQLite JSON aggregation to cross into Python once rather than
+once per catalog row. This avoids hundreds of thousands of GIL handoffs during
+each metadata-generation refresh. The filtered IDs, ordering and page contents
+are unchanged; snapshot deadlines and cancellation remain enabled.
 
 Browser pool requests have a 15-second deadline, including response-body reads.
 An initial failed request displays `POOL DATA UNAVAILABLE · RETRYING`, not

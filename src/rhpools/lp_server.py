@@ -434,6 +434,10 @@ class Handler(BaseHTTPRequestHandler):
         owner_revision = None
         seen_rows = {}
         while not self.runtime.stopping.is_set():
+            if feed["reset"]:
+                # Sequence numbers belong to one feed epoch. Keeping a retired
+                # high cursor would force snapshot-only replay after a restart.
+                block_after = 0
             for item in feed["events"]:
                 block_after = max(block_after, int(item["sequence"]))
                 feed_epoch = feed["feed_epoch"]

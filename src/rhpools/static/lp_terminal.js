@@ -5,6 +5,7 @@
   const MAX_TAPE_ROWS = 150;
   const TABLE_LIMIT = 100;
   const OWNER_STREAM_LIMIT = 200;
+  const AGGREGATE_REFRESH_MS = 3_000;
   const REFRESH_MS = 12_000;
   const HISTORY_REFRESH_MS = 15_000;
   const REQUEST_TIMEOUT_MS = 15_000;
@@ -40,7 +41,6 @@
     context: byId("strip-context"),
     liveBlockLink: byId("live-block-link"),
     liveBlockAge: byId("live-block-age"),
-    liveBlockGap: byId("live-block-gap"),
     status: byId("status-readout"),
     indexStatus: byId("index-status"),
     indexStatusShell: byId("index-status-shell"),
@@ -127,7 +127,6 @@
     ownerViewCache: new Map(),
     poolsEnvelope: null,
     dislocations: null,
-    dislocationsAt: 0,
     dislocationsScope: "",
     dislocationsController: null,
     revision: null,
@@ -1207,11 +1206,10 @@
     const scope = JSON.stringify([state.q, state.protocol]);
     if (scope !== state.dislocationsScope) {
       state.dislocations = null;
-      state.dislocationsAt = 0;
       state.dislocationsScope = scope;
       scheduleRender("dislocations", renderDislocations);
     }
-    if (state.dislocationsController || Date.now() - state.dislocationsAt < REFRESH_MS) return;
+    if (state.dislocationsController) return;
     const controller = new AbortController();
     state.dislocationsController = controller;
     byId("dislocations-table").setAttribute("aria-busy", "true");
@@ -1219,8 +1217,7 @@
       const payload = await api("/dislocations", { ...DISLOCATION_PARAMS, q: state.q, protocol: state.protocol }, controller.signal);
       if (controller.signal.aborted || scope !== state.dislocationsScope || state.tab !== "disloc") return;
       state.dislocations = payload;
-      state.dislocationsAt = Date.now();
-      healthSuccess("dislocations");
+      healthSuccess("dislocations", aggregateHealthTimestamp(payload));
     } catch (error) {
       if (error.name !== "AbortError" && !controller.signal.aborted && scope === state.dislocationsScope && state.tab === "disloc") {
         healthFailure("dislocations", error);
@@ -1277,33 +1274,6 @@
     const observed = liveHead != null && indexedHead != null ? Math.max(0, liveHead - indexedHead) : null;
     if (reported == null) return observed;
     return observed == null ? Math.max(0, reported) : Math.max(0, reported, observed);
-  }
-
-  function renderGlobalGap() {
-    const indexGap = currentIndexGap();
-    const feedGap = state.liveBlock && state.liveBlock.gap;
-    const hasIndexGap = indexGap != null && indexGap > 0;
-    const hasFeedGap = feedGap != null && feedGap !== false && feedGap !== 0;
-    const feedGapCount = typeof feedGap === "number"
-      ? feedGap
-      : feedGap && typeof feedGap === "object"
-        ? finite(feedGap.count != null ? feedGap.count : feedGap.missing)
-        : null;
-    elements.liveBlockGap.hidden = !hasIndexGap && !hasFeedGap;
-    if (elements.liveBlockGap.hidden) {
-      elements.liveBlockGap.title = "";
-      return;
-    }
-    if (hasIndexGap) {
-      elements.liveBlockGap.textContent = `INDEX GAP ${formatCount(indexGap)}${hasFeedGap ? " · FEED GAP" : ""}`;
-      elements.liveBlockGap.title = [
-        `Live chain head is ${formats.integer.format(indexGap)} block${indexGap === 1 ? "" : "s"} ahead of the durable index`,
-        hasFeedGap ? `Feed discontinuity: ${typeof feedGap === "object" ? JSON.stringify(feedGap) : String(feedGap)}` : null
-      ].filter(Boolean).join("\n");
-      return;
-    }
-    elements.liveBlockGap.textContent = feedGapCount != null ? `FEED GAP ${formatCount(feedGapCount)}` : "FEED GAP";
-    elements.liveBlockGap.title = typeof feedGap === "object" ? JSON.stringify(feedGap) : String(feedGap);
   }
 
   function pruneConfirmedOrphanRows(block) {
@@ -1418,7 +1388,6 @@
       block.parent_hash ? `parent ${block.parent_hash}` : null,
       block.source ? `source ${block.source}` : null
     ].filter(Boolean).join(" · ");
-    renderGlobalGap();
     renderStatus();
     renderLiveBlockAge();
   }
@@ -1488,32 +1457,18 @@
 
   function renderStatus() {
     const status = state.status;
+    elements.status.textContent = "INDEX STATUS";
+    elements.status.title = "Open index status details";
+    elements.footer.textContent = "INDEX STATUS";
+    elements.footer.removeAttribute("title");
     if (!status) {
-      elements.status.textContent = "CONNECTING";
-      elements.footer.textContent = "INDEX —";
       renderIndexDetails("");
-      renderGlobalGap();
       return;
     }
     const liveHead = finite(state.liveBlock && state.liveBlock.number) ?? finite(status.head);
     const indexedHead = finite(status.indexed_head);
     const gap = currentIndexGap();
     const lag = finite(status.lag_s);
-    const parts = [
-      liveHead != null ? `HEAD #${formats.integer.format(liveHead)}` : "HEAD —",
-      indexedHead != null ? `INDEX #${formats.integer.format(indexedHead)}` : "INDEXING"
-    ];
-    if (gap != null && gap > 0) {
-      parts.push(`CATCH-UP ${formats.integer.format(gap)} BLOCK${gap === 1 ? "" : "S"}`);
-    } else if (lag != null && lag > 2) {
-      parts.push(`CATCH-UP ${formatAge(lag)}`);
-    } else if (gap === 0) {
-      parts.push("INDEX CURRENT");
-    }
-    elements.status.textContent = parts.join(" · ");
-    elements.footer.textContent = gap != null && gap > 0
-      ? `INDEX ${formats.integer.format(gap)} BLOCK${gap === 1 ? "" : "S"} BEHIND${lag != null && lag > 0 ? ` · ${formatAge(lag)}` : ""}`
-      : lag != null && lag > 2 ? `INDEX ${formatAge(lag)} BEHIND` : "INDEX CURRENT";
     const details = [
       liveHead != null ? `Live head #${formats.integer.format(liveHead)}` : null,
       indexedHead != null ? `Durable indexed head #${formats.integer.format(indexedHead)}` : null,
@@ -1521,10 +1476,7 @@
       lag != null ? `Indexed block time lag ${formatAge(lag)}` : null,
       ...reportedErrorDetails(status.errors)
     ].filter(Boolean).join("\n");
-    elements.status.title = `Open index status details\n${details}`;
-    elements.footer.title = details;
     renderIndexDetails(details);
-    renderGlobalGap();
   }
 
   function renderOverview() {
@@ -1551,8 +1503,19 @@
     ].join(" · ");
   }
 
-  function healthSuccess(name) {
-    state.health.set(name, { ok: true, at: Date.now(), error: "" });
+  function aggregateHealthTimestamp(payload) {
+    const coverage = payload && typeof payload.coverage === "object" ? payload.coverage : null;
+    // Indexed coverage can predate completion of an expensive cached frame.
+    for (const value of [coverage && coverage.to, coverage && coverage.history_to, payload && payload.as_of]) {
+      const timestamp = toDate(value);
+      if (timestamp) return timestamp;
+    }
+    return null;
+  }
+
+  function healthSuccess(name, observedAt = null) {
+    const observed = toDate(observedAt);
+    state.health.set(name, { ok: true, at: observed ? observed.getTime() : Date.now(), error: "" });
     renderHealth();
   }
 
@@ -1864,12 +1827,12 @@
     return { window: state.window, q: state.q, protocol: state.protocol, limit, offset: 0 };
   }
 
-  async function loadResource(name, path, params, controller, apply) {
+  async function loadResource(name, path, params, controller, apply, healthTimestamp = null) {
     try {
       const payload = await api(path, params, controller.signal);
       if (controller.signal.aborted) return;
       apply(payload || {});
-      healthSuccess(name);
+      healthSuccess(name, healthTimestamp ? healthTimestamp(payload) : null);
     } catch (error) {
       if (error.name === "AbortError" || controller.signal.aborted) return;
       healthFailure(name, error);
@@ -1970,8 +1933,6 @@
 
   function fetchPoolView(sort, order) {
     const key = poolViewKey(sort, order);
-    const cached = state.poolViews.get(key);
-    if (cached && Date.now() - cached.at < REFRESH_MS) return Promise.resolve(cached.payload);
     const pending = state.poolRequests.get(key);
     if (pending) return pending.promise;
     const controller = new AbortController();
@@ -1980,11 +1941,11 @@
       try {
         const payload = await api("/pools", params, controller.signal);
         if (controller.signal.aborted) return;
-        state.poolViews.set(key, { payload, at: Date.now() });
+        state.poolViews.set(key, { payload });
         if (key === poolViewKey()) {
           state.poolsEnvelope = payload;
           scheduleRender("pools", renderPools);
-          healthSuccess("pools");
+          healthSuccess("pools", aggregateHealthTimestamp(payload));
         }
         return payload;
       } catch (error) {
@@ -2019,14 +1980,20 @@
     }
   }
 
-  function scheduleAggregateRefresh(delay = REFRESH_MS) {
+  function scheduleAggregateRefresh(delay = AGGREGATE_REFRESH_MS) {
     clearTimeout(state.refreshTimer);
+    state.refreshTimer = null;
     if (state.hidden) return;
-    state.refreshTimer = setTimeout(() => refreshAggregates("timer"), delay);
+    state.refreshTimer = setTimeout(() => {
+      state.refreshTimer = null;
+      refreshAggregates("timer");
+    }, delay);
   }
 
   async function refreshAggregates(reason) {
     if (state.hidden) return;
+    scheduleAggregateRefresh();
+    if (poolPanelActive()) refreshPools();
     if (state.aggregateController) {
       if (reason === "timer") return;
       state.aggregateController.abort();
@@ -2039,16 +2006,17 @@
       requests.push(loadResource("overview", "/overview", { window: state.window }, controller, (payload) => {
         state.overview = payload;
         scheduleRender("overview", renderOverview);
-      }));
+      }, aggregateHealthTimestamp));
     }
-    if (poolPanelActive()) refreshPools();
-    await Promise.all(requests);
-    if (reason === "timer" && !elements.modal.hidden && state.ownerFollow && state.ownerAddress) {
-      loadOwner(state.ownerAddress);
-    }
-    if (generation === state.aggregateGeneration && state.aggregateController === controller) {
-      state.aggregateController = null;
-      scheduleAggregateRefresh();
+    try {
+      await Promise.all(requests);
+      if (reason === "timer" && !elements.modal.hidden && state.ownerFollow && state.ownerAddress) {
+        loadOwner(state.ownerAddress);
+      }
+    } finally {
+      if (generation === state.aggregateGeneration && state.aggregateController === controller) {
+        state.aggregateController = null;
+      }
     }
   }
 
@@ -2302,7 +2270,6 @@
     abortForFilter();
     if (state.tab === "disloc") {
       state.dislocations = null;
-      state.dislocationsAt = 0;
       state.dislocationsScope = "";
       scheduleRender("dislocations", renderDislocations);
     }

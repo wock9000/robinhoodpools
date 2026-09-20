@@ -866,6 +866,12 @@ class MarketStore:
                 int(self._reader_drain_deadline is not None),
             )
 
+    @property
+    def reader_snapshot_active(self) -> bool:
+        """Whether this thread already owns a read transaction."""
+        connection = getattr(self._local, "reader", None)
+        return connection is not None and connection.in_transaction
+
     @contextlib.contextmanager
     def reader_snapshot(
         self, seconds: float | None = None,
