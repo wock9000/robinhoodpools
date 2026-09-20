@@ -1010,29 +1010,6 @@ class MarketStore:
 
             writer_exclusion = False
             store_lock_exclusion = False
-            if reset_mode:
-                # Never wait for application writes or close while owning the
-                # checkpoint lane. The writer turn excludes a concurrent BEGIN;
-                # the nonblocking store lock respects close's reverse lock order.
-                writer_exclusion = self._acquire_writer_turn(
-                    "background", blocking=False,
-                )
-                if writer_exclusion:
-                    store_lock_exclusion = self.lock.acquire(blocking=False)
-                if not store_lock_exclusion:
-                    if writer_exclusion:
-                        self._release_writer_turn()
-                        writer_exclusion = False
-                    active_snapshots, drain_pending = (
-                        self._reader_snapshot_state()
-                    )
-                    return self._checkpoint_metrics(
-                        busy=1,
-                        log_frames=-1,
-                        checkpointed_frames=-1,
-                        active_reader_snapshots=active_snapshots,
-                        reader_drain_pending=drain_pending,
-                    )
 
             try:
                 managed_attempt = False
@@ -1067,6 +1044,27 @@ class MarketStore:
                             checkpointed_frames=-1,
                             active_reader_snapshots=deferred_snapshots,
                             reader_drain_pending=1,
+                        )
+                if reset_mode:
+                    # Close reader admission before competing for the writer.
+                    # Otherwise continuous writes can starve the drain itself.
+                    # Never wait while owning the checkpoint lane: close takes
+                    # these locks in the reverse order.
+                    writer_exclusion = self._acquire_writer_turn(
+                        "background", blocking=False,
+                    )
+                    if writer_exclusion:
+                        store_lock_exclusion = self.lock.acquire(blocking=False)
+                    if not store_lock_exclusion:
+                        active_snapshots, drain_pending = (
+                            self._reader_snapshot_state()
+                        )
+                        return self._checkpoint_metrics(
+                            busy=1,
+                            log_frames=-1,
+                            checkpointed_frames=-1,
+                            active_reader_snapshots=active_snapshots,
+                            reader_drain_pending=drain_pending,
                         )
                 connection = self._checkpoint_connection
                 try:

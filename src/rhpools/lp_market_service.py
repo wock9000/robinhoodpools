@@ -1259,6 +1259,7 @@ class LPMarketService:
         self._warm_stop = threading.Event()
         self._warm_thread: threading.Thread | None = None
         self._warm_error: str | None = None
+        self._warm_cursor = 0
         self._current_view_lock = threading.Lock()
         # Direct-mapped publication makes the overwhelmingly common feed-cache
         # hit lock-free while retaining a strict memory bound. A miss is still
@@ -1798,14 +1799,21 @@ class LPMarketService:
     def _warm_cycle(self) -> int:
         """Fill missing default terminal keys one at a time; bail while busy."""
         warmed = 0
-        for route, params in _WARM_KEYS:
+        for _ in _WARM_KEYS:
             if self._warm_stop.is_set() or not self._warm_allowed():
                 break
+            cursor = self._warm_cursor
+            route, params = _WARM_KEYS[cursor]
             started = time.monotonic()
             try:
                 getattr(self, route)(dict(params))
             finally:
-                self.store.close_reader()
+                try:
+                    self.store.close_reader()
+                finally:
+                    # Advance after every attempted key. An interrupted cycle
+                    # resumes here, while a failed key is retried after wrap.
+                    self._warm_cursor = (cursor + 1) % len(_WARM_KEYS)
             warmed += 1
             self._warm_stop.wait(
                 max(_WARM_PAUSE_SECONDS, time.monotonic() - started),

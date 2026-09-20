@@ -204,7 +204,9 @@ def test_restart_checkpoint_does_not_wait_for_active_writer(tmp_path):
 
     def checkpoint():
         try:
-            checkpoint_results.append(store.checkpoint("RESTART"))
+            checkpoint_results.append(
+                store.checkpoint("RESTART", drain_readers=True)
+            )
         except BaseException as exc:
             failures.append(exc)
         finally:
@@ -221,12 +223,15 @@ def test_restart_checkpoint_does_not_wait_for_active_writer(tmp_path):
         ), "RESTART checkpoint waited behind the active writer"
         assert failures == []
         assert checkpoint_results[0]["busy"] == 1
+        assert checkpoint_results[0]["reader_drain_pending"] == 1
         release_writer.set()
         writer.join(2)
         assert failures == []
-        assert store.read().execute(
-            "SELECT value FROM metadata WHERE key='checkpoint-seed'"
-        ).fetchone()[0] == "2"
+        assert store.checkpoint("RESTART", drain_readers=True)["busy"] == 0
+        with store.reader_snapshot() as connection:
+            assert connection.execute(
+                "SELECT value FROM metadata WHERE key='checkpoint-seed'"
+            ).fetchone()[0] == "2"
         with store.transaction() as connection:
             connection.execute(
                 "UPDATE metadata SET value='3' WHERE key='checkpoint-seed'"

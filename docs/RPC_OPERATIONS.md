@@ -197,8 +197,11 @@ for this index build before serving the new query. A production build took
 43 seconds with the application stopped and SQLite temporary files on disk,
 not tmpfs; that is one measured build, not a startup deadline.
 
-Pool identity recovery tries the pinned getter, canonical transaction calldata,
-then bounded successful PoolManager call traces. A recovered full PoolKey must
+Pool identity recovery tries the pinned getter, canonical receipt evidence and
+transaction calldata, then bounded successful PoolManager call traces.
+An Initialize receipt already contains the hash-checked full PoolKey and creation
+block. It does not need ERC-20 transfers, a PositionManager NFT, or trace state.
+A recovered full PoolKey must
 hash to the requested pool ID, and its block must still be canonical after the
 RPC work. Missing trace capability remains a retryable error, not a guessed
 identity. Durable recovery clears the matching current-feed failure while
@@ -209,6 +212,9 @@ cursor coverage. If an uncovered backlog exceeds the bounded replay queue, the
 subscription reconnects and retains a recovery target; acknowledgement alone
 does not clear the error. The durable scanner must cover the dropped interval
 before the backlog reports recovery.
+Retiring duplicates already covered by the durable cursor records discard
+metrics without declaring a new failure. An ordinary pending tail does not
+extend a recovery target; only an uncovered queue beyond the bound does.
 
 The browser refreshes durable index status on its one-second heartbeat,
 independently of the slower overview refresh. Requests do not overlap and
@@ -558,6 +564,8 @@ followed by a 60-second admission cooldown if it expires.
 Once owned snapshots drain, routine maintenance uses `RESTART`, not `TRUNCATE`.
 Reset attempts take a nonblocking background writer turn before acquiring
 SQLite's writer lock; an active application writer makes the reset defer.
+Reader admission closes before this writer attempt, so continuous writes
+cannot prevent the drain from starting.
 New application writes wait behind an admitted reset instead of failing
 `BEGIN` with `database is locked`. External-reader lock waiting is bounded
 to 100 ms. `PASSIVE` checkpointing remains independent of writer admission.
@@ -616,6 +624,11 @@ older drop-in still controls these values. Resource limits are not a host-wide
 reliability guarantee; compare cursor gain against chain gain under the actual
 load. A single fast scan does not establish sustainable catch-up.
 
+Terminal warming retains its next-key position across short writer-idle windows.
+It no longer restarts at the first overview key whenever ingestion interrupts
+it. Failed keys advance the rotation too and retry after the other default
+views have had an opportunity; warming still obeys storage and latency guards.
+
 Browser pool requests have a 15-second deadline, including response-body reads.
 An initial failed request displays `POOL DATA UNAVAILABLE · RETRYING`, not
 indefinite syncing. Completed cached views remain available during refresh.
@@ -626,8 +639,20 @@ Check filesystem capacity and copy-on-write behavior when durable commit time
 dominates. A nearly full Btrfs volume can make SQLite's write workload expensive
 even on NVMe. For a dedicated non-CoW database directory, set `chattr +C` while
 the directory is empty, before copying any database or sidecar files. This
-disables Btrfs data checksums and compression for those files; SQLite WAL
-checksums and `synchronous=FULL` remain in use.
+disables Btrfs data checksums and compression for those files. SQLite WAL
+checksums and the writer/checkpoint synchronization settings above remain.
+
+The `+C` attribute does not coalesce existing fragmented extents. In a roughly
+483 GiB production database, bounded FIEMAP samples near the beginning and
+middle had 4 KiB median extents. PASSIVE checkpoints took 11–31 seconds;
+kernel samples found extent-tree reads inside database `fsync` and WAL
+`pwrite64` waiting on writeback folios. A bounded 64 MiB defragmentation pilot
+coalesced the first range into one 64 MiB extent without changing database data.
+For diagnosed fragmentation, `btrfs filesystem defragment -f -s OFFSET
+-l 1G -t 32M DATABASE` limits each maintenance range. Use background I/O priority
+and retain disk headroom. Defragmentation can break shared reflinks and increase
+space usage; see the [Btrfs filesystem documentation](https://btrfs.readthedocs.io/en/latest/btrfs-filesystem.html).
+Do not delete a journal or weaken synchronization to hide filesystem latency.
 
 If a durable commit fails because storage is full or unavailable, the store
 rolls the failed transaction back before the worker retries. Runtime-status

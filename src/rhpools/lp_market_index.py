@@ -1169,6 +1169,19 @@ class MarketIndexer:
             and _lower(log.get("address")) == POOL_MANAGER
         ]
         events = decode_logs(manager_logs, {}, {number: header})
+        # Initialize proves the full PoolKey without moving currencies or
+        # populating PositionManager.poolKeys. Reuse its hash-checked decoder.
+        for event in events:
+            if event.get("kind") != "create" or event.get("pool_id") != pool_id:
+                continue
+            pool = self._normalize_pool(event["data"]["pool"])
+            if pool is not None:
+                pool.update({
+                    "_observed_block": number,
+                    "_observed_hash": block_hash,
+                    "_observation_basis": "PoolManager.Initialize:full_poolKey_hash",
+                })
+                return pool
         if not any(_lower(event.get("pool_id")) == pool_id for event in events):
             return None
         encoded = transaction.get("input")
@@ -2080,13 +2093,8 @@ class MarketIndexer:
         health_error: BaseException | str | None = publish_error
         health_values: dict[str, Any] = {"activity_feed_source": source}
         backlog_error = False
+        discarded: list[int] = []
         if len(pending_logs) > HEAD_REPLAY_LIMIT * 2:
-            backlog_through = max(pending_logs)
-            prior_through = self._activity_backlog_recovery_through
-            self._activity_backlog_recovery_through = max(
-                backlog_through,
-                prior_through if prior_through is not None else backlog_through,
-            )
             live = self.store.cursor("live") or {}
             try:
                 durable_through = int(live.get("block_number", -1))
@@ -2101,13 +2109,7 @@ class MarketIndexer:
                 pending_logs.pop(number, None)
                 first_seen.pop(number, None)
             if discarded:
-                backlog_error = True
                 self._activity_stale_blocks_discarded += len(discarded)
-                if health_error is None:
-                    health_error = (
-                        f"discarded {len(discarded)} stale activity blocks "
-                        f"already covered by durable live index"
-                    )
                 health_values.update({
                     "activity_feed_stale_blocks_discarded":
                         self._activity_stale_blocks_discarded,
@@ -2120,6 +2122,14 @@ class MarketIndexer:
                     },
                 })
             if len(pending_logs) > HEAD_REPLAY_LIMIT * 2:
+                # Only an uncovered queue beyond the bound needs recovery.
+                # Dropping durable duplicates leaves the normal pending tail.
+                backlog_through = max(pending_logs)
+                prior_through = self._activity_backlog_recovery_through
+                self._activity_backlog_recovery_through = max(
+                    backlog_through,
+                    prior_through if prior_through is not None else backlog_through,
+                )
                 backlog_error = True
                 health_error = (
                     f"activity backlog has {len(pending_logs)} blocks outside "
@@ -2156,11 +2166,17 @@ class MarketIndexer:
         if recovery_ready:
             self._activity_backlog_error_active = False
             self._activity_backlog_recovery_through = None
+        if recovery_ready or published and not self._activity_backlog_error_active:
             health_values["activity_feed_recovered_at"] = time.time()
-            self._set_runtime("activity_feed", **health_values)
-        elif published and not self._activity_backlog_error_active:
-            health_values["activity_feed_recovered_at"] = time.time()
-            self._set_runtime("activity_feed", **health_values)
+        if recovery_ready or published or discarded:
+            with self._status_lock:
+                active_error = (
+                    self._errors.get("activity_feed")
+                    if self._activity_backlog_error_active else None
+                )
+            self._set_runtime(
+                "activity_feed", error=active_error, **health_values,
+            )
 
     def _activity_wss_once(
         self, url: str, *, session_deadline: float | None = None,

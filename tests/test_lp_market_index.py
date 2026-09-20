@@ -38,6 +38,7 @@ from rhpools.lp_market_protocols import (
     POOL_MANAGER,
     TRANSFER_TOPIC,
     V4_DONATE_TOPIC,
+    V4_INITIALIZE_TOPIC,
     V4_MODIFY_LIQUIDITY_TOPIC,
     V4_SWAP_TOPIC,
 )
@@ -555,6 +556,38 @@ def test_activity_feed_secondary_session_is_bounded_and_fails_back(
         store.close()
 
 
+def test_covered_activity_discards_keep_normal_pending_tail_healthy():
+    store = MarketStore(":memory:")
+    scanner = indexer(store)
+    pending = {
+        number: [{"blockNumber": hex(number)}]
+        for number in range(1, HEAD_REPLAY_LIMIT * 2 + 2)
+    }
+    first_seen = {number: 0.0 for number in pending}
+    durable_number = HEAD_REPLAY_LIMIT + 1
+    durable = header(durable_number)
+    try:
+        store.ingest([durable], [], lane="live", cursor={
+            "block_number": durable_number,
+            "block_hash": durable["hash"],
+            "timestamp": int(durable["timestamp"], 16),
+        })
+        scanner._flush_activity_logs(
+            pending, first_seen, max(pending), source="test", force=True,
+        )
+        assert set(pending) == set(range(
+            durable_number + 1, HEAD_REPLAY_LIMIT * 2 + 2,
+        ))
+        assert set(first_seen) == set(pending)
+        status = scanner.runtime_status()
+        assert "activity_feed" not in status["errors"]
+        assert status["activity_feed_stale_blocks_discarded"] == durable_number
+        assert store.cursor("live")["block_number"] == durable_number
+    finally:
+        scanner.close()
+        store.close()
+
+
 def test_activity_backlog_waits_for_durable_coverage_and_recovers(monkeypatch):
     store = MarketStore(":memory:")
     scanner = indexer(store)
@@ -594,19 +627,8 @@ def test_activity_backlog_waits_for_durable_coverage_and_recovers(monkeypatch):
         assert status["activity_feed_last_discard"]["durable_through"] == (
             HEAD_REPLAY_LIMIT * 2 + 1
         )
-        assert "already covered by durable live index" in (
-            status["errors"]["activity_feed"]
-        )
-
-        scanner._flush_activity_logs(
-            pending, first_seen, max(pending), source="test", force=True,
-        )
-        durable_recovery = scanner.runtime_status()
-        assert "activity_feed" not in durable_recovery["errors"]
-        assert durable_recovery["activity_feed_stale_blocks_discarded"] == (
-            HEAD_REPLAY_LIMIT + 1
-        )
-        assert durable_recovery["activity_feed_recovered_at"] > 0
+        assert "activity_feed" not in status["errors"]
+        assert status["activity_feed_recovered_at"] > 0
 
         current = header(HEAD_REPLAY_LIMIT * 2 + 2)
         with scanner._feed_condition:
@@ -1098,6 +1120,75 @@ def test_scans_durably_replay_unregistered_v4_pool_keys(
         market.published.clear()
         assert scanner._publish_stored_pool_page() is True
         assert [published["id"] for published in market.published] == [pool_id]
+    finally:
+        scanner.close()
+        store.close()
+
+
+def test_poolkey_recovery_uses_initialization_receipt_without_transfers_or_trace():
+    from eth_utils import keccak
+
+    observed = header(100)
+    token0, token1, hook = ("0x" + byte * 20 for byte in ("21", "22", "44"))
+    fee, spacing = 3000, 60
+    tx_hash = "0x" + "61" * 32
+
+    def word(value):
+        return f"{value & ((1 << 256) - 1):064x}"
+
+    pool_id = "0x" + keccak(bytes.fromhex("".join(
+        word(value) for value in (
+            int(token0, 16), int(token1, 16), fee, spacing, int(hook, 16),
+        )
+    ))).hex()
+    pool_log = {
+        "address": POOL_MANAGER,
+        "blockNumber": observed["number"],
+        "blockHash": observed["hash"],
+        "transactionHash": tx_hash,
+        "transactionIndex": "0x0",
+        "logIndex": "0x0",
+        "topics": [
+            V4_INITIALIZE_TOPIC, pool_id,
+            "0x" + word(int(token0, 16)), "0x" + word(int(token1, 16)),
+        ],
+        "data": "0x" + "".join(
+            word(value) for value in (fee, spacing, int(hook, 16), 1 << 96, 0)
+        ),
+        "removed": False,
+    }
+    transaction = {
+        "hash": tx_hash, "blockHash": observed["hash"],
+        "blockNumber": observed["number"], "input": "0xdeadbeef",
+    }
+    receipt = {
+        "transactionHash": tx_hash, "blockHash": observed["hash"],
+        "logs": [pool_log],
+    }
+
+    class InitializeRpc(StaticRpc):
+        def call(self, method, params):
+            if method == "eth_getTransactionByHash":
+                return transaction
+            if method == "eth_getTransactionReceipt":
+                return receipt
+            if method == "debug_traceTransaction":
+                raise RpcError("historical trace state unavailable")
+            return super().call(method, params)
+
+    store = MarketStore(":memory:")
+    scanner = indexer(store, InitializeRpc(100))
+    try:
+        resolved, failures = scanner._resolve_current_v4_inputs({
+            pool_id: ([pool_log], tx_hash),
+        })
+        assert failures == {}
+        pool = resolved[pool_id]
+        assert (pool["token0"], pool["token1"], pool["tick_spacing"]) == (
+            token0, token1, spacing,
+        )
+        assert pool["created_block"] == 100
+        assert pool["source"] == "PoolManager.Initialize"
     finally:
         scanner.close()
         store.close()

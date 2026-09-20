@@ -1471,6 +1471,80 @@ def test_warmer_skips_while_paused_and_fills_gaps_one_at_a_time(
         app.close()
 
 
+def test_warmer_resumes_across_short_writer_windows_and_retries_failures(
+        tmp_path, monkeypatch):
+    app = service(tmp_path / "market.sqlite")
+    monkeypatch.setattr(market_service_module, "_WARM_PAUSE_SECONDS", 0.0)
+    opportunity = {"remaining": 0}
+    blocked = {"value": False}
+    real_reader_snapshot = app.store.reader_snapshot
+    real_overview = app.overview
+    overview_failed = {"value": False}
+
+    def writer_idle():
+        if not opportunity["remaining"]:
+            return False
+        opportunity["remaining"] -= 1
+        return True
+
+    def guarded_reader_snapshot(*args, **kwargs):
+        if blocked["value"]:
+            raise AssertionError("terminal request missed its warmed value")
+        return real_reader_snapshot(*args, **kwargs)
+
+    def fail_overview_once(params):
+        if not overview_failed["value"]:
+            overview_failed["value"] = True
+            raise RuntimeError("transient warm failure")
+        return real_overview(params)
+
+    monkeypatch.setattr(app, "_writer_idle", writer_idle)
+    monkeypatch.setattr(app.store, "reader_snapshot", guarded_reader_snapshot)
+    monkeypatch.setattr(app, "overview", fail_overview_once)
+
+    def cycle():
+        opportunity["remaining"] = 1
+        result = {}
+
+        def run():
+            try:
+                result["warmed"] = app._warm_cycle()
+            except BaseException as exc:
+                result["error"] = exc
+
+        app._warm_thread = threading.Thread(target=run)
+        app._warm_thread.start()
+        app._warm_thread.join(30)
+        assert not app._warm_thread.is_alive()
+        if "error" in result:
+            raise result["error"]
+        return result["warmed"]
+
+    try:
+        app.store.upsert_pools(pools())
+        with pytest.raises(RuntimeError, match="transient warm failure"):
+            cycle()
+
+        for _ in range(len(market_service_module._WARM_KEYS) - 1):
+            assert cycle() == 1
+
+        blocked["value"] = True
+        dislocations = app.dislocations(
+            dict(market_service_module._WARM_KEYS[-1][1]),
+        )
+        assert dislocations["rows"] == []
+        assert dislocations["sort"] == "net"
+
+        blocked["value"] = False
+        assert cycle() == 1
+        blocked["value"] = True
+        overview = app.overview(dict(market_service_module._WARM_KEYS[0][1]))
+        assert overview["coverage"]["window"] == "1h"
+    finally:
+        app._warm_thread = None
+        app.close()
+
+
 def test_owner_rollup_is_used_when_built_and_live_aggregate_otherwise(
         tmp_path, monkeypatch):
     app = service(tmp_path / "market.sqlite")
