@@ -1241,8 +1241,10 @@ class MarketIndexer:
 
     def _current_v4_trace_pools(
         self, trace: Mapping[str, Any], number: int, block_hash: str,
+        requested_pool_ids: Sequence[str],
     ) -> dict[str, dict[str, Any]]:
         pools: dict[str, dict[str, Any]] = {}
+        remaining = set(requested_pool_ids)
         try:
             for index, (_path, frame, failed) in enumerate(_walk_trace(trace)):
                 if index >= CURRENT_POOL_TRACE_MAX_FRAMES:
@@ -1268,6 +1270,8 @@ class MarketIndexer:
                     )
                 raw = self._current_v4_trace_key(encoded)
                 pool_id = "0x" + keccak(raw).hex()
+                if pool_id not in remaining:
+                    continue
                 pool = self._current_v4_pool_key(
                     pool_id, raw, number, block_hash,
                     source="trace.PoolKey",
@@ -1277,6 +1281,11 @@ class MarketIndexer:
                         "PoolKey manager trace failed full-key verification"
                     )
                 pools[pool_id] = pool
+                remaining.remove(pool_id)
+                # Later unrelated calls cannot invalidate a verified PoolKey.
+                # Stop only after every requested identity has been recovered.
+                if not remaining:
+                    return pools
         except ProtocolDecodeError as exc:
             raise RpcError(f"PoolKey call trace is malformed: {exc}") from exc
         except RecursionError as exc:
@@ -1529,6 +1538,7 @@ class MarketIndexer:
                 try:
                     trace_pools = self._current_v4_trace_pools(
                         trace, entry["number"], entry["block_hash"],
+                        pool_ids,
                     )
                 except Exception as exc:
                     errors.update({pool_id: exc for pool_id in pool_ids})

@@ -206,6 +206,11 @@ hash to the requested pool ID, and its block must still be canonical after the
 RPC work. Missing trace capability remains a retryable error, not a guessed
 identity. Durable recovery clears the matching current-feed failure while
 leaving other unresolved pools visible.
+Trace traversal stops once every requested PoolKey in the transaction is
+verified. The frame limit bounds the search, not the total transaction size:
+unrelated later calls must not discard an already complete result. Searches
+that exhaust the budget before finding all requested keys still fail visibly,
+and recovered identities still pass the post-trace canonical recheck.
 
 Activity logs leave the replay queue only after successful handling or durable
 cursor coverage. If an uncovered backlog exceeds the bounded replay queue, the

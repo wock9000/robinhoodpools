@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from rhpools.lp_market_index import (
+    CURRENT_POOL_TRACE_MAX_FRAMES,
     FACTORY_SELECTOR,
     FEED_SECONDARY_MAX_SECONDS,
     HEAD_REPLAY_LIMIT,
@@ -1286,6 +1287,30 @@ def test_poolkey_fallback_reads_bounded_nested_manager_trace(manager_method):
             "output": "0x" + "00" * 64,
         }],
     }
+    other_key = "".join(word(value) for value in (
+        int(token0, 16), int(token1, 16), 3000, spacing, int(hook, 16),
+    ))
+    other_pool_id = "0x" + keccak(bytes.fromhex(other_key)).hex()
+    other_log = {
+        **pool_log,
+        "logIndex": "0x2",
+        "topics": [topic, other_pool_id, pool_log["topics"][2]],
+    }
+    receipt["logs"].append(other_log)
+    trace["calls"].append({
+        "type": "CALL",
+        "to": POOL_MANAGER,
+        "input": manager_input[:10] + other_key + manager_input[330:],
+    })
+    # Valid identities must survive unrelated calls beyond the traversal budget.
+    trace["calls"].extend(
+        {"type": "CALL", "to": custody, "input": "0x"}
+        for _ in range(CURRENT_POOL_TRACE_MAX_FRAMES)
+    )
+    candidates = {
+        pool_id: ([pool_log], tx_hash),
+        other_pool_id: ([other_log], tx_hash),
+    }
 
     class TraceRpc(StaticRpc):
         def __init__(self):
@@ -1312,19 +1337,31 @@ def test_poolkey_fallback_reads_bounded_nested_manager_trace(manager_method):
     with scanner._feed_condition:
         scanner._observed_blocks[100] = (observed, [])
     try:
-        resolved, failures = scanner._resolve_current_v4_inputs({
-            pool_id: ([pool_log], tx_hash),
-        })
+        resolved, failures = scanner._resolve_current_v4_inputs(candidates)
         assert failures == {}
+        assert set(resolved) == set(candidates)
         assert resolved[pool_id]["source"] == "trace.PoolKey"
         assert (resolved[pool_id]["token0"], resolved[pool_id]["token1"]) == (
             token0, token1,
         )
+        assert resolved[other_pool_id]["fee_ppm"] == 3000
+
+        # A target not reached within the budget still fails visibly.
+        trace["calls"].insert(0, {
+            "type": "CALL",
+            "calls": [
+                {"type": "CALL", "to": custody, "input": "0x"}
+                for _ in range(CURRENT_POOL_TRACE_MAX_FRAMES)
+            ],
+        })
+        resolved, failures = scanner._resolve_current_v4_inputs(candidates)
+        assert resolved == {}
+        assert set(failures) == set(candidates)
+        assert all(isinstance(error, RpcError) for error in failures.values())
+        trace["calls"].pop(0)
 
         rpc.trace_error = RpcError("trace RPC unavailable: Goldsky timeout")
-        resolved, failures = scanner._resolve_current_v4_inputs({
-            pool_id: ([pool_log], tx_hash),
-        })
+        resolved, failures = scanner._resolve_current_v4_inputs(candidates)
         assert resolved == {}
         assert "trace RPC unavailable: Goldsky timeout" in str(
             failures[pool_id]
@@ -1339,9 +1376,7 @@ def test_poolkey_fallback_reads_bounded_nested_manager_trace(manager_method):
                 scanner._observed_blocks[100] = (replaced, [])
 
         rpc.on_trace = reorg_during_trace
-        resolved, failures = scanner._resolve_current_v4_inputs({
-            pool_id: ([pool_log], tx_hash),
-        })
+        resolved, failures = scanner._resolve_current_v4_inputs(candidates)
         assert resolved == {}
         assert isinstance(failures[pool_id], CanonicalConflict)
     finally:
