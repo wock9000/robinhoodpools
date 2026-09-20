@@ -226,6 +226,64 @@ class Service:
         }
 
 
+def test_token_lookup_work_does_not_scale_with_unrelated_catalog(monkeypatch):
+    store = MarketStore(":memory:")
+    pool_ids = ("0x" + "a1" * 20, "0x" + "a2" * 20)
+    pools = [
+        SimpleNamespace(
+            id=pool_id, address=pool_id, kind="v2",
+            token0=token0, token1=token1, factory=V2_FACTORY,
+            created_block=7, source="census",
+        )
+        for pool_id, token0, token1 in (
+            (pool_ids[0], TOKEN, HIGH),
+            (pool_ids[1], LOW, TOKEN),
+        )
+    ]
+    rpc = SnapshotRpc({
+        (pool_id, RESERVES_SELECTOR): abi_encode(
+            ["uint112", "uint112", "uint32"], [2_000_000, 9_000_000, 10],
+        )
+        for pool_id in pool_ids
+    })
+    service = Service(store, rpc, pools)
+    api = PublicMarketAPI(service, cache_ttl=0)
+    try:
+        with store.transaction() as connection:
+            connection.executemany(
+                "INSERT INTO lp_catalog_search "
+                "(id,protocol,token0,token1,label,subtitle,href) "
+                "VALUES (?,'v2',?,?,'unrelated','','')",
+                ((f"0x{index:040x}", LOW, HIGH) for index in range(20_000)),
+            )
+            store._upsert_catalog_batch(connection, pools, service.market.universe.tokens)
+            store._set_metadata(connection, "catalog_search_signature", "ready")
+        steps = 0
+        connect = store._connect
+
+        def budgeted_connect(**kwargs):
+            connection = connect(**kwargs)
+
+            def interrupt_scan():
+                nonlocal steps
+                steps += 1000
+                return int(steps > 10_000)
+
+            connection.set_progress_handler(interrupt_scan, 1000)
+            return connection
+
+        monkeypatch.setattr(store, "_connect", budgeted_connect)
+        result = api.pools({"token": TOKEN})
+        assert {row["pool_id"] for row in result["pools"]} == set(pool_ids)
+        assert {row["matched_currency"] for row in result["pools"]} == {
+            "currency0", "currency1",
+        }
+        assert result["coverage"]["state"]["available_pools"] == 2
+    finally:
+        api.close()
+        store.close()
+
+
 def test_lookup_matches_both_currency_sides_and_recovers_canonical_dynamic_v4_key():
     v2 = "0x" + "a1" * 20
     v3 = "0x" + "b2" * 20

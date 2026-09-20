@@ -711,6 +711,17 @@ class MarketStore:
                         "fees_usd,deposit_usd,proceeds_usd)"
                     )
                 self.connection.execute("PRAGMA user_version=14")
+            if int(self.connection.execute("PRAGMA user_version").fetchone()[0]) < 15:
+                ownership_installed = self.connection.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type='table' AND name='lp_ownership_intervals'"
+                ).fetchone() is not None
+                if ownership_installed:
+                    self.connection.execute(
+                        "CREATE INDEX IF NOT EXISTS lp_ownership_intervals_custody "
+                        "ON lp_ownership_intervals(custody) WHERE custody IS NOT NULL"
+                    )
+                self.connection.execute("PRAGMA user_version=15")
             self.connection.execute(
                 "CREATE INDEX IF NOT EXISTS pending_reprojection_order_idx "
                 "ON pending_reprojection(block_number,tx_index,log_index,event_id)"

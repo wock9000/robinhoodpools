@@ -273,7 +273,8 @@ class PublicMarketAPI:
                     search_ready = False
             if search_ready:
                 indexed = connection.execute(
-                    "SELECT id FROM lp_catalog_search WHERE token0=? OR token1=? ORDER BY id",
+                    "SELECT id FROM lp_catalog_search "
+                    "WHERE token0=? COLLATE NOCASE OR token1=? COLLATE NOCASE ORDER BY id",
                     (token, token),
                 ).fetchall()
                 catalog_ids = [str(row["id"]).lower() for row in indexed]
