@@ -28,6 +28,12 @@ headers while keeping general local state fallback disabled, put the local URL
 in a private file listed under `LP_RPC_HEAD_URL_FILES` and retain
 `LP_RPC_DISABLE_LOCAL_FALLBACK=1`.
 
+Null transaction-hash and receipt lookups continue through the configured
+receipt sources. A lagging local node must not make an already observed
+transaction permanently unresolved. Successful batch siblings are retained;
+an all-null lookup remains null, and a valid null response is not counted as
+a provider outage. Transport failures remain errors.
+
 Header batches use the existing 100-item bound and endpoint-wide quota.
 Post-log missing headers and the duplicate end-boundary verification share one
 batch. Log/header hash checks and the before/after end-hash check still precede
@@ -530,8 +536,9 @@ live ingestion and head observation remain available.
 Bulk history, enrichment, projection, metadata, repair, balances and accounting
 pause at 512 MiB of uncheckpointed WAL pages and resume at 128 MiB. Allocated WAL
 length alone does not pause work because SQLite can reuse checkpointed frames.
-At 1 GiB of active WAL pages, maintenance closes admission to new analytics
-snapshots. In-flight readers get the normal 15-second snapshot budget to finish
+At 1 GiB of active WAL pages, or when uncheckpointed backlog reaches the bulk
+pause threshold, maintenance closes admission to new analytics snapshots.
+In-flight readers get the normal 15-second snapshot budget to finish
 before drain cancellation applies; ordinary resets no longer immediately abort
 healthy queries. Only snapshots admitted before that drain generation can be
 interrupted by it, so readers admitted after fail-open are not canceled by an
@@ -548,12 +555,25 @@ Bulk workers also pause during the drain. Cached complete frames remain
 available while fresh analytics wait. A drain lasts at most 60 seconds,
 followed by a 60-second admission cooldown if it expires.
 
-Once owned snapshots drain, `TRUNCATE` allows at most 100 ms of SQLite lock
-waiting. Busy resets retry on the next maintenance pass; successful resets are
-limited to one per minute. An oversized but already-reused allocation gets only
-an ordinary nonwaiting reset, without draining analytics. The journal is never
-deleted directly. Both writer and maintenance connections retain
-`synchronous=FULL`.
+Once owned snapshots drain, routine maintenance uses `RESTART`, not `TRUNCATE`.
+Reset attempts take a nonblocking background writer turn before acquiring
+SQLite's writer lock; an active application writer makes the reset defer.
+New application writes wait behind an admitted reset instead of failing
+`BEGIN` with `database is locked`. External-reader lock waiting is bounded
+to 100 ms. `PASSIVE` checkpointing remains independent of writer admission.
+
+Managed writers use `journal_size_limit=-1`, so the next live insert cannot
+silently truncate the allocated WAL after a successful restart. The allocation
+is reused; allocated length alone does not trigger maintenance. Explicit
+truncation is reserved for planned maintenance, not normal serving traffic.
+Successful size-triggered resets have a one-minute cooldown; active backlog
+pressure bypasses that cooldown, but an expired reader drain retains its
+admission cooldown. The journal is never deleted directly.
+
+The checkpoint connection uses `synchronous=FULL`; the existing writer setting
+is `synchronous=NORMAL`. A power failure may lose recent uncheckpointed commits,
+which the canonical index must re-derive. The changes above do not alter these
+durability settings.
 
 `LP_DISK_RESERVE_GIB` pauses the same bulk workers when free space falls below the
 configured reserve. They resume above the reserve plus the larger of 1 GiB or

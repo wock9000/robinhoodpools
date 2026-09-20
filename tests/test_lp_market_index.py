@@ -1529,11 +1529,17 @@ def test_checkpoint_maintenance_continues_while_projection_is_blocked(
         with store.transaction() as connection:
             connection.execute("CREATE TABLE checkpoint_probe(value TEXT)")
             connection.execute("INSERT INTO checkpoint_probe VALUES('committed')")
-        wal_path = store.path.with_name(store.path.name + "-wal")
+        committed_at = time.time()
         deadline = time.monotonic() + 1
-        while wal_path.stat().st_size and time.monotonic() < deadline:
+        while True:
+            checkpoint_status = scanner.runtime_status().get("wal_checkpoint") or {}
+            if (
+                checkpoint_status.get("observed_at", 0) >= committed_at
+                and checkpoint_status.get("backlog_bytes") == 0
+            ):
+                break
+            assert time.monotonic() < deadline, checkpoint_status
             time.sleep(0.01)
-        assert wal_path.stat().st_size == 0
         assert store.read().execute(
             "SELECT value FROM checkpoint_probe"
         ).fetchone()[0] == "committed"
@@ -1605,19 +1611,17 @@ def test_storage_pressure_hysteresis_pauses_and_resumes_history(
             "backlog_bytes": 0, "wal_bytes": 0,
         },
     ))
-    checkpoint_modes: list[str] = []
     last_passive: dict[str, int] = {}
 
     def checkpoint(mode="PASSIVE", *, drain_readers=False):
         nonlocal last_passive
-        checkpoint_modes.append(mode)
-        if mode == "TRUNCATE":
+        if mode == "RESTART":
             return {
                 "busy": int(last_passive["backlog_bytes"] > 0),
                 "log_frames": 0,
                 "checkpointed_frames": 0,
                 "backlog_bytes": 0,
-                "wal_bytes": wal_reset if last_passive["backlog_bytes"] else 0,
+                "wal_bytes": wal_reset,
                 "log_bytes": 0,
                 "active_reader_snapshots": 0,
                 "reader_drain_pending": 0,
@@ -1667,9 +1671,6 @@ def test_storage_pressure_hysteresis_pauses_and_resumes_history(
         assert status["storage_pause_reasons"] == ["free_space"]
         assert status["storage_pressure"]["wal_backlog"] is False
         assert status["storage_pressure"]["free_space"] is True
-        assert status["wal_checkpoint"]["mode"] == "TRUNCATE"
-        assert status["wal_checkpoint"]["passive"]["wal_bytes"] == wal_reset
-        assert checkpoint_modes[-2:] == ["PASSIVE", "TRUNCATE"]
 
         scanner._storage_maintenance_once()
         assert scanner.runtime_status()["storage_paused"] is True
@@ -1712,8 +1713,8 @@ def test_wal_backpressure_preserves_live_ingestion(monkeypatch):
     monkeypatch.setattr(
         store,
         "checkpoint",
-        lambda mode="PASSIVE": {
-            "busy": 0,
+        lambda mode="PASSIVE", *, drain_readers=False: {
+            "busy": int(mode != "PASSIVE"),
             "log_frames": 25,
             "checkpointed_frames": 0,
             "backlog_bytes": wal_pause,
@@ -1797,8 +1798,14 @@ def test_busy_wal_reset_retries_after_reader_releases(tmp_path):
 
         reader.rollback()
         scanner._storage_maintenance_once()
-        assert wal.stat().st_size < allocated
-        assert reader.execute("SELECT value FROM reset_probe").fetchone()[0] == 7
+        assert wal.stat().st_size == allocated
+        with store.transaction() as connection:
+            connection.execute("INSERT INTO reset_probe VALUES(8)")
+        assert [row[0] for row in reader.execute(
+            "SELECT value FROM reset_probe ORDER BY value"
+        )] == [7, 8]
+        assert wal.stat().st_size == allocated
+        assert store.checkpoint()["log_bytes"] < allocated
     finally:
         reader.rollback()
         scanner.close()

@@ -5266,19 +5266,24 @@ class MarketIndexer:
         checkpoint = passive
         reset_mode: str | None = None
         now = time.monotonic()
+        drain_needed = bool(
+            checkpoint["reader_drain_pending"]
+            or (
+                self.wal_backlog_pause_bytes
+                and checkpoint["backlog_bytes"] >= self.wal_backlog_pause_bytes
+            )
+        )
         if (
             self.wal_reset_bytes
             and (
-                checkpoint["wal_bytes"] >= self.wal_reset_bytes
-                or checkpoint["reader_drain_pending"]
+                checkpoint["log_bytes"] >= self.wal_reset_bytes
+                or drain_needed
             )
-            and now >= self._wal_reset_after
+            and (now >= self._wal_reset_after or drain_needed)
         ):
-            reset = self.store.checkpoint(
-                "TRUNCATE",
-                drain_readers=bool(checkpoint["reader_drain_pending"])
-                or checkpoint["log_bytes"] >= self.wal_reset_bytes,
-            )
+            # Reuse the allocated journal. Truncating a large WAL while serving
+            # traffic can stall the filesystem and contend with live BEGINs.
+            reset = self.store.checkpoint("RESTART", drain_readers=True)
             if not reset["busy"]:
                 self._wal_reset_after = now + WAL_RESET_RETRY_S
             checkpoint = (
@@ -5291,7 +5296,7 @@ class MarketIndexer:
                 }
                 if reset["busy"] else reset
             )
-            reset_mode = "TRUNCATE"
+            reset_mode = "RESTART"
 
         free: int | None = None
         disk_error: OSError | None = None

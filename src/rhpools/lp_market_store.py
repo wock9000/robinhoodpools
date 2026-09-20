@@ -297,7 +297,10 @@ class MarketStore:
             # startup. Standalone stores retain automatic checkpoint fallback.
             pages = 65536 if self._checkpoint_on_commit else 0
             connection.execute(f"PRAGMA wal_autocheckpoint={pages}")
-            connection.execute("PRAGMA journal_size_limit=268435456")
+            # Managed WAL resets reuse allocation. A finite size limit would
+            # move truncation into the next live INSERT after RESTART instead.
+            journal_limit = 268435456 if self._checkpoint_on_commit else -1
+            connection.execute(f"PRAGMA journal_size_limit={journal_limit}")
         elif checkpoint:
             # A checkpoint connection writes database pages even though it
             # never owns application transactions. Keep its durability
@@ -1000,76 +1003,113 @@ class MarketStore:
         if mode not in _CHECKPOINT_MODES:
             supported = ", ".join(sorted(_CHECKPOINT_MODES))
             raise ValueError(f"checkpoint mode must be one of {supported}")
+        reset_mode = mode != "PASSIVE"
         with self._checkpoint_lock:
             if self._closed:
                 raise MarketStoreError("market store is closed")
 
-            managed_attempt = False
-            deferred_snapshots = 0
-            managed_drain = drain_readers and mode == "TRUNCATE" and not self._uri
-            if managed_drain:
-                with self._reader_snapshot_condition:
-                    now = time.monotonic()
-                    self._expire_reader_drain_locked(now)
-                    if (
-                        self._reader_drain_deadline is None
-                        and self._reader_drain_retry_after <= now
-                    ):
-                        self._reader_drain_deadline = now + _READER_DRAIN_SECONDS
-                        self._reader_drain_interrupt_after = (
-                            now + _READER_SNAPSHOT_SECONDS
-                        )
-                        # Snapshots admitted before this generation receive the
-                        # grace deadline; later fail-open readers do not.
-                        self._reader_drain_generation += 1
-                    if self._reader_drain_deadline is not None:
-                        deferred_snapshots = self._active_reader_snapshots
-                        managed_attempt = not deferred_snapshots
-                if deferred_snapshots:
+            writer_exclusion = False
+            store_lock_exclusion = False
+            if reset_mode:
+                # Never wait for application writes or close while owning the
+                # checkpoint lane. The writer turn excludes a concurrent BEGIN;
+                # the nonblocking store lock respects close's reverse lock order.
+                writer_exclusion = self._acquire_writer_turn(
+                    "background", blocking=False,
+                )
+                if writer_exclusion:
+                    store_lock_exclusion = self.lock.acquire(blocking=False)
+                if not store_lock_exclusion:
+                    if writer_exclusion:
+                        self._release_writer_turn()
+                        writer_exclusion = False
+                    active_snapshots, drain_pending = (
+                        self._reader_snapshot_state()
+                    )
                     return self._checkpoint_metrics(
                         busy=1,
                         log_frames=-1,
                         checkpointed_frames=-1,
-                        active_reader_snapshots=deferred_snapshots,
-                        reader_drain_pending=1,
+                        active_reader_snapshots=active_snapshots,
+                        reader_drain_pending=drain_pending,
                     )
-            connection = self._checkpoint_connection
-            try:
-                if managed_attempt:
-                    connection.execute(
-                        f"PRAGMA busy_timeout={_CHECKPOINT_BUSY_TIMEOUT_MS}"
-                    )
-                row = connection.execute(
-                    f"PRAGMA wal_checkpoint({mode})"
-                ).fetchone()
-                if managed_attempt:
-                    connection.execute("PRAGMA busy_timeout=0")
-            except BaseException:
-                if managed_attempt:
-                    with contextlib.suppress(sqlite3.Error):
-                        connection.execute("PRAGMA busy_timeout=0")
-                self._finish_reader_drain()
-                raise
 
-            busy, log_frames, checkpointed_frames = (
-                (0, -1, -1) if row is None else map(int, row)
-            )
-            # SQLite reports -1 frame counts when the database is not using
-            # WAL, including shared in-memory stores.
-            log_frames = max(0, log_frames)
-            checkpointed_frames = max(0, checkpointed_frames)
-            if mode == "TRUNCATE" and not busy:
-                self._finish_reader_drain()
-            active_reader_snapshots, reader_drain_pending = (
-                self._reader_snapshot_state()
-            )
-            return self._checkpoint_metrics(
-                busy=busy,
-                log_frames=log_frames,
-                checkpointed_frames=checkpointed_frames,
-                active_reader_snapshots=active_reader_snapshots,
-                reader_drain_pending=reader_drain_pending,
-            )
+            try:
+                managed_attempt = False
+                deferred_snapshots = 0
+                managed_drain = (
+                    drain_readers and reset_mode and not self._uri
+                )
+                if managed_drain:
+                    with self._reader_snapshot_condition:
+                        now = time.monotonic()
+                        self._expire_reader_drain_locked(now)
+                        if (
+                            self._reader_drain_deadline is None
+                            and self._reader_drain_retry_after <= now
+                        ):
+                            self._reader_drain_deadline = (
+                                now + _READER_DRAIN_SECONDS
+                            )
+                            self._reader_drain_interrupt_after = (
+                                now + _READER_SNAPSHOT_SECONDS
+                            )
+                            # Snapshots admitted before this generation receive
+                            # the grace deadline; fail-open readers do not.
+                            self._reader_drain_generation += 1
+                        if self._reader_drain_deadline is not None:
+                            deferred_snapshots = self._active_reader_snapshots
+                            managed_attempt = not deferred_snapshots
+                    if deferred_snapshots:
+                        return self._checkpoint_metrics(
+                            busy=1,
+                            log_frames=-1,
+                            checkpointed_frames=-1,
+                            active_reader_snapshots=deferred_snapshots,
+                            reader_drain_pending=1,
+                        )
+                connection = self._checkpoint_connection
+                try:
+                    if managed_attempt:
+                        connection.execute(
+                            f"PRAGMA busy_timeout={_CHECKPOINT_BUSY_TIMEOUT_MS}"
+                        )
+                    row = connection.execute(
+                        f"PRAGMA wal_checkpoint({mode})"
+                    ).fetchone()
+                    if managed_attempt:
+                        connection.execute("PRAGMA busy_timeout=0")
+                except BaseException:
+                    if managed_attempt:
+                        with contextlib.suppress(sqlite3.Error):
+                            connection.execute("PRAGMA busy_timeout=0")
+                    self._finish_reader_drain()
+                    raise
+
+                busy, log_frames, checkpointed_frames = (
+                    (0, -1, -1) if row is None else map(int, row)
+                )
+                # SQLite reports -1 frame counts when the database is not using
+                # WAL, including shared in-memory stores.
+                log_frames = max(0, log_frames)
+                checkpointed_frames = max(0, checkpointed_frames)
+                if reset_mode and not busy:
+                    self._finish_reader_drain()
+                active_reader_snapshots, reader_drain_pending = (
+                    self._reader_snapshot_state()
+                )
+                return self._checkpoint_metrics(
+                    busy=busy,
+                    log_frames=log_frames,
+                    checkpointed_frames=checkpointed_frames,
+                    active_reader_snapshots=active_reader_snapshots,
+                    reader_drain_pending=reader_drain_pending,
+                )
+            finally:
+                if store_lock_exclusion:
+                    self.lock.release()
+                if writer_exclusion:
+                    self._release_writer_turn()
 
     def _writer_rank(self, priority: str | None) -> int:
         selected = (

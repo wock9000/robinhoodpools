@@ -227,12 +227,102 @@ def test_restart_checkpoint_does_not_wait_for_active_writer(tmp_path):
         assert store.read().execute(
             "SELECT value FROM metadata WHERE key='checkpoint-seed'"
         ).fetchone()[0] == "2"
+        with store.transaction() as connection:
+            connection.execute(
+                "UPDATE metadata SET value='3' WHERE key='checkpoint-seed'"
+            )
+            nested = store.checkpoint("RESTART", drain_readers=True)
+            assert nested["busy"] == 1
+            assert nested["log_frames"] == -1
     finally:
         release_writer.set()
         writer.join(2)
         checkpointer.join(6)
         store.close()
     assert failures == []
+
+
+def test_restart_checkpoint_excludes_concurrent_application_writer(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(
+        market_store_module, "_CHECKPOINT_BUSY_TIMEOUT_MS", 1_000,
+    )
+    path = tmp_path / "market.sqlite"
+    store = MarketStore(path, checkpoint_on_commit=False)
+    external = None
+    checkpoint_done = threading.Event()
+    writer_done = threading.Event()
+    checkpoint_results = []
+    failures = []
+
+    def checkpoint():
+        try:
+            checkpoint_results.append(
+                store.checkpoint("RESTART", drain_readers=True)
+            )
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            checkpoint_done.set()
+
+    def write():
+        try:
+            with store.transaction() as connection:
+                connection.execute(
+                    "UPDATE metadata SET value='2' "
+                    "WHERE key='checkpoint-seed'"
+                )
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            writer_done.set()
+
+    checkpointer = threading.Thread(target=checkpoint)
+    writer = threading.Thread(target=write)
+    try:
+        store.checkpoint("TRUNCATE")
+        external = sqlite3.connect(path, isolation_level=None)
+        external.execute("PRAGMA query_only=ON")
+        external.execute("BEGIN")
+        external.execute("SELECT COUNT(*) FROM events").fetchone()
+        with store.transaction() as connection:
+            connection.execute(
+                "INSERT INTO metadata(key,value) "
+                "VALUES('checkpoint-seed','1')"
+            )
+
+        checkpointer.start()
+        with store._writer_condition:
+            assert store._writer_condition.wait_for(
+                lambda: store._writer_active,
+                timeout=1,
+            )
+        writer.start()
+        assert not writer_done.wait(
+            0.1
+        ), "writer entered while RESTART owned writer exclusion"
+
+        external.rollback()
+        external.close()
+        external = None
+        assert checkpoint_done.wait(2)
+        assert writer_done.wait(2)
+        assert failures == []
+        assert checkpoint_results[0]["busy"] == 0
+        assert checkpoint_results[0]["backlog_bytes"] == 0
+        assert store.read().execute(
+            "SELECT value FROM metadata WHERE key='checkpoint-seed'"
+        ).fetchone()[0] == "2"
+    finally:
+        if external is not None:
+            external.rollback()
+            external.close()
+        if checkpointer.ident is not None:
+            checkpointer.join(2)
+        if writer.ident is not None:
+            writer.join(2)
+        store.close()
 
 
 def test_managed_reader_drain_preserves_snapshot_and_reclaims_wal(tmp_path):
@@ -396,7 +486,7 @@ def test_checkpoint_drain_finishes_running_query_before_reset(tmp_path, monkeypa
         with store.transaction() as connection:
             connection.execute("INSERT INTO frame_probe VALUES(2)")
 
-        deferred = store.checkpoint("TRUNCATE", drain_readers=True)
+        deferred = store.checkpoint("RESTART", drain_readers=True)
         assert deferred["active_reader_snapshots"] == 1
         assert deferred["reader_drain_pending"] == 1
 
@@ -409,11 +499,11 @@ def test_checkpoint_drain_finishes_running_query_before_reset(tmp_path, monkeypa
         assert query_values == [1]
         assert failures == []
 
-        recovered = store.checkpoint("TRUNCATE", drain_readers=True)
+        recovered = store.checkpoint("RESTART", drain_readers=True)
         assert recovered["busy"] == 0
         assert recovered["active_reader_snapshots"] == 0
         assert recovered["reader_drain_pending"] == 0
-        assert recovered["wal_bytes"] == 0
+        assert recovered["backlog_bytes"] == 0
         assert queued_admitted.wait(1)
         queued.join(2)
         assert queued_counts == [2]
