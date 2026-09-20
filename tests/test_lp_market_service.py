@@ -1403,71 +1403,44 @@ def test_stale_owners_are_served_while_refresh_runs_past_reader_cap(
         app.close()
 
 
-def test_warmer_skips_while_paused_and_fills_gaps_one_at_a_time(
+def test_pool_revision_churn_keeps_cached_terminal_views_available(
         tmp_path, monkeypatch):
     app = service(tmp_path / "market.sqlite")
-    monkeypatch.setattr(market_service_module, "_WARM_PAUSE_SECONDS", 0.0)
-    real_status = app.status
-    paused = {"value": True}
-    monkeypatch.setattr(
-        app, "status",
-        lambda: {
-            **real_status(),
-            "bulk_work": "paused" if paused["value"] else "running",
-        },
-    )
-    loads = {"count": 0, "threads": set()}
-    gate = threading.Lock()
+    cold_params = {"window": "24h", "sort": "flow"}
+    hot_params = {"window": "1h", "sort": "created"}
+    monkeypatch.setitem(market_service_module.WINDOW_CACHE_TTL, "1h", 0.0)
 
-    def counted(loader):
-        def run(*args, **kwargs):
-            with gate:
-                loads["count"] += 1
-                loads["threads"].add(threading.get_ident())
-            return loader(*args, **kwargs)
-        return run
-
-    monkeypatch.setattr(app, "_load_cached", counted(app._load_cached))
-    monkeypatch.setattr(
-        app, "_materialize_owner_projection",
-        counted(app._materialize_owner_projection),
-    )
-
-    def cycle():
-        warmed = {}
-        app._warm_thread = threading.Thread(
-            target=lambda: warmed.setdefault("keys", app._warm_cycle()),
-        )
-        app._warm_thread.start()
-        app._warm_thread.join(30)
-        return warmed["keys"]
+    def unavailable_reader(*_args, **_kwargs):
+        raise AssertionError("a cached terminal view unexpectedly opened SQLite")
 
     try:
         app.store.upsert_pools(pools())
-        assert cycle() == 0
-        assert loads["count"] == 0
+        cold = app.pools(cold_params)
+        assert {row["id"] for row in cold["rows"]} == {V3, V4}
+        app.pools(hot_params)
 
-        paused["value"] = False
-        assert cycle() == len(market_service_module._WARM_KEYS)
-        filled = loads["count"]
-        assert filled >= len(market_service_module._WARM_KEYS)
-        assert loads["threads"] == {app._warm_thread.ident}
-        assert len(app._owner_results) == 5
-        assert {key[1] for key in app._cache} >= {
-            "overview", "pools", "dislocations",
-        }
+        for created_block in range(2, 82):
+            pool_id = "0x" + f"{created_block:040x}"
+            app.store.upsert_pools([
+                {
+                    **pools()[0], "id": pool_id, "address": pool_id,
+                    "created_block": created_block,
+                },
+            ])
+            deadline = time.monotonic() + 5
+            while True:
+                fresh = app.pools(hot_params)
+                if fresh["rows"][0]["created_block"] == created_block:
+                    assert fresh["rows"][0]["id"] == pool_id
+                    break
+                assert time.monotonic() < deadline, "Fresh stopped updating"
+                time.sleep(0.001)
 
-        with app._cache_lock:
-            for key, (_at, value) in list(app._cache.items()):
-                app._cache[key] = (0.0, value)
-        with app.book._cache_lock:
-            app.book._owners_generation += 1
-        assert cycle() == len(market_service_module._WARM_KEYS)
-        assert loads["count"] == filled
-        assert not app._cache_refreshing
-        assert not any(key[0] == "owners" for key in app._frame_futures)
+        # The two logical views fit easily in the terminal cache. Obsolete
+        # query generations must not evict a still-usable published frame.
+        monkeypatch.setattr(app.store, "reader_snapshot", unavailable_reader)
+        assert app.pools(cold_params) == cold
     finally:
-        app._warm_thread = None
         app.close()
 
 

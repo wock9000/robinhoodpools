@@ -1227,6 +1227,7 @@ class LPMarketService:
         finally:
             self.store.close_reader()
         self._cache = OrderedDict()
+        self._query_cache = OrderedDict()
         self._cache_lock = threading.Lock()
         self._cache_futures: dict[tuple[Any, ...], Future] = {}
         self._cache_refreshing: set[tuple[Any, ...]] = set()
@@ -1959,7 +1960,19 @@ class LPMarketService:
             with self._cache_lock:
                 self._cache_refreshing.discard(key)
 
-    def _load_cached(self, key, loader):
+    def _cached_query(self, key, loader, *, epoch):
+        # Snapshot-versioned query intermediates churn with live ingestion.
+        # Keep them separate so obsolete revisions cannot evict terminal frames.
+        key = (epoch, *key)
+        with self._cache_lock:
+            cached = self._query_cache.get(key)
+            if cached is not None:
+                self._query_cache.move_to_end(key)
+                return cached[1]
+        return self._load_cached(key, loader, cache=self._query_cache)
+
+    def _load_cached(self, key, loader, *, cache=None):
+        cache = self._cache if cache is None else cache
         leader = False
         future = None
         with self._cache_lock:
@@ -1981,10 +1994,11 @@ class LPMarketService:
             raise
         completed_at = time.monotonic()
         with self._cache_lock:
-            self._cache[key] = (completed_at, value)
-            self._cache.move_to_end(key)
-            while len(self._cache) > 64:
-                self._cache.popitem(last=False)
+            cache[key] = (completed_at, value)
+            cache.move_to_end(key)
+            limit = 16 if cache is self._query_cache else 64
+            while len(cache) > limit:
+                cache.popitem(last=False)
             if future is not None and self._cache_futures.get(key) is future:
                 self._cache_futures.pop(key, None)
         if future is not None:
@@ -2294,13 +2308,12 @@ class LPMarketService:
                                 f"SELECT p.id FROM pools p WHERE {where}", filters,
                             ).fetchall()
                         ))
-                    pool_ids = self._cached(
+                    pool_ids = self._cached_query(
                         (
                             "pool-filter-base", snapshot_pool_metadata_token,
                             where, *filters,
                         ),
                         load_pool_ids,
-                        ttl=float("inf"),
                         epoch=int(status.get("epoch") or 0),
                     )
                     return [
@@ -2323,12 +2336,12 @@ class LPMarketService:
             metrics = (
                 metric_rows()
                 if bucket_aggregates is not None
-                else self._cached(
+                else self._cached_query(
                     (
                         "pool-sort-base", metric_revision, name, where, *filters,
                         sort,
                     ),
-                    metric_rows, ttl=float("inf"),
+                    metric_rows,
                     epoch=int(status.get("epoch") or 0),
                 )
             )
