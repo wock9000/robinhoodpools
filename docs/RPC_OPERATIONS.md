@@ -589,10 +589,12 @@ The September 15 recovery checkpoint retained the journal and completed in
 239.217 s, returning `[0, 0, 0]` with zero allocated WAL bytes. This is a recovery
 receipt, not a database backup or a normal checkpoint latency target.
 
-The production service has `CPUQuota=600%`, `CPUWeight=100`, `MemoryHigh=20G`
-and `MemoryMax=28G`. These are per-service ceilings and pressure controls, not
-a host-wide reliability guarantee. Measure cursor gain against chain gain
-under these limits. A single fast scan does not establish sustainable catch-up.
+The effective production settings at the September 19 verification were
+`CPUWeight=1000`, `MemoryMax=28G`, and no CPU quota or `MemoryHigh` limit.
+Check `systemctl --user show robinhoodpools.service` rather than assuming an
+older drop-in still controls these values. Resource limits are not a host-wide
+reliability guarantee; compare cursor gain against chain gain under the actual
+load. A single fast scan does not establish sustainable catch-up.
 
 Browser pool requests have a 15-second deadline, including response-body reads.
 An initial failed request displays `POOL DATA UNAVAILABLE · RETRYING`, not
