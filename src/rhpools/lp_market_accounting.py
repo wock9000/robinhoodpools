@@ -1324,6 +1324,12 @@ class AccountBook:
                     "ON lp_accounting_pending_identities(pool_id,position_key) "
                     "WHERE kind='scope'"
                 )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS "
+                    "lp_accounting_pending_identities_identity "
+                    "ON lp_accounting_pending_identities("
+                    "kind,identity,position_key)"
+                )
                 prior = {
                     str(row[0]): str(row[1])
                     for row in conn.execute(
@@ -6125,50 +6131,24 @@ class AccountBook:
         })
         if not selected:
             return through_order, through_as_of, set(), set(), True
+        # Ready hints cover every event identity for each pending position.
+        # Start from the requested page, then qualify its positions by scope;
+        # expanding identities through the ledger makes whale pages scan their
+        # entire event history and pins an old WAL snapshot.
         values = ",".join("(?,?)" for _ in selected)
         selected_args = [item for pair in selected for item in pair]
         scope_predicate = " AND ".join(
             clause.replace("h.", "scope.") for clause in hint_clauses
         )
         rows = conn.execute(
-            "WITH selected(kind,identity) AS (VALUES " + values + "), "
-            "candidate_positions(kind,identity,position_key) AS MATERIALIZED ("
-            "SELECT s.kind,s.identity,ep.position_key FROM selected s "
-            "CROSS JOIN lp_accounting_episodes ep "
-            "INDEXED BY lp_accounting_episodes_owner_position "
-            "WHERE s.kind='owner' AND ep.owner=s.identity UNION "
-            "SELECT s.kind,s.identity,ep.position_key FROM selected s "
-            "CROSS JOIN lp_accounting_episodes ep "
-            "INDEXED BY lp_accounting_episodes_custody "
-            "WHERE s.kind='custody' AND ep.custody=s.identity UNION "
-            "SELECT s.kind,s.identity,oi.position_key FROM selected s "
-            "CROSS JOIN lp_ownership_intervals oi "
-            "INDEXED BY lp_ownership_intervals_owner "
-            "WHERE s.kind='owner' AND oi.owner=s.identity UNION "
-            "SELECT s.kind,s.identity,k.position_key FROM selected s "
-            "CROSS JOIN events e INDEXED BY events_owner_time_idx "
-            "JOIN lp_accounting_event_keys k ON k.event_id=e.id "
-            "WHERE s.kind='owner' AND e.owner=s.identity UNION "
-            "SELECT s.kind,s.identity,k.position_key FROM selected s "
-            "CROSS JOIN events e INDEXED BY events_custody_time_idx "
-            "JOIN lp_accounting_event_keys k ON k.event_id=e.id "
-            "WHERE s.kind='custody' AND e.custody=s.identity) "
-            "SELECT DISTINCT cp.kind,cp.identity FROM "
-            + (
-                "lp_accounting_pending_identities scope INDEXED BY "
-                + (
-                    "lp_accounting_pending_identities_pool"
-                    if pool_id else
-                    "lp_accounting_pending_identities_scope_timestamp"
-                )
-                + " CROSS JOIN candidate_positions cp "
-                "ON cp.position_key=scope.position_key WHERE "
-                + scope_predicate
-                if cutoff is not None or pool_id else
-                "candidate_positions cp WHERE EXISTS(SELECT 1 FROM "
-                "lp_accounting_pending_identities scope WHERE "
-                "scope.position_key=cp.position_key AND " + scope_predicate + ")"
-            ),
+            "WITH selected(kind,identity) AS (VALUES " + values + ") "
+            "SELECT s.kind,s.identity FROM selected s WHERE EXISTS("
+            "SELECT 1 FROM lp_accounting_pending_identities h "
+            "INDEXED BY lp_accounting_pending_identities_identity "
+            "WHERE h.kind=s.kind AND h.identity=s.identity AND EXISTS("
+            "SELECT 1 FROM lp_accounting_pending_identities scope "
+            "WHERE scope.position_key=h.position_key AND "
+            + scope_predicate + "))",
             [*selected_args, *hint_args],
         )
         owners: set[str] = set()

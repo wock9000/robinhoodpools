@@ -231,9 +231,11 @@ class MarketStore:
         self._reader_lock = threading.Lock()
         self._checkpoint_lock = threading.Lock()
         self._reader_snapshot_condition = threading.Condition()
-        self._reader_drain_interrupt = threading.Event()
+        self._reader_shutdown_interrupt = threading.Event()
         self._active_reader_snapshots = 0
         self._reader_drain_deadline: float | None = None
+        self._reader_drain_generation = 0
+        self._reader_drain_interrupt_after: float | None = None
         self._reader_drain_retry_after = 0.0
         self._local = threading.local()
         self._writer_condition = threading.Condition()
@@ -834,7 +836,8 @@ class MarketStore:
         if deadline is None or deadline > now:
             return False
         self._reader_drain_deadline = None
-        self._reader_drain_interrupt.clear()
+        # Admission fails open, but the expired generation still identifies
+        # old snapshots for interruption without affecting newly admitted work.
         self._reader_drain_retry_after = max(
             self._reader_drain_retry_after,
             now + _READER_DRAIN_COOLDOWN_SECONDS,
@@ -844,7 +847,9 @@ class MarketStore:
 
     def _finish_reader_drain(self) -> None:
         with self._reader_snapshot_condition:
-            self._reader_drain_interrupt.clear()
+            # Maintenance only gates admission. Active snapshots finish
+            # naturally, at their own deadline, or after the bounded grace.
+            self._reader_drain_interrupt_after = None
             if self._reader_drain_deadline is None:
                 return
             self._reader_drain_deadline = None
@@ -881,6 +886,7 @@ class MarketStore:
                 condition.wait(self._reader_drain_deadline - now)
             if self._closed:
                 raise MarketStoreError("market store is closed")
+            snapshot_drain_generation = self._reader_drain_generation
             self._active_reader_snapshots += 1
         deadline = time.monotonic() + (
             _READER_SNAPSHOT_SECONDS
@@ -891,11 +897,19 @@ class MarketStore:
 
         def interrupt_read() -> int:
             nonlocal interrupted
+            now = time.monotonic()
+            drain_interrupt_after = self._reader_drain_interrupt_after
             interrupted = (
                 not in_writer
                 and (
-                    self._reader_drain_interrupt.is_set()
-                    or time.monotonic() >= deadline
+                    self._reader_shutdown_interrupt.is_set()
+                    or now >= deadline
+                    or (
+                        snapshot_drain_generation
+                        != self._reader_drain_generation
+                        and drain_interrupt_after is not None
+                        and now >= drain_interrupt_after
+                    )
                 )
             )
             return int(interrupted)
@@ -1002,7 +1016,12 @@ class MarketStore:
                         and self._reader_drain_retry_after <= now
                     ):
                         self._reader_drain_deadline = now + _READER_DRAIN_SECONDS
-                        self._reader_drain_interrupt.set()
+                        self._reader_drain_interrupt_after = (
+                            now + _READER_SNAPSHOT_SECONDS
+                        )
+                        # Snapshots admitted before this generation receive the
+                        # grace deadline; later fail-open readers do not.
+                        self._reader_drain_generation += 1
                     if self._reader_drain_deadline is not None:
                         deferred_snapshots = self._active_reader_snapshots
                         managed_attempt = not deferred_snapshots
@@ -3978,7 +3997,7 @@ class MarketStore:
                 return
             self._closed = True
             self._reader_drain_deadline = None
-            self._reader_drain_interrupt.set()
+            self._reader_shutdown_interrupt.set()
             self._reader_snapshot_condition.notify_all()
 
         with self.lock:

@@ -333,7 +333,7 @@ def test_managed_reader_drain_preserves_snapshot_and_reclaims_wal(tmp_path):
         store.close()
 
 
-def test_checkpoint_drain_interrupts_running_managed_query(tmp_path, monkeypatch):
+def test_checkpoint_drain_finishes_running_query_before_reset(tmp_path, monkeypatch):
     monkeypatch.setattr(market_store_module, "_READER_PROGRESS_STEPS", 1)
     store = MarketStore(
         tmp_path / "market.sqlite",
@@ -341,6 +341,10 @@ def test_checkpoint_drain_interrupts_running_managed_query(tmp_path, monkeypatch
     )
     entered = threading.Event()
     release = threading.Event()
+    queued_started = threading.Event()
+    queued_admitted = threading.Event()
+    query_values = []
+    queued_counts = []
     failures = []
 
     def run_query():
@@ -353,15 +357,34 @@ def test_checkpoint_drain_interrupts_running_managed_query(tmp_path, monkeypatch
         try:
             with store.reader_snapshot() as connection:
                 connection.create_function("hold_read", 1, hold)
-                connection.execute(
-                    "SELECT hold_read(value) FROM frame_probe"
-                ).fetchall()
+                query_values.extend(
+                    row[0] for row in connection.execute(
+                        "SELECT hold_read(value) FROM frame_probe"
+                    ).fetchall()
+                )
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            store.close_reader()
+
+    def read_after_reset():
+        try:
+            store.read()
+            queued_started.set()
+            with store.reader_snapshot() as connection:
+                queued_counts.append(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM frame_probe"
+                    ).fetchone()[0]
+                )
+                queued_admitted.set()
         except BaseException as exc:
             failures.append(exc)
         finally:
             store.close_reader()
 
     reader = threading.Thread(target=run_query)
+    queued = threading.Thread(target=read_after_reset)
     try:
         with store.transaction() as connection:
             connection.execute("CREATE TABLE frame_probe(value INTEGER)")
@@ -376,20 +399,118 @@ def test_checkpoint_drain_interrupts_running_managed_query(tmp_path, monkeypatch
         deferred = store.checkpoint("TRUNCATE", drain_readers=True)
         assert deferred["active_reader_snapshots"] == 1
         assert deferred["reader_drain_pending"] == 1
+
+        queued.start()
+        assert queued_started.wait(1)
+        assert not queued_admitted.wait(0.1)
+
         release.set()
         reader.join(2)
+        assert query_values == [1]
+        assert failures == []
 
-        assert len(failures) == 1
-        assert isinstance(failures[0], sqlite3.OperationalError)
-        assert failures[0].sqlite_errorcode == sqlite3.SQLITE_INTERRUPT
         recovered = store.checkpoint("TRUNCATE", drain_readers=True)
         assert recovered["busy"] == 0
         assert recovered["active_reader_snapshots"] == 0
         assert recovered["reader_drain_pending"] == 0
         assert recovered["wal_bytes"] == 0
+        assert queued_admitted.wait(1)
+        queued.join(2)
+        assert queued_counts == [2]
+        assert failures == []
     finally:
         release.set()
+        if reader.ident is not None:
+            reader.join(2)
+        if queued.ident is not None:
+            queued.join(2)
+        store.close()
+
+
+def test_checkpoint_drain_interrupts_only_snapshot_outliving_grace(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(market_store_module, "_READER_PROGRESS_STEPS", 1)
+    monkeypatch.setattr(market_store_module, "_READER_DRAIN_SECONDS", 0.05)
+    monkeypatch.setattr(market_store_module, "_READER_SNAPSHOT_SECONDS", 0.05)
+    store = MarketStore(tmp_path / "market.sqlite", checkpoint_on_commit=False)
+    entered = threading.Event()
+    release = threading.Event()
+    queued_admitted = threading.Event()
+    query_failures = []
+    queued_failures = []
+    queued_counts = []
+
+    def run_query():
+        def hold(value):
+            if not entered.is_set():
+                entered.set()
+                if not release.wait(2):
+                    raise AssertionError("blocked read was not released")
+            return value
+
+        try:
+            with store.reader_snapshot(5) as connection:
+                connection.create_function("hold_read", 1, hold)
+                connection.execute(
+                    "SELECT hold_read(value) FROM frame_probe"
+                ).fetchall()
+        except BaseException as exc:
+            query_failures.append(exc)
+        finally:
+            store.close_reader()
+
+    def read_after_grace():
+        try:
+            with store.reader_snapshot() as connection:
+                queued_counts.append(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM frame_probe"
+                    ).fetchone()[0]
+                )
+                queued_admitted.set()
+        except BaseException as exc:
+            queued_failures.append(exc)
+        finally:
+            store.close_reader()
+
+    reader = threading.Thread(target=run_query)
+    queued = threading.Thread(target=read_after_grace)
+    try:
+        with store.transaction() as connection:
+            connection.execute("CREATE TABLE frame_probe(value INTEGER)")
+            connection.executemany(
+                "INSERT INTO frame_probe VALUES(?)",
+                ((value,) for value in range(100)),
+            )
+        store.checkpoint("TRUNCATE")
+
+        reader.start()
+        assert entered.wait(1)
+        with store.transaction() as connection:
+            connection.execute("INSERT INTO frame_probe VALUES(100)")
+        deferred = store.checkpoint("TRUNCATE", drain_readers=True)
+        assert deferred["reader_drain_pending"] == 1
+
+        queued.start()
+        assert queued_admitted.wait(1)
+        release.set()
         reader.join(2)
+
+        assert queued_counts == [101]
+        assert queued_failures == []
+        assert len(query_failures) == 1
+        assert isinstance(query_failures[0], sqlite3.OperationalError)
+        assert query_failures[0].sqlite_errorcode == sqlite3.SQLITE_INTERRUPT
+        recovered = store.checkpoint("TRUNCATE", drain_readers=True)
+        assert recovered["busy"] == 0
+        assert recovered["reader_drain_pending"] == 0
+    finally:
+        release.set()
+        if reader.ident is not None:
+            reader.join(2)
+        if queued.ident is not None:
+            queued.join(2)
         store.close()
 
 

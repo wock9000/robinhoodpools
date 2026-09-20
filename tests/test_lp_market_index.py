@@ -11,6 +11,7 @@ import pytest
 from rhpools.lp_market_index import (
     FACTORY_SELECTOR,
     FEED_SECONDARY_MAX_SECONDS,
+    HEAD_REPLAY_LIMIT,
     FEE_SELECTOR,
     GET_PAIR_SELECTOR,
     TICK_SPACING_SELECTOR,
@@ -27,6 +28,8 @@ from rhpools.lp_market_index import (
 from rhpools.lp_market_store import CanonicalConflict, MarketStore
 from rhpools.lp_market_protocols import (
     LIQUIDITY_SELECTOR,
+    MODIFY_LIQUIDITY_SELECTOR,
+    SWAP_SELECTOR,
     POSITIONS_SELECTOR,
     SLOT0_SELECTOR,
     V2_FACTORIES,
@@ -34,7 +37,9 @@ from rhpools.lp_market_protocols import (
     V3_MINT_TOPIC,
     POOL_MANAGER,
     TRANSFER_TOPIC,
+    V4_DONATE_TOPIC,
     V4_MODIFY_LIQUIDITY_TOPIC,
+    V4_SWAP_TOPIC,
 )
 
 
@@ -503,6 +508,103 @@ def test_activity_feed_secondary_session_is_bounded_and_fails_back(
         store.close()
 
 
+def test_activity_backlog_waits_for_durable_coverage_and_recovers(monkeypatch):
+    store = MarketStore(":memory:")
+    scanner = indexer(store)
+    pending = {
+        number: [{"blockNumber": hex(number)}]
+        for number in range(1, HEAD_REPLAY_LIMIT * 2 + 2)
+    }
+    first_seen = {number: 0.0 for number in pending}
+    try:
+        with pytest.raises(RpcError, match="outside canonical replay"):
+            scanner._flush_activity_logs(
+                pending, first_seen, max(pending), source="test", force=True,
+            )
+        status = scanner.runtime_status()
+        assert len(pending) == HEAD_REPLAY_LIMIT * 2 + 1
+        assert "outside canonical replay" in status["errors"]["activity_feed"]
+        assert status.get("activity_feed_stale_blocks_discarded", 0) == 0
+        assert status["activity_feed_backpressure_disconnects"] == 1
+        assert status["activity_feed_recovery_through"] == (
+            HEAD_REPLAY_LIMIT * 2 + 1
+        )
+
+        durable = header(HEAD_REPLAY_LIMIT * 2 + 1)
+        store.ingest([durable], [], lane="live", cursor={
+            "block_number": HEAD_REPLAY_LIMIT * 2 + 1,
+            "block_hash": durable["hash"],
+            "timestamp": int(durable["timestamp"], 16),
+        })
+        scanner._flush_activity_logs(
+            pending, first_seen, max(pending), source="test", force=True,
+        )
+        status = scanner.runtime_status()
+        assert len(pending) == HEAD_REPLAY_LIMIT
+        assert status["activity_feed_stale_blocks_discarded"] == (
+            HEAD_REPLAY_LIMIT + 1
+        )
+        assert status["activity_feed_last_discard"]["durable_through"] == (
+            HEAD_REPLAY_LIMIT * 2 + 1
+        )
+        assert "already covered by durable live index" in (
+            status["errors"]["activity_feed"]
+        )
+
+        scanner._flush_activity_logs(
+            pending, first_seen, max(pending), source="test", force=True,
+        )
+        durable_recovery = scanner.runtime_status()
+        assert "activity_feed" not in durable_recovery["errors"]
+        assert durable_recovery["activity_feed_stale_blocks_discarded"] == (
+            HEAD_REPLAY_LIMIT + 1
+        )
+        assert durable_recovery["activity_feed_recovered_at"] > 0
+
+        current = header(HEAD_REPLAY_LIMIT * 2 + 2)
+        with scanner._feed_condition:
+            scanner._observed_last_header = current
+            scanner._observed_blocks[HEAD_REPLAY_LIMIT * 2 + 2] = (
+                current, [],
+            )
+        pending[HEAD_REPLAY_LIMIT * 2 + 2] = [{
+            "blockNumber": current["number"], "blockHash": current["hash"],
+        }]
+        first_seen[HEAD_REPLAY_LIMIT * 2 + 2] = 0.0
+
+        def fail_publish(*_args, **_kwargs):
+            raise RpcError("decode failed")
+
+        monkeypatch.setattr(
+            scanner, "_publish_late_current_logs", fail_publish,
+        )
+        scanner._flush_activity_logs(
+            pending, first_seen, HEAD_REPLAY_LIMIT * 2 + 2,
+            source="test", force=True,
+        )
+        assert HEAD_REPLAY_LIMIT * 2 + 2 in pending
+        assert scanner.runtime_status()["errors"]["activity_feed"] == "decode failed"
+
+        monkeypatch.setattr(
+            scanner, "_publish_late_current_logs",
+            lambda *_args, **_kwargs: 1,
+        )
+        scanner._flush_activity_logs(
+            pending, first_seen, HEAD_REPLAY_LIMIT * 2 + 2,
+            source="test", force=True,
+        )
+        recovered = scanner.runtime_status()
+        assert HEAD_REPLAY_LIMIT * 2 + 2 not in pending
+        assert "activity_feed" not in recovered["errors"]
+        assert recovered["activity_feed_stale_blocks_discarded"] == (
+            HEAD_REPLAY_LIMIT + 1
+        )
+        assert recovered["activity_feed_recovered_at"] > 0
+    finally:
+        scanner.close()
+        store.close()
+
+
 def test_history_progress_is_independent_of_unrunnable_enrichment(monkeypatch):
     store = MarketStore(":memory:")
     scanner = indexer(store)
@@ -915,6 +1017,15 @@ def test_scans_durably_replay_unregistered_v4_pool_keys(
         # A restart also clears process-local identity suppression state.
         with scanner._identity_resolve_lock:
             scanner._identity_checked.clear()
+        with scanner._current_receipt_lock:
+            scanner._current_pool_failure_details[pool_id] = {
+                "classification": "rpc",
+                "error": "temporary state getter failure",
+                "source": "test",
+            }
+            scanner._current_pool_failures[(pool_id, tx_hash)] = float("inf")
+        scanner._publish_pool_resolution_failures()
+        assert scanner.runtime_status()["pool_resolution_failure_count"] == 1
 
         assert scanner._resolve_deferred_pool_identities_once() is True
         pool = store.pool(pool_id)
@@ -930,6 +1041,7 @@ def test_scans_durably_replay_unregistered_v4_pool_keys(
             "SELECT COUNT(*) FROM pending_reprojection",
         ).fetchone()[0] == 1
         assert market.published[-1]["id"] == pool_id
+        assert "pool_resolution" not in scanner.runtime_status()["errors"]
 
         tampered = {
             **pool,
@@ -939,6 +1051,161 @@ def test_scans_durably_replay_unregistered_v4_pool_keys(
         market.published.clear()
         assert scanner._publish_stored_pool_page() is True
         assert [published["id"] for published in market.published] == [pool_id]
+    finally:
+        scanner.close()
+        store.close()
+
+
+@pytest.mark.parametrize("manager_method", ["modify", "swap", "donate"])
+def test_poolkey_fallback_reads_bounded_nested_manager_trace(manager_method):
+    from eth_utils import keccak
+
+    observed = header(100)
+    token0 = "0x" + "21" * 20
+    token1 = "0x" + "22" * 20
+    hook = "0x" + "44" * 20
+    fee, spacing = 0x800000, 8
+    tx_hash = "0x" + "61" * 32
+    custody = "0x" + "55" * 20
+
+    def word(value):
+        return f"{value & ((1 << 256) - 1):064x}"
+
+    key_words = (
+        int(token0, 16), int(token1, 16), fee, spacing, int(hook, 16),
+    )
+    pool_id = "0x" + keccak(bytes.fromhex(
+        "".join(word(value) for value in key_words)
+    )).hex()
+    if manager_method == "modify":
+        topic = V4_MODIFY_LIQUIDITY_TOPIC
+        event_values = (-10, 10, 100, 7)
+    elif manager_method == "swap":
+        topic = V4_SWAP_TOPIC
+        event_values = (-100, 90, 1 << 96, 1_000_000, 0, 3000)
+    else:
+        topic = V4_DONATE_TOPIC
+        event_values = (100, 200)
+    pool_log = {
+        "address": POOL_MANAGER,
+        "blockNumber": observed["number"],
+        "blockHash": observed["hash"],
+        "transactionHash": tx_hash,
+        "transactionIndex": "0x0",
+        "logIndex": "0x1",
+        "topics": [
+            topic,
+            pool_id,
+            "0x" + word(int(custody, 16)),
+        ],
+        "data": "0x" + "".join(word(value) for value in event_values),
+        "removed": False,
+    }
+    transaction = {
+        "hash": tx_hash,
+        "blockHash": observed["hash"],
+        "blockNumber": observed["number"],
+        "input": "0xdeadbeef",
+    }
+    receipt = {
+        "transactionHash": tx_hash,
+        "blockHash": observed["hash"],
+        "logs": [pool_log],
+    }
+    if manager_method == "modify":
+        manager_input = MODIFY_LIQUIDITY_SELECTOR + "".join(
+            word(value) for value in (
+                *key_words, -10, 10, 100, 7, 10 * 32, 0,
+            )
+        )
+    elif manager_method == "swap":
+        manager_input = SWAP_SELECTOR + "".join(
+            word(value) for value in (
+                *key_words, 1, -100, 1, 9 * 32, 0,
+            )
+        )
+    else:
+        donate_selector = "0x" + keccak(
+            text=(
+                "donate((address,address,uint24,int24,address),"
+                "uint256,uint256,bytes)"
+            )
+        ).hex()[:8]
+        manager_input = donate_selector + "".join(
+            word(value) for value in (
+                *key_words, 100, 200, 8 * 32, 0,
+            )
+        )
+    manager_input += "00" * 32
+    trace = {
+        "type": "CALL",
+        "to": "0x" + "99" * 20,
+        "input": transaction["input"],
+        "calls": [{
+            "type": "CALL",
+            "to": POOL_MANAGER,
+            "input": manager_input,
+            "output": "0x" + "00" * 64,
+        }],
+    }
+
+    class TraceRpc(StaticRpc):
+        def __init__(self):
+            super().__init__(100)
+            self.trace_error = None
+            self.on_trace = None
+
+        def call(self, method, params):
+            if method == "eth_getTransactionByHash":
+                return transaction
+            if method == "eth_getTransactionReceipt":
+                return receipt
+            if method == "debug_traceTransaction":
+                if self.trace_error is not None:
+                    raise self.trace_error
+                if self.on_trace is not None:
+                    self.on_trace()
+                return trace
+            return super().call(method, params)
+
+    store = MarketStore(":memory:")
+    rpc = TraceRpc()
+    scanner = indexer(store, rpc)
+    with scanner._feed_condition:
+        scanner._observed_blocks[100] = (observed, [])
+    try:
+        resolved, failures = scanner._resolve_current_v4_inputs({
+            pool_id: ([pool_log], tx_hash),
+        })
+        assert failures == {}
+        assert resolved[pool_id]["source"] == "trace.PoolKey"
+        assert (resolved[pool_id]["token0"], resolved[pool_id]["token1"]) == (
+            token0, token1,
+        )
+
+        rpc.trace_error = RpcError("trace RPC unavailable: Goldsky timeout")
+        resolved, failures = scanner._resolve_current_v4_inputs({
+            pool_id: ([pool_log], tx_hash),
+        })
+        assert resolved == {}
+        assert "trace RPC unavailable: Goldsky timeout" in str(
+            failures[pool_id]
+        )
+
+        rpc.trace_error = None
+
+        def reorg_during_trace():
+            replaced = dict(observed)
+            replaced["hash"] = "0x" + "ff" * 32
+            with scanner._feed_condition:
+                scanner._observed_blocks[100] = (replaced, [])
+
+        rpc.on_trace = reorg_during_trace
+        resolved, failures = scanner._resolve_current_v4_inputs({
+            pool_id: ([pool_log], tx_hash),
+        })
+        assert resolved == {}
+        assert isinstance(failures[pool_id], CanonicalConflict)
     finally:
         scanner.close()
         store.close()
@@ -1745,6 +2012,8 @@ def test_accounting_worker_clears_stale_error_after_recovery():
         scanner._set_runtime(
             "identity_recovery", error="reader snapshot exceeded its deadline",
         )
+
+
         scanner._initialized.set()
         scanner._accounting_run()
         assert "accounting" not in scanner.runtime_status()["errors"]
@@ -1752,6 +2021,54 @@ def test_accounting_worker_clears_stale_error_after_recovery():
         scanner._accounting_recovery_run()
         errors = scanner.runtime_status()["errors"]
         assert "identity_recovery" not in errors
+    finally:
+        scanner.close()
+        store.close()
+
+
+
+
+def test_poolkey_input_reads_preserve_receipt_capability_failures(monkeypatch):
+    store = MarketStore(":memory:")
+    scanner = indexer(store)
+    exhausted = "0x" + "11" * 32
+    absent = "0x" + "22" * 32
+    missing = "0x" + "55" * 32
+    calls = []
+
+    def batch_results(client, specifications):
+        assert client is scanner._clients["pool"]
+        calls.extend(specifications)
+        return [
+            RpcError("receipts RPC exhausted: local timeout"), {},
+            None, {},
+        ]
+
+    monkeypatch.setattr(scanner, "_batch_results_on", batch_results)
+    monkeypatch.setattr(
+        scanner, "_rpc_state_batch",
+        lambda *_args, **_kwargs: pytest.fail(
+            "transaction and receipt reads used the state batching path"
+        ),
+    )
+    try:
+        resolved, failures = scanner._resolve_current_v4_inputs({
+            exhausted: ((), "0x" + "33" * 32),
+            absent: ((), "0x" + "44" * 32),
+            missing: ((), ""),
+        })
+        assert resolved == {}
+        assert str(failures[exhausted]) == (
+            "receipts RPC exhausted: local timeout"
+        )
+        assert str(failures[absent]) == "PoolKey transaction was not found"
+        assert str(failures[missing]) == (
+            "PoolKey transaction hash is unavailable"
+        )
+        assert [method for method, _params in calls] == [
+            "eth_getTransactionByHash", "eth_getTransactionReceipt",
+            "eth_getTransactionByHash", "eth_getTransactionReceipt",
+        ]
     finally:
         scanner.close()
         store.close()
@@ -1778,7 +2095,7 @@ def test_pool_resolution_reports_address_and_recovers_health(monkeypatch):
         assert failed["pool_resolution_failures"][pool_id]["classification"] == "rpc"
 
         monkeypatch.setattr(
-            scanner, "_resolve_current_v4_pools",
+            scanner, "_resolve_current_v4_inputs",
             lambda *_args: ({pool_id: {"id": pool_id}}, {}),
         )
         monkeypatch.setattr(store, "upsert_pools", lambda _pools: None)
@@ -1795,6 +2112,44 @@ def test_pool_resolution_reports_address_and_recovers_health(monkeypatch):
         recovered = scanner.runtime_status()
         assert "pool_resolution" not in recovered["errors"]
         assert recovered["pool_resolution_failures"] == {}
+    finally:
+        scanner.close()
+        store.close()
+
+
+def test_durable_identity_recovery_clears_only_its_pool_failure(monkeypatch):
+    store = MarketStore(":memory:")
+    scanner = indexer(store)
+    first, second = "0x" + "12" * 32, "0x" + "34" * 32
+    observed = header(100)
+    with scanner._feed_condition:
+        scanner._observed_blocks[100] = (observed, [])
+
+    def fail(pool_ids, *_args):
+        pool_id = next(iter(pool_ids))
+        return {}, {pool_id: RpcError(f"{pool_id} unavailable")}
+
+    monkeypatch.setattr(scanner, "_resolve_current_v4_pools", fail)
+    try:
+        for pool_id in (first, second):
+            scanner._resolve_current_pool(
+                pool_id, 100, observed["hash"], [], "test",
+                "0x" + "56" * 32,
+            )
+        failed = scanner.runtime_status()
+        assert failed["pool_resolution_failure_count"] == 2
+
+        scanner._clear_current_pool_resolution_failure(first)
+        partial = scanner.runtime_status()
+        assert partial["pool_resolution_failure_count"] == 1
+        assert set(partial["pool_resolution_failures"]) == {second}
+        assert second in partial["errors"]["pool_resolution"]
+
+        scanner._clear_current_pool_resolution_failure(second)
+        recovered = scanner.runtime_status()
+        assert recovered["pool_resolution_failure_count"] == 0
+        assert recovered["pool_resolution_failures"] == {}
+        assert "pool_resolution" not in recovered["errors"]
     finally:
         scanner.close()
         store.close()

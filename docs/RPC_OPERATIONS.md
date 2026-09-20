@@ -135,13 +135,14 @@ historical/current receipts with matching canonical hashes and three complete
 block-receipt results in 32 ms; that evidence does not qualify archive state or
 traces.
 
-The production route gives Goldsky first choice for HTTP head discovery and
-logs, with Quicknode fallback. Quicknode remains first for state, archive state,
-receipts and traces, and supplies the WSS feed. This separates catch-up from
-background accounting's shared endpoint quota. A 256-block comparison returned
-2,432 byte-equivalent canonical log records from both providers, taking 0.626 s
-on Quicknode and 0.403 s on Goldsky. These isolated timings do not include
-contention with the running service.
+The current production route keeps Quicknode endpoints paused. Local Nitro
+serves available headers, logs, state and receipts; the existing Goldsky file
+supplies HTTP fallbacks, including `LP_RPC_TRACE_URL_FILES`. The local node's
+historical receipt access does not imply historical execution-state retention:
+a sampled transaction receipt succeeded locally while `callTracer` failed with
+`required historical state unavailable (reexec=0)`. Goldsky traced that same
+transaction successfully. Do not re-enable a billed endpoint merely to restore
+trace coverage without checking its allowance.
 
 The donated allowance is 6,000 requests/minute. This process paces Goldsky at at most 80 JSON-RPC items/second on average per endpoint, counting batch elements conservatively, with four concurrent HTTP requests. Bursts are bounded by 80-item envelopes. This leaves nominal headroom under 100/s but does not account for other applications sharing the key. Provider billing/rate accounting remains authoritative.
 
@@ -179,6 +180,28 @@ The browser compares parent hashes only for consecutive block heights.
 Skipped head notifications are not fork evidence and must not clear wallet
 snapshots. Same-height replacements and confirmed parent mismatches still
 withdraw orphaned activity and invalidate wallets.
+
+Selected wallet-page accounting coverage seeks ready pending-identity hints
+through `lp_accounting_pending_identities_identity(kind,identity,position_key)`.
+It does not expand each wallet through its complete historical event ledger.
+Pool, protocol and time-window scope still qualify the same pending position;
+incomplete identity hints remain fail-closed. On a populated deployment, allow
+for this index build before serving the new query. A production build took
+43 seconds with the application stopped and SQLite temporary files on disk,
+not tmpfs; that is one measured build, not a startup deadline.
+
+Pool identity recovery tries the pinned getter, canonical transaction calldata,
+then bounded successful PoolManager call traces. A recovered full PoolKey must
+hash to the requested pool ID, and its block must still be canonical after the
+RPC work. Missing trace capability remains a retryable error, not a guessed
+identity. Durable recovery clears the matching current-feed failure while
+leaving other unresolved pools visible.
+
+Activity logs leave the replay queue only after successful handling or durable
+cursor coverage. If an uncovered backlog exceeds the bounded replay queue, the
+subscription reconnects and retains a recovery target; acknowledgement alone
+does not clear the error. The durable scanner must cover the dropped interval
+before the backlog reports recovery.
 
 The browser refreshes durable index status on its one-second heartbeat,
 independently of the slower overview refresh. Requests do not overlap and
@@ -507,11 +530,16 @@ Bulk history, enrichment, projection, metadata, repair, balances and accounting
 pause at 512 MiB of uncheckpointed WAL pages and resume at 128 MiB. Allocated WAL
 length alone does not pause work because SQLite can reuse checkpointed frames.
 At 1 GiB of active WAL pages, maintenance closes admission to new analytics
-snapshots and signals admitted managed readers to abort. Managed snapshots have
-a 15-second lease, checked by SQLite's progress handler. Expired or interrupted
-reads roll back and discard their result; partial rows are not published or
-cached. Accounting preparation workers enforce the same read budget on their
-own connections. Writer and caller-owned transactions are not interrupted.
+snapshots. In-flight readers get the normal 15-second snapshot budget to finish
+before drain cancellation applies; ordinary resets no longer immediately abort
+healthy queries. Only snapshots admitted before that drain generation can be
+interrupted by it, so readers admitted after fail-open are not canceled by an
+expired drain. Default managed snapshots have an independent 15-second lease;
+cold owner projections retain their longer ceiling until storage pressure
+requires a drain. Expired or interrupted reads roll back and discard their
+result; partial rows are not published or cached. Accounting preparation workers
+enforce their read budget on their own connections. Writer and caller-owned
+transactions are not interrupted. Shutdown still cancels managed reads promptly.
 Progress callbacks cannot preempt kernel I/O or Python work between SQLite
 operations, so the lease is not a hard wall-clock I/O cancellation guarantee.
 Short ordinary reads, status, tape and live ingestion remain available.

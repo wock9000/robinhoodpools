@@ -143,12 +143,32 @@ def test_pool_financial_scope_returns_only_matching_pending_identities():
             _, _, recent_owners, recent_custodies, recent_complete = (
                 book._scoped_owner_financial_state(reader, {}, 75)
             )
+            _, _, page_pool_owners, page_pool_custodies, page_pool_complete = (
+                book._scoped_owner_financial_state(
+                    reader, {"pool": target}, None,
+                    (("owner", owner), ("custody", custody),
+                     ("owner", other_owner)),
+                )
+            )
+            _, _, page_recent_owners, page_recent_custodies, page_recent_complete = (
+                book._scoped_owner_financial_state(
+                    reader, {}, 75,
+                    (("owner", owner), ("custody", custody),
+                     ("owner", other_owner)),
+                )
+            )
         assert complete
         assert pending_owners == {owner}
         assert pending_custodies == {custody}
         assert recent_complete
         assert recent_owners == {owner}
         assert recent_custodies == {custody}
+        assert page_pool_complete
+        assert page_pool_owners == pending_owners
+        assert page_pool_custodies == pending_custodies
+        assert page_recent_complete
+        assert page_recent_owners == recent_owners
+        assert page_recent_custodies == recent_custodies
     finally:
         store.close()
 
@@ -222,5 +242,108 @@ def test_owner_reads_do_not_walk_irrelevant_event_history():
             )
             reader.set_progress_handler(None, 0)
             assert activities[0]["block_number"] == event_count
+    finally:
+        store.close()
+
+
+def test_owner_page_financial_scope_does_not_walk_history_or_pending_queue():
+    store = MarketStore(":memory:")
+    try:
+        book = AccountBook(store).install()
+        owner = "0x" + "11" * 20
+        custody = "0x" + "22" * 20
+        target_position = "target-position"
+        irrelevant_count = 4_096
+        with store.transaction() as connection:
+            connection.executemany(
+                "INSERT INTO events("
+                "block_number,block_hash,tx_hash,tx_index,log_index,timestamp,"
+                "protocol,kind,owner,position_key,data,revision"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    (
+                        number, f"block-{number}", f"tx-{number}", 0, 0,
+                        number, "v3", "transfer", owner,
+                        target_position if number == irrelevant_count
+                        else f"historical-{number}",
+                        "{}", 1,
+                    )
+                    for number in range(1, irrelevant_count + 1)
+                ),
+            )
+            connection.executemany(
+                "INSERT INTO lp_accounting_event_keys(event_id,position_key) "
+                "VALUES(?,?)",
+                (
+                    (
+                        number,
+                        target_position if number == irrelevant_count
+                        else f"historical-{number}",
+                    )
+                    for number in range(1, irrelevant_count + 1)
+                ),
+            )
+            connection.executemany(
+                "INSERT INTO lp_accounting_pending("
+                "position_key,generation,requested_revision,requested_epoch,"
+                "priority_block,priority_tx_index,priority_log_index,"
+                "identities_ready"
+                ") VALUES(?,1,1,0,1,0,0,1)",
+                (
+                    (target_position,),
+                    *((f"irrelevant-pending-{number}",)
+                      for number in range(irrelevant_count)),
+                ),
+            )
+            connection.executemany(
+                "INSERT INTO lp_accounting_pending_identities("
+                "position_key,kind,identity,protocol,pool_id,timestamp"
+                ") VALUES(?,?,?,?,?,?)",
+                (
+                    (target_position, "scope", "", "v3", "target-pool", 100),
+                    (target_position, "owner", owner, "v3", "target-pool", 100),
+                    (target_position, "custody", custody, "v3", "target-pool", 100),
+                    *(
+                        (
+                            f"irrelevant-pending-{number}", "scope", "",
+                            "v3", "other-pool", 100,
+                        )
+                        for number in range(irrelevant_count)
+                    ),
+                    *(
+                        (
+                            f"irrelevant-pending-{number}", "owner",
+                            f"0x{number + 1:040x}", "v3", "other-pool", 100,
+                        )
+                        for number in range(irrelevant_count)
+                    ),
+                ),
+            )
+            connection.execute(
+                "INSERT INTO lp_accounting_meta(key,value) "
+                "VALUES('bootstrap_phase','complete') "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+            )
+
+        with store.reader_snapshot() as reader:
+            steps = 0
+
+            def bound_page_qualification():
+                nonlocal steps
+                steps += 1
+                return int(steps > 1_000)
+
+            reader.set_progress_handler(bound_page_qualification, 1)
+            _, _, pending_owners, pending_custodies, complete = (
+                book._scoped_owner_financial_state(
+                    reader, {"pool": "target-pool"}, None,
+                    (("owner", owner), ("custody", custody)),
+                )
+            )
+            reader.set_progress_handler(None, 0)
+
+        assert complete
+        assert pending_owners == {owner}
+        assert pending_custodies == {custody}
     finally:
         store.close()
