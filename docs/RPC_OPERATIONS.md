@@ -562,10 +562,12 @@ available while fresh analytics wait. A drain lasts at most 60 seconds,
 followed by a 60-second admission cooldown if it expires.
 
 Once owned snapshots drain, routine maintenance uses `RESTART`, not `TRUNCATE`.
-Reset attempts take a nonblocking background writer turn before acquiring
-SQLite's writer lock; an active application writer makes the reset defer.
-Reader admission closes before this writer attempt, so continuous writes
-cannot prevent the drain from starting.
+Reader admission closes before competing for the writer. Once owned snapshots
+finish, the reset queues a background writer turn, bounded by the existing
+drain deadline; it does not rely on finding a gap between continuous writes.
+No store or checkpoint lock is held while that turn waits. Expiry reopens
+reader admission with the existing cooldown. Unmanaged resets and resets called
+inside a writer remain nonblocking.
 New application writes wait behind an admitted reset instead of failing
 `BEGIN` with `database is locked`. External-reader lock waiting is bounded
 to 100 ms. `PASSIVE` checkpointing remains independent of writer admission.

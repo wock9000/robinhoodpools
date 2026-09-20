@@ -2,6 +2,7 @@
 from __future__ import annotations
 import sqlite3
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -205,7 +206,7 @@ def test_restart_checkpoint_does_not_wait_for_active_writer(tmp_path):
     def checkpoint():
         try:
             checkpoint_results.append(
-                store.checkpoint("RESTART", drain_readers=True)
+                store.checkpoint("RESTART")
             )
         except BaseException as exc:
             failures.append(exc)
@@ -223,7 +224,7 @@ def test_restart_checkpoint_does_not_wait_for_active_writer(tmp_path):
         ), "RESTART checkpoint waited behind the active writer"
         assert failures == []
         assert checkpoint_results[0]["busy"] == 1
-        assert checkpoint_results[0]["reader_drain_pending"] == 1
+        assert checkpoint_results[0]["reader_drain_pending"] == 0
         release_writer.set()
         writer.join(2)
         assert failures == []
@@ -243,6 +244,101 @@ def test_restart_checkpoint_does_not_wait_for_active_writer(tmp_path):
         release_writer.set()
         writer.join(2)
         checkpointer.join(6)
+        store.close()
+    assert failures == []
+
+
+def test_managed_reset_queues_writer_without_blocking_passive_checkpoint(tmp_path):
+    store = MarketStore(tmp_path / "market.sqlite", checkpoint_on_commit=False)
+    writer_entered = threading.Event()
+    release_writer = threading.Event()
+    checkpoint_done = threading.Event()
+    results, failures = [], []
+    with store.transaction() as connection:
+        connection.execute("INSERT INTO metadata(key,value) VALUES('seed','1')")
+
+    def write():
+        try:
+            with store.transaction() as connection:
+                connection.execute("UPDATE metadata SET value='2' WHERE key='seed'")
+                writer_entered.set()
+                release_writer.wait(3)
+        except BaseException as exc:
+            failures.append(exc)
+
+    def reset():
+        try:
+            results.append(store.checkpoint("RESTART", drain_readers=True))
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            checkpoint_done.set()
+
+    writer = threading.Thread(target=write)
+    checkpointer = threading.Thread(target=reset)
+    try:
+        writer.start()
+        assert writer_entered.wait(1)
+        checkpointer.start()
+        deadline = time.monotonic() + 1
+        while True:
+            passive = store.checkpoint("PASSIVE")
+            if passive["reader_drain_pending"] or time.monotonic() >= deadline:
+                break
+            checkpoint_done.wait(0.001)
+        assert passive["busy"] == 0
+        assert passive["reader_drain_pending"] == 1
+        assert not checkpoint_done.wait(0.1), "managed reset did not queue a writer turn"
+        release_writer.set()
+        assert checkpoint_done.wait(1)
+        assert failures == []
+        assert results[0]["busy"] == 0
+        assert results[0]["reader_drain_pending"] == 0
+        with store.reader_snapshot() as connection:
+            assert connection.execute(
+                "SELECT value FROM metadata WHERE key='seed'"
+            ).fetchone()[0] == "2"
+    finally:
+        release_writer.set()
+        writer.join(3)
+        checkpointer.join(3)
+        store.close()
+    assert failures == []
+
+
+def test_managed_reset_writer_deadline_reopens_snapshot_admission(tmp_path, monkeypatch):
+    monkeypatch.setattr(market_store_module, "_READER_DRAIN_SECONDS", 0.05)
+    store = MarketStore(tmp_path / "market.sqlite", checkpoint_on_commit=False)
+    writer_entered = threading.Event()
+    release_writer = threading.Event()
+    failures = []
+    with store.transaction() as connection:
+        connection.execute("INSERT INTO metadata(key,value) VALUES('seed','1')")
+
+    def write():
+        try:
+            with store.transaction() as connection:
+                connection.execute("UPDATE metadata SET value='2' WHERE key='seed'")
+                writer_entered.set()
+                release_writer.wait(3)
+        except BaseException as exc:
+            failures.append(exc)
+
+    writer = threading.Thread(target=write)
+    try:
+        writer.start()
+        assert writer_entered.wait(1)
+        result = store.checkpoint("RESTART", drain_readers=True)
+        assert result["busy"] == 1
+        assert result["reader_drain_pending"] == 0
+        assert writer.is_alive()
+        with store.reader_snapshot() as connection:
+            assert connection.execute(
+                "SELECT value FROM metadata WHERE key='seed'"
+            ).fetchone()[0] == "1"
+    finally:
+        release_writer.set()
+        writer.join(3)
         store.close()
     assert failures == []
 

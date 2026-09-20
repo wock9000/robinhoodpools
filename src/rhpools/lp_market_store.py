@@ -1003,111 +1003,116 @@ class MarketStore:
         if mode not in _CHECKPOINT_MODES:
             supported = ", ".join(sorted(_CHECKPOINT_MODES))
             raise ValueError(f"checkpoint mode must be one of {supported}")
+        if self._closed:
+            raise MarketStoreError("market store is closed")
         reset_mode = mode != "PASSIVE"
-        with self._checkpoint_lock:
+        managed_attempt = False
+        drain_deadline = None
+        if drain_readers and reset_mode and not self._uri:
+            with self._reader_snapshot_condition:
+                now = time.monotonic()
+                self._expire_reader_drain_locked(now)
+                if (
+                    self._reader_drain_deadline is None
+                    and self._reader_drain_retry_after <= now
+                ):
+                    self._reader_drain_deadline = now + _READER_DRAIN_SECONDS
+                    self._reader_drain_interrupt_after = (
+                        now + _READER_SNAPSHOT_SECONDS
+                    )
+                    self._reader_drain_generation += 1
+                drain_deadline = self._reader_drain_deadline
+                deferred_snapshots = (
+                    self._active_reader_snapshots if drain_deadline is not None else 0
+                )
+                managed_attempt = drain_deadline is not None
+            if deferred_snapshots:
+                return self._checkpoint_metrics(
+                    busy=1,
+                    log_frames=-1,
+                    checkpointed_frames=-1,
+                    active_reader_snapshots=deferred_snapshots,
+                    reader_drain_pending=1,
+                )
+
+        writer_exclusion = False
+        store_lock_exclusion = False
+        checkpoint_exclusion = False
+        try:
+            if reset_mode:
+                # A drained reset needs a queued turn, not a lucky gap between
+                # continuous writers. Wait without holding either store lock.
+                # A caller already inside a write cannot wait for itself.
+                wait_for_writer = managed_attempt and not getattr(
+                    self._local, "write_depth", 0,
+                )
+                writer_exclusion = self._acquire_writer_turn(
+                    "background", blocking=bool(wait_for_writer),
+                    deadline=drain_deadline if wait_for_writer else None,
+                )
+                if writer_exclusion:
+                    store_lock_exclusion = self.lock.acquire(blocking=False)
+            if not reset_mode or store_lock_exclusion:
+                # Match close's store -> checkpoint ordering. An independent
+                # PASSIVE run must not hold up live writes behind this reset.
+                checkpoint_exclusion = self._checkpoint_lock.acquire(
+                    blocking=not reset_mode,
+                )
+            if not checkpoint_exclusion:
+                active_snapshots, drain_pending = self._reader_snapshot_state()
+                return self._checkpoint_metrics(
+                    busy=1,
+                    log_frames=-1,
+                    checkpointed_frames=-1,
+                    active_reader_snapshots=active_snapshots,
+                    reader_drain_pending=drain_pending,
+                )
             if self._closed:
                 raise MarketStoreError("market store is closed")
-
-            writer_exclusion = False
-            store_lock_exclusion = False
-
+            connection = self._checkpoint_connection
             try:
-                managed_attempt = False
-                deferred_snapshots = 0
-                managed_drain = (
-                    drain_readers and reset_mode and not self._uri
-                )
-                if managed_drain:
-                    with self._reader_snapshot_condition:
-                        now = time.monotonic()
-                        self._expire_reader_drain_locked(now)
-                        if (
-                            self._reader_drain_deadline is None
-                            and self._reader_drain_retry_after <= now
-                        ):
-                            self._reader_drain_deadline = (
-                                now + _READER_DRAIN_SECONDS
-                            )
-                            self._reader_drain_interrupt_after = (
-                                now + _READER_SNAPSHOT_SECONDS
-                            )
-                            # Snapshots admitted before this generation receive
-                            # the grace deadline; fail-open readers do not.
-                            self._reader_drain_generation += 1
-                        if self._reader_drain_deadline is not None:
-                            deferred_snapshots = self._active_reader_snapshots
-                            managed_attempt = not deferred_snapshots
-                    if deferred_snapshots:
-                        return self._checkpoint_metrics(
-                            busy=1,
-                            log_frames=-1,
-                            checkpointed_frames=-1,
-                            active_reader_snapshots=deferred_snapshots,
-                            reader_drain_pending=1,
-                        )
-                if reset_mode:
-                    # Close reader admission before competing for the writer.
-                    # Otherwise continuous writes can starve the drain itself.
-                    # Never wait while owning the checkpoint lane: close takes
-                    # these locks in the reverse order.
-                    writer_exclusion = self._acquire_writer_turn(
-                        "background", blocking=False,
+                if managed_attempt:
+                    connection.execute(
+                        f"PRAGMA busy_timeout={_CHECKPOINT_BUSY_TIMEOUT_MS}"
                     )
-                    if writer_exclusion:
-                        store_lock_exclusion = self.lock.acquire(blocking=False)
-                    if not store_lock_exclusion:
-                        active_snapshots, drain_pending = (
-                            self._reader_snapshot_state()
-                        )
-                        return self._checkpoint_metrics(
-                            busy=1,
-                            log_frames=-1,
-                            checkpointed_frames=-1,
-                            active_reader_snapshots=active_snapshots,
-                            reader_drain_pending=drain_pending,
-                        )
-                connection = self._checkpoint_connection
-                try:
-                    if managed_attempt:
-                        connection.execute(
-                            f"PRAGMA busy_timeout={_CHECKPOINT_BUSY_TIMEOUT_MS}"
-                        )
-                    row = connection.execute(
-                        f"PRAGMA wal_checkpoint({mode})"
-                    ).fetchone()
-                    if managed_attempt:
+                row = connection.execute(
+                    f"PRAGMA wal_checkpoint({mode})"
+                ).fetchone()
+                if managed_attempt:
+                    connection.execute("PRAGMA busy_timeout=0")
+            except BaseException:
+                if managed_attempt:
+                    with contextlib.suppress(sqlite3.Error):
                         connection.execute("PRAGMA busy_timeout=0")
-                except BaseException:
-                    if managed_attempt:
-                        with contextlib.suppress(sqlite3.Error):
-                            connection.execute("PRAGMA busy_timeout=0")
-                    self._finish_reader_drain()
-                    raise
+                self._finish_reader_drain()
+                raise
 
-                busy, log_frames, checkpointed_frames = (
-                    (0, -1, -1) if row is None else map(int, row)
-                )
-                # SQLite reports -1 frame counts when the database is not using
-                # WAL, including shared in-memory stores.
-                log_frames = max(0, log_frames)
-                checkpointed_frames = max(0, checkpointed_frames)
-                if reset_mode and not busy:
-                    self._finish_reader_drain()
-                active_reader_snapshots, reader_drain_pending = (
-                    self._reader_snapshot_state()
-                )
-                return self._checkpoint_metrics(
-                    busy=busy,
-                    log_frames=log_frames,
-                    checkpointed_frames=checkpointed_frames,
-                    active_reader_snapshots=active_reader_snapshots,
-                    reader_drain_pending=reader_drain_pending,
-                )
-            finally:
-                if store_lock_exclusion:
-                    self.lock.release()
-                if writer_exclusion:
-                    self._release_writer_turn()
+            busy, log_frames, checkpointed_frames = (
+                (0, -1, -1) if row is None else map(int, row)
+            )
+            # SQLite reports -1 frame counts when the database is not using
+            # WAL, including shared in-memory stores.
+            log_frames = max(0, log_frames)
+            checkpointed_frames = max(0, checkpointed_frames)
+            if reset_mode and not busy:
+                self._finish_reader_drain()
+            active_reader_snapshots, reader_drain_pending = (
+                self._reader_snapshot_state()
+            )
+            return self._checkpoint_metrics(
+                busy=busy,
+                log_frames=log_frames,
+                checkpointed_frames=checkpointed_frames,
+                active_reader_snapshots=active_reader_snapshots,
+                reader_drain_pending=reader_drain_pending,
+            )
+        finally:
+            if checkpoint_exclusion:
+                self._checkpoint_lock.release()
+            if store_lock_exclusion:
+                self.lock.release()
+            if writer_exclusion:
+                self._release_writer_turn()
 
     def _writer_rank(self, priority: str | None) -> int:
         selected = (
@@ -1139,7 +1144,7 @@ class MarketStore:
         )
 
     def _acquire_writer_turn(
-        self, priority: str | None, *, blocking: bool,
+        self, priority: str | None, *, blocking: bool, deadline: float | None = None,
     ) -> bool:
         rank = self._writer_rank(priority)
         with self._writer_condition:
@@ -1147,14 +1152,19 @@ class MarketStore:
             self._writer_ticket += 1
             self._writer_waiters[ticket] = rank
             try:
-                if not blocking and (
-                    self._writer_active or self._next_writer_locked() != ticket
-                ):
-                    return False
                 while (
                     self._writer_active or self._next_writer_locked() != ticket
                 ):
-                    self._writer_condition.wait()
+                    if not blocking:
+                        return False
+                    remaining = (
+                        None if deadline is None else deadline - time.monotonic()
+                    )
+                    if remaining is not None and remaining <= 0:
+                        return False
+                    self._writer_condition.wait(remaining)
+                if deadline is not None and time.monotonic() >= deadline:
+                    return False
                 self._writer_active = True
                 background_waiting = any(
                     waiting_rank == _WRITER_PRIORITIES["background"]
