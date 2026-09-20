@@ -747,6 +747,29 @@ and start one owner. Retain the original files until destination readiness and
 index progress are verified. Once the destination accepts new commits, pointing
 the service back at the old copy would lose those commits and is not a rollback.
 
+### Token and owner lookup cost
+
+Public token lookups must use `COLLATE NOCASE` to match the existing
+`lp_catalog_search` token indexes. A binary comparison instead scans the
+catalog's primary-key index. Ownership history needs indexes for both sides of
+`owner=? OR custody=?`; indexing only `owner` still forces a table scan.
+Schema version 15 adds a partial custody index for non-null addresses, without
+changing ownership records, coverage, ordering, or retention. Existing databases
+build the index once at startup. Pause supervision during that maintenance
+window as described above.
+
+A synthetic benchmark with 333,000 rows per table returned identical results
+before and after these changes. Across three runs, median catalog query time
+fell from 40.289 ms to 0.025 ms, and ownership query time from 24.163 ms to
+0.029 ms. These are selective SQL lookup measurements, not end-to-end API
+latencies or whole-service CPU savings. Large matching result sets still cost
+work proportional to the requested results.
+
+Keep process anonymous memory separate from reclaimable filesystem cache when
+comparing resource use. A post-restart memory decrease alone does not establish
+a sustained saving. These query fixes do not reduce SQLite cache budgets,
+request capacity, history coverage, or freshness.
+
 ## Availability monitoring and recovery
 
 The independent Cloudflare Worker at <https://status.rhpools.lol/> probes the public root and status API every two minutes. It reports the observed and indexed heads separately from HTTP availability. Its secondary-domain check can fail independently of the application; a registrar hold is not repaired by restarting the indexer.

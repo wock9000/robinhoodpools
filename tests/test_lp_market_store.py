@@ -44,6 +44,61 @@ def event(block: dict[str, str], log_index: int) -> dict[str, object]:
     }
 
 
+@pytest.mark.parametrize("upgrade", [False, True])
+def test_owner_and_custody_history_lookup_is_bounded(tmp_path, upgrade):
+    path = tmp_path / "market.sqlite"
+    identity = "0x" + "22" * 20
+    other = "0x" + "33" * 20
+    store = MarketStore(path)
+    AccountBook(store).install()
+    try:
+        with store.transaction() as connection:
+            insert = (
+                "INSERT INTO lp_ownership_intervals "
+                "(position_key,ordinal,owner,custody,identity_basis,acquired_by,"
+                "start_block,start_tx_index,start_log_index,start_timestamp,complete) "
+                "VALUES (?,0,?,?,'verified','mint',?,0,0,1,?)"
+            )
+            connection.executemany(
+                insert,
+                ((f"other-{index}", other, other, index + 4, 1)
+                 for index in range(20_000)),
+            )
+            connection.executemany(insert, [
+                ("owner", identity, other, 3, 1),
+                ("custody", other, identity, 1, 0),
+                ("both", identity, identity, 2, 1),
+            ])
+            if upgrade:
+                connection.execute("DROP INDEX IF EXISTS lp_ownership_intervals_custody")
+                connection.execute("PRAGMA user_version=14")
+        if upgrade:
+            store.close()
+            store = MarketStore(path)
+        connection = store.read()
+        steps = 0
+
+        def interrupt_scan():
+            nonlocal steps
+            steps += 1000
+            return int(steps > 10_000)
+
+        connection.set_progress_handler(interrupt_scan, 1000)
+        rows = connection.execute(
+            "SELECT position_key,owner,custody,complete "
+            "FROM lp_ownership_intervals WHERE owner=? OR custody=? "
+            "ORDER BY start_block,start_tx_index,start_log_index",
+            (identity, identity),
+        ).fetchall()
+        assert [tuple(row) for row in rows] == [
+            ("custody", other, identity, 0),
+            ("both", identity, identity, 1),
+            ("owner", identity, other, 1),
+        ]
+    finally:
+        store.close()
+
+
 def test_live_writer_admission_precedes_queued_background():
     store = MarketStore(":memory:")
     holder_entered = threading.Event()
