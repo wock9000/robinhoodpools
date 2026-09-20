@@ -656,6 +656,14 @@ and retain disk headroom. Defragmentation can break shared reflinks and increase
 space usage; see the [Btrfs filesystem documentation](https://btrfs.readthedocs.io/en/latest/btrfs-filesystem.html).
 Do not delete a journal or weaken synchronization to hide filesystem latency.
 
+Background I/O priority alone does not protect live latency during a sustained
+defragmentation pass: the online 1 GiB ranges still interfered with live commits.
+Use an approved maintenance window, or smaller ranges gated on index recovery.
+For an offline window, stop `robinhoodpools-healthcheck.timer` and its active
+one-shot service before stopping the application; otherwise the watchdog
+restarts it. Keep free-space checks active, preserve all SQLite sidecars, and
+resume the application and any paused supervision timers afterward.
+
 If a durable commit fails because storage is full or unavailable, the store
 rolls the failed transaction back before the worker retries. Runtime-status
 persistence is a separate health write. Its failure appears in the live
