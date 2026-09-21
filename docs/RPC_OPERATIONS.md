@@ -247,7 +247,7 @@ process otherwise forces repeated head-only snapshots until the new sequence
 catches up, even though the durable index and HTTP endpoints keep advancing.
 
 The browser refreshes durable index status on a one-second heartbeat and visible
-aggregate views on an independent three-second timer. A pending overview does
+aggregate views on an independent one-second timer. A pending overview does
 not delay pool or dislocation refreshes. Requests for the same view do not
 overlap, cached rows remain visible during refresh, and hidden pages stop their
 requests. Aggregate health uses indexed coverage time when available, then frame
@@ -272,6 +272,17 @@ SQLite's variable limit. This avoids handing the Python interpreter to competing
 valuation workers between every inserted row. The outer durable transaction
 preserves the raw event/cursor/job boundary.
 
+New canonical event insertion no longer writes the secondary search catalog
+inside that transaction. The search worker follows the durable event-ID cursor
+in background-priority batches of 100, capped at 250. Search status reports
+`catching_up` until it reaches the current event tail. A committed event can
+therefore appear in the tape and aggregates before search finds it.
+Existing-event enrichment and reorg repair still update affected search entries
+synchronously. Descriptive terms, including block numbers, remain searchable.
+Schema version 16 initializes a missing legacy cursor at the existing event
+tail only when version 1 of the atomically maintained search index is present;
+it does not replay the entire ledger or skip a new store's search backlog.
+
 Adaptive scan sizing targets two seconds of live or provider-history writer
 work; the archive source targets four seconds. Growth uses measured store
 throughput and log density. Live and historical commits stop at a whole-block
@@ -279,9 +290,11 @@ boundary near 2,000 logs; an indivisible block may exceed the target. Their
 cursors never advance across a fetched but uncommitted portion of the interval.
 Writer admission is FIFO within live, normal, and background priorities. Live
 work wins the next available transaction, with one background turn after eight
-foreground admissions while background work is queued. Enrichment publishes one
-completed fetch job per writer turn. History yields above four live batches or
-thirty seconds of debt, including a recheck after waiting for the writer.
+foreground admissions while background work is queued, unless live catch-up
+pressure is active. Above four live batches or two seconds of debt, queued
+lower-priority writers also wait. History rechecks the debt after acquiring its
+turn. Bulk work resumes near the head. Enrichment publishes one completed fetch
+job per writer turn.
 Price-anchor repair seeks each changed mark's own timestamp window through the
 earlier of its next mark or 300-second expiry. It uses the existing timestamp
 index rather than scanning from a historical block to the current tip under
@@ -580,11 +593,11 @@ pause at 512 MiB of uncheckpointed WAL pages and resume at 128 MiB. Allocated WA
 length alone does not pause work because SQLite can reuse checkpointed frames.
 At 1 GiB of active WAL pages, or when uncheckpointed backlog reaches the bulk
 pause threshold, maintenance closes admission to new analytics snapshots.
-In-flight readers get the normal 15-second snapshot budget to finish
-before drain cancellation applies; ordinary resets no longer immediately abort
-healthy queries. Only snapshots admitted before that drain generation can be
+In-flight readers get a one-second drain grace before cancellation applies.
+Waiting for the full query lease here froze every new summary during routine
+maintenance. Only snapshots admitted before that drain generation can be
 interrupted by it, so readers admitted after fail-open are not canceled by an
-expired drain. Default managed snapshots have an independent 15-second lease;
+expired drain. Default managed snapshots retain their independent 15-second lease;
 cold owner projections retain their longer ceiling until storage pressure
 requires a drain. Expired or interrupted reads roll back and discard their
 result; partial rows are not published or cached. Accounting preparation workers
@@ -592,6 +605,9 @@ enforce their read budget on their own connections. Writer and caller-owned
 transactions are not interrupted. Shutdown still cancels managed reads promptly.
 Progress callbacks cannot preempt kernel I/O or Python work between SQLite
 operations, so the lease is not a hard wall-clock I/O cancellation guarantee.
+SQLite checks cancellation every 100,000 VM steps, not every 1,000. Each Python
+callback reacquires the GIL, so an overly frequent check can make a short query
+miss its deadline under competing valuation work. The final lease check remains.
 Short ordinary reads, status, tape and live ingestion remain available.
 Bulk workers also pause during the drain. Cached complete frames remain
 available while fresh analytics wait. A drain lasts at most 60 seconds,
@@ -599,8 +615,8 @@ followed by a 60-second admission cooldown if it expires.
 
 Once owned snapshots drain, routine maintenance uses `RESTART`, not `TRUNCATE`.
 Reader admission closes before competing for the writer. Once owned snapshots
-finish, the reset queues a background writer turn, bounded by the existing
-drain deadline; it does not rely on finding a gap between continuous writes.
+finish, the reset queues a live-priority writer turn, bounded by the existing
+drain deadline. Catch-up pressure cannot strand the closed reader-admission gate.
 No store or checkpoint lock is held while that turn waits. Expiry reopens
 reader admission with the existing cooldown. Unmanaged resets and resets called
 inside a writer remain nonblocking.
@@ -646,8 +662,9 @@ Owner financial scope reads use the global indexed canonical boundary rather
 than searching unrelated event history for a presentation-filter match.
 Historical activity resolves its exact block, transaction and log boundary
 through `events_block_idx` instead of expanding every related event key.
-Pool summaries use one managed snapshot over the existing pool/bucket/tape read
-models. Shutdown signals managed-reader interruption before joining frame jobs.
+Pool summaries share a canonical bucket frame. Catalog and page details use a
+separate snapshot in the same epoch; an epoch change retries the frame and page.
+Shutdown signals managed-reader interruption before joining frame jobs.
 
 An oversized WAL can make recovery slow before HTTP is available. Preserve the database, `-wal`, and `-shm` together; never delete the journal to force startup. For planned exclusive checkpoint maintenance, stop the watchdog and all database owners first, let SQLite complete `PRAGMA wal_checkpoint(TRUNCATE)`, verify success, then start exactly one application owner and resume monitoring.
 
@@ -662,27 +679,44 @@ older drop-in still controls these values. Resource limits are not a host-wide
 reliability guarantee; compare cursor gain against chain gain under the actual
 load. A single fast scan does not establish sustainable catch-up.
 
-Terminal warming retains its next-key position across short writer-idle windows.
+Terminal warming starts with 24h and retains its next-key position across short writer-idle windows.
 It no longer restarts at the first overview key whenever ingestion interrupts
 it. Failed keys advance the rotation too and retry after the other default
 views have had an opportunity; warming still obeys storage and latency guards.
 
 Published terminal frames use a separate 64-entry cache from the 16-entry cache
-of snapshot-versioned pool filters, sorts, bucket aggregates and tape rows.
-Obsolete query generations cannot evict otherwise usable terminal responses.
-Canonical epoch/revision keys and same-key load coalescing remain in place;
-complete frames keep their original `as_of` while a request-triggered refresh
-runs.
+of snapshot-versioned query intermediates. Eight retained bucket frames advance
+from event revisions and entering or expired minute ranges. Only affected pools
+are reread; epoch changes or large change sets rebuild the frame. Both full and
+per-pool multi-day reads use daily rollups with hourly and minute boundaries.
+Overview totals and pool rankings reuse that frame.
+Up to 1,024 changed pools use indexed pool lookups. Larger change sets use one
+covering-window scan, with the pool IDs bound as a JSON array rather than split
+into repeated scans or limited by SQLite's parameter count. A production
+seven-day comparison returned identical totals for 2,376 candidate pools in
+0.15 seconds through the covering scan versus 1.47 seconds through pool lookups.
+
+Overview and pool refreshes use a dedicated two-worker executor. They acquire
+the canonical status and window inside the execution-time read snapshot, not
+when a request queues the work. Published `as_of`, coverage and event revision
+identify the included data. A separate request-time status cannot make old
+aggregate values appear fresh.
+
+All five windows use a one-second application cache lifetime. Summary HTTP
+responses use `max-age=0, stale-while-revalidate=0`, retaining ETags without an
+additional browser or edge stale-serving interval. Complete cached frames stay
+visible while the application refreshes them, including during maintenance.
 
 An admitted snapshot does not wait on a shared query whose producer has not yet
 acquired its snapshot: that producer may be blocked by the WAL admission gate.
 It reads its own snapshot instead without replacing the other producer's
 publication, breaking the snapshot/Future/drain wait cycle.
 
-Pool-ID scans use SQLite JSON aggregation to cross into Python once rather than
-once per catalog row. This avoids hundreds of thousands of GIL handoffs during
-each metadata-generation refresh. The filtered IDs, ordering and page contents
-are unchanged; snapshot deadlines and cancellation remain enabled.
+Pool-ID, changed-pool and aggregate scans use SQLite JSON aggregation to cross
+into Python once rather than once per row. Aggregate REAL values serialize with
+17 significant digits so this batching preserves binary64 values, including
+large counts. Filters, ordering and page contents are unchanged; snapshot
+deadlines and cancellation remain enabled.
 
 Browser pool requests have a 15-second deadline, including response-body reads.
 An initial failed request displays `POOL DATA UNAVAILABLE · RETRYING`, not

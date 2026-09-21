@@ -74,6 +74,12 @@ def test_live_writer_admission_precedes_queued_background():
         holder.start()
         assert holder_entered.wait(1)
         background.start()
+        with store._writer_condition:
+            assert store._writer_condition.wait_for(
+                lambda: len(store._writer_waiters) == 1,
+                timeout=1,
+            )
+        store.set_writer_pressure("live")
         live.start()
         with store._writer_condition:
             assert store._writer_condition.wait_for(
@@ -82,15 +88,102 @@ def test_live_writer_admission_precedes_queued_background():
             )
         release_holder.set()
         holder.join(2)
-        background.join(2)
         live.join(2)
+        assert order == ["live"]
+        assert background.is_alive()
+
+        store.set_writer_pressure(None)
+        background.join(2)
         assert failures == []
         assert order == ["live", "background"]
     finally:
         release_holder.set()
+        store.set_writer_pressure(None)
         for thread in (holder, background, live):
             if thread.ident is not None:
                 thread.join(2)
+        store.close()
+
+
+def test_canonical_ingest_commits_before_background_search_catalog():
+    store = MarketStore(":memory:")
+    block = header(10)
+    record = event(block, 0)
+    try:
+        store.ensure_search_index()
+        inserted = store.ingest(
+            [block],
+            [record],
+            cursor={
+                "from_block": 10,
+                "to_block": 10,
+                "block_number": 10,
+                "block_hash": block["hash"],
+            },
+        )
+
+        assert len(inserted) == 1
+        assert store.cursor("live")["block_number"] == 10
+        assert store.read().execute("SELECT COUNT(*) FROM events").fetchone()[0] == 1
+        assert store.search(record["tx_hash"]) == ([], 0)
+        assert store.search_index_status() == {
+            "state": "warming",
+            "phase": "catching_up",
+            "ready": False,
+            "indexed_through_event": 0,
+            "events_total": 1,
+        }
+
+        store.build_search_index(threading.Event(), batch_size=1)
+
+        assert store.search_index_status() == {
+            "state": "ready",
+            "phase": "ready",
+            "ready": True,
+            "indexed_through_event": 1,
+            "events_total": 1,
+        }
+        assert [row["id"] for row in store.search(record["tx_hash"])[0]] == [
+            record["tx_hash"],
+        ]
+    finally:
+        store.close()
+
+
+def test_legacy_search_index_baselines_durable_tail_cursor(tmp_path):
+    path = tmp_path / "market.sqlite"
+    store = MarketStore(path)
+    block = header(10)
+    record = event(block, 0)
+    try:
+        store.ingest([block], [record])
+        store.build_search_index(threading.Event())
+    finally:
+        store.close()
+
+    legacy = sqlite3.connect(path)
+    try:
+        legacy.execute("DELETE FROM metadata WHERE key='search_index_cursor'")
+        legacy.execute("DELETE FROM metadata WHERE key='search_index_state'")
+        legacy.execute("PRAGMA user_version=15")
+        legacy.commit()
+    finally:
+        legacy.close()
+
+    store = MarketStore(path)
+    try:
+        assert store.connection.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert store.search_index_status() == {
+            "state": "ready",
+            "phase": "ready",
+            "ready": True,
+            "indexed_through_event": 1,
+            "events_total": 1,
+        }
+        assert [row["id"] for row in store.search(record["tx_hash"])[0]] == [
+            record["tx_hash"],
+        ]
+    finally:
         store.close()
 
 
@@ -248,7 +341,9 @@ def test_restart_checkpoint_does_not_wait_for_active_writer(tmp_path):
     assert failures == []
 
 
-def test_managed_reset_queues_writer_without_blocking_passive_checkpoint(tmp_path):
+@pytest.mark.parametrize("live_pressure", [False, True])
+def test_managed_reset_queues_writer_without_blocking_passive_checkpoint(
+        tmp_path, live_pressure):
     store = MarketStore(tmp_path / "market.sqlite", checkpoint_on_commit=False)
     writer_entered = threading.Event()
     release_writer = threading.Event()
@@ -279,6 +374,8 @@ def test_managed_reset_queues_writer_without_blocking_passive_checkpoint(tmp_pat
     try:
         writer.start()
         assert writer_entered.wait(1)
+        if live_pressure:
+            store.set_writer_pressure("live")
         checkpointer.start()
         deadline = time.monotonic() + 1
         while True:
@@ -299,6 +396,7 @@ def test_managed_reset_queues_writer_without_blocking_passive_checkpoint(tmp_pat
                 "SELECT value FROM metadata WHERE key='seed'"
             ).fetchone()[0] == "2"
     finally:
+        store.set_writer_pressure(None)
         release_writer.set()
         writer.join(3)
         checkpointer.join(3)
@@ -623,7 +721,7 @@ def test_checkpoint_drain_interrupts_only_snapshot_outliving_grace(
 ):
     monkeypatch.setattr(market_store_module, "_READER_PROGRESS_STEPS", 1)
     monkeypatch.setattr(market_store_module, "_READER_DRAIN_SECONDS", 0.05)
-    monkeypatch.setattr(market_store_module, "_READER_SNAPSHOT_SECONDS", 0.05)
+    monkeypatch.setattr(market_store_module, "_READER_DRAIN_GRACE_SECONDS", 0.05)
     store = MarketStore(tmp_path / "market.sqlite", checkpoint_on_commit=False)
     entered = threading.Event()
     release = threading.Event()
@@ -949,6 +1047,7 @@ def test_repeated_search_entities_do_not_duplicate_search_results():
             [block], [event(block, offset) for offset in range(50)],
         )
         assert len(inserted) == 50
+        store.build_search_index(threading.Event())
         results, total = store.search("shared-position")
         assert total == 1
         assert [(row["kind"], row["id"]) for row in results] == [
@@ -1347,7 +1446,7 @@ def test_unprojected_ingest_rolls_activity_into_buckets_exactly_once(tmp_path):
         app.close()
 
 
-def test_unprojected_ingest_catalogs_identities_without_descriptive_terms():
+def test_background_search_preserves_identity_and_block_queries():
     store = MarketStore(":memory:")
     try:
         block = header(4_500_000)
@@ -1355,14 +1454,12 @@ def test_unprojected_ingest_catalogs_identities_without_descriptive_terms():
         live = event(header(4_500_001), 0)
         store.ingest([block], [archive], lane="history", project=False)
         store.ingest([header(4_500_001)], [live], lane="live")
+        store.build_search_index(threading.Event())
         assert [row["id"] for row in store.search("0x" + "cd" * 32)[0]] == ["0x" + "cd" * 32]
         assert [row["id"] for row in store.search("0x" + "11" * 20)[0]] == ["0x" + "11" * 20]
         assert [row["id"] for row in store.search("7")[0]] == ["shared-position"]
-        by_block = {row["id"] for row in store.search("block 45000")[0]}
-        assert by_block == {"0x" + "ab" * 32}
-        assert store.read().execute(
-            "SELECT COUNT(*) FROM lp_search_terms WHERE kind='transaction' AND id=?",
-            ("0x" + "cd" * 32,),
-        ).fetchone()[0] == 1
+        assert [row["id"] for row in store.search("4500001")[0]] == [
+            live["tx_hash"],
+        ]
     finally:
         store.close()

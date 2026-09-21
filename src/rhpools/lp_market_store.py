@@ -97,9 +97,13 @@ _CORE_POSITION_KEY_END = "0y"
 _CHECKPOINT_MODES = frozenset({"PASSIVE", "RESTART", "TRUNCATE"})
 _READER_DRAIN_SECONDS = 60.0
 _READER_DRAIN_COOLDOWN_SECONDS = 60.0
+# A maintenance reset must not freeze every summary for the full query lease.
+_READER_DRAIN_GRACE_SECONDS = 1.0
 _CHECKPOINT_BUSY_TIMEOUT_MS = 100
 _READER_SNAPSHOT_SECONDS = 15.0
-_READER_PROGRESS_STEPS = 1_000
+# Python progress callbacks reacquire the GIL. Keep cancellation checks bounded
+# without yielding to competing Python workers for every thousand VM steps.
+_READER_PROGRESS_STEPS = 100_000
 
 # Writer admission is strict by urgency, with one background turn after a
 # bounded foreground burst. SQLite transactions remain non-preemptive, so this
@@ -243,6 +247,7 @@ class MarketStore:
         self._writer_waiters: dict[int, int] = {}
         self._writer_ticket = 0
         self._writer_foreground_streak = 0
+        self._writer_pressure_rank: int | None = None
         self._readers: dict[int, sqlite3.Connection] = {}
         self._projections: list[tuple[ProjectionApply, ProjectionRollback, bool]] = []
         self._closed = False
@@ -711,6 +716,35 @@ class MarketStore:
                         "fees_usd,deposit_usd,proceeds_usd)"
                     )
                 self.connection.execute("PRAGMA user_version=14")
+            if int(self.connection.execute("PRAGMA user_version").fetchone()[0]) < 15:
+                ownership_installed = self.connection.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type='table' AND name='lp_ownership_intervals'"
+                ).fetchone() is not None
+                if ownership_installed:
+                    self.connection.execute(
+                        "CREATE INDEX IF NOT EXISTS lp_ownership_intervals_custody "
+                        "ON lp_ownership_intervals(custody) WHERE custody IS NOT NULL"
+                    )
+                self.connection.execute("PRAGMA user_version=15")
+            if int(self.connection.execute("PRAGMA user_version").fetchone()[0]) < 16:
+                search_version = int(self._metadata(
+                    self.connection, "search_index_version", 0,
+                ))
+                search_cursor_installed = self.connection.execute(
+                    "SELECT 1 FROM metadata WHERE key='search_index_cursor'"
+                ).fetchone() is not None
+                if search_version >= 1 and not search_cursor_installed:
+                    maximum = self.connection.execute(
+                        "SELECT COALESCE(MAX(id),0) FROM events"
+                    ).fetchone()[0]
+                    self._set_metadata(
+                        self.connection, "search_index_cursor", int(maximum),
+                    )
+                    self._set_metadata(
+                        self.connection, "search_index_state", "ready",
+                    )
+                self.connection.execute("PRAGMA user_version=16")
             self.connection.execute(
                 "CREATE INDEX IF NOT EXISTS pending_reprojection_order_idx "
                 "ON pending_reprojection(block_number,tx_index,log_index,event_id)"
@@ -1024,7 +1058,7 @@ class MarketStore:
                 ):
                     self._reader_drain_deadline = now + _READER_DRAIN_SECONDS
                     self._reader_drain_interrupt_after = (
-                        now + _READER_SNAPSHOT_SECONDS
+                        now + _READER_DRAIN_GRACE_SECONDS
                     )
                     self._reader_drain_generation += 1
                 drain_deadline = self._reader_drain_deadline
@@ -1046,14 +1080,16 @@ class MarketStore:
         checkpoint_exclusion = False
         try:
             if reset_mode:
-                # A drained reset needs a queued turn, not a lucky gap between
-                # continuous writers. Wait without holding either store lock.
+                # A drained reset blocks every new analytics snapshot. Give it
+                # a live turn, including during catch-up pressure, rather than
+                # leaving admission closed behind queued bulk writers.
                 # A caller already inside a write cannot wait for itself.
                 wait_for_writer = managed_attempt and not getattr(
                     self._local, "write_depth", 0,
                 )
                 writer_exclusion = self._acquire_writer_turn(
-                    "background", blocking=bool(wait_for_writer),
+                    "live" if wait_for_writer else "background",
+                    blocking=bool(wait_for_writer),
                     deadline=drain_deadline if wait_for_writer else None,
                 )
                 if writer_exclusion:
@@ -1131,13 +1167,28 @@ class MarketStore:
             choices = ", ".join(_WRITER_PRIORITIES)
             raise ValueError(f"writer priority must be one of {choices}") from exc
 
+    def set_writer_pressure(self, priority: str | None) -> None:
+        """Hold lower-priority admissions while urgent writes catch up."""
+        rank = None if priority is None else self._writer_rank(priority)
+        with self._writer_condition:
+            if self._writer_pressure_rank == rank:
+                return
+            self._writer_pressure_rank = rank
+            self._writer_condition.notify_all()
+
     def _next_writer_locked(self) -> int | None:
-        if not self._writer_waiters:
+        eligible = [
+            ticket
+            for ticket, rank in self._writer_waiters.items()
+            if self._writer_pressure_rank is None
+            or rank <= self._writer_pressure_rank
+        ]
+        if not eligible:
             return None
         background = [
             ticket
-            for ticket, rank in self._writer_waiters.items()
-            if rank == _WRITER_PRIORITIES["background"]
+            for ticket in eligible
+            if self._writer_waiters[ticket] == _WRITER_PRIORITIES["background"]
         ]
         if (
             background
@@ -1145,7 +1196,7 @@ class MarketStore:
         ):
             return min(background)
         return min(
-            self._writer_waiters,
+            eligible,
             key=lambda ticket: (self._writer_waiters[ticket], ticket),
         )
 
@@ -1564,59 +1615,90 @@ class MarketStore:
 
 
     def ensure_search_index(self) -> None:
-        """Build the typed search catalog once, then maintain it on writes."""
+        """Build the typed search catalog and catch it up to durable events."""
         with self.transaction() as connection:
-            if int(self._metadata(connection, "search_index_version", 0)) >= 1:
+            if int(self._metadata(connection, "search_index_version", 0)) < 1:
+                self._rebuild_search_index(connection)
+                self._set_metadata(connection, "search_index_version", 1)
+                maximum = connection.execute(
+                    "SELECT COALESCE(MAX(id),0) FROM events"
+                ).fetchone()[0]
+                self._set_metadata(connection, "search_index_cursor", int(maximum))
+                self._set_metadata(connection, "search_index_state", "ready")
                 return
-            self._rebuild_search_index(connection)
-            self._set_metadata(connection, "search_index_version", 1)
-            maximum = connection.execute("SELECT COALESCE(MAX(id),0) FROM events").fetchone()[0]
-            self._set_metadata(connection, "search_index_cursor", int(maximum))
-            self._set_metadata(connection, "search_index_state", "ready")
+        self.build_search_index(threading.Event())
+
     def search_index_status(self) -> dict[str, Any]:
         connection = self.read()
         version = int(self._metadata(connection, "search_index_version", 0))
         cursor = int(self._metadata(connection, "search_index_cursor", 0))
-        total = int(connection.execute("SELECT COALESCE(MAX(id),0) FROM events").fetchone()[0])
-        phase = str(self._metadata(
+        total = int(connection.execute(
+            "SELECT COALESCE(MAX(id),0) FROM events"
+        ).fetchone()[0])
+        ready = version >= 1 and cursor >= total
+        stored_phase = str(self._metadata(
             connection, "search_index_state", "ready" if version >= 1 else "warming",
         ))
+        phase = (
+            "ready" if ready
+            else "catching_up" if version >= 1
+            else stored_phase
+        )
         return {
-            "state": "ready" if version >= 1 else "warming",
+            "state": "ready" if ready else "warming",
             "phase": phase,
-            "ready": version >= 1,
+            "ready": ready,
             "indexed_through_event": cursor,
             "events_total": total,
         }
 
-    def build_search_index(self, stop: threading.Event, *, batch_size: int = 1000) -> None:
-        """Resume a bounded background catalog migration without blocking startup."""
-        with self.transaction() as connection:
-            if int(self._metadata(connection, "search_index_version", 0)) >= 1:
+    def build_search_index(
+        self, stop: threading.Event, *, batch_size: int = 100,
+    ) -> None:
+        """Resume bounded background catalog maintenance from durable events."""
+        connection = self.read()
+        version = int(self._metadata(connection, "search_index_version", 0))
+        if version >= 1:
+            cursor = int(self._metadata(connection, "search_index_cursor", 0))
+            maximum = int(connection.execute(
+                "SELECT COALESCE(MAX(id),0) FROM events"
+            ).fetchone()[0])
+            if cursor >= maximum:
                 return
-            state = self._metadata(connection, "search_index_state", "warming")
-            if state != "building":
-                connection.execute("DELETE FROM lp_search_entities")
-                self._set_metadata(connection, "search_index_cursor", 0)
-                self._set_metadata(connection, "search_index_state", "building")
-                for protocol, label in (
-                    ("v2", "V2"), ("v3", "V3"), ("v4", "Uniswap V4"),
-                ):
-                    self._put_search_entity(
-                        connection, kind="protocol", entity_id=protocol, label=label,
-                        subtitle=f"INDEXED {protocol.upper()} PROTOCOL",
-                        href=f"/lp?protocol={protocol}", rank=3,
-                        terms=(protocol, label,
-                               "uniswap" if protocol in {"v3", "v4"} else None),
+        else:
+            with self.transaction(priority="background") as connection:
+                version = int(self._metadata(
+                    connection, "search_index_version", 0,
+                ))
+                if version < 1:
+                    state = self._metadata(
+                        connection, "search_index_state", "warming",
                     )
-                for row in connection.execute("SELECT * FROM pools"):
-                    self._index_pool_search(connection, dict(row))
-        bounded = max(100, min(int(batch_size), 5000))
+                    if state != "building":
+                        connection.execute("DELETE FROM lp_search_entities")
+                        self._set_metadata(connection, "search_index_cursor", 0)
+                        self._set_metadata(
+                            connection, "search_index_state", "building",
+                        )
+                        for protocol, label in (
+                            ("v2", "V2"), ("v3", "V3"), ("v4", "Uniswap V4"),
+                        ):
+                            self._put_search_entity(
+                                connection, kind="protocol", entity_id=protocol,
+                                label=label,
+                                subtitle=f"INDEXED {protocol.upper()} PROTOCOL",
+                                href=f"/lp?protocol={protocol}", rank=3,
+                                terms=(
+                                    protocol, label,
+                                    "uniswap" if protocol in {"v3", "v4"} else None,
+                                ),
+                            )
+                        for row in connection.execute("SELECT * FROM pools"):
+                            self._index_pool_search(connection, dict(row))
+        bounded = max(1, min(int(batch_size), 250))
         while not stop.is_set():
             complete = False
-            with self.transaction() as connection:
-                if int(self._metadata(connection, "search_index_version", 0)) >= 1:
-                    return
+            with self.transaction(priority="background") as connection:
                 cursor = int(self._metadata(connection, "search_index_cursor", 0))
                 rows = connection.execute(
                     "SELECT id,tx_hash,block_number,owner,custody,position_key,"
@@ -1627,8 +1709,10 @@ class MarketStore:
                     connection, (dict(row) for row in rows),
                 )
                 if rows:
-                    self._set_metadata(connection, "search_index_cursor", int(rows[-1]["id"]))
-                else:
+                    self._set_metadata(
+                        connection, "search_index_cursor", int(rows[-1]["id"]),
+                    )
+                if len(rows) < bounded:
                     self._set_metadata(connection, "search_index_version", 1)
                     self._set_metadata(connection, "search_index_state", "ready")
                     complete = True
@@ -2702,7 +2786,6 @@ class MarketStore:
             if pools:
                 self._upsert_pools(connection, pools)
             inserted_events: list[dict[str, Any]] = []
-            inserted_rows: list[dict[str, Any]] = []
             insert_sql = f"INSERT INTO events({','.join(EVENT_COLUMNS)})"
             prepared: list[tuple[dict[str, Any], dict[str, Any]]] = []
             stored_blocks: dict[int, sqlite3.Row | None] = {}
@@ -2750,7 +2833,6 @@ class MarketStore:
                     event["id"] = event_id
                     event["revision"] = revision
                     inserted_events.append(event)
-                    inserted_rows.append(row)
             inserted_events.sort(key=lambda event: (
                 int(event["block_number"]), int(event["tx_index"]),
                 int(event["log_index"]), int(event["id"]),
@@ -2771,7 +2853,6 @@ class MarketStore:
                 }
                 stored_cursor["lane"] = lane
                 self._set_metadata(connection, f"cursor:{lane}", stored_cursor)
-            search_rows = inserted_rows
             if inserted_events:
                 if not project:
                     before = connection.total_changes
@@ -2793,20 +2874,10 @@ class MarketStore:
                 for apply, _rollback, _persists_events in self._projections:
                     if project:
                         apply(connection, inserted_events)
-                if project:
-                    if any(not item[2] for item in self._projections):
-                        search_rows = self._persist_projection_mutations(
-                            connection, inserted_events, revision,
-                        )
-                    else:
-                        search_rows = [
-                            self._event_row(event, revision) for event in inserted_events
-                        ]
-            # Raw archive ingests catalog identities only: the descriptive
-            # words of a transaction subtitle cost four term rows per event.
-            self._index_event_search_batch(
-                connection, search_rows, descriptive_terms=project,
-            )
+                if project and any(not item[2] for item in self._projections):
+                    self._persist_projection_mutations(
+                        connection, inserted_events, revision,
+                    )
             return inserted_events
 
     def _current_event(self, connection: sqlite3.Connection, event: Mapping[str, Any]) -> dict[str, Any] | None:

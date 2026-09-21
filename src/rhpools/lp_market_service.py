@@ -5,6 +5,7 @@ LP's realized earnings. Complete position cashflows belong to AccountBook.
 """
 from __future__ import annotations
 
+import heapq
 import json
 import math
 import threading
@@ -13,6 +14,7 @@ import traceback
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +23,7 @@ from .lp_market_store import _insert_rows
 from .workbench_market import _price_from_sqrt
 
 WINDOWS = {"1h": 3600, "24h": 86400, "7d": 604800, "30d": 2592000, "all": None}
-WINDOW_CACHE_TTL = {"1h": 3.0, "24h": 3.0, "7d": 30.0, "30d": 120.0, "all": 120.0}
+WINDOW_CACHE_TTL = {window: 1.0 for window in WINDOWS}
 PRICING_BASIS = "USDG quote (1 USDG = 1 quote dollar); not a fiat oracle"
 PRICE_PROJECTION_VERSION = 1
 BUCKET_FIELDS = (
@@ -29,7 +31,29 @@ BUCKET_FIELDS = (
     "deposit_usd", "withdrawal_usd", "priced_swaps", "priced_fees", "priced_flows", "flows",
 )
 _SUM_FIELDS = ",".join(f"SUM({name}) AS {name}" for name in BUCKET_FIELDS)
+_BUCKET_JSON_FIELDS = ",".join(
+    f"json(printf('%!.17g',COALESCE({name},0)))"
+    for name in BUCKET_FIELDS
+)
 _BUCKET_INDEX = {name: index for index, name in enumerate(BUCKET_FIELDS)}
+
+
+@dataclass
+class _BucketFrame:
+    epoch: int
+    revision: int
+    events_revision: int
+    start: int
+    end: int
+    start_minute: int
+    end_minute: int
+    coverage: dict[str, Any]
+    as_of: float
+    aggregates: dict[str, tuple[Any, ...]]
+    totals: tuple[Any, ...]
+    rankings: OrderedDict[
+        tuple[Any, ...], tuple[int, tuple[tuple[str, Any], ...]]
+    ] = field(default_factory=OrderedDict)
 
 _MISSING = object()
 # Owner projections scan a month of episodes; the request path serves the last
@@ -39,16 +63,18 @@ _OWNER_SNAPSHOT_SECONDS = 900.0
 _WARM_PAUSE_SECONDS = 3.0
 _WARM_IDLE_SECONDS = 5.0
 _WARM_ACCOUNTING_LATENCY_LIMIT_SECONDS = 30.0
-# The terminal's default requests, in the exact parameter shape lp_terminal.js
-# sends, so a warmed entry is the entry the first visitor hits.
+_BUCKET_INCREMENTAL_POOL_LIMIT = 8_192
+_BUCKET_INDEXED_POOL_LIMIT = 1_024
+_WARM_WINDOWS = ("24h", "1h", "7d", "30d", "all")
+# Warm the terminal's default 24h view first, then the alternate windows.
 _WARM_KEYS: tuple[tuple[str, dict[str, Any]], ...] = (
-    *(("overview", {"window": window}) for window in WINDOWS),
+    *(("overview", {"window": window}) for window in _WARM_WINDOWS),
     *(
         (
             "pools",
             {"window": window, "sort": sort, "order": "desc", "limit": 100, "offset": 0},
         )
-        for sort in ("fees", "flow", "created") for window in WINDOWS
+        for sort in ("fees", "flow", "created") for window in _WARM_WINDOWS
     ),
     *(
         (
@@ -58,7 +84,7 @@ _WARM_KEYS: tuple[tuple[str, dict[str, Any]], ...] = (
                 "identity_scope": "wallets",
             },
         )
-        for window in WINDOWS
+        for window in _WARM_WINDOWS
     ),
     (
         "dislocations",
@@ -1231,6 +1257,11 @@ class LPMarketService:
         self._cache_lock = threading.Lock()
         self._cache_futures: dict[tuple[Any, ...], tuple[Future, bool]] = {}
         self._cache_refreshing: set[tuple[Any, ...]] = set()
+        self._bucket_frames: OrderedDict[tuple[int, str], _BucketFrame] = OrderedDict()
+        self._bucket_futures: dict[tuple[Any, ...], Future] = {}
+        self._summary_executor = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="lp-market-summary",
+        )
         self._cache_executor = ThreadPoolExecutor(
             max_workers=2, thread_name_prefix="lp-market-cache",
         )
@@ -1840,6 +1871,7 @@ class LPMarketService:
         if self._warm_thread is not None:
             self._warm_thread.join()
         self._frame_executor.shutdown(wait=True, cancel_futures=True)
+        self._summary_executor.shutdown(wait=True, cancel_futures=True)
         self._cache_executor.shutdown(wait=True, cancel_futures=True)
 
     def _load_status(self) -> dict[str, Any]:
@@ -1920,7 +1952,7 @@ class LPMarketService:
                 self._status_cache_token = change_token
             return out
 
-    def _cached(self, key, loader, ttl=3.0, *, epoch=None):
+    def _cached(self, key, loader, ttl=3.0, *, epoch=None, executor=None):
         now = time.monotonic()
         if epoch is None:
             epoch = self.status()["epoch"]
@@ -1938,7 +1970,9 @@ class LPMarketService:
             if refresh:
                 self._cache_refreshing.add(key)
         if refresh:
-            self._cache_executor.submit(self._revalidate_cache_entry, key, loader, ttl)
+            (executor or self._cache_executor).submit(
+                self._revalidate_cache_entry, key, loader, ttl,
+            )
         if stale is not _MISSING:
             return stale
         return self._load_cached(key, loader)
@@ -2054,7 +2088,7 @@ class LPMarketService:
         hours = f"SELECT {columns} FROM {table} WHERE resolution=3600 AND bucket>=? AND bucket<?"
         low_day = (low_hour + 86399) // 86400 * 86400
         high_day = high_hour // 86400 * 86400
-        if by_pool or high_day - low_day < 2 * 86400:
+        if high_day - low_day < 2 * 86400:
             return (
                 f"({hours} UNION ALL {minutes} UNION ALL {minutes})",
                 [low_hour, high_hour, low_minute, low_hour - 60, high_hour, high_minute],
@@ -2068,39 +2102,199 @@ class LPMarketService:
              low_minute, low_hour - 60, high_hour, high_minute],
         )
 
-    def _bucket_aggregates(self, status, start, end):
-        """Share one canonical interval scan across overview and pool metrics."""
-        source, args = self._bucket_source(start, end)
-        events_revision = int(status.get("events_revision") or 0)
-
-        def load():
-            with self.store.reader_snapshot() as connection:
-                rows = connection.execute(
-                    f"SELECT pool_id,{_SUM_FIELDS} FROM {source} GROUP BY pool_id",
-                    args,
-                ).fetchall()
-            return {
-                str(row["pool_id"]): tuple(
-                    row[field] or 0 for field in BUCKET_FIELDS
-                )
-                for row in rows
-            }
-
-        epoch = int(status.get("epoch") or 0)
-        cache_key = ("bucket-aggregates", events_revision, *args)
-        aggregates = self._cached_query(
-            cache_key, load, epoch=epoch,
+    @staticmethod
+    def _bucket_rows(connection, source, args, pool_ids=()):
+        # Cross SQLite/Python once, not once per pool while other workers
+        # contend for the GIL. Preserve binary64 values through JSON encoding.
+        where = (
+            " WHERE pool_id IN (SELECT value FROM json_each(?))"
+            if pool_ids else ""
         )
-        # These values are much larger than ordinary response-cache entries.
-        # Keep every public window without crowding out smaller queries.
+        encoded = connection.execute(
+            f"SELECT json_group_array(json_array(pool_id,{_BUCKET_JSON_FIELDS})) "
+            f"FROM (SELECT pool_id,{_SUM_FIELDS} FROM {source}{where} GROUP BY pool_id)",
+            [*args, json.dumps(pool_ids)] if pool_ids else args,
+        ).fetchone()[0]
+        return (
+            (str(row[0]), tuple(row[1:]))
+            for row in json.loads(encoded)
+        )
+
+    @staticmethod
+    def _minute_delta_ranges(old_low, old_high, new_low, new_high):
+        def subtract(low, high, other_low, other_high):
+            if low > high or other_high < low or other_low > high:
+                return [(low, high)] if low <= high else []
+            ranges = []
+            if low < other_low:
+                ranges.append((low, min(high, other_low - 60)))
+            if high > other_high:
+                ranges.append((max(low, other_high + 60), high))
+            return [item for item in ranges if item[0] <= item[1]]
+
+        return [
+            *subtract(old_low, old_high, new_low, new_high),
+            *subtract(new_low, new_high, old_low, old_high),
+        ]
+
+    def _changed_bucket_pools(
+        self, connection, previous, events_revision, low_minute, high_minute,
+    ):
+        if events_revision < previous.events_revision:
+            return None
+        changed = set()
+
+        def add(source, args):
+            encoded = connection.execute(
+                f"SELECT json_group_array(pool_id) FROM ({source} LIMIT ?)",
+                [*args, _BUCKET_INCREMENTAL_POOL_LIMIT + 1],
+            ).fetchone()[0]
+            changed.update(json.loads(encoded))
+            return len(changed) <= _BUCKET_INCREMENTAL_POOL_LIMIT
+
+        if events_revision > previous.events_revision:
+            if not add(
+                "SELECT DISTINCT pool_id FROM events INDEXED BY events_revision_id_idx "
+                "WHERE revision>? AND revision<=? AND pool_id IS NOT NULL",
+                [previous.events_revision, events_revision],
+            ):
+                return None
+        for low, high in self._minute_delta_ranges(
+            previous.start_minute, previous.end_minute,
+            low_minute, high_minute,
+        ):
+            if not add(
+                "SELECT DISTINCT pool_id FROM lp_pool_buckets "
+                "WHERE resolution=60 AND bucket>=? AND bucket<=?",
+                [low, high],
+            ):
+                return None
+        return changed
+
+    def _build_bucket_frame(
+        self, connection, previous, status, start, end, coverage,
+    ):
+        epoch = int(status.get("epoch") or 0)
+        events_revision = int(status.get("events_revision") or 0)
+        low_minute, high_minute = start // 60 * 60, end // 60 * 60
+        changed = (
+            self._changed_bucket_pools(
+                connection, previous, events_revision, low_minute, high_minute,
+            )
+            if previous is not None and previous.epoch == epoch else None
+        )
+        source, args = self._bucket_source(low_minute, high_minute)
+        if changed is None:
+            aggregates = {}
+            totals = [0] * len(BUCKET_FIELDS)
+            for pool_id, values in self._bucket_rows(connection, source, args):
+                aggregates[pool_id] = values
+                for index, value in enumerate(values):
+                    totals[index] += value
+        elif not changed:
+            aggregates = previous.aggregates
+            totals = previous.totals
+        else:
+            aggregates = dict(previous.aggregates)
+            totals = list(previous.totals)
+            for pool_id in changed:
+                old = aggregates.pop(pool_id, None)
+                if old is not None:
+                    for index, value in enumerate(old):
+                        totals[index] -= value
+            # Sparse updates use pool seeks; dense repairs scan each covering
+            # window once rather than rereading it in many small batches.
+            pool_source, pool_args = self._bucket_source(
+                low_minute, high_minute,
+                by_pool=len(changed) <= _BUCKET_INDEXED_POOL_LIMIT,
+            )
+            for pool_id, values in self._bucket_rows(
+                connection, pool_source, pool_args, tuple(changed),
+            ):
+                aggregates[pool_id] = values
+                for index, value in enumerate(values):
+                    totals[index] += value
+        return _BucketFrame(
+            epoch=epoch,
+            revision=int(status.get("revision") or 0),
+            events_revision=events_revision,
+            start=start,
+            end=end,
+            start_minute=low_minute,
+            end_minute=high_minute,
+            coverage=coverage,
+            as_of=float(status["as_of"]),
+            aggregates=aggregates,
+            totals=tuple(totals),
+        )
+
+    def _bucket_aggregates(self, name, status, start, end):
+        """Advance a window from changed canonical pools instead of rescanning it."""
+        epoch = int(status.get("epoch") or 0)
+        events_revision = int(status.get("events_revision") or 0)
+        history_from = status.get("history_from")
+        frame_key = (epoch, name)
+        while True:
+            leader = False
+            with self._cache_lock:
+                previous = self._bucket_frames.get(frame_key)
+                if previous is not None and (
+                    previous.events_revision > events_revision
+                    or (
+                        previous.events_revision == events_revision
+                        and (
+                            previous.end > end
+                            or (
+                                previous.end == end
+                                and previous.coverage.get("from") == history_from
+                            )
+                        )
+                    )
+                ):
+                    self._bucket_frames.move_to_end(frame_key)
+                    return previous
+                pending = self._bucket_futures.get(frame_key)
+                if pending is None:
+                    pending = Future()
+                    self._bucket_futures[frame_key] = pending
+                    leader = True
+            if leader:
+                break
+            pending.result()
+        try:
+            with self.store.reader_snapshot() as connection:
+                snapshot_status = self._load_status()
+                _snapshot_name, snapshot_start, snapshot_end, coverage = (
+                    self._window({"window": name}, snapshot_status)
+                )
+                frame = self._build_bucket_frame(
+                    connection, previous, snapshot_status,
+                    snapshot_start, snapshot_end, coverage,
+                )
+        except BaseException as exc:
+            with self._cache_lock:
+                if self._bucket_futures.get(frame_key) is pending:
+                    self._bucket_futures.pop(frame_key, None)
+            pending.set_exception(exc)
+            raise
         with self._cache_lock:
-            keys = [
-                key for key in self._query_cache
-                if len(key) > 1 and key[1] == "bucket-aggregates"
-            ]
-            for key in keys[:-8]:
-                self._query_cache.pop(key, None)
-        return aggregates
+            actual_key = (frame.epoch, name)
+            current = self._bucket_frames.get(actual_key)
+            current_version = (
+                current.events_revision, current.end, current.revision,
+            ) if current is not None else None
+            frame_version = (
+                frame.events_revision, frame.end, frame.revision,
+            )
+            if current_version is None or frame_version >= current_version:
+                self._bucket_frames[actual_key] = frame
+                self._bucket_frames.move_to_end(actual_key)
+                while len(self._bucket_frames) > 8:
+                    self._bucket_frames.popitem(last=False)
+            if self._bucket_futures.get(frame_key) is pending:
+                self._bucket_futures.pop(frame_key, None)
+        pending.set_result(frame)
+        return frame
 
     @staticmethod
     def _bucket_sort_value(sort, values):
@@ -2124,6 +2318,156 @@ class LPMarketService:
             )
         field = "events" if sort == "activity" else sort
         return values[_BUCKET_INDEX[field]]
+
+    @staticmethod
+    def _bucket_metric_is_ranked(sort, value):
+        if value is None:
+            return False
+        if sort in {"swaps", "adds", "removes", "activity"}:
+            return value != 0
+        return True
+
+    def _filtered_bucket_pool_ids(self, connection, frame, where, filters):
+        if where == "1":
+            return frame.aggregates.keys()
+        matched = set()
+        batch = []
+        for pool_id in frame.aggregates:
+            batch.append(pool_id)
+            if len(batch) < 500:
+                continue
+            marks = ",".join("?" for _ in batch)
+            matched.update(
+                str(row["id"]) for row in connection.execute(
+                    f"SELECT p.id FROM pools p WHERE p.id IN ({marks}) AND ({where})",
+                    [*batch, *filters],
+                )
+            )
+            batch.clear()
+        if batch:
+            marks = ",".join("?" for _ in batch)
+            matched.update(
+                str(row["id"]) for row in connection.execute(
+                    f"SELECT p.id FROM pools p WHERE p.id IN ({marks}) AND ({where})",
+                    [*batch, *filters],
+                )
+            )
+        return matched
+
+    def _pool_total(self, connection, epoch, pool_metadata_token, where, filters):
+        return int(self._cached_query(
+            ("pool-filter-count", pool_metadata_token, where, *filters),
+            lambda: connection.execute(
+                f"SELECT COUNT(*) FROM pools p WHERE {where}", filters,
+            ).fetchone()[0],
+            epoch=epoch,
+        ))
+
+    def _fallback_pool_ids(
+        self, connection, frame, sort, where, filters, offset, limit,
+    ):
+        rows = connection.execute(
+            f"SELECT p.id FROM pools p WHERE {where} ORDER BY p.id", filters,
+        )
+        skipped = 0
+        selected = []
+        while len(selected) < limit:
+            batch = rows.fetchmany(512)
+            if not batch:
+                break
+            for row in batch:
+                pool_id = str(row["id"])
+                value = self._bucket_sort_value(
+                    sort, frame.aggregates.get(pool_id),
+                )
+                if self._bucket_metric_is_ranked(sort, value):
+                    continue
+                if skipped < offset:
+                    skipped += 1
+                    continue
+                selected.append(pool_id)
+                if len(selected) == limit:
+                    break
+        return selected
+
+    def _bucket_page_ids(
+        self, connection, frame, pool_metadata_token, where, filters,
+        sort, order, offset, limit,
+    ):
+        total = self._pool_total(
+            connection, frame.epoch, pool_metadata_token, where, filters,
+        )
+        keep = offset + limit
+        ranking_key = (
+            pool_metadata_token, where, *filters, sort, order, keep,
+        )
+        with self._cache_lock:
+            cached = frame.rankings.get(ranking_key)
+            if cached is not None:
+                frame.rankings.move_to_end(ranking_key)
+        if cached is None:
+            pool_ids = self._filtered_bucket_pool_ids(
+                connection, frame, where, filters,
+            )
+            ranked_count = 0
+
+            def ranked():
+                nonlocal ranked_count
+                for pool_id in pool_ids:
+                    value = self._bucket_sort_value(
+                        sort, frame.aggregates.get(pool_id),
+                    )
+                    if not self._bucket_metric_is_ranked(sort, value):
+                        continue
+                    ranked_count += 1
+                    yield pool_id, value
+
+            key = (
+                (lambda item: (-item[1], item[0]))
+                if order == "desc" else
+                (lambda item: (item[1], item[0]))
+            )
+            ranked_head = tuple(heapq.nsmallest(keep, ranked(), key=key))
+            cached = ranked_count, ranked_head
+            with self._cache_lock:
+                frame.rankings[ranking_key] = cached
+                frame.rankings.move_to_end(ranking_key)
+                while len(frame.rankings) > 16:
+                    frame.rankings.popitem(last=False)
+        ranked_count, ranked_head = cached
+        fallback_count = max(0, total - ranked_count)
+        ranked_first = not (
+            sort in {"swaps", "adds", "removes", "activity"} and order == "asc"
+        )
+        page_ids = []
+        if ranked_first:
+            ranked_offset = min(offset, ranked_count)
+            page_ids.extend(
+                pool_id for pool_id, _value
+                in ranked_head[ranked_offset:ranked_offset + limit]
+            )
+            fallback_offset = max(0, offset - ranked_count)
+            if len(page_ids) < limit and fallback_offset < fallback_count:
+                page_ids.extend(self._fallback_pool_ids(
+                    connection, frame, sort, where, filters, fallback_offset,
+                    limit - len(page_ids),
+                ))
+        else:
+            fallback_offset = min(offset, fallback_count)
+            if fallback_offset < fallback_count:
+                page_ids.extend(self._fallback_pool_ids(
+                    connection, frame, sort, where, filters, fallback_offset,
+                    min(limit, fallback_count - fallback_offset),
+                ))
+            ranked_offset = max(0, offset - fallback_count)
+            if len(page_ids) < limit:
+                page_ids.extend(
+                    pool_id for pool_id, _value
+                    in ranked_head[
+                        ranked_offset:ranked_offset + limit - len(page_ids)
+                    ]
+                )
+        return total, page_ids
 
     @staticmethod
     def _filters(params, prefix="p"):
@@ -2150,40 +2494,56 @@ class LPMarketService:
         return limit, offset
 
     def overview(self, params):
-        status = self.status()
-        name, start, end, coverage = self._window(params, status)
+        request_status = self.status()
+        name, _start, _end, _coverage = self._window(params, request_status)
+
         def load():
-            aggregates = self._bucket_aggregates(status, start, end)
-            totals = [0] * len(BUCKET_FIELDS)
-            for values in aggregates.values():
-                for index, value in enumerate(values):
-                    totals[index] += value
-            total = lambda field: totals[_BUCKET_INDEX[field]]
+            status = self.status()
+            execution_name, start, end, _coverage = self._window(params, status)
+            frame = self._bucket_aggregates(
+                execution_name, status, start, end,
+            )
+            total = lambda field: frame.totals[_BUCKET_INDEX[field]]
             priced_swaps = int(total("priced_swaps"))
             priced_fees = int(total("priced_fees"))
             priced_flows = int(total("priced_flows"))
             return {
-                "window": name, "volume_usd": total("volume_usd") if priced_swaps else None,
+                "window": name,
+                "volume_usd": total("volume_usd") if priced_swaps else None,
                 "fees_usd": total("fees_usd") if priced_fees else None,
                 "swaps": int(total("swaps")), "adds": int(total("adds")),
                 "removes": int(total("removes")), "collects": int(total("collects")),
-                "active_pools": len(aggregates),
+                "active_pools": len(frame.aggregates),
                 "active_owners": self.book.owner_count(name),
-                "net_deposits_usd": total("deposit_usd") - total("withdrawal_usd") if priced_flows else None,
-                "coverage": {**coverage, "priced_swaps": priced_swaps,
-                             "unpriced_swaps": int(total("swaps")) - priced_swaps,
-                             "priced_flows": priced_flows,
-                             "unpriced_flows": int(total("flows")) - priced_flows},
+                "net_deposits_usd": (
+                    total("deposit_usd") - total("withdrawal_usd")
+                    if priced_flows else None
+                ),
+                "coverage": {
+                    **frame.coverage,
+                    "priced_swaps": priced_swaps,
+                    "unpriced_swaps": int(total("swaps")) - priced_swaps,
+                    "priced_flows": priced_flows,
+                    "unpriced_flows": int(total("flows")) - priced_flows,
+                },
+                "revision": frame.revision,
+                "events_revision": frame.events_revision,
+                "epoch": frame.epoch,
+                "as_of": frame.as_of,
             }
+
         aggregate = self._cached(
             ("overview", name),
-            load, ttl=WINDOW_CACHE_TTL[name], epoch=int(status.get("epoch") or 0),
+            load,
+            ttl=WINDOW_CACHE_TTL[name],
+            epoch=int(request_status.get("epoch") or 0),
+            executor=self._summary_executor,
         )
-        return {**aggregate, "status": status}
+        return {**aggregate, "status": request_status}
 
     def pools(self, params):
-        status = self.status()
-        name, start, end, coverage = self._window(params, status)
+        request_status = self.status()
+        name, _start, _end, _coverage = self._window(params, request_status)
         limit, offset = self._page(params)
         where, filters = self._filters(params)
         sort = str(params.get("sort") or "fees")
@@ -2235,7 +2595,6 @@ class LPMarketService:
             "priced_flows",
         )
         ordering_value = ordering_values.get(sort)
-        ordering_args: list[Any] = []
         if sort == "change":
             ordering_value = (
                 "CASE WHEN s.price IS NULL THEN NULL ELSE s.price/"
@@ -2249,30 +2608,32 @@ class LPMarketService:
                 "(SELECT price FROM lp_price_samples b WHERE b.pool_id=p.id "
                 "AND b.timestamp>=? ORDER BY b.block_number,b.tx_index,b.log_index LIMIT 1)) END)-1 END"
             )
-            ordering_args = [start, start, start, start]
         if ordering_value is None:
             raise ValueError(
                 "sort must be fee, tvl, active_tvl, observed_active_tvl, volume, "
                 "fees, flow, swaps, adds, removes, lps, price, change or created"
             )
         aggregate_fields = bucket_sort_fields.get(sort)
-        bucket_source, bucket_args = self._bucket_source(start, end, by_pool=True)
         capital_sort = sort in {"active_tvl", "observed_active_tvl", "lps"}
-        snapshot_revision = int(status.get("revision") or 0)
-        snapshot_events_revision = int(status.get("events_revision") or 0)
-        snapshot_pool_metadata_token = self.store.pool_metadata_token
-        owner_revision = self.book.owners_revision
-        metric_revision = (
-            (
-                snapshot_events_revision, *bucket_args
-            ) if aggregate_fields is not None else (
-                snapshot_revision, start, end
-            ),
-            owner_revision if capital_sort else None,
-            snapshot_pool_metadata_token,
-        )
 
-        def materialize(conn, bucket_aggregates):
+        def materialize(conn, bucket_frame, execution):
+            status = execution["status"]
+            execution_name = execution["name"]
+            start = execution["start"]
+            end = execution["end"]
+            coverage = execution["coverage"]
+            bucket_source = execution["bucket_source"]
+            bucket_args = execution["bucket_args"]
+            snapshot_revision = execution["revision"]
+            snapshot_events_revision = execution["events_revision"]
+            snapshot_pool_metadata_token = execution["pool_metadata_token"]
+            owner_revision = execution["owner_revision"]
+            metric_revision = (
+                snapshot_revision, start, end,
+                owner_revision if capital_sort else None,
+                snapshot_pool_metadata_token,
+            )
+            ordering_args = [start, start, start, start] if sort == "change" else []
             metric_ctes = []
             if sort == "lps":
                 metric_ctes.append(
@@ -2306,70 +2667,51 @@ class LPMarketService:
                 "FROM pools p LEFT JOIN lp_pool_state s ON s.pool_id=p.id "
                 + ("LEFT JOIN a ON a.pool_id=p.id " if capital_sort else "")
             )
-            def metric_rows():
-                if bucket_aggregates is not None:
-                    def load_pool_ids():
-                        # One result avoids a GIL handoff for every catalog row.
-                        encoded = conn.execute(
-                            f"SELECT json_group_array(p.id) FROM pools p WHERE {where}",
-                            filters,
-                        ).fetchone()[0]
-                        return tuple(sorted(json.loads(encoded)))
-                    pool_ids = self._cached_query(
-                        (
-                            "pool-filter-base", snapshot_pool_metadata_token,
-                            where, *filters,
-                        ),
-                        load_pool_ids,
-                        epoch=int(status.get("epoch") or 0),
+            if bucket_frame is not None:
+                total, page_ids = self._bucket_page_ids(
+                    conn, bucket_frame, snapshot_pool_metadata_token,
+                    where, filters, sort, order, offset, limit,
+                )
+            else:
+                total = self._pool_total(
+                    conn, int(status.get("epoch") or 0),
+                    snapshot_pool_metadata_token, where, filters,
+                )
+
+                def load_page_ids():
+                    direction = "DESC" if order == "desc" else "ASC"
+                    base = (
+                        f"SELECT p.id,{ordering_value} AS sort_value "
+                        + metric_joins + f"WHERE {where}"
                     )
-                    return [
-                        (
-                            pool_id,
-                            self._bucket_sort_value(
-                                sort, bucket_aggregates.get(pool_id),
-                            ),
+                    return tuple(
+                        str(row["id"]) for row in conn.execute(
+                            metric_prefix
+                            + "SELECT id FROM (" + base + ") ranked "
+                            + "ORDER BY (sort_value IS NULL),"
+                            + f"sort_value {direction},id LIMIT ? OFFSET ?",
+                            [*ordering_args, *filters, limit, offset],
                         )
-                        for pool_id in pool_ids
-                    ]
-                return [
-                    (str(row["id"]), row["sort_value"])
-                    for row in conn.execute(
-                        metric_prefix + f"SELECT p.id,{ordering_value} AS sort_value "
-                        + metric_joins + f"WHERE {where}",
-                        [*ordering_args, *filters],
-                    ).fetchall()
-                ]
-            metrics = (
-                metric_rows()
-                if bucket_aggregates is not None
-                else self._cached_query(
+                    )
+
+                page_ids = self._cached_query(
                     (
-                        "pool-sort-base", metric_revision, name, where, *filters,
-                        sort,
+                        "pool-sort-page", metric_revision, name, where, *filters,
+                        sort, order, limit, offset,
                     ),
-                    metric_rows,
+                    load_page_ids,
                     epoch=int(status.get("epoch") or 0),
                 )
-            )
-            valued = sorted(
-                ((pool_id, value) for pool_id, value in metrics if value is not None),
-                key=lambda item: item[0],
-            )
-            valued.sort(key=lambda item: item[1], reverse=order == "desc")
-            nulls = sorted(pool_id for pool_id, value in metrics if value is None)
-            ordered_ids = [pool_id for pool_id, _value in valued] + nulls
-            total = len(ordered_ids)
-            page_ids = ordered_ids[offset:offset + limit]
             if page_ids:
                 marks = ",".join("?" for _ in page_ids)
-                if bucket_aggregates is not None:
+                if bucket_frame is not None:
                     raw_rows = conn.execute(
                         "SELECT p.*,s.price,s.price0_usd,s.price1_usd,"
                         "s.timestamp AS last_event_at,"
                         "s.liquidity AS active_liquidity,"
-                        "s.fee_ppm AS current_fee "
+                        "s.fee_ppm AS current_fee,c.timestamp AS created_at "
                         "FROM pools p LEFT JOIN lp_pool_state s ON s.pool_id=p.id "
+                        "LEFT JOIN blocks c ON c.number=p.created_block "
                         f"WHERE p.id IN ({marks})",
                         page_ids,
                     ).fetchall()
@@ -2386,10 +2728,11 @@ class LPMarketService:
                         + "SELECT p.*,s.price,s.price0_usd,s.price1_usd,"
                         "s.timestamp AS last_event_at,"
                         "s.liquidity AS active_liquidity,"
-                        "s.fee_ppm AS current_fee,"
+                        "s.fee_ppm AS current_fee,c.timestamp AS created_at,"
                         + ",".join(f"t.{field}" for field in row_bucket_fields)
                         + " FROM pools p LEFT JOIN t ON t.pool_id=p.id "
                         "LEFT JOIN lp_pool_state s ON s.pool_id=p.id "
+                        "LEFT JOIN blocks c ON c.number=p.created_block "
                         f"WHERE p.id IN ({marks})",
                         [*bucket_args, *page_ids, *page_ids],
                     ).fetchall()
@@ -2407,8 +2750,8 @@ class LPMarketService:
             result = []
             for row in rows:
                 row = dict(row)
-                if bucket_aggregates is not None:
-                    aggregate = bucket_aggregates.get(row["id"])
+                if bucket_frame is not None:
+                    aggregate = bucket_frame.aggregates.get(row["id"])
                     for field in row_bucket_fields:
                         row[field] = (
                             aggregate[_BUCKET_INDEX[field]]
@@ -2498,7 +2841,7 @@ class LPMarketService:
                     "net_deposits_usd": row["deposit_usd"] - row["withdrawal_usd"] if row["priced_flows"] else None,
                     "lp_count": stats.get("lp_count"), "price": row.get("price"), "price_change_pct": change,
                     "price_change_from": baseline["timestamp"] if baseline else None,
-                    "created_at": self._created_at(conn, row), "created_block": row.get("created_block"),
+                    "created_at": row.get("created_at"), "created_block": row.get("created_block"),
                     "last_event_at": row.get("last_event_at"), "risks": risks,
 
                     "coverage": {**coverage, "inventory_complete": complete_inventory,
@@ -2506,31 +2849,94 @@ class LPMarketService:
                                  "fees_basis": "gross trading-fee estimate, not LP net earnings"},
                 })
             return {
-                "rows": result, "total": total, "window": name,
+                "rows": result, "total": total, "window": execution_name,
                 "sort": sort, "order": order, "coverage": coverage,
                 "revision": snapshot_revision,
+                "events_revision": (
+                    bucket_frame.events_revision
+                    if bucket_frame is not None else snapshot_events_revision
+                ),
                 "epoch": int(status.get("epoch") or 0),
                 "as_of": status["as_of"],
             }
 
+        def execution_for(status, execution_name, start, end, coverage):
+            bucket_source, bucket_args = self._bucket_source(
+                start, end, by_pool=True,
+            )
+            revision = int(status.get("revision") or 0)
+            return {
+                "status": status,
+                "name": execution_name,
+                "start": start,
+                "end": end,
+                "coverage": coverage,
+                "bucket_source": bucket_source,
+                "bucket_args": bucket_args,
+                "revision": revision,
+                "events_revision": int(status.get("events_revision") or 0),
+                "pool_metadata_token": (
+                    revision, self.store.pool_metadata_token,
+                ),
+                "owner_revision": self.book.owners_revision,
+            }
+
         def load():
+            if aggregate_fields is not None:
+                while True:
+                    status = self.status()
+                    execution_name, start, end, _coverage = self._window(
+                        params, status,
+                    )
+                    bucket_frame = self._bucket_aggregates(
+                        execution_name, status, start, end,
+                    )
+                    same_epoch = False
+                    with self.store.reader_snapshot() as conn:
+                        page_status = self._load_status()
+                        same_epoch = (
+                            int(page_status.get("epoch") or 0)
+                            == bucket_frame.epoch
+                        )
+                        if same_epoch:
+                            included_status = {
+                                **page_status,
+                                "epoch": bucket_frame.epoch,
+                                "as_of": bucket_frame.as_of,
+                            }
+                            execution = execution_for(
+                                included_status, execution_name,
+                                bucket_frame.start, bucket_frame.end,
+                                bucket_frame.coverage,
+                            )
+                            execution["revision"] = bucket_frame.revision
+                            execution["events_revision"] = (
+                                bucket_frame.events_revision
+                            )
+                            result = materialize(
+                                conn, bucket_frame, execution,
+                            )
+                    if not same_epoch:
+                        continue
+                    if int(self.status().get("epoch") or 0) == bucket_frame.epoch:
+                        return result
             with self.store.reader_snapshot() as conn:
-                bucket_aggregates = (
-                    self._bucket_aggregates(status, start, end)
-                    if aggregate_fields is not None else None
+                status = self._load_status()
+                execution_name, start, end, coverage = self._window(
+                    params, status,
                 )
-                return materialize(conn, bucket_aggregates)
+                execution = execution_for(
+                    status, execution_name, start, end, coverage,
+                )
+                return materialize(conn, None, execution)
+
         return self._cached(
             ("pools", name, where, *filters, sort, order, limit, offset),
-            load, ttl=WINDOW_CACHE_TTL[name], epoch=int(status.get("epoch") or 0),
+            load,
+            ttl=WINDOW_CACHE_TTL[name],
+            epoch=int(request_status.get("epoch") or 0),
+            executor=self._summary_executor,
         )
-
-    @staticmethod
-    def _created_at(conn, row):
-        if row.get("created_block") is None:
-            return None
-        block = conn.execute("SELECT timestamp FROM blocks WHERE number=?", (row["created_block"],)).fetchone()
-        return block[0] if block else None
 
     @staticmethod
     def _token(row, side):

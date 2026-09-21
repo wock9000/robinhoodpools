@@ -232,10 +232,10 @@ def test_cold_workbench_route_waits_for_bounded_index_publication(tmp_path):
 
 CACHE_MATRIX = {
     "/api/lp/status": "public, max-age=1, stale-while-revalidate=2",
-    "/api/lp/overview?window=24h": "public, max-age=3, stale-while-revalidate=30",
-    "/api/lp/overview?window=7d": "public, max-age=30, stale-while-revalidate=120",
-    "/api/lp/pools?window=30d": "public, max-age=120, stale-while-revalidate=600",
-    "/api/lp/pools": "public, max-age=3, stale-while-revalidate=30",
+    "/api/lp/overview?window=24h": "public, max-age=0, stale-while-revalidate=0",
+    "/api/lp/overview?window=7d": "public, max-age=0, stale-while-revalidate=0",
+    "/api/lp/pools?window=30d": "public, max-age=0, stale-while-revalidate=0",
+    "/api/lp/pools": "public, max-age=0, stale-while-revalidate=0",
     "/api/lp/tape?window=24h&kind=lp": "public, max-age=2, stale-while-revalidate=10",
     "/api/lp/dislocations?min_bps=25": "public, max-age=2, stale-while-revalidate=10",
     "/api/lp/owners?window=24h": "public, max-age=5, stale-while-revalidate=60",

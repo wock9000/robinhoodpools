@@ -83,10 +83,10 @@ HISTORY_MAX_STORE_LOGS = 2_000
 ARCHIVE_MAX_STORE_SECONDS = 4.0
 ARCHIVE_PAGE_LOGS = MAX_LOGS_PER_RESPONSE * 4 // 5
 ARCHIVE_FETCH_WORKERS = 8
-# The archive lane yields the writer to live catch-up only for real debt, not
-# for the one-batch jitter of a live worker trailing a moving tip.
+# Keep canonical data within the live UI's two-second ingestion budget.
+# Bulk writers resume between catch-up bursts, rather than borrowing 30s.
 RECENT_CATCHUP_YIELD_CHUNKS = 4
-RECENT_CATCHUP_YIELD_SECONDS = 30.0
+RECENT_CATCHUP_YIELD_SECONDS = 2.0
 ENRICH_BATCH = 8
 ENRICHMENT_CAPABILITY_RECHECK_S = 300.0
 ENRICH_TRACE_BATCH = 8
@@ -5152,6 +5152,7 @@ class MarketIndexer:
         # A lagging provider is not reorg evidence. Keep the durable cursor and
         # retry until this provider can show either the cursor or its child.
         if head_number < current_number:
+            self.store.set_writer_pressure(None)
             self._set_runtime(
                 "live", latency=time.monotonic() - started,
                 error="head provider is behind the durable live cursor",
@@ -5520,6 +5521,7 @@ class MarketIndexer:
     def _recent_catchup_pending(self) -> bool:
         cursor = self.store.cursor("live")
         if not cursor or cursor.get("block_number") is None:
+            self.store.set_writer_pressure(None)
             return False
         with self._feed_condition:
             observed = self._observed_last_header
@@ -5553,6 +5555,7 @@ class MarketIndexer:
                 "recent_catchup_lag_seconds": lag_seconds,
                 "history_scheduling": "recent_gap_first" if pending else "concurrent",
             })
+        self.store.set_writer_pressure("live" if pending else None)
         return pending
 
     def _scan_history_once(self) -> bool:
@@ -6813,6 +6816,7 @@ class MarketIndexer:
                     )
                 worked = self._scan_live_once()
             except Exception as exc:
+                self.store.set_writer_pressure(None)
                 lane = "live" if self._initialized.is_set() else "startup"
                 self._set_runtime(lane, error=exc)
                 self._stop.wait(backoff)
@@ -7055,9 +7059,11 @@ class MarketIndexer:
     def close(self) -> None:
         with self._lifecycle_lock:
             if self._stop.is_set():
+                self.store.set_writer_pressure(None)
                 return
             was_started = self._started
             self._stop.set()
+            self.store.set_writer_pressure(None)
             self._live_wakeup.set()
             try:
                 current = threading.current_thread()

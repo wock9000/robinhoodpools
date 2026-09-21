@@ -1002,11 +1002,24 @@ def test_history_yields_to_urgent_live_debt_and_runs_near_head():
         "block_number": 500, "block_hash": anchor["hash"],
         "timestamp": int(anchor["timestamp"], 16),
     })
+    background_done = threading.Event()
+    background_errors = []
+
+    def background_write():
+        try:
+            with store.transaction(priority="background"):
+                pass
+        except BaseException as exc:
+            background_errors.append(exc)
+        finally:
+            background_done.set()
+
+    background = threading.Thread(target=background_write)
     try:
-        # A ten-second gap leaves room for archive progress.
+        # A one-block gap still leaves room for archive progress.
         scanner._set_runtime(
-            "head", head=510,
-            head_timestamp=int(header(510)["timestamp"], 16),
+            "head", head=501,
+            head_timestamp=int(header(501)["timestamp"], 16),
         )
         assert scanner._scan_history_once() is True
         assert store.cursor("history")["next_to"] < 499
@@ -1020,10 +1033,29 @@ def test_history_yields_to_urgent_live_debt_and_runs_near_head():
         assert scanner._scan_history_once() is False
         assert store.cursor("history")["next_to"] == before
         assert scanner.runtime_status()["recent_catchup_priority"] is True
+        background.start()
+        with store._writer_condition:
+            assert store._writer_condition.wait_for(
+                lambda: len(store._writer_waiters) == 1,
+                timeout=1,
+            )
+        assert not background_done.wait(0.05)
         assert scanner._scan_live_once() is True
         assert store.cursor("live")["block_number"] > 500
+        scanner._set_runtime(
+            "head", head=store.cursor("live")["block_number"],
+            head_timestamp=int(
+                header(store.cursor("live")["block_number"])["timestamp"], 16,
+            ),
+        )
+        assert scanner._recent_catchup_pending() is False
+        assert background_done.wait(1)
+        background.join(1)
+        assert background_errors == []
     finally:
         scanner.close()
+        if background.ident is not None:
+            background.join(1)
         store.close()
 
 

@@ -50,9 +50,9 @@ class Route(NamedTuple):
     freshness: tuple[int, int] | dict[str, tuple[int, int]]
 
 
-# (max-age, stale-while-revalidate) seconds. Window entries mirror
-# lp_market_service.WINDOW_CACHE_TTL so the edge never outlives the service cache.
-_WINDOW_FRESHNESS = {"1h": (3, 30), "24h": (3, 30), "7d": (30, 120), "30d": (120, 600), "all": (120, 600)}
+# The service coalesces summary refreshes. Downstream caches must revalidate,
+# rather than adding another freshness window to an already retained snapshot.
+_WINDOW_FRESHNESS = dict.fromkeys(("1h", "24h", "7d", "30d", "all"), (0, 0))
 _ROUTES = {
     "/api/lp/status": Route("lp", "status", "fast", (1, 2)),
     "/api/lp/search": Route("lp", "search", "fast", (5, 30)),

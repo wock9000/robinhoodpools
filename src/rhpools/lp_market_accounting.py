@@ -162,6 +162,8 @@ CREATE TABLE IF NOT EXISTS lp_ownership_intervals (
 );
 CREATE INDEX IF NOT EXISTS lp_ownership_intervals_owner
     ON lp_ownership_intervals(owner, start_timestamp, end_timestamp);
+CREATE INDEX IF NOT EXISTS lp_ownership_intervals_custody
+    ON lp_ownership_intervals(custody) WHERE custody IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS lp_accounting_positions (
     position_key TEXT PRIMARY KEY,
