@@ -456,3 +456,93 @@ def test_factory_has_no_archive_lane_without_an_archive_source(monkeypatch):
         assert factory("history") is not None
     finally:
         factory.close()
+
+
+@pytest.mark.parametrize("method", [
+    "eth_getTransactionByHash",
+    "eth_getTransactionReceipt",
+])
+def test_hash_lookup_null_retries_only_unresolved_batch_items(
+    monkeypatch, method,
+):
+    local = lp_rpc._Source("local", "http://127.0.0.1:8547")
+    remote = lp_rpc._Source("receipt-fallback", "https://receipt.test/rpc")
+    monkeypatch.setattr(
+        lp_rpc, "_source_list", lambda *_args: (local, remote),
+    )
+    monkeypatch.setattr(lp_rpc, "head_subscription_urls", lambda: ())
+    monkeypatch.setattr(
+        lp_rpc.RoutedRpc, "_ensure_chain", lambda *_args: None,
+    )
+    posted = []
+    missing_hash = "0x" + "11" * 32
+    present_hash = "0x" + "22" * 32
+
+    def post(_client, source, payload):
+        posted.append((
+            source.name,
+            [item["params"][0] for item in payload],
+        ))
+        return [{
+            "jsonrpc": "2.0",
+            "id": item["id"],
+            "result": (
+                None
+                if source is local and item["params"][0] == missing_hash
+                else {"transactionHash": item["params"][0]}
+            ),
+        } for item in payload]
+
+    monkeypatch.setattr(lp_rpc.RoutedRpc, "_post", post)
+    factory = lp_rpc.build_rpc_factory("", RuntimeError)
+    try:
+        assert factory("receipt").batch([
+            (method, [missing_hash]),
+            (method, [present_hash]),
+        ]) == [
+            {"transactionHash": missing_hash},
+            {"transactionHash": present_hash},
+        ]
+        assert posted == [
+            ("local", [missing_hash, present_hash]),
+            ("receipt-fallback", [missing_hash]),
+        ]
+    finally:
+        factory.close()
+
+
+@pytest.mark.parametrize("method", [
+    "eth_getTransactionByHash",
+    "eth_getTransactionReceipt",
+])
+def test_hash_lookup_all_provider_nulls_preserve_rpc_null(
+    monkeypatch, method,
+):
+    sources = (
+        lp_rpc._Source("local", "http://127.0.0.1:8547"),
+        lp_rpc._Source("receipt-fallback", "https://receipt.test/rpc"),
+    )
+    monkeypatch.setattr(lp_rpc, "_source_list", lambda *_args: sources)
+    monkeypatch.setattr(lp_rpc, "head_subscription_urls", lambda: ())
+    monkeypatch.setattr(
+        lp_rpc.RoutedRpc, "_ensure_chain", lambda *_args: None,
+    )
+    posted = []
+
+    def post(_client, source, payload):
+        posted.append(source.name)
+        return {
+            "jsonrpc": "2.0", "id": payload["id"], "result": None,
+        }
+
+    monkeypatch.setattr(lp_rpc.RoutedRpc, "_post", post)
+    factory = lp_rpc.build_rpc_factory("", RuntimeError)
+    try:
+        assert factory("receipt").call(method, ["0x" + "33" * 32]) is None
+        assert posted == ["local", "receipt-fallback"]
+        assert all(
+            row["state"] == "available" and row["failures"] == 0
+            for row in factory.status()["receipts"]["sources"]
+        )
+    finally:
+        factory.close()

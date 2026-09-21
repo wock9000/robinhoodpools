@@ -28,6 +28,12 @@ headers while keeping general local state fallback disabled, put the local URL
 in a private file listed under `LP_RPC_HEAD_URL_FILES` and retain
 `LP_RPC_DISABLE_LOCAL_FALLBACK=1`.
 
+Null transaction-hash and receipt lookups continue through the configured
+receipt sources. A lagging local node must not make an already observed
+transaction permanently unresolved. Successful batch siblings are retained;
+an all-null lookup remains null, and a valid null response is not counted as
+a provider outage. Transport failures remain errors.
+
 Header batches use the existing 100-item bound and endpoint-wide quota.
 Post-log missing headers and the duplicate end-boundary verification share one
 batch. Log/header hash checks and the before/after end-hash check still precede
@@ -43,13 +49,23 @@ live contention, not percentiles.
 `LP_RPC_ARCHIVE_URLS` and `LP_RPC_ARCHIVE_URL_FILES` name log and header sources
 for the history (archive backfill) lane only. The list is opt-in: no public
 provider joins it, `RHP_RPC_URLS` does not feed it, and without it the history
-lane keeps the provider log sources above. The intended entry is the local Nitro
-node, which answers `eth_getLogs` for any archive range without a quota:
+lane keeps the provider log sources above. Prefer the local Nitro node where
+it retains block bodies, but do not equate state/archive capability or readable
+headers with unlimited historical log retention. Configure a separately
+qualified historical log provider as a fallback:
 
 ```
 [Service]
 Environment=LP_RPC_ARCHIVE_URLS=http://127.0.0.1:8547
+Environment=LP_RPC_ARCHIVE_URL_FILES=%h/.config/robinhoodpools/goldsky.url
 ```
+
+Qualification must cover the actual backfill boundary and target, not only
+recent logs. Production local reads stopped at `block body not found` just
+before block 52,491,468. Goldsky returned five PoolManager logs at 52,491,467;
+its header hash matched the durable cursor's parent. It also returned three
+logs at the history target, block 29,120,565. This provider remains opt-in;
+receipt/state fallbacks do not implicitly enter the archive-only list.
 
 With an archive source the lane fetches each interval as concurrent pages sized
 from the observed log density (eight workers against a local host; a page that
@@ -60,12 +76,13 @@ the archive's own headers for both boundaries must match them, and every log's
 block hash must match its event header. A local node whose head is behind the
 requested range is skipped for that page rather than trusted.
 
-Archive chunks are sized by events per transaction (10k), not by the 10k-log page:
-raw history inserts cost per event, and a transaction that outgrows the writer
-page cache spills and slows down. `history_scan.source` reports
+Archive fetch pages retain their 10k-log safety limit, but history commits stop
+at a whole-block boundary near 2,000 logs. History walks backward, so it commits
+the newest suffix and leaves the older prefix behind its durable cursor for the
+next scan. A single dense block remains indivisible. `history_scan.source` reports
 `archive` or `provider`; `recent_catchup_lag_seconds` joins the existing lag
-fields. The lane yields the writer to live catch-up only when live debt is
-deeper than four live batches and older than thirty seconds.
+fields. The lane yields to live catch-up when debt exceeds four live batches
+or thirty seconds, and rechecks after obtaining writer admission.
 
 For routed HTTP `eth_call` and `eth_estimateGas`, an EVM execution revert is a
 contract outcome, not a provider outage. The caller receives the RPC error and
@@ -135,13 +152,14 @@ historical/current receipts with matching canonical hashes and three complete
 block-receipt results in 32 ms; that evidence does not qualify archive state or
 traces.
 
-The production route gives Goldsky first choice for HTTP head discovery and
-logs, with Quicknode fallback. Quicknode remains first for state, archive state,
-receipts and traces, and supplies the WSS feed. This separates catch-up from
-background accounting's shared endpoint quota. A 256-block comparison returned
-2,432 byte-equivalent canonical log records from both providers, taking 0.626 s
-on Quicknode and 0.403 s on Goldsky. These isolated timings do not include
-contention with the running service.
+The current production route keeps Quicknode endpoints paused. Local Nitro
+serves available headers, logs, state and receipts; the existing Goldsky file
+supplies HTTP fallbacks, including `LP_RPC_TRACE_URL_FILES`. The local node's
+historical receipt access does not imply historical execution-state retention:
+a sampled transaction receipt succeeded locally while `callTracer` failed with
+`required historical state unavailable (reexec=0)`. Goldsky traced that same
+transaction successfully. Do not re-enable a billed endpoint merely to restore
+trace coverage without checking its allowance.
 
 The donated allowance is 6,000 requests/minute. This process paces Goldsky at at most 80 JSON-RPC items/second on average per endpoint, counting batch elements conservatively, with four concurrent HTTP requests. Bursts are bounded by 80-item envelopes. This leaves nominal headroom under 100/s but does not account for other applications sharing the key. Provider billing/rate accounting remains authoritative.
 
@@ -180,10 +198,64 @@ Skipped head notifications are not fork evidence and must not clear wallet
 snapshots. Same-height replacements and confirmed parent mismatches still
 withdraw orphaned activity and invalidate wallets.
 
-The browser refreshes durable index status on its one-second heartbeat,
-independently of the slower overview refresh. Requests do not overlap and
-are aborted while the page is hidden. The moving chain head is no longer
-compared against an index cursor held back by a twelve-second overview timer.
+Selected wallet-page accounting coverage seeks ready pending-identity hints
+through `lp_accounting_pending_identities_identity(kind,identity,position_key)`.
+It does not expand each wallet through its complete historical event ledger.
+Pool, protocol and time-window scope still qualify the same pending position;
+incomplete identity hints remain fail-closed. On a populated deployment, allow
+for this index build before serving the new query. A production build took
+43 seconds with the application stopped and SQLite temporary files on disk,
+not tmpfs; that is one measured build, not a startup deadline.
+
+Pool identity recovery tries the pinned getter, canonical receipt evidence and
+transaction calldata, then bounded successful PoolManager call traces.
+An Initialize receipt already contains the hash-checked full PoolKey and creation
+block. It does not need ERC-20 transfers, a PositionManager NFT, or trace state.
+A recovered full PoolKey must
+hash to the requested pool ID, and its block must still be canonical after the
+RPC work. Missing trace capability remains a retryable error, not a guessed
+identity. Durable recovery clears the matching current-feed failure while
+leaving other unresolved pools visible.
+Trace traversal stops once every requested PoolKey in the transaction is
+verified. The frame limit bounds the search, not the total transaction size:
+unrelated later calls must not discard an already complete result. Searches
+that exhaust the budget before finding all requested keys still fail visibly,
+and recovered identities still pass the post-trace canonical recheck.
+
+Activity logs leave the replay queue only after successful handling or durable
+cursor coverage. If an uncovered backlog exceeds the bounded replay queue, the
+subscription reconnects and retains a recovery target; acknowledgement alone
+does not clear the error. The durable scanner must cover the dropped interval
+before the backlog reports recovery.
+Retiring duplicates already covered by the durable cursor records discard
+metrics without declaring a new failure. An ordinary pending tail does not
+extend a recovery target; only an uncovered queue beyond the bound does.
+
+The live scanner also publishes committed events into the current activity feed
+for retained, hash-matched observed blocks. Publication follows the transaction
+and checks the canonical epoch under the reorg lock. It does not depend on a
+timely WSS log notification. Block hash, transaction hash and log index identify
+one event across both sources; late canonical enrichment preserves stronger
+receipt facts. Historical enrichment updates existing observed rows rather than
+introducing historical activity as a new live event.
+
+Current valuation resolves verified factory metadata as well as token metadata.
+Missing decimals remain unknown, not zero; incomplete metadata cannot break the
+stream through a missing dictionary field. A feed reset discards the previous
+sequence cursor before emitting new IDs. Retaining a higher cursor from the old
+process otherwise forces repeated head-only snapshots until the new sequence
+catches up, even though the durable index and HTTP endpoints keep advancing.
+
+The browser refreshes durable index status on a one-second heartbeat and visible
+aggregate views on an independent one-second timer. A pending overview does
+not delay pool or dislocation refreshes. Requests for the same view do not
+overlap, cached rows remain visible during refresh, and hidden pages stop their
+requests. Aggregate health uses indexed coverage time when available, then frame
+time; receiving an old response now does not make its data fresh.
+
+Verify chain-to-screen age on newly displayed rows, not just HTTP duration or a
+moving head counter. Exercise a still-open browser across an application restart
+and a WAL reader-drain cycle; confirm activity delivery, not just reconnection.
 
 The running service commits raw events, cursors, balance jobs, and coalesced
 accounting jobs atomically. A separate accounting worker replays each affected
@@ -200,14 +272,36 @@ SQLite's variable limit. This avoids handing the Python interpreter to competing
 valuation workers between every inserted row. The outer durable transaction
 preserves the raw event/cursor/job boundary.
 
-Adaptive scan sizing uses separate writer targets: two seconds for live
-catch-up and 200 ms for background history. Growth is capped by measured store
-throughput and log density; history starts with eight blocks before adapting.
-History yields when the recent gap exceeds one adaptive live batch, rather than
-requiring the durable cursor to equal a continuously advancing head. Exact-tip
-admission starved history even while live ingestion stayed only a few blocks
-behind. The adaptive batch is the amount the live worker can commit next, not
-an unrelated fixed lag allowance.
+New canonical event insertion no longer writes the secondary search catalog
+inside that transaction. The search worker follows the durable event-ID cursor
+in background-priority batches of 100, capped at 250. Search status reports
+`catching_up` until it reaches the current event tail. A committed event can
+therefore appear in the tape and aggregates before search finds it.
+Existing-event enrichment and reorg repair still update affected search entries
+synchronously. Descriptive terms, including block numbers, remain searchable.
+Schema version 16 initializes a missing legacy cursor at the existing event
+tail only when version 1 of the atomically maintained search index is present;
+it does not replay the entire ledger or skip a new store's search backlog.
+
+Adaptive scan sizing targets two seconds of live or provider-history writer
+work; the archive source targets four seconds. Growth uses measured store
+throughput and log density. Live and historical commits stop at a whole-block
+boundary near 2,000 logs; an indivisible block may exceed the target. Their
+cursors never advance across a fetched but uncommitted portion of the interval.
+Writer admission is FIFO within live, normal, and background priorities. Live
+work wins the next available transaction, with one background turn after eight
+foreground admissions while background work is queued, unless live catch-up
+pressure is active. Above four live batches or two seconds of debt, queued
+lower-priority writers also wait. History rechecks the debt after acquiring its
+turn. Bulk work resumes near the head. Enrichment publishes one completed fetch
+job per writer turn.
+Price-anchor repair seeks each changed mark's own timestamp window through the
+earlier of its next mark or 300-second expiry. It uses the existing timestamp
+index rather than scanning from a historical block to the current tip under
+the writer. Separated changed marks do not bridge unaffected historical gaps.
+Pool-price repairs likewise stop at each changed sample's next price sample.
+Replays read canonical samples instead of reusing a current-state price that
+the backfill may have invalidated.
 A new block can arrive during an in-flight transaction; the reported gap
 remains the actual head-minus-cursor difference, without rounding it to zero.
 These are feedback targets, not hard transaction deadlines; indivisible block
@@ -497,25 +591,51 @@ live ingestion and head observation remain available.
 Bulk history, enrichment, projection, metadata, repair, balances and accounting
 pause at 512 MiB of uncheckpointed WAL pages and resume at 128 MiB. Allocated WAL
 length alone does not pause work because SQLite can reuse checkpointed frames.
-At 1 GiB of active WAL pages, maintenance closes admission to new analytics
-snapshots and signals admitted managed readers to abort. Managed snapshots have
-a 15-second lease, checked by SQLite's progress handler. Expired or interrupted
-reads roll back and discard their result; partial rows are not published or
-cached. Accounting preparation workers enforce the same read budget on their
-own connections. Writer and caller-owned transactions are not interrupted.
+At 1 GiB of active WAL pages, or when uncheckpointed backlog reaches the bulk
+pause threshold, maintenance closes admission to new analytics snapshots.
+In-flight readers get a one-second drain grace before cancellation applies.
+Waiting for the full query lease here froze every new summary during routine
+maintenance. Only snapshots admitted before that drain generation can be
+interrupted by it, so readers admitted after fail-open are not canceled by an
+expired drain. Default managed snapshots retain their independent 15-second lease;
+cold owner projections retain their longer ceiling until storage pressure
+requires a drain. Expired or interrupted reads roll back and discard their
+result; partial rows are not published or cached. Accounting preparation workers
+enforce their read budget on their own connections. Writer and caller-owned
+transactions are not interrupted. Shutdown still cancels managed reads promptly.
 Progress callbacks cannot preempt kernel I/O or Python work between SQLite
 operations, so the lease is not a hard wall-clock I/O cancellation guarantee.
+SQLite checks cancellation every 100,000 VM steps, not every 1,000. Each Python
+callback reacquires the GIL, so an overly frequent check can make a short query
+miss its deadline under competing valuation work. The final lease check remains.
 Short ordinary reads, status, tape and live ingestion remain available.
 Bulk workers also pause during the drain. Cached complete frames remain
 available while fresh analytics wait. A drain lasts at most 60 seconds,
 followed by a 60-second admission cooldown if it expires.
 
-Once owned snapshots drain, `TRUNCATE` allows at most 100 ms of SQLite lock
-waiting. Busy resets retry on the next maintenance pass; successful resets are
-limited to one per minute. An oversized but already-reused allocation gets only
-an ordinary nonwaiting reset, without draining analytics. The journal is never
-deleted directly. Both writer and maintenance connections retain
-`synchronous=FULL`.
+Once owned snapshots drain, routine maintenance uses `RESTART`, not `TRUNCATE`.
+Reader admission closes before competing for the writer. Once owned snapshots
+finish, the reset queues a live-priority writer turn, bounded by the existing
+drain deadline. Catch-up pressure cannot strand the closed reader-admission gate.
+No store or checkpoint lock is held while that turn waits. Expiry reopens
+reader admission with the existing cooldown. Unmanaged resets and resets called
+inside a writer remain nonblocking.
+New application writes wait behind an admitted reset instead of failing
+`BEGIN` with `database is locked`. External-reader lock waiting is bounded
+to 100 ms. `PASSIVE` checkpointing remains independent of writer admission.
+
+Managed writers use `journal_size_limit=-1`, so the next live insert cannot
+silently truncate the allocated WAL after a successful restart. The allocation
+is reused; allocated length alone does not trigger maintenance. Explicit
+truncation is reserved for planned maintenance, not normal serving traffic.
+Successful size-triggered resets have a one-minute cooldown; active backlog
+pressure bypasses that cooldown, but an expired reader drain retains its
+admission cooldown. The journal is never deleted directly.
+
+The checkpoint connection uses `synchronous=FULL`; the existing writer setting
+is `synchronous=NORMAL`. A power failure may lose recent uncheckpointed commits,
+which the canonical index must re-derive. The changes above do not alter these
+durability settings.
 
 `LP_DISK_RESERVE_GIB` pauses the same bulk workers when free space falls below the
 configured reserve. They resume above the reserve plus the larger of 1 GiB or
@@ -542,8 +662,9 @@ Owner financial scope reads use the global indexed canonical boundary rather
 than searching unrelated event history for a presentation-filter match.
 Historical activity resolves its exact block, transaction and log boundary
 through `events_block_idx` instead of expanding every related event key.
-Pool summaries use one managed snapshot over the existing pool/bucket/tape read
-models. Shutdown signals managed-reader interruption before joining frame jobs.
+Pool summaries share a canonical bucket frame. Catalog and page details use a
+separate snapshot in the same epoch; an epoch change retries the frame and page.
+Shutdown signals managed-reader interruption before joining frame jobs.
 
 An oversized WAL can make recovery slow before HTTP is available. Preserve the database, `-wal`, and `-shm` together; never delete the journal to force startup. For planned exclusive checkpoint maintenance, stop the watchdog and all database owners first, let SQLite complete `PRAGMA wal_checkpoint(TRUNCATE)`, verify success, then start exactly one application owner and resume monitoring.
 
@@ -551,10 +672,51 @@ The September 15 recovery checkpoint retained the journal and completed in
 239.217 s, returning `[0, 0, 0]` with zero allocated WAL bytes. This is a recovery
 receipt, not a database backup or a normal checkpoint latency target.
 
-The production service has `CPUQuota=600%`, `CPUWeight=100`, `MemoryHigh=20G`
-and `MemoryMax=28G`. These are per-service ceilings and pressure controls, not
-a host-wide reliability guarantee. Measure cursor gain against chain gain
-under these limits. A single fast scan does not establish sustainable catch-up.
+The effective production settings at the September 19 verification were
+`CPUWeight=1000`, `MemoryMax=28G`, and no CPU quota or `MemoryHigh` limit.
+Check `systemctl --user show robinhoodpools.service` rather than assuming an
+older drop-in still controls these values. Resource limits are not a host-wide
+reliability guarantee; compare cursor gain against chain gain under the actual
+load. A single fast scan does not establish sustainable catch-up.
+
+Terminal warming starts with 24h and retains its next-key position across short writer-idle windows.
+It no longer restarts at the first overview key whenever ingestion interrupts
+it. Failed keys advance the rotation too and retry after the other default
+views have had an opportunity; warming still obeys storage and latency guards.
+
+Published terminal frames use a separate 64-entry cache from the 16-entry cache
+of snapshot-versioned query intermediates. Eight retained bucket frames advance
+from event revisions and entering or expired minute ranges. Only affected pools
+are reread; epoch changes or large change sets rebuild the frame. Both full and
+per-pool multi-day reads use daily rollups with hourly and minute boundaries.
+Overview totals and pool rankings reuse that frame.
+Up to 1,024 changed pools use indexed pool lookups. Larger change sets use one
+covering-window scan, with the pool IDs bound as a JSON array rather than split
+into repeated scans or limited by SQLite's parameter count. A production
+seven-day comparison returned identical totals for 2,376 candidate pools in
+0.15 seconds through the covering scan versus 1.47 seconds through pool lookups.
+
+Overview and pool refreshes use a dedicated two-worker executor. They acquire
+the canonical status and window inside the execution-time read snapshot, not
+when a request queues the work. Published `as_of`, coverage and event revision
+identify the included data. A separate request-time status cannot make old
+aggregate values appear fresh.
+
+All five windows use a one-second application cache lifetime. Summary HTTP
+responses use `max-age=0, stale-while-revalidate=0`, retaining ETags without an
+additional browser or edge stale-serving interval. Complete cached frames stay
+visible while the application refreshes them, including during maintenance.
+
+An admitted snapshot does not wait on a shared query whose producer has not yet
+acquired its snapshot: that producer may be blocked by the WAL admission gate.
+It reads its own snapshot instead without replacing the other producer's
+publication, breaking the snapshot/Future/drain wait cycle.
+
+Pool-ID, changed-pool and aggregate scans use SQLite JSON aggregation to cross
+into Python once rather than once per row. Aggregate REAL values serialize with
+17 significant digits so this batching preserves binary64 values, including
+large counts. Filters, ordering and page contents are unchanged; snapshot
+deadlines and cancellation remain enabled.
 
 Browser pool requests have a 15-second deadline, including response-body reads.
 An initial failed request displays `POOL DATA UNAVAILABLE · RETRYING`, not
@@ -566,8 +728,36 @@ Check filesystem capacity and copy-on-write behavior when durable commit time
 dominates. A nearly full Btrfs volume can make SQLite's write workload expensive
 even on NVMe. For a dedicated non-CoW database directory, set `chattr +C` while
 the directory is empty, before copying any database or sidecar files. This
-disables Btrfs data checksums and compression for those files; SQLite WAL
-checksums and `synchronous=FULL` remain in use.
+disables Btrfs data checksums and compression for those files. SQLite WAL
+checksums and the writer/checkpoint synchronization settings above remain.
+
+The `+C` attribute does not coalesce existing fragmented extents. In a roughly
+483 GiB production database, bounded FIEMAP samples near the beginning and
+middle had 4 KiB median extents. PASSIVE checkpoints took 11–31 seconds;
+kernel samples found extent-tree reads inside database `fsync` and WAL
+`pwrite64` waiting on writeback folios. A bounded 64 MiB defragmentation pilot
+coalesced the first range into one 64 MiB extent without changing database data.
+For diagnosed fragmentation, `btrfs filesystem defragment -f -s OFFSET
+-l 1G -t 32M DATABASE` limits each maintenance range. Use background I/O priority
+and retain disk headroom. Defragmentation can break shared reflinks and increase
+space usage; see the [Btrfs filesystem documentation](https://btrfs.readthedocs.io/en/latest/btrfs-filesystem.html).
+Do not delete a journal or weaken synchronization to hide filesystem latency.
+
+Background I/O priority alone does not protect live latency during a sustained
+defragmentation pass: the online 1 GiB ranges still interfered with live commits.
+Use an approved maintenance window, or smaller ranges gated on index recovery.
+For an offline window, stop `robinhoodpools-healthcheck.timer` and its active
+one-shot service before stopping the application; otherwise the watchdog
+restarts it. Keep free-space checks active, preserve all SQLite sidecars, and
+resume the application and any paused supervision timers afterward.
+
+The approved September 20 offline pass completed from the 99 GiB offset to EOF
+in 3,707.818 seconds. The 544,497,786,880-byte file retained its size, all 32
+sampled 1 MiB SHA-256 digests, and the durable cursor/epoch digest. Bounded FIEMAP
+samples found single large extents at the beginning and midpoint and three
+extents in the final 64 MiB. The application and both supervision timers were
+restored. These checks establish sampled byte preservation, not a full-file
+integrity check or database backup.
 
 If a durable commit fails because storage is full or unavailable, the store
 rolls the failed transaction back before the worker retries. Runtime-status

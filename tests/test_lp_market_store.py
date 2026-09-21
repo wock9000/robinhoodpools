@@ -2,6 +2,7 @@
 from __future__ import annotations
 import sqlite3
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -41,6 +42,149 @@ def event(block: dict[str, str], log_index: int) -> dict[str, object]:
         "token_id": "7",
         "data": {},
     }
+
+
+def test_live_writer_admission_precedes_queued_background():
+    store = MarketStore(":memory:")
+    holder_entered = threading.Event()
+    release_holder = threading.Event()
+    order = []
+    failures = []
+
+    def writer(priority, label, hold=False):
+        try:
+            with store.writer_priority(priority):
+                with store.transaction():
+                    if hold:
+                        holder_entered.set()
+                        release_holder.wait(2)
+                    else:
+                        order.append(label)
+        except BaseException as exc:
+            failures.append(exc)
+
+    holder = threading.Thread(
+        target=writer, args=("background", "holder", True),
+    )
+    background = threading.Thread(
+        target=writer, args=("background", "background"),
+    )
+    live = threading.Thread(target=writer, args=("live", "live"))
+    try:
+        holder.start()
+        assert holder_entered.wait(1)
+        background.start()
+        with store._writer_condition:
+            assert store._writer_condition.wait_for(
+                lambda: len(store._writer_waiters) == 1,
+                timeout=1,
+            )
+        store.set_writer_pressure("live")
+        live.start()
+        with store._writer_condition:
+            assert store._writer_condition.wait_for(
+                lambda: len(store._writer_waiters) == 2,
+                timeout=1,
+            )
+        release_holder.set()
+        holder.join(2)
+        live.join(2)
+        assert order == ["live"]
+        assert background.is_alive()
+
+        store.set_writer_pressure(None)
+        background.join(2)
+        assert failures == []
+        assert order == ["live", "background"]
+    finally:
+        release_holder.set()
+        store.set_writer_pressure(None)
+        for thread in (holder, background, live):
+            if thread.ident is not None:
+                thread.join(2)
+        store.close()
+
+
+def test_canonical_ingest_commits_before_background_search_catalog():
+    store = MarketStore(":memory:")
+    block = header(10)
+    record = event(block, 0)
+    try:
+        store.ensure_search_index()
+        inserted = store.ingest(
+            [block],
+            [record],
+            cursor={
+                "from_block": 10,
+                "to_block": 10,
+                "block_number": 10,
+                "block_hash": block["hash"],
+            },
+        )
+
+        assert len(inserted) == 1
+        assert store.cursor("live")["block_number"] == 10
+        assert store.read().execute("SELECT COUNT(*) FROM events").fetchone()[0] == 1
+        assert store.search(record["tx_hash"]) == ([], 0)
+        assert store.search_index_status() == {
+            "state": "warming",
+            "phase": "catching_up",
+            "ready": False,
+            "indexed_through_event": 0,
+            "events_total": 1,
+        }
+
+        store.build_search_index(threading.Event(), batch_size=1)
+
+        assert store.search_index_status() == {
+            "state": "ready",
+            "phase": "ready",
+            "ready": True,
+            "indexed_through_event": 1,
+            "events_total": 1,
+        }
+        assert [row["id"] for row in store.search(record["tx_hash"])[0]] == [
+            record["tx_hash"],
+        ]
+    finally:
+        store.close()
+
+
+def test_legacy_search_index_baselines_durable_tail_cursor(tmp_path):
+    path = tmp_path / "market.sqlite"
+    store = MarketStore(path)
+    block = header(10)
+    record = event(block, 0)
+    try:
+        store.ingest([block], [record])
+        store.build_search_index(threading.Event())
+    finally:
+        store.close()
+
+    legacy = sqlite3.connect(path)
+    try:
+        legacy.execute("DELETE FROM metadata WHERE key='search_index_cursor'")
+        legacy.execute("DELETE FROM metadata WHERE key='search_index_state'")
+        legacy.execute("PRAGMA user_version=15")
+        legacy.commit()
+    finally:
+        legacy.close()
+
+    store = MarketStore(path)
+    try:
+        assert store.connection.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert store.search_index_status() == {
+            "state": "ready",
+            "phase": "ready",
+            "ready": True,
+            "indexed_through_event": 1,
+            "events_total": 1,
+        }
+        assert [row["id"] for row in store.search(record["tx_hash"])[0]] == [
+            record["tx_hash"],
+        ]
+    finally:
+        store.close()
 
 
 def test_checkpoint_recovers_after_external_reader_releases_snapshot(tmp_path):
@@ -154,7 +298,9 @@ def test_restart_checkpoint_does_not_wait_for_active_writer(tmp_path):
 
     def checkpoint():
         try:
-            checkpoint_results.append(store.checkpoint("RESTART"))
+            checkpoint_results.append(
+                store.checkpoint("RESTART")
+            )
         except BaseException as exc:
             failures.append(exc)
         finally:
@@ -171,18 +317,211 @@ def test_restart_checkpoint_does_not_wait_for_active_writer(tmp_path):
         ), "RESTART checkpoint waited behind the active writer"
         assert failures == []
         assert checkpoint_results[0]["busy"] == 1
+        assert checkpoint_results[0]["reader_drain_pending"] == 0
         release_writer.set()
         writer.join(2)
         assert failures == []
-        assert store.read().execute(
-            "SELECT value FROM metadata WHERE key='checkpoint-seed'"
-        ).fetchone()[0] == "2"
+        assert store.checkpoint("RESTART", drain_readers=True)["busy"] == 0
+        with store.reader_snapshot() as connection:
+            assert connection.execute(
+                "SELECT value FROM metadata WHERE key='checkpoint-seed'"
+            ).fetchone()[0] == "2"
+        with store.transaction() as connection:
+            connection.execute(
+                "UPDATE metadata SET value='3' WHERE key='checkpoint-seed'"
+            )
+            nested = store.checkpoint("RESTART", drain_readers=True)
+            assert nested["busy"] == 1
+            assert nested["log_frames"] == -1
     finally:
         release_writer.set()
         writer.join(2)
         checkpointer.join(6)
         store.close()
     assert failures == []
+
+
+@pytest.mark.parametrize("live_pressure", [False, True])
+def test_managed_reset_queues_writer_without_blocking_passive_checkpoint(
+        tmp_path, live_pressure):
+    store = MarketStore(tmp_path / "market.sqlite", checkpoint_on_commit=False)
+    writer_entered = threading.Event()
+    release_writer = threading.Event()
+    checkpoint_done = threading.Event()
+    results, failures = [], []
+    with store.transaction() as connection:
+        connection.execute("INSERT INTO metadata(key,value) VALUES('seed','1')")
+
+    def write():
+        try:
+            with store.transaction() as connection:
+                connection.execute("UPDATE metadata SET value='2' WHERE key='seed'")
+                writer_entered.set()
+                release_writer.wait(3)
+        except BaseException as exc:
+            failures.append(exc)
+
+    def reset():
+        try:
+            results.append(store.checkpoint("RESTART", drain_readers=True))
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            checkpoint_done.set()
+
+    writer = threading.Thread(target=write)
+    checkpointer = threading.Thread(target=reset)
+    try:
+        writer.start()
+        assert writer_entered.wait(1)
+        if live_pressure:
+            store.set_writer_pressure("live")
+        checkpointer.start()
+        deadline = time.monotonic() + 1
+        while True:
+            passive = store.checkpoint("PASSIVE")
+            if passive["reader_drain_pending"] or time.monotonic() >= deadline:
+                break
+            checkpoint_done.wait(0.001)
+        assert passive["busy"] == 0
+        assert passive["reader_drain_pending"] == 1
+        assert not checkpoint_done.wait(0.1), "managed reset did not queue a writer turn"
+        release_writer.set()
+        assert checkpoint_done.wait(1)
+        assert failures == []
+        assert results[0]["busy"] == 0
+        assert results[0]["reader_drain_pending"] == 0
+        with store.reader_snapshot() as connection:
+            assert connection.execute(
+                "SELECT value FROM metadata WHERE key='seed'"
+            ).fetchone()[0] == "2"
+    finally:
+        store.set_writer_pressure(None)
+        release_writer.set()
+        writer.join(3)
+        checkpointer.join(3)
+        store.close()
+    assert failures == []
+
+
+def test_managed_reset_writer_deadline_reopens_snapshot_admission(tmp_path, monkeypatch):
+    monkeypatch.setattr(market_store_module, "_READER_DRAIN_SECONDS", 0.05)
+    store = MarketStore(tmp_path / "market.sqlite", checkpoint_on_commit=False)
+    writer_entered = threading.Event()
+    release_writer = threading.Event()
+    failures = []
+    with store.transaction() as connection:
+        connection.execute("INSERT INTO metadata(key,value) VALUES('seed','1')")
+
+    def write():
+        try:
+            with store.transaction() as connection:
+                connection.execute("UPDATE metadata SET value='2' WHERE key='seed'")
+                writer_entered.set()
+                release_writer.wait(3)
+        except BaseException as exc:
+            failures.append(exc)
+
+    writer = threading.Thread(target=write)
+    try:
+        writer.start()
+        assert writer_entered.wait(1)
+        result = store.checkpoint("RESTART", drain_readers=True)
+        assert result["busy"] == 1
+        assert result["reader_drain_pending"] == 0
+        assert writer.is_alive()
+        with store.reader_snapshot() as connection:
+            assert connection.execute(
+                "SELECT value FROM metadata WHERE key='seed'"
+            ).fetchone()[0] == "1"
+    finally:
+        release_writer.set()
+        writer.join(3)
+        store.close()
+    assert failures == []
+
+
+def test_restart_checkpoint_excludes_concurrent_application_writer(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(
+        market_store_module, "_CHECKPOINT_BUSY_TIMEOUT_MS", 1_000,
+    )
+    path = tmp_path / "market.sqlite"
+    store = MarketStore(path, checkpoint_on_commit=False)
+    external = None
+    checkpoint_done = threading.Event()
+    writer_done = threading.Event()
+    checkpoint_results = []
+    failures = []
+
+    def checkpoint():
+        try:
+            checkpoint_results.append(
+                store.checkpoint("RESTART", drain_readers=True)
+            )
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            checkpoint_done.set()
+
+    def write():
+        try:
+            with store.transaction() as connection:
+                connection.execute(
+                    "UPDATE metadata SET value='2' "
+                    "WHERE key='checkpoint-seed'"
+                )
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            writer_done.set()
+
+    checkpointer = threading.Thread(target=checkpoint)
+    writer = threading.Thread(target=write)
+    try:
+        store.checkpoint("TRUNCATE")
+        external = sqlite3.connect(path, isolation_level=None)
+        external.execute("PRAGMA query_only=ON")
+        external.execute("BEGIN")
+        external.execute("SELECT COUNT(*) FROM events").fetchone()
+        with store.transaction() as connection:
+            connection.execute(
+                "INSERT INTO metadata(key,value) "
+                "VALUES('checkpoint-seed','1')"
+            )
+
+        checkpointer.start()
+        with store._writer_condition:
+            assert store._writer_condition.wait_for(
+                lambda: store._writer_active,
+                timeout=1,
+            )
+        writer.start()
+        assert not writer_done.wait(
+            0.1
+        ), "writer entered while RESTART owned writer exclusion"
+
+        external.rollback()
+        external.close()
+        external = None
+        assert checkpoint_done.wait(2)
+        assert writer_done.wait(2)
+        assert failures == []
+        assert checkpoint_results[0]["busy"] == 0
+        assert checkpoint_results[0]["backlog_bytes"] == 0
+        assert store.read().execute(
+            "SELECT value FROM metadata WHERE key='checkpoint-seed'"
+        ).fetchone()[0] == "2"
+    finally:
+        if external is not None:
+            external.rollback()
+            external.close()
+        if checkpointer.ident is not None:
+            checkpointer.join(2)
+        if writer.ident is not None:
+            writer.join(2)
+        store.close()
 
 
 def test_managed_reader_drain_preserves_snapshot_and_reclaims_wal(tmp_path):
@@ -283,7 +622,7 @@ def test_managed_reader_drain_preserves_snapshot_and_reclaims_wal(tmp_path):
         store.close()
 
 
-def test_checkpoint_drain_interrupts_running_managed_query(tmp_path, monkeypatch):
+def test_checkpoint_drain_finishes_running_query_before_reset(tmp_path, monkeypatch):
     monkeypatch.setattr(market_store_module, "_READER_PROGRESS_STEPS", 1)
     store = MarketStore(
         tmp_path / "market.sqlite",
@@ -291,6 +630,10 @@ def test_checkpoint_drain_interrupts_running_managed_query(tmp_path, monkeypatch
     )
     entered = threading.Event()
     release = threading.Event()
+    queued_started = threading.Event()
+    queued_admitted = threading.Event()
+    query_values = []
+    queued_counts = []
     failures = []
 
     def run_query():
@@ -303,15 +646,34 @@ def test_checkpoint_drain_interrupts_running_managed_query(tmp_path, monkeypatch
         try:
             with store.reader_snapshot() as connection:
                 connection.create_function("hold_read", 1, hold)
-                connection.execute(
-                    "SELECT hold_read(value) FROM frame_probe"
-                ).fetchall()
+                query_values.extend(
+                    row[0] for row in connection.execute(
+                        "SELECT hold_read(value) FROM frame_probe"
+                    ).fetchall()
+                )
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            store.close_reader()
+
+    def read_after_reset():
+        try:
+            store.read()
+            queued_started.set()
+            with store.reader_snapshot() as connection:
+                queued_counts.append(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM frame_probe"
+                    ).fetchone()[0]
+                )
+                queued_admitted.set()
         except BaseException as exc:
             failures.append(exc)
         finally:
             store.close_reader()
 
     reader = threading.Thread(target=run_query)
+    queued = threading.Thread(target=read_after_reset)
     try:
         with store.transaction() as connection:
             connection.execute("CREATE TABLE frame_probe(value INTEGER)")
@@ -323,23 +685,121 @@ def test_checkpoint_drain_interrupts_running_managed_query(tmp_path, monkeypatch
         with store.transaction() as connection:
             connection.execute("INSERT INTO frame_probe VALUES(2)")
 
-        deferred = store.checkpoint("TRUNCATE", drain_readers=True)
+        deferred = store.checkpoint("RESTART", drain_readers=True)
         assert deferred["active_reader_snapshots"] == 1
         assert deferred["reader_drain_pending"] == 1
+
+        queued.start()
+        assert queued_started.wait(1)
+        assert not queued_admitted.wait(0.1)
+
         release.set()
         reader.join(2)
+        assert query_values == [1]
+        assert failures == []
 
-        assert len(failures) == 1
-        assert isinstance(failures[0], sqlite3.OperationalError)
-        assert failures[0].sqlite_errorcode == sqlite3.SQLITE_INTERRUPT
-        recovered = store.checkpoint("TRUNCATE", drain_readers=True)
+        recovered = store.checkpoint("RESTART", drain_readers=True)
         assert recovered["busy"] == 0
         assert recovered["active_reader_snapshots"] == 0
         assert recovered["reader_drain_pending"] == 0
-        assert recovered["wal_bytes"] == 0
+        assert recovered["backlog_bytes"] == 0
+        assert queued_admitted.wait(1)
+        queued.join(2)
+        assert queued_counts == [2]
+        assert failures == []
     finally:
         release.set()
+        if reader.ident is not None:
+            reader.join(2)
+        if queued.ident is not None:
+            queued.join(2)
+        store.close()
+
+
+def test_checkpoint_drain_interrupts_only_snapshot_outliving_grace(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(market_store_module, "_READER_PROGRESS_STEPS", 1)
+    monkeypatch.setattr(market_store_module, "_READER_DRAIN_SECONDS", 0.05)
+    monkeypatch.setattr(market_store_module, "_READER_DRAIN_GRACE_SECONDS", 0.05)
+    store = MarketStore(tmp_path / "market.sqlite", checkpoint_on_commit=False)
+    entered = threading.Event()
+    release = threading.Event()
+    queued_admitted = threading.Event()
+    query_failures = []
+    queued_failures = []
+    queued_counts = []
+
+    def run_query():
+        def hold(value):
+            if not entered.is_set():
+                entered.set()
+                if not release.wait(2):
+                    raise AssertionError("blocked read was not released")
+            return value
+
+        try:
+            with store.reader_snapshot(5) as connection:
+                connection.create_function("hold_read", 1, hold)
+                connection.execute(
+                    "SELECT hold_read(value) FROM frame_probe"
+                ).fetchall()
+        except BaseException as exc:
+            query_failures.append(exc)
+        finally:
+            store.close_reader()
+
+    def read_after_grace():
+        try:
+            with store.reader_snapshot() as connection:
+                queued_counts.append(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM frame_probe"
+                    ).fetchone()[0]
+                )
+                queued_admitted.set()
+        except BaseException as exc:
+            queued_failures.append(exc)
+        finally:
+            store.close_reader()
+
+    reader = threading.Thread(target=run_query)
+    queued = threading.Thread(target=read_after_grace)
+    try:
+        with store.transaction() as connection:
+            connection.execute("CREATE TABLE frame_probe(value INTEGER)")
+            connection.executemany(
+                "INSERT INTO frame_probe VALUES(?)",
+                ((value,) for value in range(100)),
+            )
+        store.checkpoint("TRUNCATE")
+
+        reader.start()
+        assert entered.wait(1)
+        with store.transaction() as connection:
+            connection.execute("INSERT INTO frame_probe VALUES(100)")
+        deferred = store.checkpoint("TRUNCATE", drain_readers=True)
+        assert deferred["reader_drain_pending"] == 1
+
+        queued.start()
+        assert queued_admitted.wait(1)
+        release.set()
         reader.join(2)
+
+        assert queued_counts == [101]
+        assert queued_failures == []
+        assert len(query_failures) == 1
+        assert isinstance(query_failures[0], sqlite3.OperationalError)
+        assert query_failures[0].sqlite_errorcode == sqlite3.SQLITE_INTERRUPT
+        recovered = store.checkpoint("TRUNCATE", drain_readers=True)
+        assert recovered["busy"] == 0
+        assert recovered["reader_drain_pending"] == 0
+    finally:
+        release.set()
+        if reader.ident is not None:
+            reader.join(2)
+        if queued.ident is not None:
+            queued.join(2)
         store.close()
 
 
@@ -587,6 +1047,7 @@ def test_repeated_search_entities_do_not_duplicate_search_results():
             [block], [event(block, offset) for offset in range(50)],
         )
         assert len(inserted) == 50
+        store.build_search_index(threading.Event())
         results, total = store.search("shared-position")
         assert total == 1
         assert [(row["kind"], row["id"]) for row in results] == [
@@ -985,7 +1446,7 @@ def test_unprojected_ingest_rolls_activity_into_buckets_exactly_once(tmp_path):
         app.close()
 
 
-def test_unprojected_ingest_catalogs_identities_without_descriptive_terms():
+def test_background_search_preserves_identity_and_block_queries():
     store = MarketStore(":memory:")
     try:
         block = header(4_500_000)
@@ -993,14 +1454,12 @@ def test_unprojected_ingest_catalogs_identities_without_descriptive_terms():
         live = event(header(4_500_001), 0)
         store.ingest([block], [archive], lane="history", project=False)
         store.ingest([header(4_500_001)], [live], lane="live")
+        store.build_search_index(threading.Event())
         assert [row["id"] for row in store.search("0x" + "cd" * 32)[0]] == ["0x" + "cd" * 32]
         assert [row["id"] for row in store.search("0x" + "11" * 20)[0]] == ["0x" + "11" * 20]
         assert [row["id"] for row in store.search("7")[0]] == ["shared-position"]
-        by_block = {row["id"] for row in store.search("block 45000")[0]}
-        assert by_block == {"0x" + "ab" * 32}
-        assert store.read().execute(
-            "SELECT COUNT(*) FROM lp_search_terms WHERE kind='transaction' AND id=?",
-            ("0x" + "cd" * 32,),
-        ).fetchone()[0] == 1
+        assert [row["id"] for row in store.search("4500001")[0]] == [
+            live["tx_hash"],
+        ]
     finally:
         store.close()

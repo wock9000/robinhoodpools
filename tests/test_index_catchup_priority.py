@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 from rhpools.lp_market_index import (
     HISTORY_MAX_INTERVAL_STORE_SECONDS,
-    RECENT_CATCHUP_YIELD_CHUNKS,
+    RECENT_CATCHUP_YIELD_SECONDS,
     MarketIndexer,
 )
 
@@ -13,12 +13,15 @@ from rhpools.lp_market_index import (
 def test_background_work_uses_adaptive_live_batch_as_recent_gap_threshold():
     index = MarketIndexer.__new__(MarketIndexer)
     cursor = {"block_number": 1000}
-    index.store = SimpleNamespace(cursor=lambda _lane: cursor)
+    index.store = SimpleNamespace(
+        cursor=lambda _lane: cursor,
+        set_writer_pressure=lambda _priority: None,
+    )
     index._feed_condition = threading.Condition()
     index._status_lock = threading.RLock()
     index._observed_last_header = None
     index._live_chunk = 64
-    deep = RECENT_CATCHUP_YIELD_CHUNKS * 64
+    deep = index._live_chunk  # Without timestamps, use the conservative block budget.
     index._runtime_status = {"head": 1000 + deep + 1}
 
     assert index._recent_catchup_pending()
@@ -30,6 +33,15 @@ def test_background_work_uses_adaptive_live_batch_as_recent_gap_threshold():
     assert index._runtime_status["history_scheduling"] == "concurrent"
 
     index._runtime_status["head"] = 1002
+    assert not index._recent_catchup_pending()
+
+    cursor["timestamp"] = 100
+    limit = int(RECENT_CATCHUP_YIELD_SECONDS)
+    index._runtime_status.update({"head": 1064, "head_timestamp": 100 + limit + 1})
+    assert index._recent_catchup_pending()
+    assert index._runtime_status["recent_catchup_lag_seconds"] == limit + 1
+
+    index._runtime_status["head_timestamp"] = 100 + limit
     assert not index._recent_catchup_pending()
 
 
@@ -113,6 +125,7 @@ def test_background_batch_growth_respects_observed_write_time():
     sample_blocks = 8
     sample_seconds = HISTORY_MAX_INTERVAL_STORE_SECONDS * 0.9
     index._history_chunk = sample_blocks
+    index._clients = {}
 
     index._resize_after_success("history", 128, sample_seconds, sample_blocks)
 

@@ -79,6 +79,60 @@ def test_terminal_receives_heads_activity_and_scoped_wallets(tmp_path, monkeypat
         app.close()
 
 
+def test_reconnected_stream_drops_the_previous_feed_cursor(tmp_path, monkeypatch):
+    app = service(tmp_path / "market.sqlite")
+    waiting = threading.Event()
+    release = threading.Event()
+    original_wait = app.wait_stream
+
+    def wait_for_publication(after, timeout):
+        waiting.set()
+        assert release.wait(3)
+        return original_wait(after, timeout)
+
+    def read_frame(response):
+        name, payload = "message", None
+        while True:
+            raw = response.readline()
+            assert raw, "stream closed before the next publication"
+            line = raw.decode().strip()
+            if line.startswith("event: "):
+                name = line[7:]
+            elif line.startswith("data: "):
+                payload = json.loads(line[6:])
+            elif not line and payload is not None:
+                return name, payload
+
+    try:
+        app.store.upsert_pools(pools())
+        now = int(time.time())
+        block = header(100, now)
+        app.indexer._publish_current_block(block, [], source="test")
+        monkeypatch.setattr(app, "wait_stream", wait_for_publication)
+        with serving(app) as connection:
+            connection.request(
+                "GET", "/api/lp/stream?current_only=1&kind=all&owners=0",
+                headers={"Last-Event-ID": "0:previous-process:1000000"},
+            )
+            response = connection.getresponse()
+            assert response.status == 200
+            assert read_frame(response)[1]["number"] == 100
+            assert waiting.wait(2)
+            event = swap(block, V3, "v3")
+            app.indexer._emit_current_activity(block, [event], source="test")
+            app.indexer._publish_current_block(
+                header(101, now + 1), [], source="test",
+            )
+            release.set()
+            frames = dict(read_frame(response) for _ in range(2))
+            assert frames["activity"]["rows"][0]["tx_hash"] == event["tx_hash"]
+            assert frames["block"]["number"] == 101
+            response.close()
+    finally:
+        release.set()
+        app.close()
+
+
 def test_private_routes_stay_closed_and_upstream_errors_are_redacted(tmp_path):
     app = service(tmp_path / "market.sqlite")
     secret = "test-only-provider-credential"
@@ -178,10 +232,10 @@ def test_cold_workbench_route_waits_for_bounded_index_publication(tmp_path):
 
 CACHE_MATRIX = {
     "/api/lp/status": "public, max-age=1, stale-while-revalidate=2",
-    "/api/lp/overview?window=24h": "public, max-age=3, stale-while-revalidate=30",
-    "/api/lp/overview?window=7d": "public, max-age=30, stale-while-revalidate=120",
-    "/api/lp/pools?window=30d": "public, max-age=120, stale-while-revalidate=600",
-    "/api/lp/pools": "public, max-age=3, stale-while-revalidate=30",
+    "/api/lp/overview?window=24h": "public, max-age=0, stale-while-revalidate=0",
+    "/api/lp/overview?window=7d": "public, max-age=0, stale-while-revalidate=0",
+    "/api/lp/pools?window=30d": "public, max-age=0, stale-while-revalidate=0",
+    "/api/lp/pools": "public, max-age=0, stale-while-revalidate=0",
     "/api/lp/tape?window=24h&kind=lp": "public, max-age=2, stale-while-revalidate=10",
     "/api/lp/dislocations?min_bps=25": "public, max-age=2, stale-while-revalidate=10",
     "/api/lp/owners?window=24h": "public, max-age=5, stale-while-revalidate=60",

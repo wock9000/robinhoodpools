@@ -97,9 +97,19 @@ _CORE_POSITION_KEY_END = "0y"
 _CHECKPOINT_MODES = frozenset({"PASSIVE", "RESTART", "TRUNCATE"})
 _READER_DRAIN_SECONDS = 60.0
 _READER_DRAIN_COOLDOWN_SECONDS = 60.0
+# A maintenance reset must not freeze every summary for the full query lease.
+_READER_DRAIN_GRACE_SECONDS = 1.0
 _CHECKPOINT_BUSY_TIMEOUT_MS = 100
 _READER_SNAPSHOT_SECONDS = 15.0
-_READER_PROGRESS_STEPS = 1_000
+# Python progress callbacks reacquire the GIL. Keep cancellation checks bounded
+# without yielding to competing Python workers for every thousand VM steps.
+_READER_PROGRESS_STEPS = 100_000
+
+# Writer admission is strict by urgency, with one background turn after a
+# bounded foreground burst. SQLite transactions remain non-preemptive, so this
+# gate decides which prepared transaction starts next without weakening atomicity.
+_WRITER_PRIORITIES = {"live": 0, "normal": 1, "background": 2}
+_WRITER_MAX_FOREGROUND_BURST = 8
 
 
 class MarketStoreError(RuntimeError):
@@ -225,11 +235,19 @@ class MarketStore:
         self._reader_lock = threading.Lock()
         self._checkpoint_lock = threading.Lock()
         self._reader_snapshot_condition = threading.Condition()
-        self._reader_drain_interrupt = threading.Event()
+        self._reader_shutdown_interrupt = threading.Event()
         self._active_reader_snapshots = 0
         self._reader_drain_deadline: float | None = None
+        self._reader_drain_generation = 0
+        self._reader_drain_interrupt_after: float | None = None
         self._reader_drain_retry_after = 0.0
         self._local = threading.local()
+        self._writer_condition = threading.Condition()
+        self._writer_active = False
+        self._writer_waiters: dict[int, int] = {}
+        self._writer_ticket = 0
+        self._writer_foreground_streak = 0
+        self._writer_pressure_rank: int | None = None
         self._readers: dict[int, sqlite3.Connection] = {}
         self._projections: list[tuple[ProjectionApply, ProjectionRollback, bool]] = []
         self._closed = False
@@ -284,7 +302,10 @@ class MarketStore:
             # startup. Standalone stores retain automatic checkpoint fallback.
             pages = 65536 if self._checkpoint_on_commit else 0
             connection.execute(f"PRAGMA wal_autocheckpoint={pages}")
-            connection.execute("PRAGMA journal_size_limit=268435456")
+            # Managed WAL resets reuse allocation. A finite size limit would
+            # move truncation into the next live INSERT after RESTART instead.
+            journal_limit = 268435456 if self._checkpoint_on_commit else -1
+            connection.execute(f"PRAGMA journal_size_limit={journal_limit}")
         elif checkpoint:
             # A checkpoint connection writes database pages even though it
             # never owns application transactions. Keep its durability
@@ -695,6 +716,35 @@ class MarketStore:
                         "fees_usd,deposit_usd,proceeds_usd)"
                     )
                 self.connection.execute("PRAGMA user_version=14")
+            if int(self.connection.execute("PRAGMA user_version").fetchone()[0]) < 15:
+                ownership_installed = self.connection.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type='table' AND name='lp_ownership_intervals'"
+                ).fetchone() is not None
+                if ownership_installed:
+                    self.connection.execute(
+                        "CREATE INDEX IF NOT EXISTS lp_ownership_intervals_custody "
+                        "ON lp_ownership_intervals(custody) WHERE custody IS NOT NULL"
+                    )
+                self.connection.execute("PRAGMA user_version=15")
+            if int(self.connection.execute("PRAGMA user_version").fetchone()[0]) < 16:
+                search_version = int(self._metadata(
+                    self.connection, "search_index_version", 0,
+                ))
+                search_cursor_installed = self.connection.execute(
+                    "SELECT 1 FROM metadata WHERE key='search_index_cursor'"
+                ).fetchone() is not None
+                if search_version >= 1 and not search_cursor_installed:
+                    maximum = self.connection.execute(
+                        "SELECT COALESCE(MAX(id),0) FROM events"
+                    ).fetchone()[0]
+                    self._set_metadata(
+                        self.connection, "search_index_cursor", int(maximum),
+                    )
+                    self._set_metadata(
+                        self.connection, "search_index_state", "ready",
+                    )
+                self.connection.execute("PRAGMA user_version=16")
             self.connection.execute(
                 "CREATE INDEX IF NOT EXISTS pending_reprojection_order_idx "
                 "ON pending_reprojection(block_number,tx_index,log_index,event_id)"
@@ -823,7 +873,8 @@ class MarketStore:
         if deadline is None or deadline > now:
             return False
         self._reader_drain_deadline = None
-        self._reader_drain_interrupt.clear()
+        # Admission fails open, but the expired generation still identifies
+        # old snapshots for interruption without affecting newly admitted work.
         self._reader_drain_retry_after = max(
             self._reader_drain_retry_after,
             now + _READER_DRAIN_COOLDOWN_SECONDS,
@@ -833,7 +884,9 @@ class MarketStore:
 
     def _finish_reader_drain(self) -> None:
         with self._reader_snapshot_condition:
-            self._reader_drain_interrupt.clear()
+            # Maintenance only gates admission. Active snapshots finish
+            # naturally, at their own deadline, or after the bounded grace.
+            self._reader_drain_interrupt_after = None
             if self._reader_drain_deadline is None:
                 return
             self._reader_drain_deadline = None
@@ -846,6 +899,12 @@ class MarketStore:
                 self._active_reader_snapshots,
                 int(self._reader_drain_deadline is not None),
             )
+
+    @property
+    def reader_snapshot_active(self) -> bool:
+        """Whether this thread already owns a read transaction."""
+        connection = getattr(self._local, "reader", None)
+        return connection is not None and connection.in_transaction
 
     @contextlib.contextmanager
     def reader_snapshot(
@@ -870,6 +929,7 @@ class MarketStore:
                 condition.wait(self._reader_drain_deadline - now)
             if self._closed:
                 raise MarketStoreError("market store is closed")
+            snapshot_drain_generation = self._reader_drain_generation
             self._active_reader_snapshots += 1
         deadline = time.monotonic() + (
             _READER_SNAPSHOT_SECONDS
@@ -880,11 +940,19 @@ class MarketStore:
 
         def interrupt_read() -> int:
             nonlocal interrupted
+            now = time.monotonic()
+            drain_interrupt_after = self._reader_drain_interrupt_after
             interrupted = (
                 not in_writer
                 and (
-                    self._reader_drain_interrupt.is_set()
-                    or time.monotonic() >= deadline
+                    self._reader_shutdown_interrupt.is_set()
+                    or now >= deadline
+                    or (
+                        snapshot_drain_generation
+                        != self._reader_drain_generation
+                        and drain_interrupt_after is not None
+                        and now >= drain_interrupt_after
+                    )
                 )
             )
             return int(interrupted)
@@ -975,34 +1043,74 @@ class MarketStore:
         if mode not in _CHECKPOINT_MODES:
             supported = ", ".join(sorted(_CHECKPOINT_MODES))
             raise ValueError(f"checkpoint mode must be one of {supported}")
-        with self._checkpoint_lock:
+        if self._closed:
+            raise MarketStoreError("market store is closed")
+        reset_mode = mode != "PASSIVE"
+        managed_attempt = False
+        drain_deadline = None
+        if drain_readers and reset_mode and not self._uri:
+            with self._reader_snapshot_condition:
+                now = time.monotonic()
+                self._expire_reader_drain_locked(now)
+                if (
+                    self._reader_drain_deadline is None
+                    and self._reader_drain_retry_after <= now
+                ):
+                    self._reader_drain_deadline = now + _READER_DRAIN_SECONDS
+                    self._reader_drain_interrupt_after = (
+                        now + _READER_DRAIN_GRACE_SECONDS
+                    )
+                    self._reader_drain_generation += 1
+                drain_deadline = self._reader_drain_deadline
+                deferred_snapshots = (
+                    self._active_reader_snapshots if drain_deadline is not None else 0
+                )
+                managed_attempt = drain_deadline is not None
+            if deferred_snapshots:
+                return self._checkpoint_metrics(
+                    busy=1,
+                    log_frames=-1,
+                    checkpointed_frames=-1,
+                    active_reader_snapshots=deferred_snapshots,
+                    reader_drain_pending=1,
+                )
+
+        writer_exclusion = False
+        store_lock_exclusion = False
+        checkpoint_exclusion = False
+        try:
+            if reset_mode:
+                # A drained reset blocks every new analytics snapshot. Give it
+                # a live turn, including during catch-up pressure, rather than
+                # leaving admission closed behind queued bulk writers.
+                # A caller already inside a write cannot wait for itself.
+                wait_for_writer = managed_attempt and not getattr(
+                    self._local, "write_depth", 0,
+                )
+                writer_exclusion = self._acquire_writer_turn(
+                    "live" if wait_for_writer else "background",
+                    blocking=bool(wait_for_writer),
+                    deadline=drain_deadline if wait_for_writer else None,
+                )
+                if writer_exclusion:
+                    store_lock_exclusion = self.lock.acquire(blocking=False)
+            if not reset_mode or store_lock_exclusion:
+                # Match close's store -> checkpoint ordering. An independent
+                # PASSIVE run must not hold up live writes behind this reset.
+                checkpoint_exclusion = self._checkpoint_lock.acquire(
+                    blocking=not reset_mode,
+                )
+            if not checkpoint_exclusion:
+                active_snapshots, drain_pending = self._reader_snapshot_state()
+                return self._checkpoint_metrics(
+                    busy=1,
+                    log_frames=-1,
+                    checkpointed_frames=-1,
+                    active_reader_snapshots=active_snapshots,
+                    reader_drain_pending=drain_pending,
+                )
             if self._closed:
                 raise MarketStoreError("market store is closed")
-
-            managed_attempt = False
-            deferred_snapshots = 0
-            managed_drain = drain_readers and mode == "TRUNCATE" and not self._uri
-            if managed_drain:
-                with self._reader_snapshot_condition:
-                    now = time.monotonic()
-                    self._expire_reader_drain_locked(now)
-                    if (
-                        self._reader_drain_deadline is None
-                        and self._reader_drain_retry_after <= now
-                    ):
-                        self._reader_drain_deadline = now + _READER_DRAIN_SECONDS
-                        self._reader_drain_interrupt.set()
-                    if self._reader_drain_deadline is not None:
-                        deferred_snapshots = self._active_reader_snapshots
-                        managed_attempt = not deferred_snapshots
-                if deferred_snapshots:
-                    return self._checkpoint_metrics(
-                        busy=1,
-                        log_frames=-1,
-                        checkpointed_frames=-1,
-                        active_reader_snapshots=deferred_snapshots,
-                        reader_drain_pending=1,
-                    )
             connection = self._checkpoint_connection
             try:
                 if managed_attempt:
@@ -1028,7 +1136,7 @@ class MarketStore:
             # WAL, including shared in-memory stores.
             log_frames = max(0, log_frames)
             checkpointed_frames = max(0, checkpointed_frames)
-            if mode == "TRUNCATE" and not busy:
+            if reset_mode and not busy:
                 self._finish_reader_drain()
             active_reader_snapshots, reader_drain_pending = (
                 self._reader_snapshot_state()
@@ -1040,20 +1148,140 @@ class MarketStore:
                 active_reader_snapshots=active_reader_snapshots,
                 reader_drain_pending=reader_drain_pending,
             )
+        finally:
+            if checkpoint_exclusion:
+                self._checkpoint_lock.release()
+            if store_lock_exclusion:
+                self.lock.release()
+            if writer_exclusion:
+                self._release_writer_turn()
+
+    def _writer_rank(self, priority: str | None) -> int:
+        selected = (
+            getattr(self._local, "writer_priority", "normal")
+            if priority is None else priority
+        )
+        try:
+            return _WRITER_PRIORITIES[str(selected)]
+        except KeyError as exc:
+            choices = ", ".join(_WRITER_PRIORITIES)
+            raise ValueError(f"writer priority must be one of {choices}") from exc
+
+    def set_writer_pressure(self, priority: str | None) -> None:
+        """Hold lower-priority admissions while urgent writes catch up."""
+        rank = None if priority is None else self._writer_rank(priority)
+        with self._writer_condition:
+            if self._writer_pressure_rank == rank:
+                return
+            self._writer_pressure_rank = rank
+            self._writer_condition.notify_all()
+
+    def _next_writer_locked(self) -> int | None:
+        eligible = [
+            ticket
+            for ticket, rank in self._writer_waiters.items()
+            if self._writer_pressure_rank is None
+            or rank <= self._writer_pressure_rank
+        ]
+        if not eligible:
+            return None
+        background = [
+            ticket
+            for ticket in eligible
+            if self._writer_waiters[ticket] == _WRITER_PRIORITIES["background"]
+        ]
+        if (
+            background
+            and self._writer_foreground_streak >= _WRITER_MAX_FOREGROUND_BURST
+        ):
+            return min(background)
+        return min(
+            eligible,
+            key=lambda ticket: (self._writer_waiters[ticket], ticket),
+        )
+
+    def _acquire_writer_turn(
+        self, priority: str | None, *, blocking: bool, deadline: float | None = None,
+    ) -> bool:
+        rank = self._writer_rank(priority)
+        with self._writer_condition:
+            ticket = self._writer_ticket
+            self._writer_ticket += 1
+            self._writer_waiters[ticket] = rank
+            try:
+                while (
+                    self._writer_active or self._next_writer_locked() != ticket
+                ):
+                    if not blocking:
+                        return False
+                    remaining = (
+                        None if deadline is None else deadline - time.monotonic()
+                    )
+                    if remaining is not None and remaining <= 0:
+                        return False
+                    self._writer_condition.wait(remaining)
+                if deadline is not None and time.monotonic() >= deadline:
+                    return False
+                self._writer_active = True
+                background_waiting = any(
+                    waiting_rank == _WRITER_PRIORITIES["background"]
+                    for waiting_rank in self._writer_waiters.values()
+                )
+                if rank == _WRITER_PRIORITIES["background"]:
+                    self._writer_foreground_streak = 0
+                elif background_waiting:
+                    self._writer_foreground_streak += 1
+                else:
+                    self._writer_foreground_streak = 0
+                return True
+            finally:
+                removed = self._writer_waiters.pop(ticket, None)
+                if removed is not None and not self._writer_active:
+                    self._writer_condition.notify_all()
+
+    def _release_writer_turn(self) -> None:
+        with self._writer_condition:
+            self._writer_active = False
+            self._writer_condition.notify_all()
 
     @contextlib.contextmanager
-    def transaction(self) -> Iterator[sqlite3.Connection]:
-        """Serialize a writer transaction; nested calls share the outer commit."""
+    def writer_priority(self, priority: str) -> Iterator[None]:
+        """Set the default admission priority for writes in this thread."""
+        self._writer_rank(priority)
+        previous = getattr(self._local, "writer_priority", None)
+        self._local.writer_priority = priority
+        try:
+            yield
+        finally:
+            if previous is None:
+                del self._local.writer_priority
+            else:
+                self._local.writer_priority = previous
+
+    @contextlib.contextmanager
+    def transaction(
+        self, *, priority: str | None = None, blocking: bool = True,
+    ) -> Iterator[sqlite3.Connection | None]:
+        """Serialize one prioritized writer; nested calls share its commit."""
         if self._closed:
             raise MarketStoreError("market store is closed")
-        with self.lock:
-            depth = getattr(self._local, "write_depth", 0)
-            if depth:
-                self._local.write_depth = depth + 1
-                try:
-                    yield self.connection
-                finally:
-                    self._local.write_depth -= 1
+        depth = getattr(self._local, "write_depth", 0)
+        if depth:
+            self._local.write_depth = depth + 1
+            try:
+                yield self.connection
+            finally:
+                self._local.write_depth -= 1
+            return
+        admitted = self._acquire_writer_turn(priority, blocking=blocking)
+        if not admitted:
+            yield None
+            return
+        acquired = False
+        try:
+            acquired = self.lock.acquire(blocking=blocking)
+            if not acquired:
+                yield None
                 return
             self._local.write_depth = 1
             self._local.pool_metadata_dirty = False
@@ -1081,6 +1309,10 @@ class MarketStore:
             finally:
                 self._local.write_depth = 0
                 self._local.pool_metadata_dirty = False
+        finally:
+            if acquired:
+                self.lock.release()
+            self._release_writer_turn()
 
     @property
     def change_token(self) -> int:
@@ -1383,59 +1615,90 @@ class MarketStore:
 
 
     def ensure_search_index(self) -> None:
-        """Build the typed search catalog once, then maintain it on writes."""
+        """Build the typed search catalog and catch it up to durable events."""
         with self.transaction() as connection:
-            if int(self._metadata(connection, "search_index_version", 0)) >= 1:
+            if int(self._metadata(connection, "search_index_version", 0)) < 1:
+                self._rebuild_search_index(connection)
+                self._set_metadata(connection, "search_index_version", 1)
+                maximum = connection.execute(
+                    "SELECT COALESCE(MAX(id),0) FROM events"
+                ).fetchone()[0]
+                self._set_metadata(connection, "search_index_cursor", int(maximum))
+                self._set_metadata(connection, "search_index_state", "ready")
                 return
-            self._rebuild_search_index(connection)
-            self._set_metadata(connection, "search_index_version", 1)
-            maximum = connection.execute("SELECT COALESCE(MAX(id),0) FROM events").fetchone()[0]
-            self._set_metadata(connection, "search_index_cursor", int(maximum))
-            self._set_metadata(connection, "search_index_state", "ready")
+        self.build_search_index(threading.Event())
+
     def search_index_status(self) -> dict[str, Any]:
         connection = self.read()
         version = int(self._metadata(connection, "search_index_version", 0))
         cursor = int(self._metadata(connection, "search_index_cursor", 0))
-        total = int(connection.execute("SELECT COALESCE(MAX(id),0) FROM events").fetchone()[0])
-        phase = str(self._metadata(
+        total = int(connection.execute(
+            "SELECT COALESCE(MAX(id),0) FROM events"
+        ).fetchone()[0])
+        ready = version >= 1 and cursor >= total
+        stored_phase = str(self._metadata(
             connection, "search_index_state", "ready" if version >= 1 else "warming",
         ))
+        phase = (
+            "ready" if ready
+            else "catching_up" if version >= 1
+            else stored_phase
+        )
         return {
-            "state": "ready" if version >= 1 else "warming",
+            "state": "ready" if ready else "warming",
             "phase": phase,
-            "ready": version >= 1,
+            "ready": ready,
             "indexed_through_event": cursor,
             "events_total": total,
         }
 
-    def build_search_index(self, stop: threading.Event, *, batch_size: int = 1000) -> None:
-        """Resume a bounded background catalog migration without blocking startup."""
-        with self.transaction() as connection:
-            if int(self._metadata(connection, "search_index_version", 0)) >= 1:
+    def build_search_index(
+        self, stop: threading.Event, *, batch_size: int = 100,
+    ) -> None:
+        """Resume bounded background catalog maintenance from durable events."""
+        connection = self.read()
+        version = int(self._metadata(connection, "search_index_version", 0))
+        if version >= 1:
+            cursor = int(self._metadata(connection, "search_index_cursor", 0))
+            maximum = int(connection.execute(
+                "SELECT COALESCE(MAX(id),0) FROM events"
+            ).fetchone()[0])
+            if cursor >= maximum:
                 return
-            state = self._metadata(connection, "search_index_state", "warming")
-            if state != "building":
-                connection.execute("DELETE FROM lp_search_entities")
-                self._set_metadata(connection, "search_index_cursor", 0)
-                self._set_metadata(connection, "search_index_state", "building")
-                for protocol, label in (
-                    ("v2", "V2"), ("v3", "V3"), ("v4", "Uniswap V4"),
-                ):
-                    self._put_search_entity(
-                        connection, kind="protocol", entity_id=protocol, label=label,
-                        subtitle=f"INDEXED {protocol.upper()} PROTOCOL",
-                        href=f"/lp?protocol={protocol}", rank=3,
-                        terms=(protocol, label,
-                               "uniswap" if protocol in {"v3", "v4"} else None),
+        else:
+            with self.transaction(priority="background") as connection:
+                version = int(self._metadata(
+                    connection, "search_index_version", 0,
+                ))
+                if version < 1:
+                    state = self._metadata(
+                        connection, "search_index_state", "warming",
                     )
-                for row in connection.execute("SELECT * FROM pools"):
-                    self._index_pool_search(connection, dict(row))
-        bounded = max(100, min(int(batch_size), 5000))
+                    if state != "building":
+                        connection.execute("DELETE FROM lp_search_entities")
+                        self._set_metadata(connection, "search_index_cursor", 0)
+                        self._set_metadata(
+                            connection, "search_index_state", "building",
+                        )
+                        for protocol, label in (
+                            ("v2", "V2"), ("v3", "V3"), ("v4", "Uniswap V4"),
+                        ):
+                            self._put_search_entity(
+                                connection, kind="protocol", entity_id=protocol,
+                                label=label,
+                                subtitle=f"INDEXED {protocol.upper()} PROTOCOL",
+                                href=f"/lp?protocol={protocol}", rank=3,
+                                terms=(
+                                    protocol, label,
+                                    "uniswap" if protocol in {"v3", "v4"} else None,
+                                ),
+                            )
+                        for row in connection.execute("SELECT * FROM pools"):
+                            self._index_pool_search(connection, dict(row))
+        bounded = max(1, min(int(batch_size), 250))
         while not stop.is_set():
             complete = False
-            with self.transaction() as connection:
-                if int(self._metadata(connection, "search_index_version", 0)) >= 1:
-                    return
+            with self.transaction(priority="background") as connection:
                 cursor = int(self._metadata(connection, "search_index_cursor", 0))
                 rows = connection.execute(
                     "SELECT id,tx_hash,block_number,owner,custody,position_key,"
@@ -1446,8 +1709,10 @@ class MarketStore:
                     connection, (dict(row) for row in rows),
                 )
                 if rows:
-                    self._set_metadata(connection, "search_index_cursor", int(rows[-1]["id"]))
-                else:
+                    self._set_metadata(
+                        connection, "search_index_cursor", int(rows[-1]["id"]),
+                    )
+                if len(rows) < bounded:
                     self._set_metadata(connection, "search_index_version", 1)
                     self._set_metadata(connection, "search_index_state", "ready")
                     complete = True
@@ -2521,7 +2786,6 @@ class MarketStore:
             if pools:
                 self._upsert_pools(connection, pools)
             inserted_events: list[dict[str, Any]] = []
-            inserted_rows: list[dict[str, Any]] = []
             insert_sql = f"INSERT INTO events({','.join(EVENT_COLUMNS)})"
             prepared: list[tuple[dict[str, Any], dict[str, Any]]] = []
             stored_blocks: dict[int, sqlite3.Row | None] = {}
@@ -2569,7 +2833,6 @@ class MarketStore:
                     event["id"] = event_id
                     event["revision"] = revision
                     inserted_events.append(event)
-                    inserted_rows.append(row)
             inserted_events.sort(key=lambda event: (
                 int(event["block_number"]), int(event["tx_index"]),
                 int(event["log_index"]), int(event["id"]),
@@ -2590,7 +2853,6 @@ class MarketStore:
                 }
                 stored_cursor["lane"] = lane
                 self._set_metadata(connection, f"cursor:{lane}", stored_cursor)
-            search_rows = inserted_rows
             if inserted_events:
                 if not project:
                     before = connection.total_changes
@@ -2612,20 +2874,10 @@ class MarketStore:
                 for apply, _rollback, _persists_events in self._projections:
                     if project:
                         apply(connection, inserted_events)
-                if project:
-                    if any(not item[2] for item in self._projections):
-                        search_rows = self._persist_projection_mutations(
-                            connection, inserted_events, revision,
-                        )
-                    else:
-                        search_rows = [
-                            self._event_row(event, revision) for event in inserted_events
-                        ]
-            # Raw archive ingests catalog identities only: the descriptive
-            # words of a transaction subtitle cost four term rows per event.
-            self._index_event_search_batch(
-                connection, search_rows, descriptive_terms=project,
-            )
+                if project and any(not item[2] for item in self._projections):
+                    self._persist_projection_mutations(
+                        connection, inserted_events, revision,
+                    )
             return inserted_events
 
     def _current_event(self, connection: sqlite3.Connection, event: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -3870,7 +4122,7 @@ class MarketStore:
                 return
             self._closed = True
             self._reader_drain_deadline = None
-            self._reader_drain_interrupt.set()
+            self._reader_shutdown_interrupt.set()
             self._reader_snapshot_condition.notify_all()
 
         with self.lock:

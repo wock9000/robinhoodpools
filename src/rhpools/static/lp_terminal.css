@@ -328,16 +328,6 @@ button.readout-line:hover { color: var(--white); }
   font-weight: 400;
   text-overflow: ellipsis;
 }
-.owner-qualification {
-  grid-column: 1 / -1;
-  min-width: 0;
-  overflow: hidden;
-  color: var(--yellow);
-  font-weight: 400;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-#owners-accounting-readout { min-width: 0; }
 .filter-field {
   height: 20px;
   display: flex;
@@ -579,8 +569,9 @@ select:focus { border-color: var(--text); color: var(--text); }
   min-width: 0;
   height: 19px;
   flex: none;
-  display: flex;
-  justify-content: space-between;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
   gap: 12px;
   padding: 1px 8px;
   overflow: hidden;
@@ -588,12 +579,21 @@ select:focus { border-color: var(--text); color: var(--text); }
   color: var(--dimmer);
   white-space: nowrap;
 }
-.terminal-footer span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-.terminal-footer span:last-child { flex: none; }
+.terminal-footer #footer-state {
+  min-width: 0;
+  overflow: hidden;
+  justify-self: start;
+  text-overflow: ellipsis;
+}
+.terminal-footer .sponsor-link { grid-column: 2; justify-self: center; }
+.terminal-footer .footer-meta { grid-column: 3; justify-self: end; }
 
 @media (max-width: 600px) {
-  .terminal-footer { height: auto; flex-wrap: wrap; gap: 0 12px; }
-  .terminal-footer #footer-state { flex: 1 0 100%; }
+  .terminal-footer { height: auto; row-gap: 0; }
+  .terminal-footer #footer-state { grid-column: 1 / -1; grid-row: 1; justify-self: stretch; text-align: center; }
+  .terminal-footer .sponsor-link { grid-row: 2; }
+  .terminal-footer .footer-meta { grid-row: 2; }
+  .terminal-footer .read-only-label { display: none; }
 }
 
 .pool-inspector {
@@ -659,7 +659,6 @@ select:focus { border-color: var(--text); color: var(--text); }
   .section-head > div:first-child { flex-basis: 100%; }
   .section-note { margin-left: 4px; }
   .owners-heading { gap: 6px; }
-  .owner-qualification { flex: 1 1 auto; }
   .tools { flex: 1 0 100%; margin-left: 0; overflow-x: auto; scrollbar-width: thin; }
   .tools > * { flex: none; }
   .filter-field { flex: 0 0 150px; }
@@ -862,7 +861,6 @@ select:focus { border-color: var(--text); color: var(--text); }
     white-space: normal;
   }
   .wallet-description { display: none; }
-  .owner-qualification { grid-column: 1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 11px; }
   .tools {
     width: 100%;
     display: grid;

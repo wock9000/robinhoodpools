@@ -9,14 +9,17 @@ from types import SimpleNamespace
 import pytest
 
 from rhpools.lp_market_index import (
+    CURRENT_POOL_TRACE_MAX_FRAMES,
     FACTORY_SELECTOR,
     FEED_SECONDARY_MAX_SECONDS,
+    HEAD_REPLAY_LIMIT,
     FEE_SELECTOR,
     GET_PAIR_SELECTOR,
     TICK_SPACING_SELECTOR,
     TOKEN0_SELECTOR,
     TOKEN1_SELECTOR,
     MAX_LOGS_PER_RESPONSE,
+    LIVE_MAX_STORE_LOGS,
     REPROJECT_MAX_STORE_SECONDS,
     TOKEN_METADATA_INVALID_PREFIX,
     TOKEN_METADATA_INVALID_RECHECK_S,
@@ -26,6 +29,8 @@ from rhpools.lp_market_index import (
 from rhpools.lp_market_store import CanonicalConflict, MarketStore
 from rhpools.lp_market_protocols import (
     LIQUIDITY_SELECTOR,
+    MODIFY_LIQUIDITY_SELECTOR,
+    SWAP_SELECTOR,
     POSITIONS_SELECTOR,
     SLOT0_SELECTOR,
     V2_FACTORIES,
@@ -33,7 +38,10 @@ from rhpools.lp_market_protocols import (
     V3_MINT_TOPIC,
     POOL_MANAGER,
     TRANSFER_TOPIC,
+    V4_DONATE_TOPIC,
+    V4_INITIALIZE_TOPIC,
     V4_MODIFY_LIQUIDITY_TOPIC,
+    V4_SWAP_TOPIC,
 )
 
 
@@ -46,6 +54,27 @@ def header(number: int, *, parent: str | None = None) -> dict[str, str]:
         "hash": "0x" + f"{number:064x}",
         "parentHash": parent or ("0x" + f"{max(0, number - 1):064x}"),
         "timestamp": hex(1_700_000_000 + number),
+    }
+
+
+def activity_event(
+    block: dict[str, str],
+    *,
+    tx_hash: str = "0x" + "ab" * 32,
+    log_index: int = 0,
+) -> dict[str, object]:
+    return {
+        "block_number": int(block["number"], 16),
+        "block_hash": block["hash"],
+        "tx_hash": tx_hash,
+        "tx_index": 0,
+        "log_index": log_index,
+        "timestamp": int(block["timestamp"], 16),
+        "pool_id": None,
+        "protocol": "v3",
+        "kind": "add",
+        "owner": "0x" + "11" * 20,
+        "data": {},
     }
 
 
@@ -137,6 +166,100 @@ def test_dense_live_interval_grows_and_reports_scan_work(monkeypatch):
         scanner.close()
         store.close()
 
+
+def test_dense_live_fetch_commits_a_bounded_whole_block_prefix(monkeypatch):
+    store = MarketStore(":memory:")
+    scanner = indexer(store, StaticRpc(355))
+    anchor = header(99)
+    store.ingest(
+        [anchor], [], lane="live",
+        cursor={
+            "block_number": 99,
+            "block_hash": anchor["hash"],
+            "timestamp": int(anchor["timestamp"], 16),
+        },
+    )
+    per_block = LIVE_MAX_STORE_LOGS // 2
+    logs = [
+        {"blockNumber": hex(number)}
+        for number in (100, 101, 102)
+        for _ in range(per_block)
+    ]
+    headers = {
+        number: header(number)
+        for number in (100, 101, 102, 355)
+    }
+    monkeypatch.setattr(
+        scanner,
+        "_fetch_interval",
+        lambda _lane, _start, _end: (logs, headers),
+    )
+    monkeypatch.setattr(scanner, "_decode", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        scanner,
+        "_queue_deferred_pool_identities",
+        lambda *_args, **_kwargs: 0,
+    )
+    try:
+        assert scanner._scan_live_once() is True
+        scan = scanner.runtime_status()["live_scan"]
+        assert store.cursor("live")["block_number"] == 101
+        assert scan["to_block"] == 101
+        assert scan["logs"] == LIVE_MAX_STORE_LOGS
+        assert scan["fetched_to_block"] == 355
+        assert scan["fetched_logs"] == 3 * per_block
+        assert scan["next_chunk"] == 2
+    finally:
+        scanner.close()
+        store.close()
+
+@pytest.mark.parametrize("counts,first_low", [((2, 2, 2), 101), ((2, 2, 5), 102)])
+def test_dense_history_commits_whole_suffix_without_skipping_older_blocks(
+    monkeypatch, counts, first_low,
+):
+    import rhpools.lp_market_index as module
+
+    monkeypatch.setattr(module, "HISTORY_MAX_STORE_LOGS", 4)
+    store = MarketStore(":memory:")
+    scanner = indexer(store, StaticRpc(355))
+    store.ingest([header(355)], [], lane="live", cursor={
+        "block_number": 355, "block_hash": header(355)["hash"],
+    })
+    store.ingest([header(103)], [], lane="history", cursor={
+        "next_to": 102, "target_block": 100, "complete": False,
+    })
+    scanner._history_chunk = 3
+    logs = [
+        {"blockNumber": hex(number)}
+        for number, count in zip((100, 101, 102), counts)
+        for _ in range(count)
+    ]
+    monkeypatch.setattr(scanner, "_fetch_interval", lambda _lane, start, end: (
+        [log for log in logs if start <= int(log["blockNumber"], 16) <= end],
+        {number: header(number) for number in range(start, end + 1)},
+    ))
+    monkeypatch.setattr(scanner, "_decode", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        scanner, "_queue_deferred_pool_identities", lambda *_args, **_kwargs: 0,
+    )
+    try:
+        assert scanner._scan_history_once() is True
+        assert store.cursor("history")["low_block"] == first_low
+        assert store.cursor("history")["next_to"] == first_low - 1
+        assert store.cursor("history")["complete"] is False
+        for _ in range(2):
+            if store.cursor("history")["complete"]:
+                break
+            scanner._scan_history_once()
+        cursor = store.cursor("history")
+        assert cursor["next_to"] == 99
+        assert cursor["complete"] is True
+        coverage = store.status()["coverage"]["history"]
+        assert (coverage["from_block"], coverage["to_block"]) == (100, 102)
+    finally:
+        scanner.close()
+        store.close()
+
 def test_live_chunk_sizing_excludes_writer_lock_wait(tmp_path, monkeypatch):
     store = MarketStore(tmp_path / "market.sqlite")
     scanner = indexer(store, StaticRpc(355))
@@ -208,6 +331,246 @@ def test_live_parent_mismatch_never_advances_cursor(monkeypatch):
         assert scanner._scan_live_once() is True
         assert recovered == ["block 100 does not extend live cursor"]
         assert store.cursor("live")["block_number"] == 99
+    finally:
+        scanner.close()
+        store.close()
+
+
+def test_live_commit_publishes_activity_without_wss_logs(monkeypatch):
+    store = MarketStore(":memory:")
+    scanner = indexer(store, StaticRpc(100))
+    anchor = header(99)
+    block = header(100)
+    event = activity_event(block)
+    store.ingest([anchor], [], lane="live", cursor={
+        "block_number": 99,
+        "block_hash": anchor["hash"],
+        "timestamp": int(anchor["timestamp"], 16),
+    })
+    scanner._publish_current_block(block, (), source="wss-head")
+    cursor = scanner.feed_updates()
+    raw_log = {
+        "blockNumber": block["number"],
+        "blockHash": block["hash"],
+    }
+    monkeypatch.setattr(
+        scanner,
+        "_fetch_interval",
+        lambda *_args: ([raw_log], {100: block}),
+    )
+    monkeypatch.setattr(scanner, "_decode", lambda *_args, **_kwargs: [event])
+    monkeypatch.setattr(
+        scanner,
+        "_queue_deferred_pool_identities",
+        lambda *_args, **_kwargs: 0,
+    )
+    monkeypatch.setattr(
+        scanner, "_schedule_current_pool_resolutions",
+        lambda *_args, **_kwargs: None,
+    )
+    try:
+        assert scanner._scan_live_once() is True
+        delivered = scanner.feed_updates(
+            cursor["sequence"], cursor["feed_epoch"],
+        )
+        rows = [
+            row
+            for item in delivered["events"] if item["event"] == "activity"
+            for row in item["data"]["rows"]
+        ]
+        assert len(rows) == 1
+        assert (
+            rows[0]["block_hash"],
+            rows[0]["tx_hash"],
+            rows[0]["log_index"],
+        ) == (block["hash"], event["tx_hash"], 0)
+        assert rows[0]["id"] > 0
+
+        duplicate_cursor = scanner.feed_updates()
+        monkeypatch.setattr(
+            scanner, "_decode_current",
+            lambda *_args, **_kwargs: [dict(event)],
+        )
+        assert scanner._publish_late_current_logs(
+            100, [raw_log], source="wss-logs",
+        ) == 1
+        duplicate = scanner.feed_updates(
+            duplicate_cursor["sequence"], duplicate_cursor["feed_epoch"],
+        )
+        assert [
+            item for item in duplicate["events"]
+            if item["event"] == "activity"
+        ] == []
+    finally:
+        scanner.close()
+        store.close()
+
+
+def test_live_commit_does_not_publish_after_concurrent_reset(monkeypatch):
+    store = MarketStore(":memory:")
+    scanner = indexer(store, StaticRpc(100))
+    anchor = header(99)
+    block = header(100)
+    event = activity_event(block)
+    store.ingest([anchor], [], lane="live", cursor={
+        "block_number": 99,
+        "block_hash": anchor["hash"],
+        "timestamp": int(anchor["timestamp"], 16),
+    })
+    scanner._publish_current_block(block, (), source="wss-head")
+    cursor = scanner.feed_updates()
+    monkeypatch.setattr(
+        scanner,
+        "_fetch_interval",
+        lambda *_args: (
+            [{"blockNumber": block["number"], "blockHash": block["hash"]}],
+            {100: block},
+        ),
+    )
+    monkeypatch.setattr(scanner, "_decode", lambda *_args, **_kwargs: [event])
+    monkeypatch.setattr(
+        scanner,
+        "_queue_deferred_pool_identities",
+        lambda *_args, **_kwargs: 0,
+    )
+    monkeypatch.setattr(
+        scanner,
+        "_publish_event_pools",
+        lambda _events: store.rollback(99, header=anchor),
+    )
+    try:
+        assert scanner._scan_live_once() is True
+        delivered = scanner.feed_updates(
+            cursor["sequence"], cursor["feed_epoch"],
+        )
+        assert [
+            item for item in delivered["events"]
+            if item["event"] == "activity"
+        ] == []
+        assert store.cursor("live")["block_number"] == 99
+    finally:
+        scanner.close()
+        store.close()
+
+
+def test_canonical_current_merge_keeps_stronger_receipt_facts(monkeypatch):
+    store = MarketStore(":memory:")
+    scanner = indexer(store)
+    block = header(100)
+    strong = {
+        **activity_event(block),
+        "transaction_transfers": [{
+            "token": "0x" + "22" * 20,
+            "from": "0x" + "33" * 20,
+            "to": "0x" + "44" * 20,
+            "amount": "25",
+        }],
+        "transaction_transfers_truncated": False,
+        "transaction_flow0": "-25",
+        "transaction_flow1": "0",
+        "flow_scope": "transaction",
+        "flow_complete": True,
+        "flow_qualification": "verified_receipt_transfer_logs",
+        "data": {"receipt_checked": True},
+    }
+    monkeypatch.setattr(
+        scanner, "_decode_current", lambda *_args, **_kwargs: [strong],
+    )
+    monkeypatch.setattr(
+        scanner, "_schedule_current_receipts",
+        lambda *_args, **_kwargs: None,
+    )
+    try:
+        scanner._publish_current_block(block, [{
+            "blockNumber": block["number"],
+            "blockHash": block["hash"],
+        }], source="wss-logs")
+        cursor = scanner.feed_updates()
+        canonical = {
+            **activity_event(block),
+            "id": 17,
+            "transaction_transfers": None,
+            "transaction_transfers_truncated": None,
+            "transaction_flow0": None,
+            "transaction_flow1": None,
+            "flow_scope": None,
+            "flow_complete": None,
+            "flow_qualification": None,
+            "data": {"receipt_checked": None, "trace_complete": True},
+        }
+        scanner._publish_canonical_current_events(
+            [canonical], source="live-index", add_unseen=True,
+        )
+        delivered = scanner.feed_updates(
+            cursor["sequence"], cursor["feed_epoch"],
+        )
+        rows = [
+            row
+            for item in delivered["events"] if item["event"] == "activity"
+            for row in item["data"]["rows"]
+        ]
+        assert len(rows) == 1
+        assert rows[0]["id"] == 17
+        assert rows[0]["transaction_flow0"] == "-25"
+        assert rows[0]["transaction_transfers"] == strong["transaction_transfers"]
+        assert rows[0]["flow_complete"] is True
+        assert rows[0]["data"] == {
+            "receipt_checked": True,
+            "trace_complete": True,
+        }
+
+        duplicate_cursor = scanner.feed_updates()
+        scanner._publish_canonical_current_events(
+            [canonical], source="live-index", add_unseen=True,
+        )
+        duplicate = scanner.feed_updates(
+            duplicate_cursor["sequence"], duplicate_cursor["feed_epoch"],
+        )
+        assert [
+            item for item in duplicate["events"]
+            if item["event"] == "activity"
+        ] == []
+    finally:
+        scanner.close()
+        store.close()
+
+
+def test_canonical_current_publication_rejects_wrong_historical_or_evicted_rows():
+    store = MarketStore(":memory:")
+    scanner = indexer(store)
+    observed = header(100)
+    replacement = {
+        **observed,
+        "hash": "0x" + "ff" * 32,
+    }
+    scanner._publish_current_block(observed, (), source="wss-head")
+    cursor = scanner.feed_updates()
+    try:
+        scanner._publish_canonical_current_events(
+            [activity_event(replacement)],
+            source="live-index",
+            add_unseen=True,
+        )
+        scanner._publish_canonical_current_events(
+            [activity_event(observed)],
+            source="history-enrichment",
+        )
+        for number in range(101, 101 + HEAD_REPLAY_LIMIT * 2):
+            scanner._publish_current_block(
+                header(number), (), source="wss-head",
+            )
+        scanner._publish_canonical_current_events(
+            [activity_event(observed)],
+            source="live-index",
+            add_unseen=True,
+        )
+        delivered = scanner.feed_updates(
+            cursor["sequence"], cursor["feed_epoch"],
+        )
+        assert [
+            item for item in delivered["events"]
+            if item["event"] == "activity"
+        ] == []
     finally:
         scanner.close()
         store.close()
@@ -455,6 +818,124 @@ def test_activity_feed_secondary_session_is_bounded_and_fails_back(
         store.close()
 
 
+def test_covered_activity_discards_keep_normal_pending_tail_healthy():
+    store = MarketStore(":memory:")
+    scanner = indexer(store)
+    pending = {
+        number: [{"blockNumber": hex(number)}]
+        for number in range(1, HEAD_REPLAY_LIMIT * 2 + 2)
+    }
+    first_seen = {number: 0.0 for number in pending}
+    durable_number = HEAD_REPLAY_LIMIT + 1
+    durable = header(durable_number)
+    try:
+        store.ingest([durable], [], lane="live", cursor={
+            "block_number": durable_number,
+            "block_hash": durable["hash"],
+            "timestamp": int(durable["timestamp"], 16),
+        })
+        scanner._flush_activity_logs(
+            pending, first_seen, max(pending), source="test", force=True,
+        )
+        assert set(pending) == set(range(
+            durable_number + 1, HEAD_REPLAY_LIMIT * 2 + 2,
+        ))
+        assert set(first_seen) == set(pending)
+        status = scanner.runtime_status()
+        assert "activity_feed" not in status["errors"]
+        assert status["activity_feed_stale_blocks_discarded"] == durable_number
+        assert store.cursor("live")["block_number"] == durable_number
+    finally:
+        scanner.close()
+        store.close()
+
+
+def test_activity_backlog_waits_for_durable_coverage_and_recovers(monkeypatch):
+    store = MarketStore(":memory:")
+    scanner = indexer(store)
+    pending = {
+        number: [{"blockNumber": hex(number)}]
+        for number in range(1, HEAD_REPLAY_LIMIT * 2 + 2)
+    }
+    first_seen = {number: 0.0 for number in pending}
+    try:
+        with pytest.raises(RpcError, match="outside canonical replay"):
+            scanner._flush_activity_logs(
+                pending, first_seen, max(pending), source="test", force=True,
+            )
+        status = scanner.runtime_status()
+        assert len(pending) == HEAD_REPLAY_LIMIT * 2 + 1
+        assert "outside canonical replay" in status["errors"]["activity_feed"]
+        assert status.get("activity_feed_stale_blocks_discarded", 0) == 0
+        assert status["activity_feed_backpressure_disconnects"] == 1
+        assert status["activity_feed_recovery_through"] == (
+            HEAD_REPLAY_LIMIT * 2 + 1
+        )
+
+        durable = header(HEAD_REPLAY_LIMIT * 2 + 1)
+        store.ingest([durable], [], lane="live", cursor={
+            "block_number": HEAD_REPLAY_LIMIT * 2 + 1,
+            "block_hash": durable["hash"],
+            "timestamp": int(durable["timestamp"], 16),
+        })
+        scanner._flush_activity_logs(
+            pending, first_seen, max(pending), source="test", force=True,
+        )
+        status = scanner.runtime_status()
+        assert len(pending) == HEAD_REPLAY_LIMIT
+        assert status["activity_feed_stale_blocks_discarded"] == (
+            HEAD_REPLAY_LIMIT + 1
+        )
+        assert status["activity_feed_last_discard"]["durable_through"] == (
+            HEAD_REPLAY_LIMIT * 2 + 1
+        )
+        assert "activity_feed" not in status["errors"]
+        assert status["activity_feed_recovered_at"] > 0
+
+        current = header(HEAD_REPLAY_LIMIT * 2 + 2)
+        with scanner._feed_condition:
+            scanner._observed_last_header = current
+            scanner._observed_blocks[HEAD_REPLAY_LIMIT * 2 + 2] = (
+                current, [],
+            )
+        pending[HEAD_REPLAY_LIMIT * 2 + 2] = [{
+            "blockNumber": current["number"], "blockHash": current["hash"],
+        }]
+        first_seen[HEAD_REPLAY_LIMIT * 2 + 2] = 0.0
+
+        def fail_publish(*_args, **_kwargs):
+            raise RpcError("decode failed")
+
+        monkeypatch.setattr(
+            scanner, "_publish_late_current_logs", fail_publish,
+        )
+        scanner._flush_activity_logs(
+            pending, first_seen, HEAD_REPLAY_LIMIT * 2 + 2,
+            source="test", force=True,
+        )
+        assert HEAD_REPLAY_LIMIT * 2 + 2 in pending
+        assert scanner.runtime_status()["errors"]["activity_feed"] == "decode failed"
+
+        monkeypatch.setattr(
+            scanner, "_publish_late_current_logs",
+            lambda *_args, **_kwargs: 1,
+        )
+        scanner._flush_activity_logs(
+            pending, first_seen, HEAD_REPLAY_LIMIT * 2 + 2,
+            source="test", force=True,
+        )
+        recovered = scanner.runtime_status()
+        assert HEAD_REPLAY_LIMIT * 2 + 2 not in pending
+        assert "activity_feed" not in recovered["errors"]
+        assert recovered["activity_feed_stale_blocks_discarded"] == (
+            HEAD_REPLAY_LIMIT + 1
+        )
+        assert recovered["activity_feed_recovered_at"] > 0
+    finally:
+        scanner.close()
+        store.close()
+
+
 def test_history_progress_is_independent_of_unrunnable_enrichment(monkeypatch):
     store = MarketStore(":memory:")
     scanner = indexer(store)
@@ -506,7 +987,7 @@ def test_history_progress_is_independent_of_unrunnable_enrichment(monkeypatch):
         store.close()
 
 
-def test_history_yields_only_to_live_debt_deeper_than_several_batches():
+def test_history_yields_to_urgent_live_debt_and_runs_near_head():
     store = MarketStore(":memory:")
     scanner = indexer(store, StaticRpc(5_000))
     scanner._history_verified = True
@@ -521,12 +1002,24 @@ def test_history_yields_only_to_live_debt_deeper_than_several_batches():
         "block_number": 500, "block_hash": anchor["hash"],
         "timestamp": int(anchor["timestamp"], 16),
     })
+    background_done = threading.Event()
+    background_errors = []
+
+    def background_write():
+        try:
+            with store.transaction(priority="background"):
+                pass
+        except BaseException as exc:
+            background_errors.append(exc)
+        finally:
+            background_done.set()
+
+    background = threading.Thread(target=background_write)
     try:
-        # Trailing the tip by a little over one adaptive live batch is the
-        # normal steady state, not debt: the archive keeps its writer window.
+        # A one-block gap still leaves room for archive progress.
         scanner._set_runtime(
-            "head", head=500 + scanner._live_chunk + 100,
-            head_timestamp=int(header(500 + scanner._live_chunk + 100)["timestamp"], 16),
+            "head", head=501,
+            head_timestamp=int(header(501)["timestamp"], 16),
         )
         assert scanner._scan_history_once() is True
         assert store.cursor("history")["next_to"] < 499
@@ -540,10 +1033,29 @@ def test_history_yields_only_to_live_debt_deeper_than_several_batches():
         assert scanner._scan_history_once() is False
         assert store.cursor("history")["next_to"] == before
         assert scanner.runtime_status()["recent_catchup_priority"] is True
+        background.start()
+        with store._writer_condition:
+            assert store._writer_condition.wait_for(
+                lambda: len(store._writer_waiters) == 1,
+                timeout=1,
+            )
+        assert not background_done.wait(0.05)
         assert scanner._scan_live_once() is True
         assert store.cursor("live")["block_number"] > 500
+        scanner._set_runtime(
+            "head", head=store.cursor("live")["block_number"],
+            head_timestamp=int(
+                header(store.cursor("live")["block_number"])["timestamp"], 16,
+            ),
+        )
+        assert scanner._recent_catchup_pending() is False
+        assert background_done.wait(1)
+        background.join(1)
+        assert background_errors == []
     finally:
         scanner.close()
+        if background.ident is not None:
+            background.join(1)
         store.close()
 
 
@@ -868,6 +1380,15 @@ def test_scans_durably_replay_unregistered_v4_pool_keys(
         # A restart also clears process-local identity suppression state.
         with scanner._identity_resolve_lock:
             scanner._identity_checked.clear()
+        with scanner._current_receipt_lock:
+            scanner._current_pool_failure_details[pool_id] = {
+                "classification": "rpc",
+                "error": "temporary state getter failure",
+                "source": "test",
+            }
+            scanner._current_pool_failures[(pool_id, tx_hash)] = float("inf")
+        scanner._publish_pool_resolution_failures()
+        assert scanner.runtime_status()["pool_resolution_failure_count"] == 1
 
         assert scanner._resolve_deferred_pool_identities_once() is True
         pool = store.pool(pool_id)
@@ -883,6 +1404,7 @@ def test_scans_durably_replay_unregistered_v4_pool_keys(
             "SELECT COUNT(*) FROM pending_reprojection",
         ).fetchone()[0] == 1
         assert market.published[-1]["id"] == pool_id
+        assert "pool_resolution" not in scanner.runtime_status()["errors"]
 
         tampered = {
             **pool,
@@ -892,6 +1414,264 @@ def test_scans_durably_replay_unregistered_v4_pool_keys(
         market.published.clear()
         assert scanner._publish_stored_pool_page() is True
         assert [published["id"] for published in market.published] == [pool_id]
+    finally:
+        scanner.close()
+        store.close()
+
+
+def test_poolkey_recovery_uses_initialization_receipt_without_transfers_or_trace():
+    from eth_utils import keccak
+
+    observed = header(100)
+    token0, token1, hook = ("0x" + byte * 20 for byte in ("21", "22", "44"))
+    fee, spacing = 3000, 60
+    tx_hash = "0x" + "61" * 32
+
+    def word(value):
+        return f"{value & ((1 << 256) - 1):064x}"
+
+    pool_id = "0x" + keccak(bytes.fromhex("".join(
+        word(value) for value in (
+            int(token0, 16), int(token1, 16), fee, spacing, int(hook, 16),
+        )
+    ))).hex()
+    pool_log = {
+        "address": POOL_MANAGER,
+        "blockNumber": observed["number"],
+        "blockHash": observed["hash"],
+        "transactionHash": tx_hash,
+        "transactionIndex": "0x0",
+        "logIndex": "0x0",
+        "topics": [
+            V4_INITIALIZE_TOPIC, pool_id,
+            "0x" + word(int(token0, 16)), "0x" + word(int(token1, 16)),
+        ],
+        "data": "0x" + "".join(
+            word(value) for value in (fee, spacing, int(hook, 16), 1 << 96, 0)
+        ),
+        "removed": False,
+    }
+    transaction = {
+        "hash": tx_hash, "blockHash": observed["hash"],
+        "blockNumber": observed["number"], "input": "0xdeadbeef",
+    }
+    receipt = {
+        "transactionHash": tx_hash, "blockHash": observed["hash"],
+        "logs": [pool_log],
+    }
+
+    class InitializeRpc(StaticRpc):
+        def call(self, method, params):
+            if method == "eth_getTransactionByHash":
+                return transaction
+            if method == "eth_getTransactionReceipt":
+                return receipt
+            if method == "debug_traceTransaction":
+                raise RpcError("historical trace state unavailable")
+            return super().call(method, params)
+
+    store = MarketStore(":memory:")
+    scanner = indexer(store, InitializeRpc(100))
+    try:
+        resolved, failures = scanner._resolve_current_v4_inputs({
+            pool_id: ([pool_log], tx_hash),
+        })
+        assert failures == {}
+        pool = resolved[pool_id]
+        assert (pool["token0"], pool["token1"], pool["tick_spacing"]) == (
+            token0, token1, spacing,
+        )
+        assert pool["created_block"] == 100
+        assert pool["source"] == "PoolManager.Initialize"
+    finally:
+        scanner.close()
+        store.close()
+
+
+@pytest.mark.parametrize("manager_method", ["modify", "swap", "donate"])
+def test_poolkey_fallback_reads_bounded_nested_manager_trace(manager_method):
+    from eth_utils import keccak
+
+    observed = header(100)
+    token0 = "0x" + "21" * 20
+    token1 = "0x" + "22" * 20
+    hook = "0x" + "44" * 20
+    fee, spacing = 0x800000, 8
+    tx_hash = "0x" + "61" * 32
+    custody = "0x" + "55" * 20
+
+    def word(value):
+        return f"{value & ((1 << 256) - 1):064x}"
+
+    key_words = (
+        int(token0, 16), int(token1, 16), fee, spacing, int(hook, 16),
+    )
+    pool_id = "0x" + keccak(bytes.fromhex(
+        "".join(word(value) for value in key_words)
+    )).hex()
+    if manager_method == "modify":
+        topic = V4_MODIFY_LIQUIDITY_TOPIC
+        event_values = (-10, 10, 100, 7)
+    elif manager_method == "swap":
+        topic = V4_SWAP_TOPIC
+        event_values = (-100, 90, 1 << 96, 1_000_000, 0, 3000)
+    else:
+        topic = V4_DONATE_TOPIC
+        event_values = (100, 200)
+    pool_log = {
+        "address": POOL_MANAGER,
+        "blockNumber": observed["number"],
+        "blockHash": observed["hash"],
+        "transactionHash": tx_hash,
+        "transactionIndex": "0x0",
+        "logIndex": "0x1",
+        "topics": [
+            topic,
+            pool_id,
+            "0x" + word(int(custody, 16)),
+        ],
+        "data": "0x" + "".join(word(value) for value in event_values),
+        "removed": False,
+    }
+    transaction = {
+        "hash": tx_hash,
+        "blockHash": observed["hash"],
+        "blockNumber": observed["number"],
+        "input": "0xdeadbeef",
+    }
+    receipt = {
+        "transactionHash": tx_hash,
+        "blockHash": observed["hash"],
+        "logs": [pool_log],
+    }
+    if manager_method == "modify":
+        manager_input = MODIFY_LIQUIDITY_SELECTOR + "".join(
+            word(value) for value in (
+                *key_words, -10, 10, 100, 7, 10 * 32, 0,
+            )
+        )
+    elif manager_method == "swap":
+        manager_input = SWAP_SELECTOR + "".join(
+            word(value) for value in (
+                *key_words, 1, -100, 1, 9 * 32, 0,
+            )
+        )
+    else:
+        donate_selector = "0x" + keccak(
+            text=(
+                "donate((address,address,uint24,int24,address),"
+                "uint256,uint256,bytes)"
+            )
+        ).hex()[:8]
+        manager_input = donate_selector + "".join(
+            word(value) for value in (
+                *key_words, 100, 200, 8 * 32, 0,
+            )
+        )
+    manager_input += "00" * 32
+    trace = {
+        "type": "CALL",
+        "to": "0x" + "99" * 20,
+        "input": transaction["input"],
+        "calls": [{
+            "type": "CALL",
+            "to": POOL_MANAGER,
+            "input": manager_input,
+            "output": "0x" + "00" * 64,
+        }],
+    }
+    other_key = "".join(word(value) for value in (
+        int(token0, 16), int(token1, 16), 3000, spacing, int(hook, 16),
+    ))
+    other_pool_id = "0x" + keccak(bytes.fromhex(other_key)).hex()
+    other_log = {
+        **pool_log,
+        "logIndex": "0x2",
+        "topics": [topic, other_pool_id, pool_log["topics"][2]],
+    }
+    receipt["logs"].append(other_log)
+    trace["calls"].append({
+        "type": "CALL",
+        "to": POOL_MANAGER,
+        "input": manager_input[:10] + other_key + manager_input[330:],
+    })
+    # Valid identities must survive unrelated calls beyond the traversal budget.
+    trace["calls"].extend(
+        {"type": "CALL", "to": custody, "input": "0x"}
+        for _ in range(CURRENT_POOL_TRACE_MAX_FRAMES)
+    )
+    candidates = {
+        pool_id: ([pool_log], tx_hash),
+        other_pool_id: ([other_log], tx_hash),
+    }
+
+    class TraceRpc(StaticRpc):
+        def __init__(self):
+            super().__init__(100)
+            self.trace_error = None
+            self.on_trace = None
+
+        def call(self, method, params):
+            if method == "eth_getTransactionByHash":
+                return transaction
+            if method == "eth_getTransactionReceipt":
+                return receipt
+            if method == "debug_traceTransaction":
+                if self.trace_error is not None:
+                    raise self.trace_error
+                if self.on_trace is not None:
+                    self.on_trace()
+                return trace
+            return super().call(method, params)
+
+    store = MarketStore(":memory:")
+    rpc = TraceRpc()
+    scanner = indexer(store, rpc)
+    with scanner._feed_condition:
+        scanner._observed_blocks[100] = (observed, [])
+    try:
+        resolved, failures = scanner._resolve_current_v4_inputs(candidates)
+        assert failures == {}
+        assert set(resolved) == set(candidates)
+        assert resolved[pool_id]["source"] == "trace.PoolKey"
+        assert (resolved[pool_id]["token0"], resolved[pool_id]["token1"]) == (
+            token0, token1,
+        )
+        assert resolved[other_pool_id]["fee_ppm"] == 3000
+
+        # A target not reached within the budget still fails visibly.
+        trace["calls"].insert(0, {
+            "type": "CALL",
+            "calls": [
+                {"type": "CALL", "to": custody, "input": "0x"}
+                for _ in range(CURRENT_POOL_TRACE_MAX_FRAMES)
+            ],
+        })
+        resolved, failures = scanner._resolve_current_v4_inputs(candidates)
+        assert resolved == {}
+        assert set(failures) == set(candidates)
+        assert all(isinstance(error, RpcError) for error in failures.values())
+        trace["calls"].pop(0)
+
+        rpc.trace_error = RpcError("trace RPC unavailable: Goldsky timeout")
+        resolved, failures = scanner._resolve_current_v4_inputs(candidates)
+        assert resolved == {}
+        assert "trace RPC unavailable: Goldsky timeout" in str(
+            failures[pool_id]
+        )
+
+        rpc.trace_error = None
+
+        def reorg_during_trace():
+            replaced = dict(observed)
+            replaced["hash"] = "0x" + "ff" * 32
+            with scanner._feed_condition:
+                scanner._observed_blocks[100] = (replaced, [])
+
+        rpc.on_trace = reorg_during_trace
+        resolved, failures = scanner._resolve_current_v4_inputs(candidates)
+        assert resolved == {}
+        assert isinstance(failures[pool_id], CanonicalConflict)
     finally:
         scanner.close()
         store.close()
@@ -1085,33 +1865,6 @@ def test_archive_interval_rejects_a_boundary_the_canonical_source_disputes():
         store.close()
 
 
-def test_archive_chunk_grows_toward_the_event_budget_not_the_page_cap():
-    from rhpools.lp_market_index import ARCHIVE_MAX_CHUNK, ARCHIVE_TARGET_EVENTS
-
-    created: dict[str, list] = {}
-    store = MarketStore(":memory:")
-    provider_store = MarketStore(":memory:")
-    archive = indexer(store, archive_factory(created))
-    provider = indexer(provider_store)
-    try:
-        for scanner in (archive, provider):
-            scanner._history_chunk = 1_000
-            scanner._resize_after_success("history", 8_000, 1.0, 1_000)
-        assert provider._history_chunk == 1_000
-        assert archive._history_chunk == 1_250
-        archive._history_chunk = ARCHIVE_MAX_CHUNK
-        archive._resize_after_success("history", 0, 0.5, ARCHIVE_MAX_CHUNK)
-        assert archive._history_chunk == ARCHIVE_MAX_CHUNK
-        archive._history_chunk = 4_000
-        archive._resize_after_success(
-            "history", ARCHIVE_TARGET_EVENTS * 4, 1.0, 4_000,
-        )
-        assert archive._history_chunk == 4_000
-    finally:
-        archive.close()
-        provider.close()
-        store.close()
-        provider_store.close()
 
 
 def test_interval_end_is_rechecked_after_logs_before_commit():
@@ -1195,11 +1948,17 @@ def test_checkpoint_maintenance_continues_while_projection_is_blocked(
         with store.transaction() as connection:
             connection.execute("CREATE TABLE checkpoint_probe(value TEXT)")
             connection.execute("INSERT INTO checkpoint_probe VALUES('committed')")
-        wal_path = store.path.with_name(store.path.name + "-wal")
+        committed_at = time.time()
         deadline = time.monotonic() + 1
-        while wal_path.stat().st_size and time.monotonic() < deadline:
+        while True:
+            checkpoint_status = scanner.runtime_status().get("wal_checkpoint") or {}
+            if (
+                checkpoint_status.get("observed_at", 0) >= committed_at
+                and checkpoint_status.get("backlog_bytes") == 0
+            ):
+                break
+            assert time.monotonic() < deadline, checkpoint_status
             time.sleep(0.01)
-        assert wal_path.stat().st_size == 0
         assert store.read().execute(
             "SELECT value FROM checkpoint_probe"
         ).fetchone()[0] == "committed"
@@ -1271,19 +2030,17 @@ def test_storage_pressure_hysteresis_pauses_and_resumes_history(
             "backlog_bytes": 0, "wal_bytes": 0,
         },
     ))
-    checkpoint_modes: list[str] = []
     last_passive: dict[str, int] = {}
 
     def checkpoint(mode="PASSIVE", *, drain_readers=False):
         nonlocal last_passive
-        checkpoint_modes.append(mode)
-        if mode == "TRUNCATE":
+        if mode == "RESTART":
             return {
                 "busy": int(last_passive["backlog_bytes"] > 0),
                 "log_frames": 0,
                 "checkpointed_frames": 0,
                 "backlog_bytes": 0,
-                "wal_bytes": wal_reset if last_passive["backlog_bytes"] else 0,
+                "wal_bytes": wal_reset,
                 "log_bytes": 0,
                 "active_reader_snapshots": 0,
                 "reader_drain_pending": 0,
@@ -1333,9 +2090,6 @@ def test_storage_pressure_hysteresis_pauses_and_resumes_history(
         assert status["storage_pause_reasons"] == ["free_space"]
         assert status["storage_pressure"]["wal_backlog"] is False
         assert status["storage_pressure"]["free_space"] is True
-        assert status["wal_checkpoint"]["mode"] == "TRUNCATE"
-        assert status["wal_checkpoint"]["passive"]["wal_bytes"] == wal_reset
-        assert checkpoint_modes[-2:] == ["PASSIVE", "TRUNCATE"]
 
         scanner._storage_maintenance_once()
         assert scanner.runtime_status()["storage_paused"] is True
@@ -1378,8 +2132,8 @@ def test_wal_backpressure_preserves_live_ingestion(monkeypatch):
     monkeypatch.setattr(
         store,
         "checkpoint",
-        lambda mode="PASSIVE": {
-            "busy": 0,
+        lambda mode="PASSIVE", *, drain_readers=False: {
+            "busy": int(mode != "PASSIVE"),
             "log_frames": 25,
             "checkpointed_frames": 0,
             "backlog_bytes": wal_pause,
@@ -1463,8 +2217,14 @@ def test_busy_wal_reset_retries_after_reader_releases(tmp_path):
 
         reader.rollback()
         scanner._storage_maintenance_once()
-        assert wal.stat().st_size < allocated
-        assert reader.execute("SELECT value FROM reset_probe").fetchone()[0] == 7
+        assert wal.stat().st_size == allocated
+        with store.transaction() as connection:
+            connection.execute("INSERT INTO reset_probe VALUES(8)")
+        assert [row[0] for row in reader.execute(
+            "SELECT value FROM reset_probe ORDER BY value"
+        )] == [7, 8]
+        assert wal.stat().st_size == allocated
+        assert store.checkpoint()["log_bytes"] < allocated
     finally:
         reader.rollback()
         scanner.close()
@@ -1698,6 +2458,8 @@ def test_accounting_worker_clears_stale_error_after_recovery():
         scanner._set_runtime(
             "identity_recovery", error="reader snapshot exceeded its deadline",
         )
+
+
         scanner._initialized.set()
         scanner._accounting_run()
         assert "accounting" not in scanner.runtime_status()["errors"]
@@ -1705,6 +2467,54 @@ def test_accounting_worker_clears_stale_error_after_recovery():
         scanner._accounting_recovery_run()
         errors = scanner.runtime_status()["errors"]
         assert "identity_recovery" not in errors
+    finally:
+        scanner.close()
+        store.close()
+
+
+
+
+def test_poolkey_input_reads_preserve_receipt_capability_failures(monkeypatch):
+    store = MarketStore(":memory:")
+    scanner = indexer(store)
+    exhausted = "0x" + "11" * 32
+    absent = "0x" + "22" * 32
+    missing = "0x" + "55" * 32
+    calls = []
+
+    def batch_results(client, specifications):
+        assert client is scanner._clients["pool"]
+        calls.extend(specifications)
+        return [
+            RpcError("receipts RPC exhausted: local timeout"), {},
+            None, {},
+        ]
+
+    monkeypatch.setattr(scanner, "_batch_results_on", batch_results)
+    monkeypatch.setattr(
+        scanner, "_rpc_state_batch",
+        lambda *_args, **_kwargs: pytest.fail(
+            "transaction and receipt reads used the state batching path"
+        ),
+    )
+    try:
+        resolved, failures = scanner._resolve_current_v4_inputs({
+            exhausted: ((), "0x" + "33" * 32),
+            absent: ((), "0x" + "44" * 32),
+            missing: ((), ""),
+        })
+        assert resolved == {}
+        assert str(failures[exhausted]) == (
+            "receipts RPC exhausted: local timeout"
+        )
+        assert str(failures[absent]) == "PoolKey transaction was not found"
+        assert str(failures[missing]) == (
+            "PoolKey transaction hash is unavailable"
+        )
+        assert [method for method, _params in calls] == [
+            "eth_getTransactionByHash", "eth_getTransactionReceipt",
+            "eth_getTransactionByHash", "eth_getTransactionReceipt",
+        ]
     finally:
         scanner.close()
         store.close()
@@ -1731,7 +2541,7 @@ def test_pool_resolution_reports_address_and_recovers_health(monkeypatch):
         assert failed["pool_resolution_failures"][pool_id]["classification"] == "rpc"
 
         monkeypatch.setattr(
-            scanner, "_resolve_current_v4_pools",
+            scanner, "_resolve_current_v4_inputs",
             lambda *_args: ({pool_id: {"id": pool_id}}, {}),
         )
         monkeypatch.setattr(store, "upsert_pools", lambda _pools: None)
@@ -1748,6 +2558,44 @@ def test_pool_resolution_reports_address_and_recovers_health(monkeypatch):
         recovered = scanner.runtime_status()
         assert "pool_resolution" not in recovered["errors"]
         assert recovered["pool_resolution_failures"] == {}
+    finally:
+        scanner.close()
+        store.close()
+
+
+def test_durable_identity_recovery_clears_only_its_pool_failure(monkeypatch):
+    store = MarketStore(":memory:")
+    scanner = indexer(store)
+    first, second = "0x" + "12" * 32, "0x" + "34" * 32
+    observed = header(100)
+    with scanner._feed_condition:
+        scanner._observed_blocks[100] = (observed, [])
+
+    def fail(pool_ids, *_args):
+        pool_id = next(iter(pool_ids))
+        return {}, {pool_id: RpcError(f"{pool_id} unavailable")}
+
+    monkeypatch.setattr(scanner, "_resolve_current_v4_pools", fail)
+    try:
+        for pool_id in (first, second):
+            scanner._resolve_current_pool(
+                pool_id, 100, observed["hash"], [], "test",
+                "0x" + "56" * 32,
+            )
+        failed = scanner.runtime_status()
+        assert failed["pool_resolution_failure_count"] == 2
+
+        scanner._clear_current_pool_resolution_failure(first)
+        partial = scanner.runtime_status()
+        assert partial["pool_resolution_failure_count"] == 1
+        assert set(partial["pool_resolution_failures"]) == {second}
+        assert second in partial["errors"]["pool_resolution"]
+
+        scanner._clear_current_pool_resolution_failure(second)
+        recovered = scanner.runtime_status()
+        assert recovered["pool_resolution_failure_count"] == 0
+        assert recovered["pool_resolution_failures"] == {}
+        assert "pool_resolution" not in recovered["errors"]
     finally:
         scanner.close()
         store.close()
