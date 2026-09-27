@@ -1,0 +1,8256 @@
+[
+{
+"body": "eyJjaGFpbl9pZCI6NDY2Mywic3RhdGUiOiJyZWFkeSIsInJldmlzaW9uIjo3LCJlcG9jaCI6MywicGFkIjpbInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiXX0=",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=1, stale-while-revalidate=2"
+],
+[
+"ETag",
+"W/\"11983322a3a4ffb7\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1784"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "GET",
+"path": "/api/lp/status"
+},
+"status": 200
+},
+{
+"body": "H4sIAAAAAAAEA6tWSs5IzMyLz0xRsjIxMzPWUSouSSxJVbJSKkpNTKlU0gHSZZnFmfl5SlbmOkqpBfnJGUpWQGUFiUAd0UoVRAKgQUSqrBhVOhoCoyEwGgKjITAaAjQKgdhaAG0c+Jj4BgAA",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=1, stale-while-revalidate=2"
+],
+[
+"ETag",
+"W/\"11983322a3a4ffb7\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Encoding",
+"gzip"
+],
+[
+"Content-Length",
+"108"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Accept-Encoding": "gzip"
+},
+"method": "GET",
+"path": "/api/lp/status"
+},
+"status": 200
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=1, stale-while-revalidate=2"
+],
+[
+"ETag",
+"W/\"11983322a3a4ffb7\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"If-None-Match": "W/\"11983322a3a4ffb7\""
+},
+"method": "GET",
+"path": "/api/lp/status"
+},
+"status": 304
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=1, stale-while-revalidate=2"
+],
+[
+"ETag",
+"W/\"11983322a3a4ffb7\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1784"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "HEAD",
+"path": "/api/lp/status"
+},
+"status": 200
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Access-Control-Allow-Methods",
+"GET, HEAD, OPTIONS"
+],
+[
+"Access-Control-Allow-Headers",
+"Accept, Content-Type"
+],
+[
+"Content-Length",
+"0"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "OPTIONS",
+"path": "/api/lp/status"
+},
+"status": 204
+},
+{
+"body": "eyJjaGFpbl9pZCI6NDY2Mywic3RhdGUiOiJyZWFkeSIsInJldmlzaW9uIjo3LCJlcG9jaCI6MywicGFkIjpbInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiXX0=",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=1, stale-while-revalidate=2"
+],
+[
+"ETag",
+"W/\"11983322a3a4ffb7\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1784"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Authorization": "Basic dXNlcjpwdw==",
+"Cookie": "session=abc"
+},
+"method": "GET",
+"path": "/api/lp/status"
+},
+"status": 200
+},
+{
+"body": "eyJyb3V0ZSI6InNlYXJjaCIsInF1ZXJ5Ijp7fSwicmV2aXNpb24iOjcsImVwb2NoIjozLCJzdGF0dXMiOnsicmV2aXNpb24iOjcsImVwb2NoIjozfSwicGFkIjpbInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiXX0=",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=5, stale-while-revalidate=30"
+],
+[
+"ETag",
+"W/\"437ab60ab326de96\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1814"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "GET",
+"path": "/api/lp/search"
+},
+"status": 200
+},
+{
+"body": "H4sIAAAAAAAEA+3QMQ6AIAyF4bu8mc3BpFcxDkSbyCJIwWAId5cDOLC4tWv/pslXEX1ODIKwjdsBgytzfEC1GUS+nTh/gmYDDr7vaTKQZFOWnnwH/TDYHbSgDE7/OlgWTVVABVRABVTgJ4G1vd1yo/IWBwAA",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=5, stale-while-revalidate=30"
+],
+[
+"ETag",
+"W/\"437ab60ab326de96\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Encoding",
+"gzip"
+],
+[
+"Content-Length",
+"117"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Accept-Encoding": "gzip"
+},
+"method": "GET",
+"path": "/api/lp/search"
+},
+"status": 200
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=5, stale-while-revalidate=30"
+],
+[
+"ETag",
+"W/\"437ab60ab326de96\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"If-None-Match": "W/\"437ab60ab326de96\""
+},
+"method": "GET",
+"path": "/api/lp/search"
+},
+"status": 304
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=5, stale-while-revalidate=30"
+],
+[
+"ETag",
+"W/\"437ab60ab326de96\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1814"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "HEAD",
+"path": "/api/lp/search"
+},
+"status": 200
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Access-Control-Allow-Methods",
+"GET, HEAD, OPTIONS"
+],
+[
+"Access-Control-Allow-Headers",
+"Accept, Content-Type"
+],
+[
+"Content-Length",
+"0"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "OPTIONS",
+"path": "/api/lp/search"
+},
+"status": 204
+},
+{
+"body": "eyJyb3V0ZSI6InNlYXJjaCIsInF1ZXJ5Ijp7fSwicmV2aXNpb24iOjcsImVwb2NoIjozLCJzdGF0dXMiOnsicmV2aXNpb24iOjcsImVwb2NoIjozfSwicGFkIjpbInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiXX0=",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=5, stale-while-revalidate=30"
+],
+[
+"ETag",
+"W/\"437ab60ab326de96\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1814"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Authorization": "Basic dXNlcjpwdw==",
+"Cookie": "session=abc"
+},
+"method": "GET",
+"path": "/api/lp/search"
+},
+"status": 200
+},
+{
+"body": "eyJyb3V0ZSI6Im92ZXJ2aWV3IiwicXVlcnkiOnsid2luZG93IjoiN2QifSwicmV2aXNpb24iOjcsImVwb2NoIjozLCJzdGF0dXMiOnsicmV2aXNpb24iOjcsImVwb2NoIjozfSwicGFkIjpbInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiXX0=",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=0, stale-while-revalidate=0"
+],
+[
+"ETag",
+"W/\"63afdeb2e63d5584\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1829"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "GET",
+"path": "/api/lp/overview?window=7d"
+},
+"status": 200
+},
+{
+"body": "H4sIAAAAAAAEA+3QPQqAMAyG4bt8czcHIVcRB7EBu5jaX0W8u3V3cHFL1ryB8JwIkhODIIVDcVxhsGUOB+hEdauV2pa9xWUQuLjoZAX1BuxlXkCdQUxTyvHpX4N26CcLGrB/nPbCx3LXVAVUQAVUQAV+EhivG1qRwswlBwAA",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=0, stale-while-revalidate=0"
+],
+[
+"ETag",
+"W/\"63afdeb2e63d5584\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Encoding",
+"gzip"
+],
+[
+"Content-Length",
+"126"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Accept-Encoding": "gzip"
+},
+"method": "GET",
+"path": "/api/lp/overview?window=7d"
+},
+"status": 200
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=0, stale-while-revalidate=0"
+],
+[
+"ETag",
+"W/\"63afdeb2e63d5584\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"If-None-Match": "W/\"63afdeb2e63d5584\""
+},
+"method": "GET",
+"path": "/api/lp/overview?window=7d"
+},
+"status": 304
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=0, stale-while-revalidate=0"
+],
+[
+"ETag",
+"W/\"63afdeb2e63d5584\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1829"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "HEAD",
+"path": "/api/lp/overview?window=7d"
+},
+"status": 200
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Access-Control-Allow-Methods",
+"GET, HEAD, OPTIONS"
+],
+[
+"Access-Control-Allow-Headers",
+"Accept, Content-Type"
+],
+[
+"Content-Length",
+"0"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "OPTIONS",
+"path": "/api/lp/overview"
+},
+"status": 204
+},
+{
+"body": "eyJyb3V0ZSI6Im92ZXJ2aWV3IiwicXVlcnkiOnsid2luZG93IjoiN2QifSwicmV2aXNpb24iOjcsImVwb2NoIjozLCJzdGF0dXMiOnsicmV2aXNpb24iOjcsImVwb2NoIjozfSwicGFkIjpbInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiXX0=",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=0, stale-while-revalidate=0"
+],
+[
+"ETag",
+"W/\"63afdeb2e63d5584\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1829"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Authorization": "Basic dXNlcjpwdw==",
+"Cookie": "session=abc"
+},
+"method": "GET",
+"path": "/api/lp/overview?window=7d"
+},
+"status": 200
+},
+{
+"body": "eyJyb3V0ZSI6InBvb2xzIiwicXVlcnkiOnsid2luZG93IjoiN2QifSwicmV2aXNpb24iOjcsImVwb2NoIjozLCJzdGF0dXMiOnsicmV2aXNpb24iOjcsImVwb2NoIjozfSwicGFkIjpbInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiXX0=",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=0, stale-while-revalidate=0"
+],
+[
+"ETag",
+"W/\"4653c83bbe277f64\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1826"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "GET",
+"path": "/api/lp/pools?window=7d"
+},
+"status": 200
+},
+{
+"body": "H4sIAAAAAAAEA+3QPQqAMAyG4bt8czeHQq4iDsUWLIip/bGKeHfr7uDilqx5A+E5EblkB0JgnhMU1uLiATpR/WK5to22uBSi23zyvIC0ggs8TqBOIWWTS3r616AdBmNBPfaP0174WO6SioAIiIAIiMBPAsN1AxOiVsoiBwAA",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=0, stale-while-revalidate=0"
+],
+[
+"ETag",
+"W/\"4653c83bbe277f64\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Encoding",
+"gzip"
+],
+[
+"Content-Length",
+"126"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Accept-Encoding": "gzip"
+},
+"method": "GET",
+"path": "/api/lp/pools?window=7d"
+},
+"status": 200
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=0, stale-while-revalidate=0"
+],
+[
+"ETag",
+"W/\"4653c83bbe277f64\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"If-None-Match": "W/\"4653c83bbe277f64\""
+},
+"method": "GET",
+"path": "/api/lp/pools?window=7d"
+},
+"status": 304
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=0, stale-while-revalidate=0"
+],
+[
+"ETag",
+"W/\"4653c83bbe277f64\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1826"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "HEAD",
+"path": "/api/lp/pools?window=7d"
+},
+"status": 200
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Access-Control-Allow-Methods",
+"GET, HEAD, OPTIONS"
+],
+[
+"Access-Control-Allow-Headers",
+"Accept, Content-Type"
+],
+[
+"Content-Length",
+"0"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "OPTIONS",
+"path": "/api/lp/pools"
+},
+"status": 204
+},
+{
+"body": "eyJyb3V0ZSI6InBvb2xzIiwicXVlcnkiOnsid2luZG93IjoiN2QifSwicmV2aXNpb24iOjcsImVwb2NoIjozLCJzdGF0dXMiOnsicmV2aXNpb24iOjcsImVwb2NoIjozfSwicGFkIjpbInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiXX0=",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=0, stale-while-revalidate=0"
+],
+[
+"ETag",
+"W/\"4653c83bbe277f64\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1826"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Authorization": "Basic dXNlcjpwdw==",
+"Cookie": "session=abc"
+},
+"method": "GET",
+"path": "/api/lp/pools?window=7d"
+},
+"status": 200
+},
+{
+"body": "eyJyb3V0ZSI6InRhcGUiLCJxdWVyeSI6e30sInJldmlzaW9uIjo3LCJlcG9jaCI6Mywic3RhdHVzIjp7InJldmlzaW9uIjo3LCJlcG9jaCI6M30sInBhZCI6WyJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4Il19",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=2, stale-while-revalidate=10"
+],
+[
+"ETag",
+"W/\"ed5ab6fe640d0035\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1812"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "GET",
+"path": "/api/lp/tape"
+},
+"status": 200
+},
+{
+"body": "H4sIAAAAAAAEA+3QPQqAMAyG4bt8czYHIVcRh6IBu9jaH6mU3t0ewKGLWzK/4YOnIricBIxkvIBwZQkPuDZCkNtG607wTBDvtgM8EWIyKceefAf90ZsdvKAMXl8dLIumKqACKqACKvCTwNpeKbHmXRQHAAA=",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=2, stale-while-revalidate=10"
+],
+[
+"ETag",
+"W/\"ed5ab6fe640d0035\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Encoding",
+"gzip"
+],
+[
+"Content-Length",
+"116"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Accept-Encoding": "gzip"
+},
+"method": "GET",
+"path": "/api/lp/tape"
+},
+"status": 200
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=2, stale-while-revalidate=10"
+],
+[
+"ETag",
+"W/\"ed5ab6fe640d0035\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"If-None-Match": "W/\"ed5ab6fe640d0035\""
+},
+"method": "GET",
+"path": "/api/lp/tape"
+},
+"status": 304
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=2, stale-while-revalidate=10"
+],
+[
+"ETag",
+"W/\"ed5ab6fe640d0035\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1812"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "HEAD",
+"path": "/api/lp/tape"
+},
+"status": 200
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Access-Control-Allow-Methods",
+"GET, HEAD, OPTIONS"
+],
+[
+"Access-Control-Allow-Headers",
+"Accept, Content-Type"
+],
+[
+"Content-Length",
+"0"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "OPTIONS",
+"path": "/api/lp/tape"
+},
+"status": 204
+},
+{
+"body": "eyJyb3V0ZSI6InRhcGUiLCJxdWVyeSI6e30sInJldmlzaW9uIjo3LCJlcG9jaCI6Mywic3RhdHVzIjp7InJldmlzaW9uIjo3LCJlcG9jaCI6M30sInBhZCI6WyJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4Il19",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=2, stale-while-revalidate=10"
+],
+[
+"ETag",
+"W/\"ed5ab6fe640d0035\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1812"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Authorization": "Basic dXNlcjpwdw==",
+"Cookie": "session=abc"
+},
+"method": "GET",
+"path": "/api/lp/tape"
+},
+"status": 200
+},
+{
+"body": "eyJyb3V0ZSI6ImRpc2xvY2F0aW9ucyIsInF1ZXJ5Ijp7fSwicmV2aXNpb24iOjcsImVwb2NoIjozLCJzdGF0dXMiOnsicmV2aXNpb24iOjcsImVwb2NoIjozfSwicGFkIjpbInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiXX0=",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=2, stale-while-revalidate=10"
+],
+[
+"ETag",
+"W/\"91e17a5e334bd1f7\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1820"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "GET",
+"path": "/api/lp/dislocations"
+},
+"status": 200
+},
+{
+"body": "H4sIAAAAAAAEA+3QMQrAIAyF4bu82a1DIVcpHUSFCqVao8Ui3r0eoEOXbskY/hD4GlIo2YFgPe/B6OzDwVA4i0s3qHWF5C7PYw2aFVwMZgNNCpx1LjyS92AcRm1BC+rHGV8/llVSERABERABEfhJYO0PnLobRhwHAAA=",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=2, stale-while-revalidate=10"
+],
+[
+"ETag",
+"W/\"91e17a5e334bd1f7\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Encoding",
+"gzip"
+],
+[
+"Content-Length",
+"122"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Accept-Encoding": "gzip"
+},
+"method": "GET",
+"path": "/api/lp/dislocations"
+},
+"status": 200
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=2, stale-while-revalidate=10"
+],
+[
+"ETag",
+"W/\"91e17a5e334bd1f7\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"If-None-Match": "W/\"91e17a5e334bd1f7\""
+},
+"method": "GET",
+"path": "/api/lp/dislocations"
+},
+"status": 304
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=2, stale-while-revalidate=10"
+],
+[
+"ETag",
+"W/\"91e17a5e334bd1f7\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1820"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "HEAD",
+"path": "/api/lp/dislocations"
+},
+"status": 200
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Access-Control-Allow-Methods",
+"GET, HEAD, OPTIONS"
+],
+[
+"Access-Control-Allow-Headers",
+"Accept, Content-Type"
+],
+[
+"Content-Length",
+"0"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "OPTIONS",
+"path": "/api/lp/dislocations"
+},
+"status": 204
+},
+{
+"body": "eyJyb3V0ZSI6ImRpc2xvY2F0aW9ucyIsInF1ZXJ5Ijp7fSwicmV2aXNpb24iOjcsImVwb2NoIjozLCJzdGF0dXMiOnsicmV2aXNpb24iOjcsImVwb2NoIjozfSwicGFkIjpbInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiXX0=",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=2, stale-while-revalidate=10"
+],
+[
+"ETag",
+"W/\"91e17a5e334bd1f7\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1820"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Authorization": "Basic dXNlcjpwdw==",
+"Cookie": "session=abc"
+},
+"method": "GET",
+"path": "/api/lp/dislocations"
+},
+"status": 200
+},
+{
+"body": "eyJyb3V0ZSI6Im93bmVycyIsInF1ZXJ5Ijp7fSwicmV2aXNpb24iOjcsImVwb2NoIjozLCJzdGF0dXMiOnsicmV2aXNpb24iOjcsImVwb2NoIjozfSwicGFkIjpbInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiXX0=",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=5, stale-while-revalidate=60"
+],
+[
+"ETag",
+"W/\"a66ae5b767d62377\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1814"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "GET",
+"path": "/api/lp/owners"
+},
+"status": 200
+},
+{
+"body": "H4sIAAAAAAAEA+3QOw6AIBBF0b28ms7CZLZiLIhOIg0gH8UQ9i4LsKCxm6nv5CWnIricGAR3Ww4RCmfm8IBqUwh8mWicBc0K7N12gCaFmHTKsSffQX/0egctKIPXVwfLIqkIiIAIiIAI/CSwthcTQ6uuFgcAAA==",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=5, stale-while-revalidate=60"
+],
+[
+"ETag",
+"W/\"a66ae5b767d62377\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Encoding",
+"gzip"
+],
+[
+"Content-Length",
+"118"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Accept-Encoding": "gzip"
+},
+"method": "GET",
+"path": "/api/lp/owners"
+},
+"status": 200
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=5, stale-while-revalidate=60"
+],
+[
+"ETag",
+"W/\"a66ae5b767d62377\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"If-None-Match": "W/\"a66ae5b767d62377\""
+},
+"method": "GET",
+"path": "/api/lp/owners"
+},
+"status": 304
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=5, stale-while-revalidate=60"
+],
+[
+"ETag",
+"W/\"a66ae5b767d62377\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1814"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "HEAD",
+"path": "/api/lp/owners"
+},
+"status": 200
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Access-Control-Allow-Methods",
+"GET, HEAD, OPTIONS"
+],
+[
+"Access-Control-Allow-Headers",
+"Accept, Content-Type"
+],
+[
+"Content-Length",
+"0"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "OPTIONS",
+"path": "/api/lp/owners"
+},
+"status": 204
+},
+{
+"body": "eyJyb3V0ZSI6Im93bmVycyIsInF1ZXJ5Ijp7fSwicmV2aXNpb24iOjcsImVwb2NoIjozLCJzdGF0dXMiOnsicmV2aXNpb24iOjcsImVwb2NoIjozfSwicGFkIjpbInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiXX0=",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=5, stale-while-revalidate=60"
+],
+[
+"ETag",
+"W/\"a66ae5b767d62377\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1814"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Authorization": "Basic dXNlcjpwdw==",
+"Cookie": "session=abc"
+},
+"method": "GET",
+"path": "/api/lp/owners"
+},
+"status": 200
+},
+{
+"body": "eyJyb3V0ZSI6ImNsb3NlZCIsInF1ZXJ5Ijp7fSwicmV2aXNpb24iOjcsImVwb2NoIjozLCJzdGF0dXMiOnsicmV2aXNpb24iOjcsImVwb2NoIjozfSwicGFkIjpbInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiXX0=",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=15, stale-while-revalidate=60"
+],
+[
+"ETag",
+"W/\"8c5dd44387856bfb\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1814"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "GET",
+"path": "/api/lp/closed"
+},
+"status": 200
+},
+{
+"body": "H4sIAAAAAAAEA+3QOwqAMBBF0b28Op2FMFsRi5AMGBAT85FIyN7NAixs7GbqOzw4DdGXzCCY3Se2UDgLxxvUukLkyyXnD9CswMGbDTQppKxzSSN5D8Zj0Ba0oH68sfqxrJKKgAiIgAiIwE8Ca38AKT5rnhYHAAA=",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=15, stale-while-revalidate=60"
+],
+[
+"ETag",
+"W/\"8c5dd44387856bfb\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Encoding",
+"gzip"
+],
+[
+"Content-Length",
+"119"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Accept-Encoding": "gzip"
+},
+"method": "GET",
+"path": "/api/lp/closed"
+},
+"status": 200
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=15, stale-while-revalidate=60"
+],
+[
+"ETag",
+"W/\"8c5dd44387856bfb\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"If-None-Match": "W/\"8c5dd44387856bfb\""
+},
+"method": "GET",
+"path": "/api/lp/closed"
+},
+"status": 304
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=15, stale-while-revalidate=60"
+],
+[
+"ETag",
+"W/\"8c5dd44387856bfb\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1814"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "HEAD",
+"path": "/api/lp/closed"
+},
+"status": 200
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Access-Control-Allow-Methods",
+"GET, HEAD, OPTIONS"
+],
+[
+"Access-Control-Allow-Headers",
+"Accept, Content-Type"
+],
+[
+"Content-Length",
+"0"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "OPTIONS",
+"path": "/api/lp/closed"
+},
+"status": 204
+},
+{
+"body": "eyJyb3V0ZSI6ImNsb3NlZCIsInF1ZXJ5Ijp7fSwicmV2aXNpb24iOjcsImVwb2NoIjozLCJzdGF0dXMiOnsicmV2aXNpb24iOjcsImVwb2NoIjozfSwicGFkIjpbInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiXX0=",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=15, stale-while-revalidate=60"
+],
+[
+"ETag",
+"W/\"8c5dd44387856bfb\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1814"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Authorization": "Basic dXNlcjpwdw==",
+"Cookie": "session=abc"
+},
+"method": "GET",
+"path": "/api/lp/closed"
+},
+"status": 200
+},
+{
+"body": "eyJyb3V0ZSI6Im93bmVyIiwicXVlcnkiOnt9LCJyZXZpc2lvbiI6NywiZXBvY2giOjMsInN0YXR1cyI6eyJyZXZpc2lvbiI6NywiZXBvY2giOjN9LCJwYWQiOlsieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCJdfQ==",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=5, stale-while-revalidate=60"
+],
+[
+"ETag",
+"W/\"a2080cab0a174120\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1813"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "GET",
+"path": "/api/lp/owner"
+},
+"status": 200
+},
+{
+"body": "H4sIAAAAAAAEA+3QOw6AIBBF0b28ms7CZLZiLIhOIg0gH8UQ9i4LsKCxm6nv5CWnIricGAR3Ww5QODOHB1SbQuDLROMsaFZg77YDNCnEpFOOPfkO+qPXO2hBGby+OlgWSUVABERABETgJ4G1vR6mZywVBwAA",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=5, stale-while-revalidate=60"
+],
+[
+"ETag",
+"W/\"a2080cab0a174120\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Encoding",
+"gzip"
+],
+[
+"Content-Length",
+"117"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Accept-Encoding": "gzip"
+},
+"method": "GET",
+"path": "/api/lp/owner"
+},
+"status": 200
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=5, stale-while-revalidate=60"
+],
+[
+"ETag",
+"W/\"a2080cab0a174120\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"If-None-Match": "W/\"a2080cab0a174120\""
+},
+"method": "GET",
+"path": "/api/lp/owner"
+},
+"status": 304
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=5, stale-while-revalidate=60"
+],
+[
+"ETag",
+"W/\"a2080cab0a174120\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1813"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "HEAD",
+"path": "/api/lp/owner"
+},
+"status": 200
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Access-Control-Allow-Methods",
+"GET, HEAD, OPTIONS"
+],
+[
+"Access-Control-Allow-Headers",
+"Accept, Content-Type"
+],
+[
+"Content-Length",
+"0"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "OPTIONS",
+"path": "/api/lp/owner"
+},
+"status": 204
+},
+{
+"body": "eyJyb3V0ZSI6Im93bmVyIiwicXVlcnkiOnt9LCJyZXZpc2lvbiI6NywiZXBvY2giOjMsInN0YXR1cyI6eyJyZXZpc2lvbiI6NywiZXBvY2giOjN9LCJwYWQiOlsieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCJdfQ==",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=5, stale-while-revalidate=60"
+],
+[
+"ETag",
+"W/\"a2080cab0a174120\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1813"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Authorization": "Basic dXNlcjpwdw==",
+"Cookie": "session=abc"
+},
+"method": "GET",
+"path": "/api/lp/owner"
+},
+"status": 200
+},
+{
+"body": "eyJyb3V0ZSI6InB1YmxpYy5wb29scyIsInF1ZXJ5Ijp7fSwicmV2aXNpb24iOjcsImVwb2NoIjozLCJzdGF0dXMiOnsicmV2aXNpb24iOjcsImVwb2NoIjozfSwicGFkIjpbInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiXX0=",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=2, stale-while-revalidate=10"
+],
+[
+"ETag",
+"W/\"f11e84d5005c8462\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1820"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "GET",
+"path": "/api/v1/pools"
+},
+"status": 200
+},
+{
+"body": "H4sIAAAAAAAEA+3QOwqAMBBF0b28OthYCLMVsfATMCDOmI8oIXs3C7CwsZup7/DgZHhO0YIgadrc3AjzFmBwJOtvUC4G3p4uON5BnYEVnldQaxDiGFOoyXtQH2VcQD2uj1dXP5aXpiqgAiqgAirwk8BQHvePgf0cBwAA",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=2, stale-while-revalidate=10"
+],
+[
+"ETag",
+"W/\"f11e84d5005c8462\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Encoding",
+"gzip"
+],
+[
+"Content-Length",
+"123"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Accept-Encoding": "gzip"
+},
+"method": "GET",
+"path": "/api/v1/pools"
+},
+"status": 200
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=2, stale-while-revalidate=10"
+],
+[
+"ETag",
+"W/\"f11e84d5005c8462\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"If-None-Match": "W/\"f11e84d5005c8462\""
+},
+"method": "GET",
+"path": "/api/v1/pools"
+},
+"status": 304
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=2, stale-while-revalidate=10"
+],
+[
+"ETag",
+"W/\"f11e84d5005c8462\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1820"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "HEAD",
+"path": "/api/v1/pools"
+},
+"status": 200
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Access-Control-Allow-Methods",
+"GET, HEAD, OPTIONS"
+],
+[
+"Access-Control-Allow-Headers",
+"Accept, Content-Type"
+],
+[
+"Content-Length",
+"0"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "OPTIONS",
+"path": "/api/v1/pools"
+},
+"status": 204
+},
+{
+"body": "eyJyb3V0ZSI6InB1YmxpYy5wb29scyIsInF1ZXJ5Ijp7fSwicmV2aXNpb24iOjcsImVwb2NoIjozLCJzdGF0dXMiOnsicmV2aXNpb24iOjcsImVwb2NoIjozfSwicGFkIjpbInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiXX0=",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=2, stale-while-revalidate=10"
+],
+[
+"ETag",
+"W/\"f11e84d5005c8462\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1820"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Authorization": "Basic dXNlcjpwdw==",
+"Cookie": "session=abc"
+},
+"method": "GET",
+"path": "/api/v1/pools"
+},
+"status": 200
+},
+{
+"body": "eyJyb3V0ZSI6InB1YmxpYy5hc3NldHMiLCJxdWVyeSI6e30sInJldmlzaW9uIjo3LCJlcG9jaCI6Mywic3RhdHVzIjp7InJldmlzaW9uIjo3LCJlcG9jaCI6M30sInBhZCI6WyJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4Il19",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=2, stale-while-revalidate=10"
+],
+[
+"ETag",
+"W/\"708a2fa4c9cb93bd\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1821"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "GET",
+"path": "/api/v1/assets"
+},
+"status": 200
+},
+{
+"body": "H4sIAAAAAAAEA+3QMQqAMAyF4bu8ubg4CLmKONQasCC2Nq0o4t3tARxc3JL5Dw++CymUzCDEMi7eNVaEs8BgK5xO0HUbJN69+LCCOgOOwc2g1kCyzUVq8h7Ux2gnUI/j49XVj+WhqQqogAqogAr8JDDcD2dJZXkdBwAA",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=2, stale-while-revalidate=10"
+],
+[
+"ETag",
+"W/\"708a2fa4c9cb93bd\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Encoding",
+"gzip"
+],
+[
+"Content-Length",
+"123"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Accept-Encoding": "gzip"
+},
+"method": "GET",
+"path": "/api/v1/assets"
+},
+"status": 200
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=2, stale-while-revalidate=10"
+],
+[
+"ETag",
+"W/\"708a2fa4c9cb93bd\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"If-None-Match": "W/\"708a2fa4c9cb93bd\""
+},
+"method": "GET",
+"path": "/api/v1/assets"
+},
+"status": 304
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=2, stale-while-revalidate=10"
+],
+[
+"ETag",
+"W/\"708a2fa4c9cb93bd\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1821"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "HEAD",
+"path": "/api/v1/assets"
+},
+"status": 200
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Access-Control-Allow-Methods",
+"GET, HEAD, OPTIONS"
+],
+[
+"Access-Control-Allow-Headers",
+"Accept, Content-Type"
+],
+[
+"Content-Length",
+"0"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "OPTIONS",
+"path": "/api/v1/assets"
+},
+"status": 204
+},
+{
+"body": "eyJyb3V0ZSI6InB1YmxpYy5hc3NldHMiLCJxdWVyeSI6e30sInJldmlzaW9uIjo3LCJlcG9jaCI6Mywic3RhdHVzIjp7InJldmlzaW9uIjo3LCJlcG9jaCI6M30sInBhZCI6WyJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4Il19",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=2, stale-while-revalidate=10"
+],
+[
+"ETag",
+"W/\"708a2fa4c9cb93bd\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1821"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Authorization": "Basic dXNlcjpwdw==",
+"Cookie": "session=abc"
+},
+"method": "GET",
+"path": "/api/v1/assets"
+},
+"status": 200
+},
+{
+"body": "eyJyb3V0ZSI6Im93bmVyIiwicXVlcnkiOnt9LCJyZXZpc2lvbiI6NywiZXBvY2giOjMsInN0YXR1cyI6eyJyZXZpc2lvbiI6NywiZXBvY2giOjN9LCJwYWQiOlsieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCJdfQ==",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=5, stale-while-revalidate=60"
+],
+[
+"ETag",
+"W/\"5be2fbc8381168b9\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1813"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "GET",
+"path": "/api/v1/research/owner"
+},
+"status": 200
+},
+{
+"body": "H4sIAAAAAAAEA+3QOw6AIBBF0b28ms7CZLZiLIhOIg0gH8UQ9i4LsKCxm6nv5CWnIricGAR3Ww5QODOHB1SbQuDLROMsaFZg77YDNCnEpFOOPfkO+qPXO2hBGby+OlgWSUVABERABETgJ4G1vR6mZywVBwAA",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=5, stale-while-revalidate=60"
+],
+[
+"ETag",
+"W/\"5be2fbc8381168b9\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Encoding",
+"gzip"
+],
+[
+"Content-Length",
+"117"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Accept-Encoding": "gzip"
+},
+"method": "GET",
+"path": "/api/v1/research/owner"
+},
+"status": 200
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=5, stale-while-revalidate=60"
+],
+[
+"ETag",
+"W/\"5be2fbc8381168b9\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"If-None-Match": "W/\"5be2fbc8381168b9\""
+},
+"method": "GET",
+"path": "/api/v1/research/owner"
+},
+"status": 304
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=5, stale-while-revalidate=60"
+],
+[
+"ETag",
+"W/\"5be2fbc8381168b9\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1813"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "HEAD",
+"path": "/api/v1/research/owner"
+},
+"status": 200
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Access-Control-Allow-Methods",
+"GET, HEAD, OPTIONS"
+],
+[
+"Access-Control-Allow-Headers",
+"Accept, Content-Type"
+],
+[
+"Content-Length",
+"0"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "OPTIONS",
+"path": "/api/v1/research/owner"
+},
+"status": 204
+},
+{
+"body": "eyJyb3V0ZSI6Im93bmVyIiwicXVlcnkiOnt9LCJyZXZpc2lvbiI6NywiZXBvY2giOjMsInN0YXR1cyI6eyJyZXZpc2lvbiI6NywiZXBvY2giOjN9LCJwYWQiOlsieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCJdfQ==",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=5, stale-while-revalidate=60"
+],
+[
+"ETag",
+"W/\"5be2fbc8381168b9\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1813"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Authorization": "Basic dXNlcjpwdw==",
+"Cookie": "session=abc"
+},
+"method": "GET",
+"path": "/api/v1/research/owner"
+},
+"status": 200
+},
+{
+"body": "eyJyb3V0ZSI6ImZsb3ciLCJxdWVyeSI6e30sInJldmlzaW9uIjo3LCJlcG9jaCI6Mywic3RhdHVzIjp7InJldmlzaW9uIjo3LCJlcG9jaCI6M30sInBhZCI6WyJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4Il19",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=10, stale-while-revalidate=60"
+],
+[
+"ETag",
+"W/\"87bd4a67a7dffd3a\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1812"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "GET",
+"path": "/api/v1/fomo/flow"
+},
+"status": 200
+},
+{
+"body": "H4sIAAAAAAAEA6tWKsovLUlVslJKy8kvV9JRKixNLapUsqqu1VEqSi3LLM7Mz1OyMtdRSi3IT85QsjLWUSouSSwpLQYqwa4AqLEgMUXJKlqpgkgAtJVIlRWjSkdDYDQERkNgNARGQ4BGIRBbCwBcrLiFFAcAAA==",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=10, stale-while-revalidate=60"
+],
+[
+"ETag",
+"W/\"87bd4a67a7dffd3a\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Encoding",
+"gzip"
+],
+[
+"Content-Length",
+"118"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Accept-Encoding": "gzip"
+},
+"method": "GET",
+"path": "/api/v1/fomo/flow"
+},
+"status": 200
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=10, stale-while-revalidate=60"
+],
+[
+"ETag",
+"W/\"87bd4a67a7dffd3a\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"If-None-Match": "W/\"87bd4a67a7dffd3a\""
+},
+"method": "GET",
+"path": "/api/v1/fomo/flow"
+},
+"status": 304
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=10, stale-while-revalidate=60"
+],
+[
+"ETag",
+"W/\"87bd4a67a7dffd3a\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1812"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "HEAD",
+"path": "/api/v1/fomo/flow"
+},
+"status": 200
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Access-Control-Allow-Methods",
+"GET, HEAD, OPTIONS"
+],
+[
+"Access-Control-Allow-Headers",
+"Accept, Content-Type"
+],
+[
+"Content-Length",
+"0"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "OPTIONS",
+"path": "/api/v1/fomo/flow"
+},
+"status": 204
+},
+{
+"body": "eyJyb3V0ZSI6ImZsb3ciLCJxdWVyeSI6e30sInJldmlzaW9uIjo3LCJlcG9jaCI6Mywic3RhdHVzIjp7InJldmlzaW9uIjo3LCJlcG9jaCI6M30sInBhZCI6WyJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4Il19",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=10, stale-while-revalidate=60"
+],
+[
+"ETag",
+"W/\"87bd4a67a7dffd3a\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1812"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Authorization": "Basic dXNlcjpwdw==",
+"Cookie": "session=abc"
+},
+"method": "GET",
+"path": "/api/v1/fomo/flow"
+},
+"status": 200
+},
+{
+"body": "eyJyb3V0ZSI6ImNhdGFsb2ciLCJxdWVyeSI6e30sInJldmlzaW9uIjo3LCJlcG9jaCI6Mywic3RhdHVzIjp7InJldmlzaW9uIjo3LCJlcG9jaCI6M30sInBhZCI6WyJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4Il19",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=5, stale-while-revalidate=30"
+],
+[
+"ETag",
+"W/\"1d2c9e8253a50858\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1815"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "GET",
+"path": "/api/workbench/pools"
+},
+"status": 200
+},
+{
+"body": "H4sIAAAAAAAEA+3QOwqAMBBF0b28Op2FMFsRixCDCuLEfCQSsnezAIs0djP1HR6cAs8pWhCMjvrgFQpXsv4Blarg7b2HnU/QqGAdmw00KISoYwot+Q7ao9MLaELuvLbaWWZJRUAEREAEROAngbm+d7G7eBcHAAA=",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=5, stale-while-revalidate=30"
+],
+[
+"ETag",
+"W/\"1d2c9e8253a50858\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Encoding",
+"gzip"
+],
+[
+"Content-Length",
+"119"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Accept-Encoding": "gzip"
+},
+"method": "GET",
+"path": "/api/workbench/pools"
+},
+"status": 200
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=5, stale-while-revalidate=30"
+],
+[
+"ETag",
+"W/\"1d2c9e8253a50858\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"If-None-Match": "W/\"1d2c9e8253a50858\""
+},
+"method": "GET",
+"path": "/api/workbench/pools"
+},
+"status": 304
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=5, stale-while-revalidate=30"
+],
+[
+"ETag",
+"W/\"1d2c9e8253a50858\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1815"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "HEAD",
+"path": "/api/workbench/pools"
+},
+"status": 200
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Access-Control-Allow-Methods",
+"GET, HEAD, OPTIONS"
+],
+[
+"Access-Control-Allow-Headers",
+"Accept, Content-Type"
+],
+[
+"Content-Length",
+"0"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "OPTIONS",
+"path": "/api/workbench/pools"
+},
+"status": 204
+},
+{
+"body": "eyJyb3V0ZSI6ImNhdGFsb2ciLCJxdWVyeSI6e30sInJldmlzaW9uIjo3LCJlcG9jaCI6Mywic3RhdHVzIjp7InJldmlzaW9uIjo3LCJlcG9jaCI6M30sInBhZCI6WyJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4Il19",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=5, stale-while-revalidate=30"
+],
+[
+"ETag",
+"W/\"1d2c9e8253a50858\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1815"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Authorization": "Basic dXNlcjpwdw==",
+"Cookie": "session=abc"
+},
+"method": "GET",
+"path": "/api/workbench/pools"
+},
+"status": 200
+},
+{
+"body": "eyJwb29sIjp7ImlkIjoiMHhhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiIn0sInJldmlzaW9uIjo3LCJlcG9jaCI6MywicGFkIjpbInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiXX0=",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=2, stale-while-revalidate=10"
+],
+[
+"ETag",
+"W/\"0313c946f2bc58df\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1835"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "GET",
+"path": "/api/workbench/pool?id=0xabababababababababababababababababababababababababababababababab"
+},
+"status": 200
+},
+{
+"body": "H4sIAAAAAAAEA6tWKsjPz1GyqlbKTFGyUjKoSEyiDCrV6igVpZZlFmfm5ylZmesopRbkJ2coWRnrKBUkAq2IVqogEijpjCodDYHREBgNgdEQGA2BgQ6B2FoAX1vDLCsHAAA=",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=2, stale-while-revalidate=10"
+],
+[
+"ETag",
+"W/\"0313c946f2bc58df\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Encoding",
+"gzip"
+],
+[
+"Content-Length",
+"98"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Accept-Encoding": "gzip"
+},
+"method": "GET",
+"path": "/api/workbench/pool?id=0xabababababababababababababababababababababababababababababababab"
+},
+"status": 200
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=2, stale-while-revalidate=10"
+],
+[
+"ETag",
+"W/\"0313c946f2bc58df\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"If-None-Match": "W/\"0313c946f2bc58df\""
+},
+"method": "GET",
+"path": "/api/workbench/pool?id=0xabababababababababababababababababababababababababababababababab"
+},
+"status": 304
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=2, stale-while-revalidate=10"
+],
+[
+"ETag",
+"W/\"0313c946f2bc58df\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1835"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "HEAD",
+"path": "/api/workbench/pool?id=0xabababababababababababababababababababababababababababababababab"
+},
+"status": 200
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Access-Control-Allow-Methods",
+"GET, HEAD, OPTIONS"
+],
+[
+"Access-Control-Allow-Headers",
+"Accept, Content-Type"
+],
+[
+"Content-Length",
+"0"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "OPTIONS",
+"path": "/api/workbench/pool"
+},
+"status": 204
+},
+{
+"body": "eyJwb29sIjp7ImlkIjoiMHhhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiIn0sInJldmlzaW9uIjo3LCJlcG9jaCI6MywicGFkIjpbInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4IiwieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCIsInh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiXX0=",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"public, max-age=2, stale-while-revalidate=10"
+],
+[
+"ETag",
+"W/\"0313c946f2bc58df\""
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"1835"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Authorization": "Basic dXNlcjpwdw==",
+"Cookie": "session=abc"
+},
+"method": "GET",
+"path": "/api/workbench/pool?id=0xabababababababababababababababababababababababababababababababab"
+},
+"status": 200
+},
+{
+"body_sha256": "42e7d24f493df394ad012d429ce20c62a5ac28cdb2ba026c0f5e6b29a798871c",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"text/html; charset=utf-8"
+],
+[
+"ETag",
+"\"42e7d24f493df394\""
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"X-Frame-Options",
+"DENY"
+],
+[
+"Referrer-Policy",
+"no-referrer"
+],
+[
+"Content-Security-Policy",
+"default-src 'self';script-src 'self';style-src 'self' 'unsafe-inline';img-src 'self' data:;connect-src 'self';object-src 'none';base-uri 'none';frame-ancestors 'none'"
+],
+[
+"Content-Length",
+"56795"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "GET",
+"path": "/"
+},
+"status": 200
+},
+{
+"body_sha256": "0bafbfb2a3282717a7517470bb15a9e4fdc13ef2d63db2525871109b43c32b03",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"text/html; charset=utf-8"
+],
+[
+"ETag",
+"\"42e7d24f493df394\""
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"X-Frame-Options",
+"DENY"
+],
+[
+"Referrer-Policy",
+"no-referrer"
+],
+[
+"Content-Security-Policy",
+"default-src 'self';script-src 'self';style-src 'self' 'unsafe-inline';img-src 'self' data:;connect-src 'self';object-src 'none';base-uri 'none';frame-ancestors 'none'"
+],
+[
+"Content-Encoding",
+"gzip"
+],
+[
+"Content-Length",
+"15261"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Accept-Encoding": "gzip"
+},
+"method": "GET",
+"path": "/"
+},
+"status": 200
+},
+{
+"body_sha256": "c8d3eae160a892e32837db3dcae515e843e5383fef52b8141940c8bcf8b6d59f",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"21"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "OPTIONS",
+"path": "/"
+},
+"status": 404
+},
+{
+"body_sha256": "42e7d24f493df394ad012d429ce20c62a5ac28cdb2ba026c0f5e6b29a798871c",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"text/html; charset=utf-8"
+],
+[
+"ETag",
+"\"42e7d24f493df394\""
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"X-Frame-Options",
+"DENY"
+],
+[
+"Referrer-Policy",
+"no-referrer"
+],
+[
+"Content-Security-Policy",
+"default-src 'self';script-src 'self';style-src 'self' 'unsafe-inline';img-src 'self' data:;connect-src 'self';object-src 'none';base-uri 'none';frame-ancestors 'none'"
+],
+[
+"Content-Length",
+"56795"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "GET",
+"path": "/pools"
+},
+"status": 200
+},
+{
+"body_sha256": "0bafbfb2a3282717a7517470bb15a9e4fdc13ef2d63db2525871109b43c32b03",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"text/html; charset=utf-8"
+],
+[
+"ETag",
+"\"42e7d24f493df394\""
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"X-Frame-Options",
+"DENY"
+],
+[
+"Referrer-Policy",
+"no-referrer"
+],
+[
+"Content-Security-Policy",
+"default-src 'self';script-src 'self';style-src 'self' 'unsafe-inline';img-src 'self' data:;connect-src 'self';object-src 'none';base-uri 'none';frame-ancestors 'none'"
+],
+[
+"Content-Encoding",
+"gzip"
+],
+[
+"Content-Length",
+"15261"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Accept-Encoding": "gzip"
+},
+"method": "GET",
+"path": "/pools"
+},
+"status": 200
+},
+{
+"body_sha256": "c8d3eae160a892e32837db3dcae515e843e5383fef52b8141940c8bcf8b6d59f",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"21"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "OPTIONS",
+"path": "/pools"
+},
+"status": 404
+},
+{
+"body_sha256": "42e7d24f493df394ad012d429ce20c62a5ac28cdb2ba026c0f5e6b29a798871c",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"text/html; charset=utf-8"
+],
+[
+"ETag",
+"\"42e7d24f493df394\""
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"X-Frame-Options",
+"DENY"
+],
+[
+"Referrer-Policy",
+"no-referrer"
+],
+[
+"Content-Security-Policy",
+"default-src 'self';script-src 'self';style-src 'self' 'unsafe-inline';img-src 'self' data:;connect-src 'self';object-src 'none';base-uri 'none';frame-ancestors 'none'"
+],
+[
+"Content-Length",
+"56795"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "GET",
+"path": "/lp"
+},
+"status": 200
+},
+{
+"body_sha256": "0bafbfb2a3282717a7517470bb15a9e4fdc13ef2d63db2525871109b43c32b03",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"text/html; charset=utf-8"
+],
+[
+"ETag",
+"\"42e7d24f493df394\""
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"X-Frame-Options",
+"DENY"
+],
+[
+"Referrer-Policy",
+"no-referrer"
+],
+[
+"Content-Security-Policy",
+"default-src 'self';script-src 'self';style-src 'self' 'unsafe-inline';img-src 'self' data:;connect-src 'self';object-src 'none';base-uri 'none';frame-ancestors 'none'"
+],
+[
+"Content-Encoding",
+"gzip"
+],
+[
+"Content-Length",
+"15261"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Accept-Encoding": "gzip"
+},
+"method": "GET",
+"path": "/lp"
+},
+"status": 200
+},
+{
+"body_sha256": "c8d3eae160a892e32837db3dcae515e843e5383fef52b8141940c8bcf8b6d59f",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"21"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "OPTIONS",
+"path": "/lp"
+},
+"status": 404
+},
+{
+"body_sha256": "74c17d074c18f5d79e891381e9f043b836c38f67e697d03545a3c1e0d7b3aa21",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"text/html; charset=utf-8"
+],
+[
+"ETag",
+"\"74c17d074c18f5d7\""
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"X-Frame-Options",
+"SAMEORIGIN"
+],
+[
+"Referrer-Policy",
+"no-referrer"
+],
+[
+"Content-Security-Policy",
+"default-src 'self';script-src 'self';style-src 'self' 'unsafe-inline';img-src 'self' data:;connect-src 'self';object-src 'none';base-uri 'none';frame-ancestors 'self'"
+],
+[
+"Content-Length",
+"63138"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "GET",
+"path": "/pool"
+},
+"status": 200
+},
+{
+"body_sha256": "0791282200fd310d1e42260d7412486a25d99bdd8d6325b36fa29f4a6315eb11",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"text/html; charset=utf-8"
+],
+[
+"ETag",
+"\"74c17d074c18f5d7\""
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"X-Frame-Options",
+"SAMEORIGIN"
+],
+[
+"Referrer-Policy",
+"no-referrer"
+],
+[
+"Content-Security-Policy",
+"default-src 'self';script-src 'self';style-src 'self' 'unsafe-inline';img-src 'self' data:;connect-src 'self';object-src 'none';base-uri 'none';frame-ancestors 'self'"
+],
+[
+"Content-Encoding",
+"gzip"
+],
+[
+"Content-Length",
+"17223"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Accept-Encoding": "gzip"
+},
+"method": "GET",
+"path": "/pool"
+},
+"status": 200
+},
+{
+"body_sha256": "c8d3eae160a892e32837db3dcae515e843e5383fef52b8141940c8bcf8b6d59f",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"21"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "OPTIONS",
+"path": "/pool"
+},
+"status": 404
+},
+{
+"body_sha256": "e4e3dbfbfc36fb4e04592b74061b53cc443b3e710b743fe8dfb9ce4eaa9f16bc",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"text/html; charset=utf-8"
+],
+[
+"ETag",
+"\"e4e3dbfbfc36fb4e\""
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"X-Frame-Options",
+"DENY"
+],
+[
+"Referrer-Policy",
+"no-referrer"
+],
+[
+"Content-Security-Policy",
+"default-src 'self';script-src 'self';style-src 'self' 'unsafe-inline';img-src 'self' data:;connect-src 'self';object-src 'none';base-uri 'none';frame-ancestors 'none'"
+],
+[
+"Content-Length",
+"53529"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "GET",
+"path": "/guide"
+},
+"status": 200
+},
+{
+"body_sha256": "2a9a4aaf538945ac0dd1096375c2eb0328f664ee38cb142ad7f3c076c7e0a486",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"text/html; charset=utf-8"
+],
+[
+"ETag",
+"\"e4e3dbfbfc36fb4e\""
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"X-Frame-Options",
+"DENY"
+],
+[
+"Referrer-Policy",
+"no-referrer"
+],
+[
+"Content-Security-Policy",
+"default-src 'self';script-src 'self';style-src 'self' 'unsafe-inline';img-src 'self' data:;connect-src 'self';object-src 'none';base-uri 'none';frame-ancestors 'none'"
+],
+[
+"Content-Encoding",
+"gzip"
+],
+[
+"Content-Length",
+"18456"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Accept-Encoding": "gzip"
+},
+"method": "GET",
+"path": "/guide"
+},
+"status": 200
+},
+{
+"body_sha256": "c8d3eae160a892e32837db3dcae515e843e5383fef52b8141940c8bcf8b6d59f",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"21"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "OPTIONS",
+"path": "/guide"
+},
+"status": 404
+},
+{
+"body_sha256": "8a7b06d963b8933e275fa17f9d00203c2047c5aa77859f2fd738bed9910f299e",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"text/html; charset=utf-8"
+],
+[
+"ETag",
+"\"8a7b06d963b8933e\""
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"X-Frame-Options",
+"DENY"
+],
+[
+"Referrer-Policy",
+"no-referrer"
+],
+[
+"Content-Security-Policy",
+"default-src 'self';script-src 'self';style-src 'self' 'unsafe-inline';img-src 'self' data:;connect-src 'self';object-src 'none';base-uri 'none';frame-ancestors 'none'"
+],
+[
+"Content-Length",
+"21056"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "GET",
+"path": "/research"
+},
+"status": 200
+},
+{
+"body_sha256": "02aeab08c29111119eda0c6ee9f4d71a124a2c7ee5f0a2c9d9cd1c20f65c6d01",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"text/html; charset=utf-8"
+],
+[
+"ETag",
+"\"8a7b06d963b8933e\""
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"X-Frame-Options",
+"DENY"
+],
+[
+"Referrer-Policy",
+"no-referrer"
+],
+[
+"Content-Security-Policy",
+"default-src 'self';script-src 'self';style-src 'self' 'unsafe-inline';img-src 'self' data:;connect-src 'self';object-src 'none';base-uri 'none';frame-ancestors 'none'"
+],
+[
+"Content-Encoding",
+"gzip"
+],
+[
+"Content-Length",
+"6399"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Accept-Encoding": "gzip"
+},
+"method": "GET",
+"path": "/research"
+},
+"status": 200
+},
+{
+"body_sha256": "c8d3eae160a892e32837db3dcae515e843e5383fef52b8141940c8bcf8b6d59f",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"21"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "OPTIONS",
+"path": "/research"
+},
+"status": 404
+},
+{
+"body_sha256": "820f5760e0581c05d19aca70c32432d8e6d5a6d7b168d1d0720fe9b916fee385",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"text/html; charset=utf-8"
+],
+[
+"ETag",
+"\"820f5760e0581c05\""
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"X-Frame-Options",
+"DENY"
+],
+[
+"Referrer-Policy",
+"no-referrer"
+],
+[
+"Content-Security-Policy",
+"default-src 'self';script-src 'self';style-src 'self' 'unsafe-inline';img-src 'self' data:;connect-src 'self';object-src 'none';base-uri 'none';frame-ancestors 'none'"
+],
+[
+"Content-Length",
+"24641"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "GET",
+"path": "/flow"
+},
+"status": 200
+},
+{
+"body_sha256": "7a968a1ba6805bbea0d45aee71e26b1b671e7f3fccdb3f91d115fa08c49b31cf",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"text/html; charset=utf-8"
+],
+[
+"ETag",
+"\"820f5760e0581c05\""
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"X-Frame-Options",
+"DENY"
+],
+[
+"Referrer-Policy",
+"no-referrer"
+],
+[
+"Content-Security-Policy",
+"default-src 'self';script-src 'self';style-src 'self' 'unsafe-inline';img-src 'self' data:;connect-src 'self';object-src 'none';base-uri 'none';frame-ancestors 'none'"
+],
+[
+"Content-Encoding",
+"gzip"
+],
+[
+"Content-Length",
+"7740"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Accept-Encoding": "gzip"
+},
+"method": "GET",
+"path": "/flow"
+},
+"status": 200
+},
+{
+"body_sha256": "c8d3eae160a892e32837db3dcae515e843e5383fef52b8141940c8bcf8b6d59f",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"21"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "OPTIONS",
+"path": "/flow"
+},
+"status": 404
+},
+{
+"body_sha256": "c89370d9971757a3de9bd75b7b2141c8e7b783d2b4f49186936f1c99c9682f3f",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json; charset=utf-8"
+],
+[
+"ETag",
+"\"c89370d9971757a3\""
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"X-Frame-Options",
+"DENY"
+],
+[
+"Referrer-Policy",
+"no-referrer"
+],
+[
+"Content-Security-Policy",
+"default-src 'self';script-src 'self';style-src 'self' 'unsafe-inline';img-src 'self' data:;connect-src 'self';object-src 'none';base-uri 'none';frame-ancestors 'none'"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"64284"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "GET",
+"path": "/api/v1/openapi.json"
+},
+"status": 200
+},
+{
+"body_sha256": "dd9b71dd069233638bf8de9d4ef4a496b035ef717fa2e22aece5cdcbdb2621b4",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json; charset=utf-8"
+],
+[
+"ETag",
+"\"c89370d9971757a3\""
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"X-Frame-Options",
+"DENY"
+],
+[
+"Referrer-Policy",
+"no-referrer"
+],
+[
+"Content-Security-Policy",
+"default-src 'self';script-src 'self';style-src 'self' 'unsafe-inline';img-src 'self' data:;connect-src 'self';object-src 'none';base-uri 'none';frame-ancestors 'none'"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Encoding",
+"gzip"
+],
+[
+"Content-Length",
+"13188"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Accept-Encoding": "gzip"
+},
+"method": "GET",
+"path": "/api/v1/openapi.json"
+},
+"status": 200
+},
+{
+"body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Access-Control-Allow-Methods",
+"GET, HEAD, OPTIONS"
+],
+[
+"Access-Control-Allow-Headers",
+"Accept, Content-Type"
+],
+[
+"Content-Length",
+"0"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "OPTIONS",
+"path": "/api/v1/openapi.json"
+},
+"status": 204
+},
+{
+"body_sha256": "21fae1b6d7539a5e085405ba68c174743ff7b55e5f65fc5b25fd7a59649d5095",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"text/css; charset=utf-8"
+],
+[
+"ETag",
+"\"21fae1b6d7539a5e\""
+],
+[
+"Cache-Control",
+"public,max-age=60"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"X-Frame-Options",
+"DENY"
+],
+[
+"Referrer-Policy",
+"no-referrer"
+],
+[
+"Content-Security-Policy",
+"default-src 'self';script-src 'self';style-src 'self' 'unsafe-inline';img-src 'self' data:;connect-src 'self';object-src 'none';base-uri 'none';frame-ancestors 'none'"
+],
+[
+"Content-Length",
+"754"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "GET",
+"path": "/static/lp_theme.css"
+},
+"status": 200
+},
+{
+"body_sha256": "21fae1b6d7539a5e085405ba68c174743ff7b55e5f65fc5b25fd7a59649d5095",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"text/css; charset=utf-8"
+],
+[
+"ETag",
+"\"21fae1b6d7539a5e\""
+],
+[
+"Cache-Control",
+"public,max-age=60"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"X-Frame-Options",
+"DENY"
+],
+[
+"Referrer-Policy",
+"no-referrer"
+],
+[
+"Content-Security-Policy",
+"default-src 'self';script-src 'self';style-src 'self' 'unsafe-inline';img-src 'self' data:;connect-src 'self';object-src 'none';base-uri 'none';frame-ancestors 'none'"
+],
+[
+"Content-Length",
+"754"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Accept-Encoding": "gzip"
+},
+"method": "GET",
+"path": "/static/lp_theme.css"
+},
+"status": 200
+},
+{
+"body_sha256": "c8d3eae160a892e32837db3dcae515e843e5383fef52b8141940c8bcf8b6d59f",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"21"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "OPTIONS",
+"path": "/static/lp_theme.css"
+},
+"status": 404
+},
+{
+"body_sha256": "94fed110d9b49ec7c3adfcbfb92274ce456772288c57235c90c1ec48292925c0",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"text/css; charset=utf-8"
+],
+[
+"ETag",
+"\"94fed110d9b49ec7\""
+],
+[
+"Cache-Control",
+"public,max-age=60"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"X-Frame-Options",
+"DENY"
+],
+[
+"Referrer-Policy",
+"no-referrer"
+],
+[
+"Content-Security-Policy",
+"default-src 'self';script-src 'self';style-src 'self' 'unsafe-inline';img-src 'self' data:;connect-src 'self';object-src 'none';base-uri 'none';frame-ancestors 'none'"
+],
+[
+"Content-Length",
+"37484"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "GET",
+"path": "/static/lp_terminal.css"
+},
+"status": 200
+},
+{
+"body_sha256": "de291379f1a213b4b6daedfb1f730c3d910622dfff77a3f3d495b915048548f2",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"text/css; charset=utf-8"
+],
+[
+"ETag",
+"\"94fed110d9b49ec7\""
+],
+[
+"Cache-Control",
+"public,max-age=60"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"X-Frame-Options",
+"DENY"
+],
+[
+"Referrer-Policy",
+"no-referrer"
+],
+[
+"Content-Security-Policy",
+"default-src 'self';script-src 'self';style-src 'self' 'unsafe-inline';img-src 'self' data:;connect-src 'self';object-src 'none';base-uri 'none';frame-ancestors 'none'"
+],
+[
+"Content-Encoding",
+"gzip"
+],
+[
+"Content-Length",
+"9743"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Accept-Encoding": "gzip"
+},
+"method": "GET",
+"path": "/static/lp_terminal.css"
+},
+"status": 200
+},
+{
+"body_sha256": "c8d3eae160a892e32837db3dcae515e843e5383fef52b8141940c8bcf8b6d59f",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"21"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "OPTIONS",
+"path": "/static/lp_terminal.css"
+},
+"status": 404
+},
+{
+"body_sha256": "9562255e61e4c48ab79e0b47d87c321983bfc8d97d8c17d30c80156631af358c",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/javascript; charset=utf-8"
+],
+[
+"ETag",
+"\"9562255e61e4c48a\""
+],
+[
+"Cache-Control",
+"public,max-age=60"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"X-Frame-Options",
+"DENY"
+],
+[
+"Referrer-Policy",
+"no-referrer"
+],
+[
+"Content-Security-Policy",
+"default-src 'self';script-src 'self';style-src 'self' 'unsafe-inline';img-src 'self' data:;connect-src 'self';object-src 'none';base-uri 'none';frame-ancestors 'none'"
+],
+[
+"Content-Length",
+"142152"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "GET",
+"path": "/static/lp_terminal.js"
+},
+"status": 200
+},
+{
+"body_sha256": "6f8f156503161461dd7c54976a056cbdd43d674d52d3f23226b51528a1d6c457",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/javascript; charset=utf-8"
+],
+[
+"ETag",
+"\"9562255e61e4c48a\""
+],
+[
+"Cache-Control",
+"public,max-age=60"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"X-Frame-Options",
+"DENY"
+],
+[
+"Referrer-Policy",
+"no-referrer"
+],
+[
+"Content-Security-Policy",
+"default-src 'self';script-src 'self';style-src 'self' 'unsafe-inline';img-src 'self' data:;connect-src 'self';object-src 'none';base-uri 'none';frame-ancestors 'none'"
+],
+[
+"Content-Encoding",
+"gzip"
+],
+[
+"Content-Length",
+"42089"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Accept-Encoding": "gzip"
+},
+"method": "GET",
+"path": "/static/lp_terminal.js"
+},
+"status": 200
+},
+{
+"body_sha256": "c8d3eae160a892e32837db3dcae515e843e5383fef52b8141940c8bcf8b6d59f",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"21"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "OPTIONS",
+"path": "/static/lp_terminal.js"
+},
+"status": 404
+},
+{
+"body_sha256": "48f66060f761cdcbf9d2320e8e69655f1efe3a4f19afc984eb6e54560176ced1",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/javascript; charset=utf-8"
+],
+[
+"ETag",
+"\"48f66060f761cdcb\""
+],
+[
+"Cache-Control",
+"public,max-age=60"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"X-Frame-Options",
+"DENY"
+],
+[
+"Referrer-Policy",
+"no-referrer"
+],
+[
+"Content-Security-Policy",
+"default-src 'self';script-src 'self';style-src 'self' 'unsafe-inline';img-src 'self' data:;connect-src 'self';object-src 'none';base-uri 'none';frame-ancestors 'none'"
+],
+[
+"Content-Length",
+"817"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "GET",
+"path": "/static/lp_panes_boot.js"
+},
+"status": 200
+},
+{
+"body_sha256": "48f66060f761cdcbf9d2320e8e69655f1efe3a4f19afc984eb6e54560176ced1",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/javascript; charset=utf-8"
+],
+[
+"ETag",
+"\"48f66060f761cdcb\""
+],
+[
+"Cache-Control",
+"public,max-age=60"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"X-Frame-Options",
+"DENY"
+],
+[
+"Referrer-Policy",
+"no-referrer"
+],
+[
+"Content-Security-Policy",
+"default-src 'self';script-src 'self';style-src 'self' 'unsafe-inline';img-src 'self' data:;connect-src 'self';object-src 'none';base-uri 'none';frame-ancestors 'none'"
+],
+[
+"Content-Length",
+"817"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Accept-Encoding": "gzip"
+},
+"method": "GET",
+"path": "/static/lp_panes_boot.js"
+},
+"status": 200
+},
+{
+"body_sha256": "c8d3eae160a892e32837db3dcae515e843e5383fef52b8141940c8bcf8b6d59f",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"21"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "OPTIONS",
+"path": "/static/lp_panes_boot.js"
+},
+"status": 404
+},
+{
+"body_sha256": "1e9e2687aa5d1e69e242c731a840e701b46ee18df208f58c5a2379253bc3ed06",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"text/css; charset=utf-8"
+],
+[
+"ETag",
+"\"1e9e2687aa5d1e69\""
+],
+[
+"Cache-Control",
+"public,max-age=60"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"X-Frame-Options",
+"DENY"
+],
+[
+"Referrer-Policy",
+"no-referrer"
+],
+[
+"Content-Security-Policy",
+"default-src 'self';script-src 'self';style-src 'self' 'unsafe-inline';img-src 'self' data:;connect-src 'self';object-src 'none';base-uri 'none';frame-ancestors 'none'"
+],
+[
+"Content-Length",
+"41897"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "GET",
+"path": "/static/workbench.css"
+},
+"status": 200
+},
+{
+"body_sha256": "ede4484790887db6880f8f03b83f7ef2b08ac1384ddfb9adbb24ab8b428c5dec",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"text/css; charset=utf-8"
+],
+[
+"ETag",
+"\"1e9e2687aa5d1e69\""
+],
+[
+"Cache-Control",
+"public,max-age=60"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"X-Frame-Options",
+"DENY"
+],
+[
+"Referrer-Policy",
+"no-referrer"
+],
+[
+"Content-Security-Policy",
+"default-src 'self';script-src 'self';style-src 'self' 'unsafe-inline';img-src 'self' data:;connect-src 'self';object-src 'none';base-uri 'none';frame-ancestors 'none'"
+],
+[
+"Content-Encoding",
+"gzip"
+],
+[
+"Content-Length",
+"10489"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Accept-Encoding": "gzip"
+},
+"method": "GET",
+"path": "/static/workbench.css"
+},
+"status": 200
+},
+{
+"body_sha256": "c8d3eae160a892e32837db3dcae515e843e5383fef52b8141940c8bcf8b6d59f",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"21"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "OPTIONS",
+"path": "/static/workbench.css"
+},
+"status": 404
+},
+{
+"body_sha256": "29a7ec6f170cf4794b84bd08cb953f75fc4e040d64c1ef1a70bcc0c07fbcf39b",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/javascript; charset=utf-8"
+],
+[
+"ETag",
+"\"29a7ec6f170cf479\""
+],
+[
+"Cache-Control",
+"public,max-age=60"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"X-Frame-Options",
+"DENY"
+],
+[
+"Referrer-Policy",
+"no-referrer"
+],
+[
+"Content-Security-Policy",
+"default-src 'self';script-src 'self';style-src 'self' 'unsafe-inline';img-src 'self' data:;connect-src 'self';object-src 'none';base-uri 'none';frame-ancestors 'none'"
+],
+[
+"Content-Length",
+"174260"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "GET",
+"path": "/static/workbench.js"
+},
+"status": 200
+},
+{
+"body_sha256": "7585c7776a46faa9fc4cb4089a5d29d286e6ed2e19cc8456d9cf6721592cc41e",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/javascript; charset=utf-8"
+],
+[
+"ETag",
+"\"29a7ec6f170cf479\""
+],
+[
+"Cache-Control",
+"public,max-age=60"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"X-Frame-Options",
+"DENY"
+],
+[
+"Referrer-Policy",
+"no-referrer"
+],
+[
+"Content-Security-Policy",
+"default-src 'self';script-src 'self';style-src 'self' 'unsafe-inline';img-src 'self' data:;connect-src 'self';object-src 'none';base-uri 'none';frame-ancestors 'none'"
+],
+[
+"Content-Encoding",
+"gzip"
+],
+[
+"Content-Length",
+"49869"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Accept-Encoding": "gzip"
+},
+"method": "GET",
+"path": "/static/workbench.js"
+},
+"status": 200
+},
+{
+"body_sha256": "c8d3eae160a892e32837db3dcae515e843e5383fef52b8141940c8bcf8b6d59f",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"21"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "OPTIONS",
+"path": "/static/workbench.js"
+},
+"status": 404
+},
+{
+"body_sha256": "c71699c7f5ffa299ee9f6e0b3bbdc805d69bd64fc3309d2b7ca4a1dd5698201e",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"text/css; charset=utf-8"
+],
+[
+"ETag",
+"\"c71699c7f5ffa299\""
+],
+[
+"Cache-Control",
+"public,max-age=60"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"X-Frame-Options",
+"DENY"
+],
+[
+"Referrer-Policy",
+"no-referrer"
+],
+[
+"Content-Security-Policy",
+"default-src 'self';script-src 'self';style-src 'self' 'unsafe-inline';img-src 'self' data:;connect-src 'self';object-src 'none';base-uri 'none';frame-ancestors 'none'"
+],
+[
+"Content-Length",
+"17350"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "GET",
+"path": "/static/lp_guide.css"
+},
+"status": 200
+},
+{
+"body_sha256": "20e5bb2af6ca094f6cc58cea21eb1c3e370b97871c9822fda236f191e6706229",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"text/css; charset=utf-8"
+],
+[
+"ETag",
+"\"c71699c7f5ffa299\""
+],
+[
+"Cache-Control",
+"public,max-age=60"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"X-Frame-Options",
+"DENY"
+],
+[
+"Referrer-Policy",
+"no-referrer"
+],
+[
+"Content-Security-Policy",
+"default-src 'self';script-src 'self';style-src 'self' 'unsafe-inline';img-src 'self' data:;connect-src 'self';object-src 'none';base-uri 'none';frame-ancestors 'none'"
+],
+[
+"Content-Encoding",
+"gzip"
+],
+[
+"Content-Length",
+"4838"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Accept-Encoding": "gzip"
+},
+"method": "GET",
+"path": "/static/lp_guide.css"
+},
+"status": 200
+},
+{
+"body_sha256": "c8d3eae160a892e32837db3dcae515e843e5383fef52b8141940c8bcf8b6d59f",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"21"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "OPTIONS",
+"path": "/static/lp_guide.css"
+},
+"status": 404
+},
+{
+"body_sha256": "fa3aedfb9a83a8a32823544dd6fbdc84489e42259f319657489ca9876cbe58a2",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"text/css; charset=utf-8"
+],
+[
+"ETag",
+"\"fa3aedfb9a83a8a3\""
+],
+[
+"Cache-Control",
+"public,max-age=60"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"X-Frame-Options",
+"DENY"
+],
+[
+"Referrer-Policy",
+"no-referrer"
+],
+[
+"Content-Security-Policy",
+"default-src 'self';script-src 'self';style-src 'self' 'unsafe-inline';img-src 'self' data:;connect-src 'self';object-src 'none';base-uri 'none';frame-ancestors 'none'"
+],
+[
+"Content-Length",
+"14533"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "GET",
+"path": "/static/lp_research.css"
+},
+"status": 200
+},
+{
+"body_sha256": "35c0583b4ac3073521a5fb84eb655e91a288c073f764fe9cc952a5238c5a9e85",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"text/css; charset=utf-8"
+],
+[
+"ETag",
+"\"fa3aedfb9a83a8a3\""
+],
+[
+"Cache-Control",
+"public,max-age=60"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"X-Frame-Options",
+"DENY"
+],
+[
+"Referrer-Policy",
+"no-referrer"
+],
+[
+"Content-Security-Policy",
+"default-src 'self';script-src 'self';style-src 'self' 'unsafe-inline';img-src 'self' data:;connect-src 'self';object-src 'none';base-uri 'none';frame-ancestors 'none'"
+],
+[
+"Content-Encoding",
+"gzip"
+],
+[
+"Content-Length",
+"4000"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Accept-Encoding": "gzip"
+},
+"method": "GET",
+"path": "/static/lp_research.css"
+},
+"status": 200
+},
+{
+"body_sha256": "c8d3eae160a892e32837db3dcae515e843e5383fef52b8141940c8bcf8b6d59f",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"21"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "OPTIONS",
+"path": "/static/lp_research.css"
+},
+"status": 404
+},
+{
+"body_sha256": "ee0c42327d1941f8d4378cbab6c4a1b53e3782d24c222ac344b634e466f1496d",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/javascript; charset=utf-8"
+],
+[
+"ETag",
+"\"ee0c42327d1941f8\""
+],
+[
+"Cache-Control",
+"public,max-age=60"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"X-Frame-Options",
+"DENY"
+],
+[
+"Referrer-Policy",
+"no-referrer"
+],
+[
+"Content-Security-Policy",
+"default-src 'self';script-src 'self';style-src 'self' 'unsafe-inline';img-src 'self' data:;connect-src 'self';object-src 'none';base-uri 'none';frame-ancestors 'none'"
+],
+[
+"Content-Length",
+"20809"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "GET",
+"path": "/static/lp_research.js"
+},
+"status": 200
+},
+{
+"body_sha256": "5a00da5d711472ffc378a465630ec14fec226e5beb0dfbf6a0a6d62869e8dde3",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/javascript; charset=utf-8"
+],
+[
+"ETag",
+"\"ee0c42327d1941f8\""
+],
+[
+"Cache-Control",
+"public,max-age=60"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"X-Frame-Options",
+"DENY"
+],
+[
+"Referrer-Policy",
+"no-referrer"
+],
+[
+"Content-Security-Policy",
+"default-src 'self';script-src 'self';style-src 'self' 'unsafe-inline';img-src 'self' data:;connect-src 'self';object-src 'none';base-uri 'none';frame-ancestors 'none'"
+],
+[
+"Content-Encoding",
+"gzip"
+],
+[
+"Content-Length",
+"6727"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Accept-Encoding": "gzip"
+},
+"method": "GET",
+"path": "/static/lp_research.js"
+},
+"status": 200
+},
+{
+"body_sha256": "c8d3eae160a892e32837db3dcae515e843e5383fef52b8141940c8bcf8b6d59f",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"21"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "OPTIONS",
+"path": "/static/lp_research.js"
+},
+"status": 404
+},
+{
+"body_sha256": "850a3b9ce8029cea504e9aea162995b6fdbb9482ff2c666e98b6606125f22984",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"text/css; charset=utf-8"
+],
+[
+"ETag",
+"\"850a3b9ce8029cea\""
+],
+[
+"Cache-Control",
+"public,max-age=60"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"X-Frame-Options",
+"DENY"
+],
+[
+"Referrer-Policy",
+"no-referrer"
+],
+[
+"Content-Security-Policy",
+"default-src 'self';script-src 'self';style-src 'self' 'unsafe-inline';img-src 'self' data:;connect-src 'self';object-src 'none';base-uri 'none';frame-ancestors 'none'"
+],
+[
+"Content-Length",
+"16170"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "GET",
+"path": "/static/lp_flow.css"
+},
+"status": 200
+},
+{
+"body_sha256": "06e41f1f6397368264b8d5fe21823183b0ef2d87b1946310f5b7f61a09b6b9c3",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"text/css; charset=utf-8"
+],
+[
+"ETag",
+"\"850a3b9ce8029cea\""
+],
+[
+"Cache-Control",
+"public,max-age=60"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"X-Frame-Options",
+"DENY"
+],
+[
+"Referrer-Policy",
+"no-referrer"
+],
+[
+"Content-Security-Policy",
+"default-src 'self';script-src 'self';style-src 'self' 'unsafe-inline';img-src 'self' data:;connect-src 'self';object-src 'none';base-uri 'none';frame-ancestors 'none'"
+],
+[
+"Content-Encoding",
+"gzip"
+],
+[
+"Content-Length",
+"4490"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Accept-Encoding": "gzip"
+},
+"method": "GET",
+"path": "/static/lp_flow.css"
+},
+"status": 200
+},
+{
+"body_sha256": "c8d3eae160a892e32837db3dcae515e843e5383fef52b8141940c8bcf8b6d59f",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"21"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "OPTIONS",
+"path": "/static/lp_flow.css"
+},
+"status": 404
+},
+{
+"body_sha256": "1cfa7a0a90cafeba3b728fc0007dd9404582535b61614896f47e726411deed71",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/javascript; charset=utf-8"
+],
+[
+"ETag",
+"\"1cfa7a0a90cafeba\""
+],
+[
+"Cache-Control",
+"public,max-age=60"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"X-Frame-Options",
+"DENY"
+],
+[
+"Referrer-Policy",
+"no-referrer"
+],
+[
+"Content-Security-Policy",
+"default-src 'self';script-src 'self';style-src 'self' 'unsafe-inline';img-src 'self' data:;connect-src 'self';object-src 'none';base-uri 'none';frame-ancestors 'none'"
+],
+[
+"Content-Length",
+"20839"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "GET",
+"path": "/static/lp_flow.js"
+},
+"status": 200
+},
+{
+"body_sha256": "b5263b51403cf1261504ee02e7ade3bcc9e73f76d874b310893c9ed00396cb17",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/javascript; charset=utf-8"
+],
+[
+"ETag",
+"\"1cfa7a0a90cafeba\""
+],
+[
+"Cache-Control",
+"public,max-age=60"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"X-Frame-Options",
+"DENY"
+],
+[
+"Referrer-Policy",
+"no-referrer"
+],
+[
+"Content-Security-Policy",
+"default-src 'self';script-src 'self';style-src 'self' 'unsafe-inline';img-src 'self' data:;connect-src 'self';object-src 'none';base-uri 'none';frame-ancestors 'none'"
+],
+[
+"Content-Encoding",
+"gzip"
+],
+[
+"Content-Length",
+"7201"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Accept-Encoding": "gzip"
+},
+"method": "GET",
+"path": "/static/lp_flow.js"
+},
+"status": 200
+},
+{
+"body_sha256": "c8d3eae160a892e32837db3dcae515e843e5383fef52b8141940c8bcf8b6d59f",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"21"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "OPTIONS",
+"path": "/static/lp_flow.js"
+},
+"status": 404
+},
+{
+"body": "eyJhbGxvY2F0aW9uX3ByZXZpZXciOnRydWUsInNpbXVsYXRlIjp0cnVlLCJwcmVwYXJlIjpmYWxzZSwiYnJvYWRjYXN0IjpmYWxzZSwic2VydmVyX3NpZ25pbmciOmZhbHNlfQ==",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"100"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "GET",
+"path": "/api/workbench/capabilities"
+},
+"status": 200
+},
+{
+"body": "eyJhbGxvY2F0aW9uX3ByZXZpZXciOnRydWUsInNpbXVsYXRlIjp0cnVlLCJwcmVwYXJlIjpmYWxzZSwiYnJvYWRjYXN0IjpmYWxzZSwic2VydmVyX3NpZ25pbmciOmZhbHNlfQ==",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"100"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {
+"Host": "127.0.0.1"
+},
+"method": "GET",
+"path": "/api/workbench/capabilities"
+},
+"status": 200
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Access-Control-Allow-Methods",
+"GET, HEAD, OPTIONS"
+],
+[
+"Access-Control-Allow-Headers",
+"Accept, Content-Type"
+],
+[
+"Content-Length",
+"0"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "OPTIONS",
+"path": "/api/workbench/capabilities"
+},
+"status": 204
+},
+{
+"body": "",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"37"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "HEAD",
+"path": "/api/lp/stream"
+},
+"status": 405
+},
+{
+"body": "eyJlcnJvciI6Ik5vdCBmb3VuZCJ9",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"21"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "GET",
+"path": "/api/nope"
+},
+"status": 404
+},
+{
+"body": "eyJlcnJvciI6Ik5vdCBmb3VuZCJ9",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"21"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "OPTIONS",
+"path": "/api/nope"
+},
+"status": 404
+},
+{
+"body": "eyJlcnJvciI6Ik5vdCBmb3VuZCJ9",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"21"
+],
+[
+"Connection",
+"close"
+]
+],
+"request": {
+"body": "{}",
+"frames": 0,
+"headers": {
+"Content-Type": "application/json",
+"Host": "rhpools.lol",
+"Origin": "https://rhpools.lol"
+},
+"method": "POST",
+"path": "/api/nope"
+},
+"status": 404
+},
+{
+"body": "eyJlcnJvciI6Ik5vdCBmb3VuZCJ9",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"21"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "GET",
+"path": "/stream"
+},
+"status": 404
+},
+{
+"body": "eyJlcnJvciI6Ik5vdCBmb3VuZCJ9",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"21"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "OPTIONS",
+"path": "/stream"
+},
+"status": 404
+},
+{
+"body": "eyJlcnJvciI6Ik5vdCBmb3VuZCJ9",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"21"
+],
+[
+"Connection",
+"close"
+]
+],
+"request": {
+"body": "{}",
+"frames": 0,
+"headers": {
+"Content-Type": "application/json",
+"Host": "rhpools.lol",
+"Origin": "https://rhpools.lol"
+},
+"method": "POST",
+"path": "/stream"
+},
+"status": 404
+},
+{
+"body": "eyJlcnJvciI6Ik5vdCBmb3VuZCJ9",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"21"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "GET",
+"path": "/health"
+},
+"status": 404
+},
+{
+"body": "eyJlcnJvciI6Ik5vdCBmb3VuZCJ9",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"21"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "OPTIONS",
+"path": "/health"
+},
+"status": 404
+},
+{
+"body": "eyJlcnJvciI6Ik5vdCBmb3VuZCJ9",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"21"
+],
+[
+"Connection",
+"close"
+]
+],
+"request": {
+"body": "{}",
+"frames": 0,
+"headers": {
+"Content-Type": "application/json",
+"Host": "rhpools.lol",
+"Origin": "https://rhpools.lol"
+},
+"method": "POST",
+"path": "/health"
+},
+"status": 404
+},
+{
+"body": "eyJlcnJvciI6Ik5vdCBmb3VuZCJ9",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"21"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "GET",
+"path": "/api/gate/me"
+},
+"status": 404
+},
+{
+"body": "eyJlcnJvciI6Ik5vdCBmb3VuZCJ9",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"21"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "OPTIONS",
+"path": "/api/gate/me"
+},
+"status": 404
+},
+{
+"body": "eyJlcnJvciI6Ik5vdCBmb3VuZCJ9",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"21"
+],
+[
+"Connection",
+"close"
+]
+],
+"request": {
+"body": "{}",
+"frames": 0,
+"headers": {
+"Content-Type": "application/json",
+"Host": "rhpools.lol",
+"Origin": "https://rhpools.lol"
+},
+"method": "POST",
+"path": "/api/gate/me"
+},
+"status": 404
+},
+{
+"body": "eyJlcnJvciI6Ik5vdCBmb3VuZCJ9",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"21"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "GET",
+"path": "/api/v1/stream"
+},
+"status": 404
+},
+{
+"body": "eyJlcnJvciI6Ik5vdCBmb3VuZCJ9",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"21"
+]
+],
+"request": {
+"body": null,
+"frames": 0,
+"headers": {},
+"method": "OPTIONS",
+"path": "/api/v1/stream"
+},
+"status": 404
+},
+{
+"body": "eyJlcnJvciI6Ik5vdCBmb3VuZCJ9",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"21"
+],
+[
+"Connection",
+"close"
+]
+],
+"request": {
+"body": "{}",
+"frames": 0,
+"headers": {
+"Content-Type": "application/json",
+"Host": "rhpools.lol",
+"Origin": "https://rhpools.lol"
+},
+"method": "POST",
+"path": "/api/v1/stream"
+},
+"status": 404
+},
+{
+"body": "eyJlcnJvciI6IkNvbmZpZ3VyZWQgc2FtZS1vcmlnaW4gcmVxdWVzdCByZXF1aXJlZCJ9",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"51"
+],
+[
+"Connection",
+"close"
+]
+],
+"request": {
+"body": "{}",
+"frames": 0,
+"headers": {
+"Content-Type": "application/json"
+},
+"method": "POST",
+"path": "/api/lp/allocation"
+},
+"status": 403
+},
+{
+"body": "eyJlcnJvciI6IkV4cGVjdGVkIGFwcGxpY2F0aW9uL2pzb24ifQ==",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"37"
+],
+[
+"Connection",
+"close"
+]
+],
+"request": {
+"body": "{}",
+"frames": 0,
+"headers": {
+"Content-Type": "text/plain",
+"Host": "rhpools.lol",
+"Origin": "https://rhpools.lol"
+},
+"method": "POST",
+"path": "/api/lp/allocation"
+},
+"status": 415
+},
+{
+"body": "eyJlcnJvciI6IlJlcXVlc3QgbXVzdCBiZSBiZXR3ZWVuIDEgYW5kIDE2Mzg0IGJ5dGVzIn0=",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"53"
+],
+[
+"Connection",
+"close"
+]
+],
+"request": {
+"body": "",
+"frames": 0,
+"headers": {
+"Content-Type": "application/json",
+"Host": "rhpools.lol",
+"Origin": "https://rhpools.lol"
+},
+"method": "POST",
+"path": "/api/lp/allocation"
+},
+"status": 413
+},
+{
+"body": "eyJlcnJvciI6IkNvbmZpZ3VyZWQgc2FtZS1vcmlnaW4gcmVxdWVzdCByZXF1aXJlZCJ9",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"51"
+],
+[
+"Connection",
+"close"
+]
+],
+"request": {
+"body": "{}",
+"frames": 0,
+"headers": {
+"Content-Type": "application/json"
+},
+"method": "POST",
+"path": "/api/workbench/simulate"
+},
+"status": 403
+},
+{
+"body": "eyJlcnJvciI6IlNpbXVsYXRpb24gYW5kIHByZXBhcmF0aW9uIHJlcXVpcmUgbG9vcGJhY2sgYWNjZXNzIn0=",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"62"
+],
+[
+"Connection",
+"close"
+]
+],
+"request": {
+"body": "{}",
+"frames": 0,
+"headers": {
+"Content-Type": "text/plain",
+"Host": "rhpools.lol",
+"Origin": "https://rhpools.lol"
+},
+"method": "POST",
+"path": "/api/workbench/simulate"
+},
+"status": 403
+},
+{
+"body": "eyJlcnJvciI6IlNpbXVsYXRpb24gYW5kIHByZXBhcmF0aW9uIHJlcXVpcmUgbG9vcGJhY2sgYWNjZXNzIn0=",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"62"
+],
+[
+"Connection",
+"close"
+]
+],
+"request": {
+"body": "",
+"frames": 0,
+"headers": {
+"Content-Type": "application/json",
+"Host": "rhpools.lol",
+"Origin": "https://rhpools.lol"
+},
+"method": "POST",
+"path": "/api/workbench/simulate"
+},
+"status": 403
+},
+{
+"body": "eyJlcnJvciI6IkNvbmZpZ3VyZWQgc2FtZS1vcmlnaW4gcmVxdWVzdCByZXF1aXJlZCJ9",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"51"
+],
+[
+"Connection",
+"close"
+]
+],
+"request": {
+"body": "{}",
+"frames": 0,
+"headers": {
+"Content-Type": "application/json"
+},
+"method": "POST",
+"path": "/api/workbench/prepare"
+},
+"status": 403
+},
+{
+"body": "eyJlcnJvciI6IlNpbXVsYXRpb24gYW5kIHByZXBhcmF0aW9uIHJlcXVpcmUgbG9vcGJhY2sgYWNjZXNzIn0=",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"62"
+],
+[
+"Connection",
+"close"
+]
+],
+"request": {
+"body": "{}",
+"frames": 0,
+"headers": {
+"Content-Type": "text/plain",
+"Host": "rhpools.lol",
+"Origin": "https://rhpools.lol"
+},
+"method": "POST",
+"path": "/api/workbench/prepare"
+},
+"status": 403
+},
+{
+"body": "eyJlcnJvciI6IlNpbXVsYXRpb24gYW5kIHByZXBhcmF0aW9uIHJlcXVpcmUgbG9vcGJhY2sgYWNjZXNzIn0=",
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"application/json"
+],
+[
+"Cache-Control",
+"no-store"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+],
+[
+"Access-Control-Allow-Origin",
+"*"
+],
+[
+"Content-Length",
+"62"
+],
+[
+"Connection",
+"close"
+]
+],
+"request": {
+"body": "",
+"frames": 0,
+"headers": {
+"Content-Type": "application/json",
+"Host": "rhpools.lol",
+"Origin": "https://rhpools.lol"
+},
+"method": "POST",
+"path": "/api/workbench/prepare"
+},
+"status": 403
+},
+{
+"frames": [
+"id: 0:fe1:1\nevent: block\ndata: {\"number\":100,\"hash\":\"0x0101010101010101010101010101010101010101010101010101010101010101\"}\n",
+"id: 0:fe1:2\nevent: activity\ndata: {\"rows\":[{\"id\":\"r1\",\"kind\":\"add\"}]}\n",
+"id: 0:fe1:2\nevent: owners\ndata: {\"revision\":7,\"current_activity\":{\"epoch\":3},\"rows\":[{\"owner\":\"0x1212121212121212121212121212121212121212\"}]}\n"
+],
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"text/event-stream"
+],
+[
+"Connection",
+"close"
+],
+[
+"Cache-Control",
+"no-store,no-transform"
+],
+[
+"X-Accel-Buffering",
+"no"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+]
+],
+"request": {
+"body": null,
+"frames": 3,
+"headers": {},
+"method": "GET",
+"path": "/api/lp/stream?view=terminal&current_only=1&channel=both"
+},
+"status": 200
+},
+{
+"frames": [
+"id: 0:fe1:1\nevent: block\ndata: {\"number\":100,\"hash\":\"0x0101010101010101010101010101010101010101010101010101010101010101\"}\n",
+"id: 7:fe1:2\ndata: {\"revision\":7,\"epoch\":3,\"reset\":false,\"rows\":[{\"id\":\"r1\",\"kind\":\"add\"}],\"removed\":[],\"snapshot\":true}\n"
+],
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"text/event-stream"
+],
+[
+"Connection",
+"close"
+],
+[
+"Cache-Control",
+"no-store,no-transform"
+],
+[
+"X-Accel-Buffering",
+"no"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+]
+],
+"request": {
+"body": null,
+"frames": 2,
+"headers": {},
+"method": "GET",
+"path": "/api/lp/stream?channel=heads"
+},
+"status": 200
+},
+{
+"frames": [
+"data: {\"type\":\"pool\",\"data\":{\"pool\":{\"id\":\"0xabababababababababababababababababababababababababababababababab\"},\"revision\":7,\"epoch\":3,\"pad\":[\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"]}}\n"
+],
+"headers": [
+[
+"Server",
+"BaseHTTP/0.6 Python/3.13.14"
+],
+[
+"Content-Type",
+"text/event-stream"
+],
+[
+"Connection",
+"close"
+],
+[
+"Cache-Control",
+"no-store,no-transform"
+],
+[
+"X-Accel-Buffering",
+"no"
+],
+[
+"X-Content-Type-Options",
+"nosniff"
+],
+[
+"Vary",
+"Accept-Encoding"
+]
+],
+"request": {
+"body": null,
+"frames": 1,
+"headers": {},
+"method": "GET",
+"path": "/api/workbench/stream?id=0xabababababababababababababababababababababababababababababababab"
+},
+"status": 200
+}
+]
