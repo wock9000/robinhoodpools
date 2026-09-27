@@ -348,6 +348,19 @@ pycryptodome = [
 ]
 
 [[package]]
+name = "eth-keys"
+version = "0.8.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "eth-typing" },
+    { name = "eth-utils" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/39/58/f54660cffe3f39aad2d80d13b072973ee9134b6cdfd8b4d086419eda997b/eth_keys-0.8.0.tar.gz", hash = "sha256:11549b251876fccd7caedd6905e494ea2309aec352ec2579b00ef9978017a964", size = 31311, upload-time = "2026-08-21T17:01:21.923Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f9/f5/24806598664a2fbc65d5ed4f0e9e986e7f9061e3b43738412c8df7ba1cbd/eth_keys-0.8.0-py3-none-any.whl", hash = "sha256:a7b94222638cccbdf2b5dae5c365d883a96826d82bb0faeb56baa65375f514ae", size = 20461, upload-time = "2026-08-21T17:01:20.767Z" },
+]
+
+[[package]]
 name = "eth-typing"
 version = "6.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -737,6 +750,7 @@ source = { editable = "." }
 dependencies = [
     { name = "eth-abi" },
     { name = "eth-hash", extra = ["pycryptodome"] },
+    { name = "eth-keys" },
     { name = "eth-utils" },
     { name = "requests" },
     { name = "websockets" },
@@ -751,6 +765,7 @@ test = [
 requires-dist = [
     { name = "eth-abi", specifier = ">=5,<6" },
     { name = "eth-hash", extras = ["pycryptodome"], specifier = ">=0.7,<1" },
+    { name = "eth-keys", specifier = ">=0.6,<1" },
     { name = "eth-utils", specifier = ">=5,<6" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8,<9" },
     { name = "requests", specifier = ">=2.31,<3" },

@@ -13,6 +13,7 @@ requires-python = ">=3.11"
 dependencies = [
   "eth-abi>=5,<6",
   "eth-hash[pycryptodome]>=0.7,<1",
+  "eth-keys>=0.6,<1",
   "eth-utils>=5,<6",
   "requests>=2.31,<3",
   "websockets>=12,<16",
@@ -28,6 +29,7 @@ test = ["pytest>=8,<9"]
 
 [project.scripts]
 rhpools = "rhpools.lp_server:main"
+rhpools-gate = "rhpools.lp_gate_cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/rhpools"]
