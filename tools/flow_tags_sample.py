@@ -1,12 +1,19 @@
 """Measure flow tags against the chain, or capture test fixtures from it.
 
     python tools/flow_tags_sample.py measure [--rpc URL] [--market PATH] [--swaps 200]
+    python tools/flow_tags_sample.py evidence [--swaps 1000] [--reported-minutes 60]
     python tools/flow_tags_sample.py capture [--rpc URL] [--market PATH] [--out DIR]
 
 ``measure`` classifies the most recent swaps, checks every PONS tag against a
 direct ``launches(poolId)`` read, and, when ``RHP_LISTENER_DSN`` is set, reports
-on-chain versus listener FOMO agreement with each disagreement listed. The market
-database is opened read-only; the tag store is a temporary file.
+on-chain versus listener FOMO agreement with each disagreement listed.
+
+``evidence`` needs ``RHP_LISTENER_DSN`` (read-only) and checks the FOMO tag
+against FOMO's own wallet roster in apollo (fomo_wallet_bindings, official
+trader candidates, curated wallets) and against the FOMO fee-receiver trade
+feed (fomo_public_trade_observation) linked through relay-listener order ids.
+
+The market database is opened read-only; the tag store is a temporary file.
 """
 from __future__ import annotations
 
@@ -265,9 +272,258 @@ def capture(args: argparse.Namespace) -> int:
     return 0
 
 
+TOPIC_USER_OPERATION = "0x49628fd1471006c1482da88028e9ce4dbb080b815c9b0344d39e5a8e6ec1419f"
+RELAY_CONTRACTS = frozenset({tags.DEPOSITORY, tags.EXECUTOR, tags.FOMO_ROUTER})
+ROSTER_SQL = """
+    SELECT DISTINCT encode(address, 'hex') FROM (
+        SELECT w.address FROM fomo_wallet_bindings b JOIN wallets w ON w.id = b.wallet_id
+        WHERE b.chain_id = 50 AND w.address = ANY(%(wallets)s)
+        UNION ALL
+        SELECT evm_wallet FROM fomo_official_trader_candidate WHERE evm_wallet = ANY(%(wallets)s)
+        UNION ALL
+        SELECT decode(substr(evm_wallet, 3), 'hex') FROM fomo_curated_trader_wallet
+        WHERE decode(substr(evm_wallet, 3), 'hex') = ANY(%(wallets)s)
+    ) roster
+"""
+
+
+def pg_connect() -> Any:
+    import psycopg
+
+    connection = psycopg.connect(
+        os.environ["RHP_LISTENER_DSN"], connect_timeout=5, application_name="rhpools-flow-tags-evidence",
+        options="-c default_transaction_read_only=on -c statement_timeout=120000",
+    )
+    connection.read_only = True
+    return connection
+
+
+def roster_members(connection: Any, wallets: set[str]) -> set[str]:
+    if not wallets:
+        return set()
+    raw = [bytes.fromhex(wallet[2:]) for wallet in sorted(wallets)]
+    with connection.transaction():
+        rows = connection.execute(ROSTER_SQL, {"wallets": raw}).fetchall()
+    return {"0x" + row[0] for row in rows}
+
+
+def relay_wallets(logs: list[dict[str, Any]]) -> set[str]:
+    wallets: set[str] = set()
+    for log in logs:
+        topics = [t.lower() for t in log["topics"]]
+        if log["address"].lower() == tags.DEPOSITORY and topics[0] in (tags.TOPIC_DEPOSIT, tags.TOPIC_NATIVE_DEPOSIT):
+            wallets.add("0x" + log["data"][26:66].lower())
+        elif topics[0] == tags.TOPIC_TRANSFER and len(topics) == 3 and topics[1] == tags.EXECUTOR_TOPIC:
+            recipient = "0x" + topics[2][-40:]
+            if recipient not in RELAY_CONTRACTS:
+                wallets.add(recipient)
+    return wallets
+
+
+def chunked_logs(rpc: HttpRpc, low: int, high: int, filters: Any, step: int = 2000) -> list[dict[str, Any]]:
+    calls = []
+    for start in range(low, high + 1, step):
+        calls.extend(filters(start, min(start + step - 1, high)))
+    return [log for batch in rpc.batch(calls, size=20) for log in batch]
+
+
+def wallet_classes(rpc: HttpRpc, wallets: set[str], roster: set[str]) -> dict[str, str]:
+    ordered = sorted(wallets)
+    codes = dict(zip(ordered, rpc.batch([("eth_getCode", [wallet, "latest"]) for wallet in ordered])))
+    classes = {}
+    for wallet in ordered:
+        code = codes[wallet].lower()
+        if wallet in roster:
+            classes[wallet] = "roster"
+        elif code == FOMO_WALLET_CODE:
+            classes[wallet] = "fomo_code"
+        elif code.startswith("0xef0100"):
+            classes[wallet] = "other_7702"
+        elif code == "0x":
+            classes[wallet] = "eoa"
+        else:
+            classes[wallet] = "contract"
+    return classes
+
+
+def ledger_window(connection: Any, start_ms: int, end_ms: int) -> list[tuple[Any, ...]]:
+    """Ledger rows with event time inside [start_ms, end_ms], read along the primary key."""
+
+    def query(sql: str, params: tuple[Any, ...]) -> list[Any]:
+        with connection.transaction():
+            return connection.execute(sql, params).fetchall()
+
+    rows: list[tuple[Any, ...]] = []
+    instances = query(
+        "SELECT source_instance_id, last_sequence FROM relay_listener_research_source_state "
+        "WHERE last_event_at_unix_ms >= %s", (start_ms,),
+    )
+    for instance, last_sequence in instances:
+        first = query(
+            "SELECT event_at_unix_ms FROM relay_listener_research_event "
+            "WHERE source_instance_id = %s ORDER BY sequence LIMIT 1", (instance,),
+        )
+        if not first or int(first[0][0]) > end_ms:
+            continue
+        low, high = 0, int(last_sequence)
+        while low < high:
+            middle = (low + high + 1) // 2
+            probe = query(
+                "SELECT event_at_unix_ms FROM relay_listener_research_event "
+                "WHERE source_instance_id = %s AND sequence >= %s ORDER BY sequence LIMIT 1",
+                (instance, middle),
+            )
+            if probe and int(probe[0][0]) < start_ms:
+                low = middle
+            else:
+                high = middle - 1
+        cursor = low
+        while True:
+            page = query(
+                "SELECT sequence, event_at_unix_ms, order_id, "
+                "payload->'observation'->>'chain', payload->'observation'->>'observation_kind', "
+                "payload->'observation'->>'transaction_hash', payload->'observation'->>'wallet', "
+                "payload->'observation'->>'block_number', payload->'observation'->>'status' "
+                "FROM relay_listener_research_event WHERE source_instance_id = %s AND sequence > %s "
+                "AND record_kind = 'fomo_observation' ORDER BY sequence LIMIT 5000",
+                (instance, cursor),
+            )
+            if not page:
+                break
+            cursor = int(page[-1][0])
+            rows.extend(row for row in page if int(row[1]) <= end_ms)
+            if int(page[-1][1]) > end_ms:
+                break
+    return rows
+
+
+def classify_hashes(rpc: HttpRpc, hashes: list[str]) -> dict[str, tags.TxEnvelope]:
+    transactions = rpc.batch([("eth_getTransactionByHash", [h]) for h in hashes])
+    known = [(h, tx) for h, tx in zip(hashes, transactions) if tx]
+    if not known:
+        return {}
+    blocks = [int(tx["blockNumber"], 16) for _h, tx in known]
+    footprint: dict[str, list[dict[str, Any]]] = {}
+    for log in chunked_logs(rpc, min(blocks), max(blocks), tags.footprint_filters):
+        footprint.setdefault(log["transactionHash"].lower(), []).append(log)
+    return {h: tags.envelope(tx, 0, footprint.get(h, [])) for h, tx in known}
+
+
+def evidence(args: argparse.Namespace) -> int:
+    rpc = HttpRpc(args.rpc)
+    db = market(args.market)
+    connection = pg_connect()
+    rows = recent_swaps(rpc, db, args.swaps, args.head_offset)
+    hashes = list(dict.fromkeys(row["tx_hash"] for row in rows))
+    low, high = rows[0]["block_number"], rows[-1]["block_number"]
+    transactions = dict(zip(hashes, rpc.batch([("eth_getTransactionByHash", [h]) for h in hashes])))
+    footprint: dict[str, list[dict[str, Any]]] = {h: [] for h in hashes}
+    for log in chunked_logs(rpc, low, high, tags.footprint_filters):
+        if log["transactionHash"].lower() in footprint:
+            footprint[log["transactionHash"].lower()].append(log)
+    senders: dict[str, set[str]] = {h: {transactions[h]["from"].lower()} for h in hashes}
+    zero_gas: dict[str, bool] = {}
+    user_ops = chunked_logs(rpc, low, high, lambda a, b: [
+        ("eth_getLogs", [{"fromBlock": hex(a), "toBlock": hex(b), "address": ENTRYPOINT, "topics": [TOPIC_USER_OPERATION]}]),
+    ])
+    for log in user_ops:
+        tx_hash = log["transactionHash"].lower()
+        if tx_hash in senders:
+            senders[tx_hash].add("0x" + log["topics"][2][-40:].lower())
+            gas_cost = int(log["data"][2 + 2 * 64:2 + 3 * 64], 16)
+            zero_gas[tx_hash] = zero_gas.get(tx_hash, True) and gas_cost == 0
+    envelopes = {h: tags.envelope(transactions[h], 0, footprint[h]) for h in hashes}
+    fomo = {h for h, env in envelopes.items() if env.deposit_order_ids or env.executor_fill}
+    counterparties = {h: relay_wallets(footprint[h]) for h in fomo}
+    every_wallet = set().union(*senders.values(), *counterparties.values())
+    roster = roster_members(connection, every_wallet)
+    classes = wallet_classes(rpc, every_wallet, roster)
+    print(f"sampled {len(rows)} swaps in {len(hashes)} transactions over blocks {low}..{high}; "
+          f"{len(fomo)} tagged FOMO; roster hits {len(roster)} of {len(every_wallet)} wallets")
+
+    rank = {"roster": 0, "fomo_code": 1, "other_7702": 2, "eoa": 3, "contract": 4}
+    best = {}
+    for h in fomo:
+        wallets = counterparties[h]
+        best[h] = min((classes[w] for w in wallets), key=rank.get) if wallets else "no_wallet"
+    tally = Counter(best.values())
+    print("FOMO-tagged transactions by best counterparty wallet class:", dict(tally))
+    sells = {h for h in fomo if envelopes[h].deposit_order_ids}
+    depositor_class = Counter(
+        min((classes[w] for w in relay_wallets([
+            log for log in footprint[h] if log["address"].lower() == tags.DEPOSITORY
+        ])), key=rank.get, default="no_wallet")
+        for h in sells
+    )
+    print(f"  sells ({len(sells)}) by depositor wallet class: {dict(depositor_class)}")
+    fill_class = Counter(best[h] for h in fomo - sells)
+    print(f"  fills ({len(fomo - sells)}) by best recipient wallet class: {dict(fill_class)}")
+    strict = tally["roster"]
+    lenient = strict + tally["fomo_code"]
+    print(f"precision: roster-confirmed {strict}/{len(fomo)} = {strict / max(len(fomo), 1):.3f}; "
+          f"roster or FOMO wallet code {lenient}/{len(fomo)} = {lenient / max(len(fomo), 1):.3f}; "
+          f"no FOMO identity (other 7702 / EOA / contract / none) {len(fomo) - lenient}")
+    for h in sorted(fomo):
+        if best[h] not in ("roster", "fomo_code"):
+            env = envelopes[h]
+            print("  non-FOMO relay trade", h, "to", env.to, best[h],
+                  "sell" if h in sells else "fill", sorted(counterparties[h])[:2])
+    gas_by_class = Counter(
+        (min((classes[w] for w in senders[h]), key=rank.get), "zero_gas" if zero_gas[h] else "paid_gas")
+        for h in zero_gas
+    )
+    print("user-op transactions by sender class and gas:", dict(gas_by_class))
+    zero_gas_fomo = sum(1 for h in zero_gas if zero_gas[h] and h in fomo)
+    print(f"  zero-gas user-op transactions tagged FOMO: {zero_gas_fomo}/{sum(zero_gas.values())}")
+
+    roster_txs = {h for h in hashes if any(classes[w] == "roster" for w in senders[h] | counterparties.get(h, set()))}
+    tagged = len(roster_txs & fomo)
+    print(f"reverse: {len(roster_txs)} sampled transactions involve a rostered FOMO wallet; "
+          f"{tagged} tagged FOMO ({tagged / max(len(roster_txs), 1):.3f})")
+    for h in sorted(roster_txs - fomo):
+        print("  rostered wallet without Relay footprint", h, "to", envelopes[h].to)
+
+    code_only = {h for h in hashes if any(classes[w] == "fomo_code" for w in senders[h])}
+    print(f"extra condition check: {len(code_only & fomo)}/{len(code_only)} transactions whose sender carries "
+          f"the FOMO wallet code are tagged FOMO; {len(fomo & code_only)} of {len(fomo)} FOMO tags have such a sender")
+    narrowed = {h for h in fomo if best[h] in ("roster", "fomo_code")}
+    print(f"narrowed rule (Relay footprint AND counterparty carries FOMO wallet code or is rostered): "
+          f"{len(narrowed)}/{len(fomo)} kept; drops {len(fomo - narrowed)}")
+
+    reported_end = connection.execute(
+        "SELECT max(observed_at) FROM fomo_public_trade_observation"
+    ).fetchone()[0]
+    if reported_end is None:
+        print("no fomo_public_trade_observation rows")
+        return 0
+    end_ms = int(reported_end.timestamp() * 1000)
+    start_ms = end_ms - args.reported_minutes * 60_000
+    with connection.transaction():
+        reported = connection.execute(
+            "SELECT signature FROM fomo_public_trade_observation "
+            "WHERE occurred_at >= to_timestamp(%s) AND occurred_at <= to_timestamp(%s)",
+            (start_ms / 1000, end_ms / 1000),
+        ).fetchall()
+    signatures = {row[0] for row in reported}
+    ledger = ledger_window(connection, start_ms - 60_000, end_ms + 600_000)
+    orders = {row[2] for row in ledger if row[3] == "solana" and row[4] == "payment" and row[5] in signatures and row[2]}
+    fills = {row[5].lower() for row in ledger if row[3] == "robinhood" and row[2] in orders and row[8] == "observed"}
+    print(f"FOMO fee-receiver trades {reported_end.isoformat()} minus {args.reported_minutes} min: "
+          f"{len(signatures)} signatures, {len(orders)} matched Relay orders, "
+          f"{len(fills)} Robinhood fill transactions in the ledger ({len(ledger)} ledger rows scanned)")
+    if fills:
+        envelopes = classify_hashes(rpc, sorted(fills))
+        tagged_fills = [h for h, env in envelopes.items() if env.deposit_order_ids or env.executor_fill]
+        print(f"  {len(tagged_fills)}/{len(fills)} FOMO-reported fills tagged FOMO by the on-chain rule")
+        for h in sorted(fills - set(tagged_fills)):
+            print("  reported fill not tagged", h)
+    connection.close()
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("command", choices=("measure", "capture"))
+    parser.add_argument("command", choices=("measure", "evidence", "capture"))
     parser.add_argument("--rpc", default="http://127.0.0.1:8547")
     parser.add_argument("--market", default=DEFAULT_MARKET)
     parser.add_argument("--swaps", type=int, default=200)
@@ -275,9 +531,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="extra blocks below head to sample from")
     parser.add_argument("--listener-window", type=int, default=900)
     parser.add_argument("--listener-budget", type=int, default=400000)
+    parser.add_argument("--reported-minutes", type=int, default=60)
     parser.add_argument("--out", default=str(Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "flow_tags"))
     args = parser.parse_args(argv)
-    return measure(args) if args.command == "measure" else capture(args)
+    return {"measure": measure, "evidence": evidence, "capture": capture}[args.command](args)
 
 
 if __name__ == "__main__":

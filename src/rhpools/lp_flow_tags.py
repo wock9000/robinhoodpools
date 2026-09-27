@@ -103,7 +103,6 @@ class FlowTag:
             "pool_id": self.pool_id,
             "tags": sorted(self.tags),
             "basis": sorted(self.basis),
-            "early_ms": self.early_ms,
         }
 
 
