@@ -20,6 +20,12 @@ Treat credential-bearing RPC URLs as secrets. Store them outside the repository 
 
 Keep the HTTP listener on loopback by default. Binding to a non-loopback address or authorizing an additional browser origin does not add authentication, TLS, request filtering, or host-level access control; those controls must be designed and operated separately.
 
+## Sessions, API keys and the holder gate
+
+Wallet sign-in is EIP-4361: the server verifies a signature and never receives, stores, or produces one. `eth-keys` is used for recovery only; there is no signing code path. Sessions and API keys are one credential type whose secret is shown once and stored only as a SHA-256 hash; browsers keep it in the `__Host-rhp_session` cookie (`HttpOnly; Secure; SameSite=Strict`), scripts send it as a bearer. Keys can be minted from a browser session only, so a leaked bearer cannot spawn more keys. Cookie-authenticated POSTs require a same-origin `Origin`. Entitlement belongs to the wallet (on-chain balance, 30 s cache, grace window), never to the key, so revocation and threshold changes take effect at the next request or stream iteration and the gate fails closed when the balance is unknown.
+
+Gate state lives in its own SQLite file (`gate.sqlite`, default next to the market database), never inside the market store, and nothing under the gate imports the market code. The policy is changed only by an EIP-712 message signed by the owner address pinned in host configuration (`RHP_GATE_OWNER`); the web route and the `rhpools-gate` CLI share one apply path, and every accepted or refused change writes an audit row with the recovered signer. Do not put the owner private key on the host: sign with a hardware or browser wallet and submit the signature.
+
 ## Sensitive local state
 
 The SQLite index can reveal queried owners and locally retained chain-derived state even though its inputs are public. Give one running service process exclusive ownership of a database, restrict local filesystem access, and stop the process before backups or migrations. Never attach a live or production database to a report or commit it to the repository.

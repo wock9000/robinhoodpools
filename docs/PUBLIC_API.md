@@ -13,10 +13,14 @@ The API exposes four `GET` routes:
 | `/api/v1/research/owner` | Bounded, coverage-qualified owner allocation, configuration, and lifecycle research |
 | `/api/v1/fomo/flow` | One bounded, attributed page from a selected anonymous public flow publisher |
 
-No route requires authentication. JSON responses include
-`Access-Control-Allow-Origin: *`; browser clients do not send credentials. The
-routes do not accept RPC URLs, submit transactions, recommend trades, or infer
-private strategies.
+No route requires authentication for its anonymous form. JSON responses include
+`Access-Control-Allow-Origin: *`; anonymous browser clients do not send
+credentials. The routes do not accept RPC URLs, submit transactions, recommend
+trades, or infer private strategies.
+
+Holders of the rhpools token can present an API key (see [API keys](#api-keys))
+to move the same routes into a keyed quota tier and to open the keyed
+`/api/v1/stream`. Anonymous responses are unchanged by the existence of keys.
 
 ## Run an installed local service
 
@@ -274,13 +278,93 @@ responses distinguish complete collected-fee totals from partial evidence:
 Fresh canonical activity does not imply complete transaction enrichment or
 historical accounting. Preserve both freshness and completeness qualifications.
 
+## API keys
+
+Access above the anonymous tier is a property of a wallet, not of a key. The
+server reads the wallet's `balanceOf` on the token named in the owner-signed
+gate policy (cached 30 s, at most one read per wallet per 30 s regardless of
+how many keys or streams the wallet holds) and grants the `api` feature while
+the balance is at or above the policy threshold, or for `grace_s` seconds after
+the last qualifying observation. Revoking one key never changes another key's
+outcome; losing the balance affects every key at its next request.
+
+Sign in once with an EIP-4361 (SIWE) message. The message's domain must be
+`rhpools.lol`, its chain ID `4663`, and its nonce must come from `/api/gate/nonce`
+(single use, 600 s). `personal_sign` over the message text is enough; no
+transaction, no fee. Contract wallets are verified with ERC-1271; EIP-7702
+delegated accounts are verified like plain EOAs.
+
+```sh
+NONCE=$(curl -s https://rhpools.lol/api/gate/nonce?wallet=$WALLET)
+# build the SIWE text from the nonce response, sign it with the wallet, then:
+curl -s -c jar -X POST https://rhpools.lol/api/gate/session \
+  -H 'content-type: application/json' \
+  -d '{"message":"<siwe text>","signature":"0x…","label":"research-box"}'
+# mint a long-lived key from the session (cookie plus same-origin header)
+curl -s -b jar -H 'origin: https://rhpools.lol' -X POST https://rhpools.lol/api/gate/keys \
+  -H 'content-type: application/json' -d '{"op":"mint","label":"bot-1","ttl_s":7776000}'
+# → {"key_id":"5c1d9b2e0a7f43aa","secret":"rhp_…","label":"bot-1","expires_at":…}
+curl -s -H 'authorization: Bearer rhp_…' https://rhpools.lol/api/v1/pools?token=0x…
+```
+
+The secret is shown once; only its SHA-256 is stored. `key_id` is the public
+handle. The sign-in session itself is the same kind of credential (a browser
+receives it as the `__Host-rhp_session` cookie; a script may send it as a
+bearer) but keys can only be minted from a browser session, never from a
+bearer. A wallet may hold eight live keys and four concurrent keyed streams.
+
+| Route | Credential | Purpose |
+| --- | --- | --- |
+| `GET /api/gate/nonce?wallet=` | none | Fresh nonce, timestamps, statement, checksummed address |
+| `POST /api/gate/session` | none | `{message, signature, label}` → session cookie plus the `/me` body |
+| `GET /api/gate/me` | optional | Wallet, features, holding, grace deadlines, policy; `{"signed_in": false}` otherwise |
+| `GET /api/gate/keys` | required | Live and revoked keys for the wallet (no secrets) |
+| `POST /api/gate/keys` | required | `{"op":"mint","label","ttl_s"}`, `{"op":"revoke","key_id"}`, `{"op":"revoke_all"}` |
+| `POST /api/gate/logout` | cookie | Revokes the session key and clears the cookie |
+| `GET /api/gate/policy` | none | Current owner-signed policy and its EIP-712 typed-data template |
+| `POST /api/gate/policy` | owner signature | `{policy, signature}`; refused and audited unless signed by the pinned owner |
+
+A cookie-authenticated POST must carry a same-origin `Origin`; a bearer POST
+need not. `Authorization: Bearer rhp_…` takes precedence over the cookie. Any
+other `Authorization` scheme is ignored and the request is served anonymously.
+
+### Keyed quota tier
+
+Sending a bearer on any `/api/lp/*`, `/api/v1/*`, or `/api/workbench/*` route
+selects the keyed tier: a per-key token bucket (10 requests per second, burst
+40) on its own capacity lane, `Cache-Control: private, no-store`, no `ETag`, and
+the headers `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`
+(unix seconds until the bucket is full). Exhausting the bucket returns `429`
+with `Retry-After` and `gate.retry_after_ms`.
+
+### Keyed streaming: `GET /api/v1/stream`
+
+The same frames as the terminal's `/api/lp/stream` (`block`, `activity`,
+`owners`, durable frames) with the same query parameters, behind a credential.
+Without `Upgrade: websocket` it is `text/event-stream`; with it, the frames
+arrive as JSON text messages `{"event":…,"id":…,"data":…}` and the server
+never reads client data frames (send only pong or close).
+
+The server re-evaluates the wallet on every loop iteration. When the credential
+is revoked or the wallet drops below the threshold past grace, an SSE client
+receives `event: gate` with the refusal body and the connection ends; a
+WebSocket client receives `{"event":"gate","data":{…}}` and close code `4403`.
+Reconnecting yields the refusal as a normal HTTP error.
+
 ## Errors
 
-All errors use a JSON object with an `error` string.
+All errors use a JSON object with an `error` string. Gate refusals add a `gate`
+object with `state` (`anonymous`, `invalid`, `revoked`, `unset`, `below`,
+`refused`, `forbidden`) and, for `below`, the `feature`, `need` and `have`
+raw-unit amounts.
 
 | HTTP | Meaning |
 | --- | --- |
 | `400` | Missing, malformed, unsupported, or source-incompatible query input |
+| `401` | A credential is required, or an `rhp_` bearer is unknown, expired, or revoked |
+| `403` | Signed in but not entitled (below threshold, policy unset), cross-site cookie POST, key minted from a bearer, or a policy signed by a non-owner |
+| `409` | Policy version does not exceed the current version |
+| `429` | Keyed quota, per-wallet stream limit, or sign-in rate limit (5 per minute per client, 60 per minute per service) |
 | `503` | Bounded request capacity, required current/indexed service, canonical confirmation, or selected public publisher is unavailable or unusable |
 
 A canonical block changing before publication is `503`; retry the whole request.

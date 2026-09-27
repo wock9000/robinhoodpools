@@ -40,6 +40,22 @@ Run `uv run rhpools --help` for the installed command's complete option list. `-
 
 The equivalent environment settings are `RHP_HTTP_HOST`, `RHP_HTTP_PORT`, `RHP_RPC_URL`, `RHP_DATA_DIR`, `RHP_DATABASE`, `LP_HISTORY_DAYS`, and `LP_DISK_RESERVE_GIB`. Additional origins and preparation of supported direct-pool transactions require explicit CLI flags; there is no environment switch that silently enables preparation.
 
+### Holder gate
+
+Token-gated features (wallet sign-in, API keys, the keyed `/api/v1/stream`) are configured by three settings: `--gate-owner` / `RHP_GATE_OWNER` pins the EOA whose EIP-712 signature is the only way to change the policy; `--gate-rpc-url` / `RHP_GATE_RPC_URL` (default `http://127.0.0.1:8547`) is the JSON-RPC endpoint the balance oracle reads `balanceOf` from; `--gate-db` / `RHP_GATE_DB` (default `<data-dir>/gate.sqlite`) holds credentials, grace anchors, policy versions and the audit log. With the owner unset or no policy applied, every gated feature refuses and the anonymous site is unchanged. The systemd unit ships these lines commented out.
+
+The owner applies a policy from the terminal's wallet dialog (`eth_signTypedData_v4`) or from the host with the same signature:
+
+```sh
+uv run rhpools-gate policy typed-data policy.json > typed.json
+cast wallet sign --data --from-file typed.json --ledger
+uv run rhpools-gate policy apply policy.json --signature 0x…
+uv run rhpools-gate audit --limit 20
+uv run rhpools-gate keys revoke --key-id 5c1d9b2e0a7f43aa
+```
+
+`policy.json` is `{"version", "token", "decimals", "threshold": {"trade","lp","api","flags"}, "grace_s", "issued_at"}` with raw-unit thresholds as decimal strings; `version` must increase and `issued_at` must be within 600 s of the apply time. The API contract for keys and the stream is in [`docs/PUBLIC_API.md`](docs/PUBLIC_API.md#api-keys).
+
 ### Serving health is not index freshness
 
 A successful request to `/` establishes only that the HTTP process can serve the installed UI. Index progress and source coverage are separate; inspect `/api/lp/status` and its observed head, indexed head, lag, history coverage, and provider status before treating results as current. During startup, catch-up, provider failure, or a chain reorganization, the server can remain available while indexed data is incomplete or stale.
@@ -66,6 +82,7 @@ The versioned public API is described in [`docs/PUBLIC_API.md`](docs/PUBLIC_API.
 ## Repository map
 
 - `src/rhpools/lp_server.py` — installed `rhpools` CLI, process lifecycle, HTTP, static assets, and route boundaries
+- `src/rhpools/lp_gate.py`, `lp_gate_siwe.py`, `lp_gate_ws.py`, `lp_gate_cli.py` — holder gate: owner-signed policy, balance oracle, SIWE sign-in, one credential type, keyed streams, `rhpools-gate` CLI
 - `src/rhpools/lp_chain.py` — side-effect-free chain ID and reviewed public deployment registry
 - `src/rhpools/lp_rpc.py` — runtime RPC source selection and capability handling
 - `src/rhpools/lp_market_protocols.py` — protocol decoding and pool identity rules
