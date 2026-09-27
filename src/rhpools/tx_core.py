@@ -36,6 +36,7 @@ GAS_HEADROOM_PCT = 130
 _ADDRESS_RE = re.compile(r"^0x[0-9a-f]{40}$")
 _HASH_RE = re.compile(r"^0x[0-9a-f]{64}$")
 SEL_OWNER_OF = selector("ownerOf(uint256)")
+SEL_TOKEN_OF_OWNER_BY_INDEX = selector("tokenOfOwnerByIndex(address,uint256)")
 NFPM_FACTORY = {manager: factory for factory, manager in NFPM_BY_FACTORY.items()}
 LP_TARGETS = frozenset({POSM, NFPM_UNISWAP, NFPM_PANCAKE, NFPM_GIGA})
 
@@ -538,6 +539,49 @@ class TxCore:
         if (token0, token1, fee) != (pool.token0, pool.token1, pool.fee_ppm):
             raise TxError("invalid_intent", "token_id belongs to a different pool")
         return PositionState(_signed24(_word(raw, 5)), _signed24(_word(raw, 6)), _word(raw, 7))
+
+    def pool_view(self, pool_id: str, wallet: str, known_ids: tuple[int, ...] = ()) -> dict[str, Any]:
+        """Pool state and the wallet's positions in it, all read at one block. ``known_ids``
+        are the client's own recent mints; V4 managers are not enumerable and the accounting
+        index can lag, so every candidate is verified on chain before it is listed."""
+        wallet = _address(wallet, "wallet")
+        pool = self.routes.pool(str(pool_id).lower())
+        if pool is None:
+            raise TxRefusal("unknown_pool", "pool_id is not in the market index")
+        manager = self.lps.manager_for(pool)
+        if manager is None:
+            raise TxRefusal("unsupported_pool", "no position manager for this pool")
+        block = self._header("latest")
+        tag = hex(block.number)
+        if pool.venue is Venue.V4:
+            raw = self._call(STATE_VIEW, state_view_slot0(pool.id), tag)
+        else:
+            raw = self._call(pool.address, selector("slot0()"), tag)
+        sqrt_price, tick = _word(raw), _signed24(_word(raw, 1))
+        candidates: list[int] = []
+        if manager != POSM:
+            count = min(_word(self._call(manager, erc20_balance_of(wallet), tag)), 50)
+            candidates = [
+                _word(self._call(manager, SEL_TOKEN_OF_OWNER_BY_INDEX + bytes.fromhex(wallet[2:].rjust(64, "0")) + index.to_bytes(32, "big"), tag))
+                for index in range(count)
+            ]
+        candidates += self.routes.position_candidates(wallet, pool.id)
+        candidates += [int(token_id) for token_id in known_ids[:20]]
+        positions = []
+        for token_id in dict.fromkeys(candidates):
+            try:
+                state = self._position(pool, manager, token_id, wallet, tag)
+            except (TxError, RuntimeError, ValueError):
+                continue
+            positions.append({"token_id": str(token_id), "tick_lower": state.tick_lower, "tick_upper": state.tick_upper, "liquidity": str(state.liquidity)})
+        tokens = self.balances(wallet, [pool.token0, pool.token1])
+        return {
+            "pool_id": pool.id, "venue": pool.venue.value, "manager": manager, "fee_ppm": pool.fee_ppm,
+            "tick_spacing": pool.tick_spacing, "tick": tick, "sqrt_price_x96": str(sqrt_price), "block": block.to_json(),
+            "pons": pool.hook == PONS_HOOK, "hook": pool.hook,
+            "token0": {"address": pool.token0, **tokens[pool.token0]}, "token1": {"address": pool.token1, **tokens[pool.token1]},
+            "positions": positions,
+        }
 
     def _sqrt_price(self, pool: Pool, tag: str) -> int:
         if pool.venue is Venue.V4:

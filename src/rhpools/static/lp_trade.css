@@ -25,3 +25,4 @@
   .trade-form { grid-template-columns: 1fr; gap: 1px 0; }
   .trade-form > label { margin-top: 4px; }
 }
+.trade-results button.seg { width: 100%; text-align: left; margin: 1px 0; }

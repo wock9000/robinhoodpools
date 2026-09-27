@@ -181,6 +181,18 @@ class RouteBook:
             row = connection.execute(_BY_ID_SQL, (pool_id.lower(),)).fetchone()
         return _pool_from_row(row) if row else None
 
+    def position_candidates(self, wallet: str, pool_id: str, limit: int = 50) -> list[int]:
+        """Token ids the accounting index attributes to wallet in pool; the chain is the authority."""
+        with self._reader() as connection:
+            try:
+                rows = connection.execute(
+                    "SELECT token_id FROM lp_accounting_positions WHERE owner=? AND pool_id=? AND token_id IS NOT NULL LIMIT ?",
+                    (wallet.lower(), pool_id.lower(), limit),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return []
+        return sorted({int(row[0]) for row in rows if str(row[0]).isdigit()})
+
     def pool_for(self, venue: Venue, token_a: str, token_b: str, fee_ppm: int | None = None, factory: str | None = None) -> Pool | None:
         """``factory`` narrows to one deployer; without it only UR-swappable pools match."""
         token0, token1 = sorted((token_a.lower(), token_b.lower()))

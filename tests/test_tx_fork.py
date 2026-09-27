@@ -417,6 +417,9 @@ def test_v3_nfpm_lifecycle(core, fork, manager, pool_id, fee, spacing):
     assert fill.amounts.token_id == quote.amounts.token_id and quote.amounts.token_id is not None
     assert 0 < quote.amounts.amount0 <= weth and 0 < quote.amounts.amount1 <= usdg
     token_id = quote.amounts.token_id
+    view = core.pool_view(pool_id, fork.user)
+    assert {p["token_id"]: int(p["liquidity"]) for p in view["positions"]}[str(token_id)] == quote.amounts.liquidity
+    assert view["manager"] == manager and view["tick_spacing"] == spacing
     probe = core.quote(mint)
     assert lp_bound_probe(core, fork, probe, (probe.amounts.amount0 + 1, probe.amounts.amount1), None).revert.kind == "slippage"
     inc = lp(fork.user, LpOp.INCREASE, pool_id, token_id=token_id, amount0=weth // 2, amount1=usdg // 2)
@@ -459,6 +462,8 @@ def test_v4_posm_lifecycle_with_permit_batch(core, fork):
     assert 0 < quote.amounts.amount0 <= eth and 0 < quote.amounts.amount1 <= usdg
     token_id = quote.amounts.token_id
     assert token_id is not None and fill.amounts.token_id == token_id
+    assert not [p for p in core.pool_view(V4_ETH_USDG, fork.user)["positions"] if p["token_id"] == str(token_id)]
+    assert [p["token_id"] for p in core.pool_view(V4_ETH_USDG, fork.user, (token_id, 1))["positions"]] == [str(token_id)]
     probe = core.quote(mint)
     sig = fork.sign(probe.step("permit").typed_data)
     assert lp_bound_probe(core, fork, probe, (probe.amounts.amount0 - 1, probe.amounts.amount1), sig).revert.kind == "slippage"

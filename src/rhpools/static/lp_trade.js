@@ -6,6 +6,9 @@
   const USDG = "0x5fc5360d0400a0fd4f2af552add042d716f1d168";
   const CURRENCIES = [[NATIVE, "ETH"], [WETH, "WETH"], [USDG, "USDG"]];
   const SLIPPAGE_PRESETS = [50, 100, 300];
+  const LP_RANGES = [["full", "full range"], ["10", "±10%"], ["25", "±25%"]];
+  const LP_PCTS = [25, 50, 75, 100];
+  const MAX_TICK = 887272;
   const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
   const EXPLORER = "https://robinhoodchain.blockscout.com/tx/";
   const REQUOTE_MS = 10000;
@@ -16,6 +19,12 @@
     unmodeled_fee: "this token takes a transfer fee the ticket cannot price; refused",
     allowlist_mismatch: "trading paused: a pinned contract's code changed",
     trading_disabled: "trading is not enabled",
+    pons_add: "Pons pools pay LPs nothing: fee 0 and the hook keeps every swap fee",
+    hook_blocked_add: "this pool's hook refuses new liquidity",
+    unknown_pool: "pool is not in the rhpools index",
+    unsupported_pool: "no supported position manager for this pool",
+    not_owner: "that position is not owned by this wallet",
+    not_executable: "the chain would reject this transaction",
   };
 
   const dialog = document.getElementById("trade-dialog");
@@ -25,6 +34,8 @@
   const state = {
     token: null, side: "buy", currency: NATIVE, amount: "", slippage: 100,
     meta: {}, results: [], quote: null, phase: "idle", note: null, keepNote: false, hash: null, fill: null, txStatus: null, seq: 0,
+    mode: "swap",
+    lp: { poolId: null, view: null, tokenId: null, op: "mint", range: "10", side: 0, amount: "", pct: 50, caps: null },
   };
   const refs = {};
   let quoteTimer = null;
@@ -106,9 +117,13 @@
     return data;
   }
 
-  function entitled() {
+  function feature() {
+    return state.mode === "lp" ? "lp" : "trade";
+  }
+
+  function entitled(name) {
     const me = gate().me;
-    return Boolean(me && me.signed_in && (me.features || []).includes("trade"));
+    return Boolean(me && me.signed_in && (me.features || []).includes(name || feature()));
   }
 
   function walletError(error) {
@@ -120,7 +135,7 @@
   }
 
   async function loadBalances() {
-    if (!entitled()) return;
+    if (!entitled("trade")) return;
     const currencies = [...new Set([state.token, NATIVE, WETH, USDG].filter(Boolean))].join(",");
     try {
       const data = await api("/api/tx/balances?feature=trade&currencies=" + currencies);
@@ -149,6 +164,109 @@
     return ["approving", "permit", "preparing", "confirming", "pending"].includes(state.phase);
   }
 
+  function lpKey() {
+    return "rhp:lp:" + String(gate().wallet || "").toLowerCase() + ":" + state.lp.poolId;
+  }
+
+  function knownIds() {
+    try { return JSON.parse(localStorage.getItem(lpKey()) || "[]"); } catch (_) { return []; }
+  }
+
+  function rememberId(tokenId) {
+    const ids = [...new Set([String(tokenId), ...knownIds()])].slice(0, 20);
+    try { localStorage.setItem(lpKey(), JSON.stringify(ids)); } catch (_) { return; }
+  }
+
+  async function loadPool() {
+    const lp = state.lp;
+    const poolId = lp.poolId;
+    if (!poolId || !entitled("lp")) return;
+    try {
+      const view = await api("/api/tx/pool?feature=lp&pool_id=" + poolId + "&ids=" + knownIds().join(","));
+      if (lp.poolId !== poolId) return;
+      lp.view = view;
+      state.note = null;
+    } catch (error) {
+      if (lp.poolId !== poolId) return;
+      lp.view = null;
+      state.note = error.status === 422 ? REFUSALS[error.data.refusal] || error.data.detail : (error.data && error.data.error) || "pool unavailable";
+    }
+    if (lp.tokenId && !(lp.view && lp.view.positions.some((p) => p.token_id === lp.tokenId))) lp.tokenId = null;
+    if (!lp.tokenId) lp.op = "mint";
+    else if (lp.op === "mint") lp.op = "increase";
+    renderLpForm();
+    render();
+    scheduleQuote(0);
+  }
+
+  function lpPosition() {
+    const view = state.lp.view;
+    return view && state.lp.tokenId ? view.positions.find((p) => p.token_id === state.lp.tokenId) : null;
+  }
+
+  function priceOf(view, tick) {
+    return Math.pow(1.0001, tick) * Math.pow(10, view.token0.decimals - view.token1.decimals);
+  }
+
+  function formatPrice(value) {
+    if (!isFinite(value) || value <= 0) return "—";
+    if (value >= 1000) return value.toLocaleString("en-US", { maximumFractionDigits: 2 });
+    return value.toPrecision(5).replace(/\.?0+$/, "");
+  }
+
+  function rangeTicks(view, range) {
+    const spacing = view.tick_spacing;
+    if (range === "full") return [Math.ceil(-MAX_TICK / spacing) * spacing, Math.floor(MAX_TICK / spacing) * spacing];
+    const pct = Number(range) / 100;
+    const down = Math.log(1 - pct) / Math.log(1.0001);
+    const up = Math.log(1 + pct) / Math.log(1.0001);
+    return [Math.floor((view.tick + down) / spacing) * spacing, Math.ceil((view.tick + up) / spacing) * spacing];
+  }
+
+  function missingSide() {
+    const lp = state.lp;
+    const view = lp.view;
+    if (!view || (lp.op !== "mint" && lp.op !== "increase")) return null;
+    const other = lp.side === 0 ? view.token1 : view.token0;
+    if (BigInt(other.balance) > 0n) return null;
+    let [lower, upper] = lp.op === "mint" ? rangeTicks(view, lp.range) : [null, null];
+    if (lp.op === "increase") {
+      const position = lpPosition();
+      if (!position) return null;
+      [lower, upper] = [position.tick_lower, position.tick_upper];
+    }
+    const inRange = view.tick >= lower && view.tick < upper;
+    const needsOther = inRange || (lp.side === 0 ? view.tick >= upper : view.tick < lower);
+    return needsOther ? other.symbol : null;
+  }
+
+  function lpPayload() {
+    const lp = state.lp;
+    const view = lp.view;
+    if (!view || missingSide()) return null;
+    if (view.pool_id !== lp.poolId) return null;
+    const base = { kind: "lp", op: lp.op, pool_id: view.pool_id, slippage_bps: state.slippage };
+    if (lp.op === "collect") return lp.tokenId ? { ...base, token_id: lp.tokenId } : null;
+    if (lp.op === "decrease") {
+      const position = lpPosition();
+      if (!position) return null;
+      const liquidity = BigInt(position.liquidity) * BigInt(lp.pct) / 100n;
+      return liquidity > 0n ? { ...base, token_id: lp.tokenId, liquidity: liquidity.toString() } : null;
+    }
+    const entered = lp.side === 0 ? view.token0 : view.token1;
+    const other = lp.side === 0 ? view.token1 : view.token0;
+    const raw = lp.amount ? toRaw(lp.amount, entered.decimals) : null;
+    if (raw == null || raw <= 0n) return null;
+    const cap = lp.caps ? BigInt(lp.caps[1 - lp.side]) : BigInt(other.balance);
+    const amounts = lp.side === 0 ? [raw, cap] : [cap, raw];
+    const payload = { ...base, amount0: amounts[0].toString(), amount1: amounts[1].toString() };
+    if (lp.op === "mint") {
+      const [lower, upper] = rangeTicks(view, lp.range);
+      return { ...payload, tick_lower: lower, tick_upper: upper };
+    }
+    return { ...payload, token_id: lp.tokenId };
+  }
+
   function settled() {
     return state.phase === "confirmed" || state.phase === "failed";
   }
@@ -156,7 +274,9 @@
   async function requestQuote() {
     if (busy() || settled() || !dialog.open) return;
     const raw = amountRaw();
-    if (!entitled() || !state.token || raw == null || (state.txStatus && !state.txStatus.enabled)) {
+    const lpBody = state.mode === "lp" ? lpPayload() : null;
+    const ready = state.mode === "lp" ? lpBody != null : state.token && raw != null;
+    if (!entitled() || !ready || (state.txStatus && !state.txStatus.enabled)) {
       clearQuote();
       if (!busy()) state.phase = "idle";
       return render();
@@ -165,11 +285,19 @@
     if (!state.quote) state.phase = "quoting";
     renderCta();
     try {
-      const quote = await api("/api/tx/quote", {
+      const quote = await api("/api/tx/quote", state.mode === "lp" ? lpBody : {
         kind: "swap", side: state.side, token: state.token, quote_currency: state.currency,
         amount_in: raw.toString(), slippage_bps: state.slippage,
       });
       if (seq !== state.seq || busy() || settled()) return;
+      if (state.mode === "lp" && (state.lp.op === "mint" || state.lp.op === "increase") && !state.lp.caps) {
+        const buffer = (value) => (BigInt(value) * BigInt(10000 + state.slippage) / 10000n + 1n).toString();
+        const view = state.lp.view;
+        const capped = [buffer(quote.amounts.amount0), buffer(quote.amounts.amount1)];
+        const balances = [view.token0.balance, view.token1.balance];
+        state.lp.caps = capped.map((value, index) => (BigInt(value) > BigInt(balances[index]) ? balances[index] : value));
+        return requestQuote();
+      }
       state.quote = quote;
       state.phase = "quoted";
       if (!state.keepNote) state.note = null;
@@ -178,9 +306,9 @@
     } catch (error) {
       if (seq !== state.seq) return;
       clearQuote();
-      if (error.status === 422) {
+      if (error.status === 422 || error.status === 400) {
         state.phase = "refused";
-        state.note = REFUSALS[error.data.refusal] || error.data.detail || error.data.refusal;
+        state.note = REFUSALS[error.data.refusal] || error.data.detail || error.data.refusal || error.data.error;
       } else if (error.status === 401 || error.status === 403) {
         state.phase = "idle";
         if (window.rhpGate) window.rhpGate.refresh();
@@ -209,6 +337,10 @@
   async function execute() {
     let quote = state.quote;
     if (!quote) return;
+    if (quote.kind === "lp" && (!state.lp.view || quote.pool_id !== state.lp.poolId)) {
+      clearQuote();
+      return render();
+    }
     const wallet = gate().wallet;
     state.note = null;
     try {
@@ -260,13 +392,18 @@
     const until = Date.now() + 180000;
     while (Date.now() < until) {
       try {
-        const fill = await api("/api/tx/receipt?feature=trade&hash=" + hash);
+        const fill = await api("/api/tx/receipt?feature=" + feature() + "&hash=" + hash);
         if (fill.status === "confirmed" || fill.status === "failed") {
           state.fill = fill;
           state.phase = fill.status;
           if (fill.status === "failed") state.note = "reverted on chain: price moved past min received, or the quote expired";
+          if (fill.status === "confirmed" && state.mode === "lp" && fill.amounts && fill.amounts.token_id != null) {
+            rememberId(fill.amounts.token_id);
+            state.lp.tokenId = String(fill.amounts.token_id);
+          }
           render();
-          loadBalances();
+          if (state.mode === "lp") loadPool();
+          else loadBalances();
           return;
         }
       } catch (_) {
@@ -285,8 +422,12 @@
     state.fill = null;
     state.note = null;
     state.amount = "";
+    state.lp.amount = "";
+    state.lp.caps = null;
+    if (refs.lpAmount) refs.lpAmount.value = "";
     clearQuote();
     render();
+    if (state.mode === "lp") loadPool();
   }
 
   function segment(options, current, onpick) {
@@ -390,6 +531,86 @@
     renderResults();
   }
 
+  function lpChange(mutate) {
+    mutate(state.lp);
+    state.lp.caps = null;
+    clearQuote();
+    state.phase = "idle";
+    renderLpForm();
+    render();
+    scheduleQuote(0);
+  }
+
+  function positionLabel(view, position) {
+    const inRange = view.tick >= position.tick_lower && view.tick < position.tick_upper;
+    const low = formatPrice(priceOf(view, position.tick_lower));
+    const high = formatPrice(priceOf(view, position.tick_upper));
+    return "#" + position.token_id + "  " + low + "–" + high + (inRange ? "  in range" : "  out of range") + (BigInt(position.liquidity) === 0n ? "  empty" : "");
+  }
+
+  function renderLpForm() {
+    const lp = state.lp;
+    const view = lp.view;
+    if (!refs.lpForm) return;
+    const rows = [el("label", { text: "pool" }), el("div", {}, [
+      el("div", { class: "gate-row" }, [refs.lpPool]),
+      view ? el("span", { class: "note", text: view.token0.symbol + " / " + view.token1.symbol + " · " + view.venue + " " + (view.pons ? "pons" : view.fee_ppm & 0x800000 ? "dynamic fee" : view.fee_ppm / 10000 + "%") +
+        " · 1 " + view.token0.symbol + " = " + formatPrice(priceOf(view, view.tick)) + " " + view.token1.symbol }) : null,
+    ])];
+    if (view) {
+      const choices = [["", "new position"], ...view.positions.map((pos) => [pos.token_id, positionLabel(view, pos)])];
+      rows.push(el("label", { text: "position" }), el("ul", { class: "trade-results" }, choices.map(([id, label]) => el("li", {}, [
+        el("button", { type: "button", class: "seg", "aria-pressed": String((lp.tokenId || "") === id), text: label, onclick: () => lpChange((s) => {
+          s.tokenId = id || null;
+          s.op = id ? "increase" : "mint";
+        }) }),
+      ]))));
+      const ops = lp.tokenId ? [["increase", "ADD"], ["decrease", "REMOVE"], ["collect", "COLLECT"]] : [["mint", "MINT"]];
+      rows.push(el("label", { text: "action" }), segment(ops, lp.op, (value) => lpChange((s) => { s.op = value; })));
+      const adding = lp.op === "mint" || lp.op === "increase";
+      if (adding && view.pons) {
+        rows.push(el("span"), el("p", { class: "trade-refusal", text: REFUSALS.pons_add }));
+      } else if (adding) {
+        if (lp.op === "mint") {
+          const [lower, upper] = rangeTicks(view, lp.range);
+          rows.push(el("label", { text: "range" }), el("div", {}, [
+            segment(LP_RANGES, lp.range, (value) => lpChange((s) => { s.range = value; })),
+            el("span", { class: "note", text: formatPrice(priceOf(view, lower)) + " – " + formatPrice(priceOf(view, upper)) + " " + view.token1.symbol + " per " + view.token0.symbol }),
+          ]));
+        }
+        const entered = lp.side === 0 ? view.token0 : view.token1;
+        rows.push(el("label", { text: "deposit" }), el("div", {}, [
+          el("div", { class: "gate-row" }, [refs.lpAmount, segment([[0, view.token0.symbol], [1, view.token1.symbol]], lp.side, (value) => lpChange((s) => {
+            s.side = value;
+            s.amount = "";
+            refs.lpAmount.value = "";
+          }))]),
+          el("span", { class: "note", text: "bal " + fromRaw(entered.balance, entered.decimals) + " " + entered.symbol + " · the other side is sized by the range" }),
+        ]));
+      } else if (lp.op === "decrease") {
+        rows.push(el("label", { text: "remove" }), segment(LP_PCTS.map((pct) => [pct, pct + "%"]), lp.pct, (value) => lpChange((s) => { s.pct = value; })));
+      }
+    }
+    refs.lpForm.replaceChildren(el("div", { class: "trade-form" }, rows));
+  }
+
+  function setMode(mode) {
+    state.mode = mode;
+    clearQuote();
+    state.phase = "idle";
+    state.note = null;
+    refs.mode.replaceWith(refs.mode = segment([["swap", "SWAP"], ["lp", "LIQUIDITY"]], mode, setMode));
+    refs.swapForm.hidden = mode !== "swap";
+    refs.lpForm.hidden = mode !== "lp";
+    document.getElementById("trade-dialog-title").textContent = mode === "lp" ? "LIQUIDITY" : "TRADE";
+    if (mode === "lp") {
+      renderLpForm();
+      loadPool();
+    }
+    render();
+    scheduleQuote(0);
+  }
+
   function buildForm() {
     refs.token = el("input", { type: "text", class: "trade-token", placeholder: "symbol or 0x token address", autocomplete: "off", spellcheck: "false", "aria-label": "token", oninput: onTokenInput });
     refs.results = el("ul", { class: "trade-results" });
@@ -409,8 +630,24 @@
     refs.quote = el("section", { class: "gate-section trade-quote" });
     refs.cta = el("button", { type: "submit", class: "trade-cta" });
     refs.status = el("p", { class: "trade-status note", "aria-live": "polite" });
+    refs.mode = el("div");
+    refs.lpForm = el("section", { class: "gate-section", hidden: true });
+    refs.lpPool = el("input", { type: "text", class: "trade-token", placeholder: "0x pool id or address", autocomplete: "off", spellcheck: "false", "aria-label": "pool", onchange: (event) => {
+      const value = event.target.value.trim().toLowerCase();
+      if (/^0x[0-9a-f]{40}$|^0x[0-9a-f]{64}$/.test(value)) lpChange((s) => { s.poolId = value; s.view = null; s.tokenId = null; s.op = "mint"; s.amount = ""; refs.lpAmount.value = ""; });
+      loadPool();
+    } });
+    refs.lpAmount = el("input", { type: "text", class: "trade-amount", inputmode: "decimal", placeholder: "0.0", autocomplete: "off", "aria-label": "deposit amount", oninput: (event) => {
+      state.lp.amount = event.target.value;
+      state.lp.caps = null;
+      clearQuote();
+      state.phase = "idle";
+      renderCta();
+      scheduleQuote();
+    } });
     body.replaceChildren(
-      el("section", { class: "gate-section" }, [
+      el("section", { class: "gate-section" }, [refs.mode]),
+      refs.swapForm = el("section", { class: "gate-section" }, [
         el("div", { class: "trade-form" }, [
           el("label", { text: "token" }), el("div", {}, [el("div", { class: "gate-row" }, [refs.token]), refs.results]),
           el("label", { text: "side" }), refs.side,
@@ -419,9 +656,11 @@
           el("label", { text: "slippage" }), refs.slippage,
         ]),
       ]),
+      refs.lpForm,
       refs.quote,
       el("section", { class: "gate-section" }, [refs.cta, refs.status]),
     );
+    refs.mode.replaceWith(refs.mode = segment([["swap", "SWAP"], ["lp", "LIQUIDITY"]], state.mode, setMode));
     renderForm();
   }
 
@@ -429,7 +668,7 @@
     const parts = [symbolOf(quote.hops[0].currency_in)];
     for (const hop of quote.hops) {
       const pons = hop.hook_fee_bps || hop.creator_tax_bps;
-      parts.push(hop.venue + (pons ? " pons" : " " + (hop.fee_ppm / 10000) + "%"));
+      parts.push(hop.venue + (pons ? " pons" : hop.fee_ppm & 0x800000 ? " dyn" : " " + (hop.fee_ppm / 10000) + "%"));
       parts.push(symbolOf(hop.currency_out));
     }
     return parts.join(" → ");
@@ -444,12 +683,42 @@
     ]);
   }
 
+  function renderLpQuote(quote) {
+    const view = state.lp.view;
+    const a = quote.amounts;
+    const t0 = view.token0, t1 = view.token1;
+    const op = quote.intent.op;
+    const adding = op === "mint" || op === "increase";
+    const verb = adding ? "deposit" : op === "collect" ? "collect" : "withdraw";
+    const bound = adding && view.venue === "v4" ? "max" : "min";
+    const amount = (value, token) => fromRaw(value, token.decimals) + " " + token.symbol;
+    refs.quote.replaceChildren(el("table", { class: "gate-table" }, [el("tbody", {}, [
+      el("tr", {}, [el("th", { text: verb }), el("td", {}), el("td", { class: "numeric", text: amount(a.amount0, t0) })]),
+      el("tr", {}, [el("th", {}), el("td", {}), el("td", { class: "numeric", text: amount(a.amount1, t1) })]),
+      op === "collect" ? null : el("tr", {}, [el("th", { text: bound }), el("td", { class: "dim", text: state.slippage / 100 + "% slippage" }), el("td", { class: "numeric", text: amount(a.bound0, t0) + " · " + amount(a.bound1, t1) })]),
+      a.fees0 != null ? el("tr", {}, [el("th", { text: "fees" }), el("td", {}), el("td", { class: "numeric", text: amount(a.fees0, t0) + " · " + amount(a.fees1 || "0", t1) })]) : null,
+      el("tr", {}, [el("th", { text: "manager" }), el("td", { class: "dim", text: view.venue === "v4" ? "Uniswap v4 positions" : "V3 positions NFT" }), el("td", { class: "numeric dim", text: short(quote.manager) })]),
+      el("tr", {}, [el("th", { text: "quote" }), el("td", { class: "dim", text: "block " + quote.block.number }), el("td", { class: "numeric dim" }, [refs.expiry = el("span")])]),
+    ])]));
+    tick();
+  }
+
   function renderQuote() {
     const quote = state.quote;
     if (!quote || state.phase === "confirmed") {
       refs.quote.replaceChildren();
       refs.quote.hidden = true;
       return;
+    }
+    if (quote.kind === "lp") {
+      if (!state.lp.view || quote.pool_id !== state.lp.view.pool_id) {
+        clearQuote();
+        refs.quote.replaceChildren();
+        refs.quote.hidden = true;
+        return;
+      }
+      refs.quote.hidden = false;
+      return renderLpQuote(quote);
     }
     refs.quote.hidden = false;
     const amounts = quote.amounts;
@@ -487,25 +756,40 @@
     if (Number(g.chain) !== CHAIN_ID) return { label: "switch to chain 4663", action: () => window.rhpGate.switchChain() };
     if (!me.signed_in) return { label: "sign in", action: () => window.rhpGate.signIn() };
     if (me.state === "unset") return { label: "token not launched yet", disabled: true };
-    if (!(me.features || []).includes("trade")) {
+    if (!(me.features || []).includes(feature())) {
       const policy = me.policy || {};
-      const need = policy.threshold ? fromRaw(policy.threshold.trade, policy.decimals || 18, 2) : "the threshold";
-      return { label: "hold ≥ " + need + " tokens to trade", action: () => window.rhpGate.open() };
+      const need = policy.threshold ? fromRaw(policy.threshold[feature()], policy.decimals || 18, 2) : "the threshold";
+      return { label: "hold ≥ " + need + " tokens to " + (state.mode === "lp" ? "manage liquidity" : "trade"), action: () => window.rhpGate.open() };
     }
     if (state.txStatus && !state.txStatus.enabled) return { label: state.txStatus.reason || "trading is not enabled", disabled: true };
     const busyLabels = {
       approving: "approve " + symbolOf(currencyIn()) + " in wallet (once per token)…",
       permit: "sign permit in wallet…", preparing: "checking the exact transaction…",
-      confirming: "confirm " + state.side + " in wallet…", pending: "pending on chain…",
+      confirming: "confirm " + (state.mode === "lp" ? "liquidity change" : state.side) + " in wallet…", pending: "pending on chain…",
     };
+    if (state.mode === "lp") busyLabels.approving = "approve pool tokens in wallet…";
     if (busyLabels[state.phase]) return { label: busyLabels[state.phase], disabled: true };
     if (state.phase === "confirmed" || state.phase === "failed") return { label: "new trade", action: reset };
-    if (!state.token) return { label: "pick a token", disabled: true };
-    if (amountRaw() == null) return { label: "enter an amount", disabled: true };
+    if (state.mode === "lp") {
+      const lp = state.lp;
+      if (!lp.poolId) return { label: "pick a pool", disabled: true };
+      if (!lp.view) return { label: state.note ? "pool unavailable" : "loading pool…", disabled: true };
+      if ((lp.op === "mint" || lp.op === "increase") && lp.view.pons) return { label: "adds refused on Pons pools", disabled: true };
+      const missing = missingSide();
+      if (missing) return { label: "this range also needs " + missing + "; your balance is 0", disabled: true };
+      if (lpPayload() == null) return { label: lp.op === "decrease" || lp.op === "collect" ? "pick a position" : "enter a deposit amount", disabled: true };
+    } else {
+      if (!state.token) return { label: "pick a token", disabled: true };
+      if (amountRaw() == null) return { label: "enter an amount", disabled: true };
+    }
     if (state.phase === "quoting") return { label: "quoting…", disabled: true };
     if (state.phase === "refused") return { label: "not tradable", disabled: true };
     if (!state.quote) return { label: "quoting…", disabled: true };
     if (state.quote.expires_at - Date.now() / 1000 <= 3) return { label: "refreshing quote…", disabled: true };
+    if (state.mode === "lp") {
+      const labels = { mint: "mint position", increase: "add liquidity", decrease: "remove " + state.lp.pct + "%", collect: "collect fees" };
+      return { label: labels[state.lp.op], action: execute };
+    }
     return { label: state.side + " " + symbolOf(state.token), action: execute };
   }
 
@@ -516,7 +800,12 @@
     refs.cta.onclick = next.action ? (event) => { event.preventDefault(); next.action(); } : (event) => event.preventDefault();
     const parts = [];
     if (state.phase === "refused" && state.note) parts.push(el("span", { class: "trade-refusal", text: state.note }));
-    else if (state.phase === "confirmed" && state.fill && state.fill.amounts) {
+    else if (state.phase === "confirmed" && state.mode === "lp" && state.fill && state.fill.amounts && state.lp.view) {
+      const a = state.fill.amounts, v = state.lp.view;
+      const verb = { mint: "deposited", increase: "deposited", decrease: "withdrew", collect: "collected" }[state.quote ? state.quote.intent.op : state.lp.op] || "done";
+      parts.push(el("span", { class: "good", text: verb + " " + fromRaw(a.amount0, v.token0.decimals) + " " + v.token0.symbol + " + " + fromRaw(a.amount1, v.token1.decimals) + " " + v.token1.symbol +
+        (a.token_id != null ? " · position #" + a.token_id : "") + " · " }));
+    } else if (state.phase === "confirmed" && state.fill && state.fill.amounts) {
       const amounts = state.fill.amounts;
       const fee = amounts.rhpools_fee;
       parts.push(el("span", { class: "good", text: "received " + fromRaw(amounts.net_out, decimalsOf(currencyOut())) + " " + symbolOf(currencyOut()) +
@@ -535,12 +824,23 @@
 
   async function open(options) {
     if (!dialog.open) dialog.showModal();
+    if (options && options.pool) {
+      Object.assign(state.lp, { poolId: String(options.pool).toLowerCase(), view: null, tokenId: null, op: "mint", amount: "", caps: null });
+      refs.lpPool.value = state.lp.poolId;
+      refs.lpAmount.value = "";
+      clearQuote();
+      state.phase = "idle";
+      state.hash = null;
+      state.fill = null;
+    }
+    if (options && options.mode && options.mode !== state.mode) setMode(options.mode);
+    else if (state.mode === "lp") loadPool();
     if (options && options.token && ADDRESS_RE.test(options.token)) pickToken(options.token, options.label || null);
     if (!state.txStatus) {
       try { state.txStatus = await api("/api/tx/status"); } catch (_) { state.txStatus = null; }
     }
     render();
-    if (!options || !options.token) refs.token.focus();
+    if (state.mode === "swap" && (!options || !options.token)) refs.token.focus();
     loadBalances();
   }
 
@@ -561,8 +861,28 @@
   document.addEventListener("rhp:gate", () => {
     if (!dialog.open) return;
     render();
-    if (entitled() && state.token && !state.meta[state.token]) loadBalances();
+    if (entitled("trade") && state.token && !state.meta[state.token]) loadBalances();
+    if (state.mode === "lp" && entitled("lp") && state.lp.poolId && !state.lp.view) loadPool();
   });
+  async function openFromInspector(mode) {
+    const link = document.getElementById("pool-inspector-new-tab");
+    const match = link && /[?&]id=(0x[0-9a-fA-F]+)/.exec(link.getAttribute("href") || "");
+    if (!match) return open({ mode: mode });
+    const pool = match[1].toLowerCase();
+    if (mode === "lp") return open({ mode: "lp", pool: pool });
+    try {
+      const view = await api("/api/tx/pool?feature=trade&pool_id=" + pool);
+      const quoteSide = [NATIVE, WETH, USDG];
+      const token = quoteSide.includes(view.token0.address) ? view.token1 : view.token0;
+      return open({ mode: "swap", token: token.address, label: token.symbol });
+    } catch (_) {
+      return open({ mode: "swap" });
+    }
+  }
+  for (const [id, mode] of [["pool-inspector-trade", "swap"], ["pool-inspector-lp", "lp"]]) {
+    const button = document.getElementById(id);
+    if (button) button.addEventListener("click", () => openFromInspector(mode));
+  }
   const nav = document.getElementById("trade-nav");
   if (nav) nav.addEventListener("click", (event) => { event.preventDefault(); open(); });
   document.addEventListener("keydown", (event) => {

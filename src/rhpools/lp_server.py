@@ -81,7 +81,7 @@ _LANE_SHARE = {"fast": 1.0, "slow": 0.5, "keyed": 0.5}
 _GATE_GET = {"/api/gate/nonce", "/api/gate/me", "/api/gate/keys", "/api/gate/policy"}
 _GATE_POST = {"/api/gate/session", "/api/gate/keys", "/api/gate/logout", "/api/gate/policy"}
 KEYED_STREAM = "/api/v1/stream"
-_TX_GET = {"/api/tx/status", "/api/tx/receipt", "/api/tx/balances"}
+_TX_GET = {"/api/tx/status", "/api/tx/receipt", "/api/tx/balances", "/api/tx/pool"}
 _TX_POST = {"/api/tx/quote", "/api/tx/prepare"}
 TX_FEE_BPS = 75
 TAGS_PATH = "/api/v1/tags"
@@ -985,6 +985,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/tx/balances":
                 currencies = [c for c in str(query.get("currencies") or "").split(",") if c]
                 return self._json(200, {"wallet": principal.wallet, "balances": core.balances(principal.wallet, currencies)}, private=True)
+            if path == "/api/tx/pool":
+                known = tuple(int(i) for i in str(query.get("ids") or "").split(",") if i.isdigit())
+                return self._json(200, core.pool_view(str(query.get("pool_id") or ""), principal.wallet, known), private=True)
             return self._json(200, core.receipt(str(query.get("hash") or ""), principal.wallet).to_json(), private=True)
         except GateRefusal as refusal:
             self._refuse(refusal)
