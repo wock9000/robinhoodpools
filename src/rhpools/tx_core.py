@@ -1,12 +1,4 @@
-"""The shared transaction core: quote, prepare, receipt. Never signs, never sends.
-
-Quotes simulate the exact plan with eth_simulateV1 at a pinned block from the
-user's address (allowances staged inside the simulated block), reconcile the
-logs to the wei, and live 60 s in process. Prepare re-checks the target code
-hashes, the pinned block, the allowance, finalizes min-out plus permit, and
-re-simulates the final bytes. Receipt decodes what landed from the transaction
-calldata and its logs with the same accounting used for quotes.
-"""
+"""The shared transaction core. Never signs, never sends; the wallet signs what it is handed."""
 from __future__ import annotations
 
 import hashlib
@@ -21,7 +13,7 @@ from typing import Any
 from . import tx_allowlist
 from .tx_chain import (
     ADD_GOVERNING_FLAGS, CHAIN_ID, MSG_SENDER, NATIVE, NFPM_BY_FACTORY, NFPM_GIGA, NFPM_PANCAKE,
-    NFPM_UNISWAP, PERMIT2, PONS_HOOK, POOL_MANAGER, POSM, STATE_VIEW, UR, NfpmCollect,
+    NFPM_UNISWAP, PERMIT2, PONS_HOOK, POSM, STATE_VIEW, UR, NfpmCollect,
     NfpmDecrease, NfpmIncrease, NfpmMint, PayPortion, Permit2TransferFrom, PoolKey, PosmDecrease,
     PosmIncrease, PosmMint, RevertKind, SEL_MULTICALL, SEL_POSM_PERMIT_BATCH, Sweep, UnwrapWeth, V2Swap, V3Swap, V4Swap,
     V4SwapExactInSingle, decode_multicall, decode_nfpm_call, decode_posm_modify_liquidities,
@@ -31,7 +23,7 @@ from .tx_chain import (
 )
 from .tx_plan import (
     Amounts, Call, FeeLeg, Ledger, LpAmounts, LpIntent, LpOp, LpPlanner, LpShape, Plan,
-    PositionState, Signatures, SwapBody, SwapIntent, SwapPlanner, SwapShape, TxError, TxPolicy,
+    PositionState, Signatures, SwapIntent, SwapPlanner, SwapShape, TxError, TxPolicy,
     TxRefusal, impact_bps, min_out_for, swap_amounts,
 )
 from .tx_routes import QUOTE_CURRENCIES, Hop, Pool, Route, RouteBook, Side, Venue, v4_pool

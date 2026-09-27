@@ -1,7 +1,6 @@
 """End-to-end proofs on an anvil fork of Robinhood Chain (skipped without anvil or a fork RPC).
 
-Every test drives TxCore exactly as the server will: quote -> wallet steps ->
-prepare -> send -> receipt, from a fresh EOA funded with anvil_setBalance (the
+Every test drives TxCore from a fresh EOA funded with anvil_setBalance (the
 anvil dev accounts carry EIP-7702 code on chain 4663 and Permit2 would route
 their signatures through ERC-1271). Amounts are checked against balance deltas
 to the wei.
@@ -259,7 +258,6 @@ def swap(wallet: str, side: Side, token: str, quote_currency: str, amount_in: in
 
 
 def expect_steps(fork: Fork, quote, permit_tokens: dict[str, int]) -> None:
-    """The one-time ERC-20 -> Permit2 approval appears only while the allowance is short."""
     approvals = sum(1 for t, amount in permit_tokens.items() if int.from_bytes(fork.call(t, tc.erc20_allowance(fork.user, tc.PERMIT2)), "big") < amount)
     permit = ["permit"] if permit_tokens else []
     assert [s.kind for s in quote.steps] == ["approve"] * approvals + permit + ["send"]

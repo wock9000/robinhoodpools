@@ -39,7 +39,6 @@ def code_hash(code_hex: Any) -> str:
 
 
 def verify(rpc: Any, block: str = "latest") -> tuple[Mismatch, ...]:
-    """Return every pinned target whose code at ``block`` does not hash to its pin."""
     found: list[Mismatch] = []
     for address, expected in CODE_HASHES.items():
         actual = code_hash(rpc.call("eth_getCode", [address, block]))

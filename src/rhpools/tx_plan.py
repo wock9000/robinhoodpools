@@ -1,6 +1,4 @@
-"""Intent + route -> Plan (typed calldata); logs -> Amounts. Pure.
-
-A swap Plan is a tuple of typed UniversalRouter commands; ``min_out`` lives in
+"""A swap Plan is a tuple of typed UniversalRouter commands; ``min_out`` lives in
 exactly one command and the Permit2 permit is prepended at finalize. LP plans
 target a V3 NFPM or the V4 PositionManager. Accounting reads venue Swap logs,
 ERC-20 Transfer logs and (under eth_simulateV1 traceTransfers) native
@@ -157,8 +155,6 @@ class Fee:
 
 @dataclass(frozen=True)
 class SwapShape:
-    """What accounting needs to know about a swap, derivable from a Plan or from calldata."""
-
     wallet: str
     route: Route
     currency_in: str
@@ -318,8 +314,6 @@ class SwapLog:
 
 
 class Ledger:
-    """Indexed logs of one execution: transfers, swaps and liquidity events."""
-
     def __init__(self, logs: list[dict[str, Any]], *, traced: bool, native_flows: dict[str, int] | None = None) -> None:
         """``traced`` says the logs came from eth_simulateV1 with traceTransfers, so native moves are complete."""
         self.transfers: list[tuple[str, str, str, int]] = []
@@ -374,7 +368,7 @@ class Ledger:
         return sum(a for c, f, t, a in self.transfers if c == currency and f == who and t != who)
 
     def flow(self, currency: str, who: str) -> int:
-        """Net gain of ``who`` in ``currency``; native falls back to a supplied balance delta."""
+        """Native falls back to the supplied balance delta when the logs were not traced."""
         if currency == NATIVE and not self.native_traced:
             try:
                 return self._native_flows[who.lower()]

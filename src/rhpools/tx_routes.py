@@ -124,7 +124,7 @@ class UnknownHook(RuntimeError):
 
 
 def _pool_from_row(row: tuple[Any, ...]) -> Pool | None:
-    """Parse one ``pools`` row; a V4 row whose id is not keccak(PoolKey) describes a pool it is not and is dropped."""
+    """A V4 row whose id is not keccak(PoolKey) describes a pool it is not and is dropped."""
     id_, protocol, address, token0, token1, fee_ppm, tick_spacing, hook, factory = row[:9]
     pool = Pool(
         venue=Venue(protocol),
@@ -182,7 +182,7 @@ class RouteBook:
         return _pool_from_row(row) if row else None
 
     def pool_for(self, venue: Venue, token_a: str, token_b: str, fee_ppm: int | None = None, factory: str | None = None) -> Pool | None:
-        """Find a pool by pair; ``factory`` narrows to one deployer, else only UR-swappable pools match."""
+        """``factory`` narrows to one deployer; without it only UR-swappable pools match."""
         token0, token1 = sorted((token_a.lower(), token_b.lower()))
 
         def accepts(pool: Pool) -> bool:

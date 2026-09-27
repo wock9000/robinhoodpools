@@ -1,6 +1,4 @@
-"""Pinned Robinhood Chain transaction targets, calldata encoders and decoders.
-
-Pure: no RPC, no clock, no policy. Every byte layout here was executed on an
+"""Pure: no RPC, no clock, no policy. Every byte layout here was executed on an
 anvil fork of the chain and is pinned by tests/test_tx_chain.py.
 """
 from __future__ import annotations
@@ -823,8 +821,8 @@ _KNOWN_SELECTORS: dict[bytes, str] = {
     selector("V4TooLittleReceived(uint256,uint256)"): "slippage",
     selector("InsufficientETH()"): "slippage",
     selector("InsufficientToken()"): "slippage",
-    selector("MinimumAmountInsufficient(uint256,uint256)"): "slippage",
-    selector("MaximumAmountExceeded(uint256,uint256)"): "slippage",
+    selector("MinimumAmountInsufficient(uint128,uint128)"): "slippage",
+    selector("MaximumAmountExceeded(uint128,uint128)"): "slippage",
     bytes.fromhex("4713c18b"): "slippage",
     selector("InvalidSignature()"): "bad_signature",
     selector("InvalidSigner()"): "bad_signature",
