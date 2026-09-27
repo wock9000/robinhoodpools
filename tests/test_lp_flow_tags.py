@@ -14,11 +14,11 @@ from rhpools import lp_flow_tags as tags
 
 FIXTURES = Path(__file__).parent / "fixtures" / "flow_tags"
 EXPECTED = {
-    "router_pons": ({"PONS", "FOMO"}, {"pons_hook", "fomo_fill"}),
-    "router_plain": ({"FOMO"}, {"fomo_fill"}),
-    "executor_pons": ({"PONS", "FOMO"}, {"pons_hook", "fomo_fill"}),
-    "entrypoint_sell": ({"FOMO"}, {"fomo_deposit", "fomo_fill"}),
-    "multicall_sell": ({"FOMO"}, {"fomo_deposit", "fomo_fill"}),
+    "router_pons": ({"PONS", "FOMO"}, {"pons_hook", "relay_footprint", "fomo_fill"}),
+    "router_plain": ({"FOMO"}, {"relay_footprint", "fomo_fill"}),
+    "router_eoa_fill": (set(), {"relay_footprint"}),
+    "entrypoint_sell": ({"PONS", "FOMO"}, {"pons_hook", "relay_footprint", "fomo_deposit", "fomo_user_op"}),
+    "multicall_sell": ({"PONS"}, {"pons_hook", "relay_footprint"}),
     "direct_pons": ({"PONS"}, {"pons_hook"}),
     "direct_v3": (set(), set()),
 }
@@ -35,6 +35,13 @@ def pool_of(data):
 
 def envelope_of(data):
     return tags.envelope(data["tx"], data["block_time"], data["footprint_logs"])
+
+
+def fomo_wallets_of(*fixtures):
+    return frozenset(
+        wallet for data in fixtures for wallet, code in data["wallet_codes"].items()
+        if (code or "").lower() == tags.FOMO_WALLET_CODE
+    )
 
 
 def log_matches(log, query):
@@ -54,6 +61,7 @@ class FakeRpc:
         self.transactions = {f["tx"]["hash"].lower(): f["tx"] for f in fixtures}
         self.logs = [log for f in fixtures for log in f["footprint_logs"]]
         self.launches = {f["pool"]["id"]: f["launches_word0_nonzero"] for f in fixtures}
+        self.codes = {wallet: code for f in fixtures for wallet, code in f["wallet_codes"].items()}
         self.calls = []
 
     def batch(self, calls):
@@ -74,6 +82,8 @@ class FakeRpc:
                 pool_id = "0x" + params[0]["data"][len(tags.LAUNCHES_SELECTOR):]
                 word0 = "1" if self.launches.get(pool_id) else "0"
                 results.append("0x" + word0.rjust(64, "0") + "0" * 64)
+            elif method == "eth_getCode":
+                results.append(self.codes.get(params[0].lower(), "0x"))
             else:
                 raise AssertionError(method)
         return results
@@ -85,7 +95,7 @@ class FakeRpc:
 @pytest.mark.parametrize("name", sorted(EXPECTED))
 def test_classify_recorded_envelopes(name):
     data = fixture(name)
-    tag = tags.classify(pool_of(data), envelope_of(data), None)
+    tag = tags.classify(pool_of(data), envelope_of(data), None, fomo_wallets_of(data))
     expected_tags, expected_basis = EXPECTED[name]
     assert set(tag.tags) == expected_tags
     assert set(tag.basis) == expected_basis
@@ -99,14 +109,14 @@ def test_relay_footprint_reads_deposit_order_ids_and_fills():
     deposit = next(log for log in data["footprint_logs"] if log["address"].lower() == tags.DEPOSITORY)
     assert deposit["topics"][0] == tags.TOPIC_DEPOSIT
     assert env.deposit_order_ids == ("0x" + deposit["data"][2 + 3 * 64:2 + 4 * 64],)
-    assert env.executor_fill and env.router_order_id is None
+    assert env.deposit_wallets and env.zero_gas_senders and env.router_order_id is None
     assert env.order_ids == env.deposit_order_ids
 
     removed = [dict(log, removed=True) for log in data["footprint_logs"]]
     anonymous = [{"address": tags.DEPOSITORY, "topics": [], "data": "0x"}]
-    assert tags.relay_footprint(removed + anonymous) == ((), False)
+    assert tags.relay_footprint(removed + anonymous) == tags.RelayFootprint((), (), (), ())
     quiet = tags.envelope(data["tx"], data["block_time"], [])
-    assert not tags.classify(pool_of(data), quiet, None).tags
+    assert "FOMO" not in tags.classify(pool_of(data), quiet, None, fomo_wallets_of(data)).tags
 
 
 def test_router_order_id_is_the_calldata_suffix():
@@ -114,15 +124,23 @@ def test_router_order_id_is_the_calldata_suffix():
     env = envelope_of(data)
     assert env.router_order_id == "0x" + data["tx"]["input"][-64:]
     assert env.order_ids == (env.router_order_id,)
-    assert env.executor_fill and not env.deposit_order_ids
+    assert env.fill_recipients and not env.deposit_order_ids
+
+
+def test_generic_relay_counterparties_are_not_fomo():
+    eoa_fill, other_7702 = fixture("router_eoa_fill"), fixture("multicall_sell")
+    for data in (eoa_fill, other_7702):
+        tag = tags.classify(pool_of(data), envelope_of(data), None, fomo_wallets_of(data))
+        assert "relay_footprint" in tag.basis and "FOMO" not in tag.tags, data["name"]
+    assert tags.classify(pool_of(eoa_fill), envelope_of(eoa_fill), None, frozenset(envelope_of(eoa_fill).fill_recipients)).tags == {"FOMO"}
 
 
 def test_one_transaction_two_pools_keeps_pons_per_pool():
     pons, plain = fixture("router_pons"), fixture("router_plain")
-    assert pons["tx"]["hash"] == plain["tx"]["hash"]
     env = envelope_of(pons)
-    assert tags.classify(pool_of(pons), env, None).tags == {"PONS", "FOMO"}
-    assert tags.classify(pool_of(plain), env, None).tags == {"FOMO"}
+    fomo = fomo_wallets_of(pons)
+    assert tags.classify(pool_of(pons), env, None, fomo).tags == {"PONS", "FOMO"}
+    assert tags.classify(pool_of(plain), env, None, fomo).tags == {"FOMO"}
 
 
 def observation(kind, status="observed", index="1", order_id=None, at=0):
@@ -134,30 +152,28 @@ def test_listener_evidence_and_early_ms():
     env, pool = envelope_of(data), pool_of(data)
     first_seen = env.block_time * 1000 - 1400
     facts = tags.ListenerFacts((observation("destination_transfer"),), first_seen)
-    tag = tags.classify(pool, env, facts)
-    assert tag.basis == {"fomo_fill", "fomo_listener"}
+    tag = tags.classify(pool, env, facts, fomo_wallets_of(data))
+    assert tag.basis == {"relay_footprint", "fomo_fill", "fomo_listener"}
     assert tag.early_ms == 1400
     assert tag.chain_fomo and tag.listener_fomo
 
     late = tags.ListenerFacts((observation("destination_transfer"),), env.block_time * 1000 + 5)
-    assert tags.classify(pool, env, late).early_ms is None
+    assert tags.classify(pool, env, late, fomo_wallets_of(data)).early_ms is None
 
     retracted = tags.ListenerFacts((observation("destination_transfer", "retracted"),), None)
-    assert "fomo_listener" not in tags.classify(pool, env, retracted).basis
+    assert "fomo_listener" not in tags.classify(pool, env, retracted, fomo_wallets_of(data)).basis
 
     generic_op = tags.ListenerFacts((observation("user_operation"),), None)
-    assert "fomo_listener" not in tags.classify(pool, env, generic_op).basis
+    assert "fomo_listener" not in tags.classify(pool, env, generic_op, fomo_wallets_of(data)).basis
 
 
-def test_listener_alone_tags_fomo_and_early_ms_needs_a_fomo_tag():
+def test_listener_alone_does_not_tag_fomo():
     data = fixture("direct_v3")
     env, pool = envelope_of(data), pool_of(data)
     facts = tags.ListenerFacts((observation("payment"),), env.block_time * 1000 - 300)
     tag = tags.classify(pool, env, facts)
-    assert tag.tags == {"FOMO"} and tag.basis == {"fomo_listener"} and tag.early_ms == 300
+    assert tag.tags == set() and tag.basis == {"fomo_listener"}
     assert not tag.chain_fomo and tag.listener_fomo
-    quiet = tags.classify(pool, env, tags.ListenerFacts((), env.block_time * 1000 - 300))
-    assert quiet.tags == set() and quiet.early_ms is None
 
 
 def test_fetch_envelopes_batches_transactions_and_footprint_logs():
@@ -173,7 +189,7 @@ def test_fetch_envelopes_batches_transactions_and_footprint_logs():
     assert rpc.count("eth_getTransactionByHash") == len(unique) + 1
     assert rpc.count("eth_getTransactionReceipt") == 0
     log_queries = [params[0] for method, params in rpc.calls if method == "eth_getLogs"]
-    assert len(log_queries) == 2
+    assert len(log_queries) == 3
     assert {q["fromBlock"] for q in log_queries} == {hex(1)}
     assert {q["toBlock"] for q in log_queries} == {hex(max(block for _h, block, _t in requests))}
     for data in fixtures:
@@ -429,7 +445,8 @@ def test_flow_tagger_classifies_persists_and_reuses(tmp_path):
     result = tagger.tag(rows)
     assert [(set(t.tags), set(t.basis)) for t in result] == [EXPECTED[f["name"]] for f in fixtures]
     assert rpc.count("eth_getTransactionByHash") == len({f["tx"]["hash"] for f in fixtures}) + 1
-    assert rpc.count("eth_getLogs") == 2
+    assert rpc.count("eth_getLogs") == 3
+    assert rpc.count("eth_getCode") == len({w for f in fixtures for w in envelope_of(f).wallets})
     assert rpc.count("eth_call") == len({f["pool"]["id"] for f in fixtures if f["pool"]["hook"] == tags.PONS_HOOK})
 
     calls = len(rpc.calls)

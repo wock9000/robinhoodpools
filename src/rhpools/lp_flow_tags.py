@@ -1,4 +1,10 @@
-"""PONS / FOMO flow tags for live swap and LP events."""
+"""PONS / FOMO flow tags for live swap and LP events.
+
+FOMO means a Relay-routed trade whose counterparty wallet carries FOMO's
+EIP-7702 delegation code (Simple7702Account ``0xe6ca...555b``). Residual risk:
+any wallet that delegates to the same implementation is indistinguishable on
+chain; apollo's own copy wallets (``0x2fbd...4221`` verified) carry it too.
+"""
 from __future__ import annotations
 
 import bisect
@@ -7,17 +13,23 @@ import os
 import sqlite3
 import threading
 import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 PONS = "PONS"
 FOMO = "FOMO"
 BASIS_PONS_HOOK = "pons_hook"
+BASIS_RELAY_FOOTPRINT = "relay_footprint"
 BASIS_FOMO_DEPOSIT = "fomo_deposit"
 BASIS_FOMO_FILL = "fomo_fill"
+BASIS_FOMO_USER_OP = "fomo_user_op"
 BASIS_FOMO_LISTENER = "fomo_listener"
-CHAIN_FOMO_BASIS = frozenset({BASIS_FOMO_DEPOSIT, BASIS_FOMO_FILL})
+CHAIN_FOMO_BASIS = frozenset({BASIS_FOMO_DEPOSIT, BASIS_FOMO_FILL, BASIS_FOMO_USER_OP})
+ALL_BASIS = (
+    BASIS_PONS_HOOK, BASIS_RELAY_FOOTPRINT, BASIS_FOMO_DEPOSIT, BASIS_FOMO_FILL,
+    BASIS_FOMO_USER_OP, BASIS_FOMO_LISTENER,
+)
 
 PONS_HOOK = "0xe5e702641ea86f4ae6cc3cdaed2b886f976be044"
 LAUNCHES_SELECTOR = "0xad091230"
@@ -25,12 +37,18 @@ FOMO_ROUTER = "0xccc88a9d1b4ed6b0eaba998850414b24f1c315be"
 DEPOSITORY = "0x4cd00e387622c35bddb9b4c962c136462338bc31"
 EXECUTOR = "0xb92fe925dc43a0ecde6c8b1a2709c170ec4fff4f"
 EXECUTOR_TOPIC = "0x" + EXECUTOR[2:].rjust(64, "0")
+ENTRYPOINT = "0x4337084d9e255ff0702461cf8895ce9e3b5ff108"
+POOL_MANAGER = "0x8366a39cc670b4001a1121b8f6a443a643e40951"
+RELAY_CONTRACTS = frozenset({FOMO_ROUTER, DEPOSITORY, EXECUTOR, POOL_MANAGER})
+FOMO_WALLET_CODE = "0xef0100e6cae83bde06e4c305530e199d7217f42808555b"
 TOPIC_DEPOSIT = "0x49fed1d0b752ce30eee63c7a81133f3363b532fec5d4d7dd1ccfd005de4555e1"
 TOPIC_NATIVE_DEPOSIT = "0x8032066556caf3967d8fec4ad22a2d9e1e9576556b2903a0fcd5b1fd201e3477"
 TOPIC_TRANSFER = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+TOPIC_USER_OPERATION = "0x49628fd1471006c1482da88028e9ce4dbb080b815c9b0344d39e5a8e6ec1419f"
 LISTENER_FOMO_KINDS = frozenset({"payment", "destination_transfer"})
 
 RETENTION_S = 7 * 24 * 3600
+WALLET_CODE_TTL_S = 7 * 24 * 3600
 LISTENER_WINDOW_S = 1800
 LISTENER_STATEMENT_TIMEOUT_MS = 2000
 LISTENER_RETRY_S = 30.0
@@ -56,7 +74,19 @@ class TxEnvelope:
     tx_type: int
     router_order_id: str | None
     deposit_order_ids: tuple[str, ...]
-    executor_fill: bool
+    deposit_wallets: tuple[str, ...]
+    fill_recipients: tuple[str, ...]
+    zero_gas_senders: tuple[str, ...]
+
+    @property
+    def relay_footprint(self) -> bool:
+        return bool(self.deposit_wallets or self.fill_recipients)
+
+    @property
+    def wallets(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(
+            (*self.deposit_wallets, *self.fill_recipients, *self.zero_gas_senders)
+        ))
 
     @property
     def order_ids(self) -> tuple[str, ...]:
@@ -106,14 +136,21 @@ class FlowTag:
         }
 
 
-def classify(pool: PoolIdentity, env: TxEnvelope, observed: ListenerFacts | None) -> FlowTag:
+def classify(
+    pool: PoolIdentity, env: TxEnvelope, observed: ListenerFacts | None,
+    fomo_wallets: Collection[str] = (),
+) -> FlowTag:
     basis: set[str] = set()
     if pool.pons_registered:
         basis.add(BASIS_PONS_HOOK)
-    if env.deposit_order_ids:
+    if env.relay_footprint:
+        basis.add(BASIS_RELAY_FOOTPRINT)
+    if any(wallet in fomo_wallets for wallet in env.deposit_wallets):
         basis.add(BASIS_FOMO_DEPOSIT)
-    if env.executor_fill:
+    if any(wallet in fomo_wallets for wallet in env.fill_recipients):
         basis.add(BASIS_FOMO_FILL)
+    if env.to == ENTRYPOINT and any(wallet in fomo_wallets for wallet in env.zero_gas_senders):
+        basis.add(BASIS_FOMO_USER_OP)
     early_ms = None
     if observed is not None:
         if any(
@@ -127,7 +164,7 @@ def classify(pool: PoolIdentity, env: TxEnvelope, observed: ListenerFacts | None
     tags: set[str] = set()
     if BASIS_PONS_HOOK in basis:
         tags.add(PONS)
-    if basis - {BASIS_PONS_HOOK}:
+    if basis & CHAIN_FOMO_BASIS:
         tags.add(FOMO)
     return FlowTag(
         env.tx_hash, pool.pool_id, frozenset(tags), frozenset(basis),
@@ -140,29 +177,53 @@ def _word(data: str, index: int) -> str:
     return data[start:start + 64]
 
 
-def relay_footprint(logs: Iterable[Mapping[str, Any]]) -> tuple[tuple[str, ...], bool]:
-    """Relay depository deposits and executor fills, the same logs relay-listener
-    keys its Robinhood observations on."""
+@dataclass(frozen=True, slots=True)
+class RelayFootprint:
+    deposit_order_ids: tuple[str, ...]
+    deposit_wallets: tuple[str, ...]
+    fill_recipients: tuple[str, ...]
+    zero_gas_senders: tuple[str, ...]
+
+
+def relay_footprint(logs: Iterable[Mapping[str, Any]]) -> RelayFootprint:
+    """Relay depository deposits, executor fills and EntryPoint operations: the
+    depository/executor logs are what relay-listener keys its observations on;
+    the zero-gas operation is how FOMO's bundler posts every op (upstream docs)."""
     order_ids: list[str] = []
-    fill = False
+    depositors: list[str] = []
+    recipients: list[str] = []
+    zero_gas: list[str] = []
     for log in logs:
         if log.get("removed"):
             continue
         topics = [str(item).lower() for item in log.get("topics") or ()]
         if not topics:
             continue
-        if str(log["address"]).lower() == DEPOSITORY and topics[0] in (TOPIC_DEPOSIT, TOPIC_NATIVE_DEPOSIT):
-            order_ids.append("0x" + _word(str(log["data"]), 3 if topics[0] == TOPIC_DEPOSIT else 2))
+        address = str(log["address"]).lower()
+        data = str(log.get("data") or "0x")
+        if address == DEPOSITORY and topics[0] in (TOPIC_DEPOSIT, TOPIC_NATIVE_DEPOSIT):
+            order_ids.append("0x" + _word(data, 3 if topics[0] == TOPIC_DEPOSIT else 2))
+            depositors.append("0x" + _word(data, 0)[-40:])
         elif topics[0] == TOPIC_TRANSFER and len(topics) == 3 and topics[1] == EXECUTOR_TOPIC:
-            fill = True
-    return tuple(dict.fromkeys(order_ids)), fill
+            recipient = "0x" + topics[2][-40:]
+            if recipient not in RELAY_CONTRACTS:
+                recipients.append(recipient)
+        elif address == ENTRYPOINT and topics[0] == TOPIC_USER_OPERATION and len(topics) == 4:
+            success = int(_word(data, 1) or "0", 16) == 1
+            gas_cost = int(_word(data, 2) or "0", 16)
+            if success and gas_cost == 0 and int(topics[3], 16) == 0:
+                zero_gas.append("0x" + topics[2][-40:])
+    return RelayFootprint(
+        tuple(dict.fromkeys(order_ids)), tuple(dict.fromkeys(depositors)),
+        tuple(dict.fromkeys(recipients)), tuple(dict.fromkeys(zero_gas)),
+    )
 
 
 def envelope(tx: Mapping[str, Any], block_time: int, logs: Iterable[Mapping[str, Any]]) -> TxEnvelope:
     to = str(tx["to"]).lower() if tx.get("to") else None
     data = str(tx.get("input") or "0x")
     router_order_id = "0x" + data[-64:] if to == FOMO_ROUTER and len(data) >= 66 else None
-    deposit_order_ids, executor_fill = relay_footprint(logs)
+    footprint = relay_footprint(logs)
     return TxEnvelope(
         tx_hash=str(tx["hash"]).lower(),
         block_number=int(str(tx["blockNumber"]), 16),
@@ -171,8 +232,10 @@ def envelope(tx: Mapping[str, Any], block_time: int, logs: Iterable[Mapping[str,
         to=to,
         tx_type=int(str(tx.get("type") or "0x0"), 16),
         router_order_id=router_order_id,
-        deposit_order_ids=deposit_order_ids,
-        executor_fill=executor_fill,
+        deposit_order_ids=footprint.deposit_order_ids,
+        deposit_wallets=footprint.deposit_wallets,
+        fill_recipients=footprint.fill_recipients,
+        zero_gas_senders=footprint.zero_gas_senders,
     )
 
 
@@ -185,6 +248,7 @@ def footprint_filters(from_block: int, to_block: int) -> list[tuple[str, list[An
     return [
         ("eth_getLogs", [{**window, "address": DEPOSITORY, "topics": [[TOPIC_DEPOSIT, TOPIC_NATIVE_DEPOSIT]]}]),
         ("eth_getLogs", [{**window, "topics": [TOPIC_TRANSFER, EXECUTOR_TOPIC]}]),
+        ("eth_getLogs", [{**window, "address": ENTRYPOINT, "topics": [TOPIC_USER_OPERATION]}]),
     ]
 
 
@@ -225,6 +289,9 @@ class TagStore:
         CREATE INDEX IF NOT EXISTS flow_tags_time_idx ON flow_tags(block_time);
         CREATE TABLE IF NOT EXISTS pons_pools(
             pool_id TEXT PRIMARY KEY, registered INTEGER NOT NULL
+        ) WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS wallet_codes(
+            wallet TEXT PRIMARY KEY, fomo INTEGER NOT NULL, checked_at INTEGER NOT NULL
         ) WITHOUT ROWID;
     """
 
@@ -301,7 +368,26 @@ class TagStore:
                 [(pool_id, int(flag)) for pool_id, flag in registrations.items()],
             )
 
+    def wallet_codes(self) -> dict[str, tuple[bool, int]]:
+        with self._lock:
+            return {
+                row["wallet"]: (bool(row["fomo"]), int(row["checked_at"]))
+                for row in self._connection.execute("SELECT wallet,fomo,checked_at FROM wallet_codes")
+            }
+
+    def remember_codes(self, codes: Mapping[str, tuple[bool, int]]) -> None:
+        if not codes:
+            return
+        with self._lock, self._connection:
+            self._connection.executemany(
+                "INSERT OR REPLACE INTO wallet_codes(wallet,fomo,checked_at) VALUES(?,?,?)",
+                [(wallet, int(fomo), int(checked_at)) for wallet, (fomo, checked_at) in codes.items()],
+            )
+
     def status(self) -> dict[str, Any]:
+        basis_sums = ",".join(
+            f"SUM(instr(' '||basis||' ',' {name} ')>0) AS b_{name}" for name in ALL_BASIS
+        )
         with self._lock:
             counts = self._connection.execute(
                 "SELECT COUNT(*) AS rows_total,"
@@ -309,11 +395,14 @@ class TagStore:
                 "SUM(listener_checked) AS compared,"
                 "SUM(listener_checked AND chain_fomo AND listener_fomo) AS agree_fomo,"
                 "SUM(listener_checked AND chain_fomo AND NOT listener_fomo) AS chain_only,"
-                "SUM(listener_checked AND NOT chain_fomo AND listener_fomo) AS listener_only "
-                "FROM flow_tags"
+                "SUM(listener_checked AND NOT chain_fomo AND listener_fomo) AS listener_only,"
+                f"{basis_sums} FROM flow_tags"
             ).fetchone()
             pons_pools = self._connection.execute(
                 "SELECT COUNT(*) AS total,SUM(registered) AS registered FROM pons_pools"
+            ).fetchone()
+            wallets = self._connection.execute(
+                "SELECT COUNT(*) AS total,SUM(fomo) AS fomo FROM wallet_codes"
             ).fetchone()
         compared = int(counts["compared"] or 0)
         disagree = int(counts["chain_only"] or 0) + int(counts["listener_only"] or 0)
@@ -321,9 +410,14 @@ class TagStore:
             "rows": int(counts["rows_total"] or 0),
             "pons": int(counts["pons"] or 0),
             "fomo": int(counts["fomo"] or 0),
+            "basis": {name: int(counts[f"b_{name}"] or 0) for name in ALL_BASIS},
             "pons_pools": {
                 "cached": int(pons_pools["total"] or 0),
                 "registered": int(pons_pools["registered"] or 0),
+            },
+            "wallet_codes": {
+                "cached": int(wallets["total"] or 0),
+                "fomo": int(wallets["fomo"] or 0),
             },
             "fomo_agreement": {
                 "compared": compared,
@@ -375,6 +469,40 @@ class PonsRegistry:
                 )
                 for pool_id, pool in rows.items()
             }
+
+
+class WalletCodes:
+    """eth_getCode per wallet, cached in the tag store; a delegation can change,
+    so entries are re-read after ``ttl_s``."""
+
+    def __init__(
+        self, rpc: Rpc, store: TagStore, *, ttl_s: int = WALLET_CODE_TTL_S,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        self._rpc = rpc
+        self._store = store
+        self._ttl_s = int(ttl_s)
+        self._clock = clock
+        self._cache = store.wallet_codes()
+        self._lock = threading.Lock()
+
+    def fomo(self, wallets: Iterable[str]) -> frozenset[str]:
+        wanted = sorted({wallet.lower() for wallet in wallets})
+        now = int(self._clock())
+        with self._lock:
+            stale = [
+                wallet for wallet in wanted
+                if wallet not in self._cache or self._cache[wallet][1] + self._ttl_s <= now
+            ]
+            if stale:
+                codes = self._rpc.batch([("eth_getCode", [wallet, "latest"]) for wallet in stale])
+                learned = {
+                    wallet: (str(code).lower() == FOMO_WALLET_CODE, now)
+                    for wallet, code in zip(stale, codes)
+                }
+                self._store.remember_codes(learned)
+                self._cache.update(learned)
+            return frozenset(wallet for wallet in wanted if self._cache[wallet][0])
 
 
 class ListenerSource(Protocol):
@@ -659,6 +787,7 @@ class FlowTagger:
         self._listener = listener or NoListener()
         self._clock = clock
         self._registry = PonsRegistry(rpc, store)
+        self._codes = WalletCodes(rpc, store, clock=clock)
 
     def tag(self, rows: Iterable[Mapping[str, Any]]) -> list[FlowTag]:
         wanted: dict[tuple[str, str], tuple[int, int]] = {}
@@ -691,6 +820,9 @@ class FlowTagger:
             row = self._pools(pool_id)
             pool_rows.append(row if row is not None else {"id": pool_id, "protocol": "", "hook": None})
         identities = self._registry.identify(pool_rows)
+        fomo_wallets = self._codes.fomo(
+            wallet for env in envelopes.values() for wallet in env.wallets
+        )
         facts = self._listener.facts(list(envelopes.values()))
         tagged: dict[tuple[str, str], FlowTag] = {}
         stored: list[tuple[FlowTag, int, int, bool]] = []
@@ -699,7 +831,7 @@ class FlowTagger:
             if env is None:
                 continue
             observed = facts.get(tx_hash)
-            tag = classify(identities[pool_id], env, observed)
+            tag = classify(identities[pool_id], env, observed, fomo_wallets)
             tagged[(tx_hash, pool_id)] = tag
             stored.append((tag, block_number, block_time, observed is not None and observed.covered))
         now = int(self._clock())
@@ -712,15 +844,20 @@ class FlowTagger:
 
 
 __all__ = [
+    "ALL_BASIS",
     "BASIS_FOMO_DEPOSIT",
     "BASIS_FOMO_FILL",
     "BASIS_FOMO_LISTENER",
+    "BASIS_FOMO_USER_OP",
     "BASIS_PONS_HOOK",
+    "BASIS_RELAY_FOOTPRINT",
     "CHAIN_FOMO_BASIS",
     "DEPOSITORY",
+    "ENTRYPOINT",
     "EXECUTOR",
     "FOMO",
     "FOMO_ROUTER",
+    "FOMO_WALLET_CODE",
     "FlowTag",
     "FlowTagger",
     "ListenerFacts",
@@ -730,11 +867,16 @@ __all__ = [
     "ObservationWindow",
     "PONS",
     "PONS_HOOK",
+    "POOL_MANAGER",
     "PonsRegistry",
     "PoolIdentity",
     "PostgresListener",
+    "RELAY_CONTRACTS",
+    "RelayFootprint",
+    "TOPIC_USER_OPERATION",
     "TagStore",
     "TxEnvelope",
+    "WalletCodes",
     "classify",
     "envelope",
     "fetch_envelopes",

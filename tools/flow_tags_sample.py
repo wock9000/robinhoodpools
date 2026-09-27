@@ -37,8 +37,6 @@ from rhpools.lp_chain import POOL_MANAGER  # noqa: E402
 SWAP_V4 = "0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f"
 SWAP_V3 = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"
 DEFAULT_MARKET = os.path.expanduser("~/.local/share/rhpools-nocow/lp_market.sqlite")
-FOMO_WALLET_CODE = "0xef0100e6cae83bde06e4c305530e199d7217f42808555b"
-ENTRYPOINT = "0x4337084d9e255ff0702461cf8895ce9e3b5ff108"
 MULTICALL3 = "0xca11bde05977b3631167028862be2a173976ca11"
 
 
@@ -130,31 +128,6 @@ def launches_word0(rpc: HttpRpc, pool_ids: list[str]) -> dict[str, bool]:
     return {pool_id: int(result[2:66], 16) != 0 for pool_id, result in zip(pool_ids, results)}
 
 
-def fill_recipient_codes(rpc: HttpRpc, hashes: list[str]) -> Counter:
-    receipts = rpc.batch([("eth_getTransactionReceipt", [tx_hash]) for tx_hash in hashes])
-    recipients: dict[str, str | None] = {}
-    for tx_hash, receipt in zip(hashes, receipts):
-        last = None
-        for log in receipt["logs"]:
-            topics = log["topics"]
-            if len(topics) == 3 and topics[0] == tags.TOPIC_TRANSFER and topics[1] == tags.EXECUTOR_TOPIC:
-                last = "0x" + topics[2][-40:].lower()
-        recipients[tx_hash] = last
-    wallets = sorted({wallet for wallet in recipients.values() if wallet})
-    codes = dict(zip(wallets, rpc.batch([("eth_getCode", [wallet, "latest"]) for wallet in wallets])))
-    outcome: Counter = Counter()
-    for wallet in recipients.values():
-        if wallet is None:
-            outcome["no_executor_transfer"] += 1
-        elif codes[wallet].lower() == FOMO_WALLET_CODE:
-            outcome["fomo_wallet_code"] += 1
-        elif codes[wallet] == "0x":
-            outcome["plain_eoa"] += 1
-        else:
-            outcome["other_code"] += 1
-    return outcome
-
-
 def measure(args: argparse.Namespace) -> int:
     rpc = HttpRpc(args.rpc)
     db = market(args.market)
@@ -181,9 +154,7 @@ def measure(args: argparse.Namespace) -> int:
     by_key = {(tag.tx_hash, tag.pool_id): tag for tag in result}
     print(f"sampled {len(rows)} swaps over blocks "
           f"{rows[0]['block_number']}..{rows[-1]['block_number']}, tagged {len(result)}")
-    print("chain basis:", dict(Counter(
-        " ".join(sorted(t.basis & tags.CHAIN_FOMO_BASIS)) or "-" for t in result
-    )))
+    print("basis:", dict(Counter(" ".join(sorted(t.basis - {tags.BASIS_PONS_HOOK})) or "-" for t in result)))
     print("tags:", dict(Counter(" ".join(sorted(t.tags)) or "-" for t in result)))
 
     v4_pools = sorted({row["pool_id"] for row in rows if row["pool"]["protocol"] == "v4"})
@@ -197,9 +168,7 @@ def measure(args: argparse.Namespace) -> int:
     for (tx_hash, pool_id), tag in pons_mismatch:
         print("  mismatch", tx_hash, pool_id, sorted(tag.basis), pools[pool_id]["hook"])
 
-    fill_hashes = sorted({t.tx_hash for t in result if tags.BASIS_FOMO_FILL in t.basis})
-    if fill_hashes:
-        print("executor fill recipients:", dict(fill_recipient_codes(rpc, fill_hashes)))
+    print("wallet codes:", json.dumps(status["wallet_codes"]), "basis totals:", json.dumps(status["basis"]))
 
     print("listener:", json.dumps(status["listener"]))
     agreement = status["fomo_agreement"]
@@ -227,38 +196,48 @@ def capture(args: argparse.Namespace) -> int:
     db = market(args.market)
     rows = recent_swaps(rpc, db, 2000)
     hashes = list(dict.fromkeys(row["tx_hash"] for row in rows))
-    transactions = dict(zip(hashes, rpc.batch([("eth_getTransactionByHash", [h]) for h in hashes])))
-    footprint: dict[str, list[dict[str, Any]]] = {h: [] for h in hashes}
+    envelopes = tags.fetch_envelopes(rpc, [(row["tx_hash"], row["block_number"], row["timestamp"]) for row in rows])
+    logs: dict[str, list[dict[str, Any]]] = {h: [] for h in hashes}
     blocks = [row["block_number"] for row in rows]
     for batch in rpc.batch(tags.footprint_filters(min(blocks), max(blocks))):
         for log in batch:
-            if log["transactionHash"].lower() in footprint:
-                footprint[log["transactionHash"].lower()].append(log)
+            if log["transactionHash"].lower() in logs:
+                logs[log["transactionHash"].lower()].append(log)
+    wallets = sorted({wallet for env in envelopes.values() for wallet in env.wallets})
+    codes = dict(zip(wallets, rpc.batch([("eth_getCode", [wallet, "latest"]) for wallet in wallets])))
+    fomo_wallets = {wallet for wallet, code in codes.items() if code.lower() == tags.FOMO_WALLET_CODE}
+    transactions = dict(zip(hashes, rpc.batch([("eth_getTransactionByHash", [h]) for h in hashes])))
     v4_pools = sorted({row["pool_id"] for row in rows if row["pool"]["protocol"] == "v4"})
     registered = launches_word0(rpc, v4_pools)
 
     def pick(name: str, predicate: Any) -> dict[str, Any] | None:
         for row in reversed(rows):
-            tx = transactions[row["tx_hash"]]
-            to = (tx.get("to") or "").lower()
+            env = envelopes.get(row["tx_hash"])
+            if env is None:
+                continue
             pons = registered.get(row["pool_id"], False)
-            deposits, fill = tags.relay_footprint(footprint[row["tx_hash"]])
-            if predicate(to, pons, row, bool(deposits), fill):
+            fomo = bool(fomo_wallets & set(env.wallets))
+            if predicate(env, pons, row, fomo):
                 return {
-                    "name": name, "tx": tx, "footprint_logs": footprint[row["tx_hash"]],
+                    "name": name, "tx": transactions[row["tx_hash"]], "footprint_logs": logs[row["tx_hash"]],
+                    "wallet_codes": {wallet: codes[wallet] for wallet in env.wallets},
                     "block_time": row["timestamp"], "pool": row["pool"],
                     "launches_word0_nonzero": pons,
                 }
         return None
 
+    def fill_only(env: tags.TxEnvelope) -> bool:
+        return bool(env.fill_recipients) and not env.deposit_wallets
+
     wanted = {
-        "router_pons": lambda to, pons, row, dep, fill: to == tags.FOMO_ROUTER and pons and fill and not dep,
-        "router_plain": lambda to, pons, row, dep, fill: to == tags.FOMO_ROUTER and not pons and fill and not dep,
-        "executor_pons": lambda to, pons, row, dep, fill: to == tags.EXECUTOR and pons and fill and not dep,
-        "entrypoint_sell": lambda to, pons, row, dep, fill: to == ENTRYPOINT and dep and fill,
-        "multicall_sell": lambda to, pons, row, dep, fill: to == MULTICALL3 and dep,
-        "direct_pons": lambda to, pons, row, dep, fill: pons and not dep and not fill,
-        "direct_v3": lambda to, pons, row, dep, fill: row["pool"]["protocol"] == "v3" and not dep and not fill,
+        "router_pons": lambda env, pons, row, fomo: env.to == tags.FOMO_ROUTER and pons and fill_only(env) and fomo,
+        "router_plain": lambda env, pons, row, fomo: env.to == tags.FOMO_ROUTER and not pons and fill_only(env) and fomo,
+        "router_eoa_fill": lambda env, pons, row, fomo: env.to == tags.FOMO_ROUTER and fill_only(env) and not fomo,
+        "entrypoint_sell": lambda env, pons, row, fomo: env.to == tags.ENTRYPOINT and env.deposit_wallets
+        and env.zero_gas_senders and fomo,
+        "multicall_sell": lambda env, pons, row, fomo: env.to == MULTICALL3 and env.deposit_wallets and not fomo,
+        "direct_pons": lambda env, pons, row, fomo: pons and not env.relay_footprint,
+        "direct_v3": lambda env, pons, row, fomo: row["pool"]["protocol"] == "v3" and not env.relay_footprint,
     }
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -272,8 +251,6 @@ def capture(args: argparse.Namespace) -> int:
     return 0
 
 
-TOPIC_USER_OPERATION = "0x49628fd1471006c1482da88028e9ce4dbb080b815c9b0344d39e5a8e6ec1419f"
-RELAY_CONTRACTS = frozenset({tags.DEPOSITORY, tags.EXECUTOR, tags.FOMO_ROUTER})
 ROSTER_SQL = """
     SELECT DISTINCT encode(address, 'hex') FROM (
         SELECT w.address FROM fomo_wallet_bindings b JOIN wallets w ON w.id = b.wallet_id
@@ -307,19 +284,6 @@ def roster_members(connection: Any, wallets: set[str]) -> set[str]:
     return {"0x" + row[0] for row in rows}
 
 
-def relay_wallets(logs: list[dict[str, Any]]) -> set[str]:
-    wallets: set[str] = set()
-    for log in logs:
-        topics = [t.lower() for t in log["topics"]]
-        if log["address"].lower() == tags.DEPOSITORY and topics[0] in (tags.TOPIC_DEPOSIT, tags.TOPIC_NATIVE_DEPOSIT):
-            wallets.add("0x" + log["data"][26:66].lower())
-        elif topics[0] == tags.TOPIC_TRANSFER and len(topics) == 3 and topics[1] == tags.EXECUTOR_TOPIC:
-            recipient = "0x" + topics[2][-40:]
-            if recipient not in RELAY_CONTRACTS:
-                wallets.add(recipient)
-    return wallets
-
-
 def chunked_logs(rpc: HttpRpc, low: int, high: int, filters: Any, step: int = 2000) -> list[dict[str, Any]]:
     calls = []
     for start in range(low, high + 1, step):
@@ -335,7 +299,7 @@ def wallet_classes(rpc: HttpRpc, wallets: set[str], roster: set[str]) -> dict[st
         code = codes[wallet].lower()
         if wallet in roster:
             classes[wallet] = "roster"
-        elif code == FOMO_WALLET_CODE:
+        elif code == tags.FOMO_WALLET_CODE:
             classes[wallet] = "fomo_code"
         elif code.startswith("0xef0100"):
             classes[wallet] = "other_7702"
@@ -397,16 +361,17 @@ def ledger_window(connection: Any, start_ms: int, end_ms: int) -> list[tuple[Any
     return rows
 
 
-def classify_hashes(rpc: HttpRpc, hashes: list[str]) -> dict[str, tags.TxEnvelope]:
+def classify_hashes(rpc: HttpRpc, hashes: list[str]) -> dict[str, tags.FlowTag]:
     transactions = rpc.batch([("eth_getTransactionByHash", [h]) for h in hashes])
-    known = [(h, tx) for h, tx in zip(hashes, transactions) if tx]
-    if not known:
-        return {}
-    blocks = [int(tx["blockNumber"], 16) for _h, tx in known]
-    footprint: dict[str, list[dict[str, Any]]] = {}
-    for log in chunked_logs(rpc, min(blocks), max(blocks), tags.footprint_filters):
-        footprint.setdefault(log["transactionHash"].lower(), []).append(log)
-    return {h: tags.envelope(tx, 0, footprint.get(h, [])) for h, tx in known}
+    requests = [(h, int(tx["blockNumber"], 16), 0) for h, tx in zip(hashes, transactions) if tx]
+    with tempfile.TemporaryDirectory() as directory:
+        store = tags.TagStore(os.path.join(directory, "tags.sqlite"))
+        envelopes = tags.fetch_envelopes(rpc, requests)
+        fomo_wallets = tags.WalletCodes(rpc, store).fomo(w for env in envelopes.values() for w in env.wallets)
+        pool = tags.PoolIdentity("0x", "", None, False)
+        result = {h: tags.classify(pool, env, None, fomo_wallets) for h, env in envelopes.items()}
+        store.close()
+    return result
 
 
 def evidence(args: argparse.Namespace) -> int:
@@ -417,78 +382,61 @@ def evidence(args: argparse.Namespace) -> int:
     hashes = list(dict.fromkeys(row["tx_hash"] for row in rows))
     low, high = rows[0]["block_number"], rows[-1]["block_number"]
     transactions = dict(zip(hashes, rpc.batch([("eth_getTransactionByHash", [h]) for h in hashes])))
-    footprint: dict[str, list[dict[str, Any]]] = {h: [] for h in hashes}
+    logs: dict[str, list[dict[str, Any]]] = {h: [] for h in hashes}
     for log in chunked_logs(rpc, low, high, tags.footprint_filters):
-        if log["transactionHash"].lower() in footprint:
-            footprint[log["transactionHash"].lower()].append(log)
+        if log["transactionHash"].lower() in logs:
+            logs[log["transactionHash"].lower()].append(log)
+    envelopes = {h: tags.envelope(transactions[h], 0, logs[h]) for h in hashes}
     senders: dict[str, set[str]] = {h: {transactions[h]["from"].lower()} for h in hashes}
-    zero_gas: dict[str, bool] = {}
-    user_ops = chunked_logs(rpc, low, high, lambda a, b: [
-        ("eth_getLogs", [{"fromBlock": hex(a), "toBlock": hex(b), "address": ENTRYPOINT, "topics": [TOPIC_USER_OPERATION]}]),
-    ])
-    for log in user_ops:
-        tx_hash = log["transactionHash"].lower()
-        if tx_hash in senders:
-            senders[tx_hash].add("0x" + log["topics"][2][-40:].lower())
-            gas_cost = int(log["data"][2 + 2 * 64:2 + 3 * 64], 16)
-            zero_gas[tx_hash] = zero_gas.get(tx_hash, True) and gas_cost == 0
-    envelopes = {h: tags.envelope(transactions[h], 0, footprint[h]) for h in hashes}
-    fomo = {h for h, env in envelopes.items() if env.deposit_order_ids or env.executor_fill}
-    counterparties = {h: relay_wallets(footprint[h]) for h in fomo}
+    for log in (log for h in hashes for log in logs[h]):
+        if log["address"].lower() == tags.ENTRYPOINT and log["topics"][0].lower() == tags.TOPIC_USER_OPERATION:
+            senders[log["transactionHash"].lower()].add("0x" + log["topics"][2][-40:].lower())
+    counterparties = {h: set(env.deposit_wallets) | set(env.fill_recipients) for h, env in envelopes.items()}
     every_wallet = set().union(*senders.values(), *counterparties.values())
     roster = roster_members(connection, every_wallet)
     classes = wallet_classes(rpc, every_wallet, roster)
+    fomo_wallets = frozenset(w for w, kind in classes.items() if kind == "fomo_code")
+    pool = tags.PoolIdentity("0x", "", None, False)
+    tagged = {h: tags.classify(pool, env, None, fomo_wallets) for h, env in envelopes.items()}
+    relay = {h for h, env in envelopes.items() if env.relay_footprint}
+    fomo = {h for h, tag in tagged.items() if tags.FOMO in tag.tags}
     print(f"sampled {len(rows)} swaps in {len(hashes)} transactions over blocks {low}..{high}; "
-          f"{len(fomo)} tagged FOMO; roster hits {len(roster)} of {len(every_wallet)} wallets")
+          f"{len(relay)} Relay-footprint, {len(fomo)} tagged FOMO; roster hits {len(roster)} of {len(every_wallet)} wallets")
+    print("basis:", dict(Counter(" ".join(sorted(tag.basis)) or "-" for tag in tagged.values())))
 
     rank = {"roster": 0, "fomo_code": 1, "other_7702": 2, "eoa": 3, "contract": 4}
-    best = {}
-    for h in fomo:
-        wallets = counterparties[h]
-        best[h] = min((classes[w] for w in wallets), key=rank.get) if wallets else "no_wallet"
-    tally = Counter(best.values())
-    print("FOMO-tagged transactions by best counterparty wallet class:", dict(tally))
-    sells = {h for h in fomo if envelopes[h].deposit_order_ids}
-    depositor_class = Counter(
-        min((classes[w] for w in relay_wallets([
-            log for log in footprint[h] if log["address"].lower() == tags.DEPOSITORY
-        ])), key=rank.get, default="no_wallet")
-        for h in sells
-    )
-    print(f"  sells ({len(sells)}) by depositor wallet class: {dict(depositor_class)}")
-    fill_class = Counter(best[h] for h in fomo - sells)
-    print(f"  fills ({len(fomo - sells)}) by best recipient wallet class: {dict(fill_class)}")
-    strict = tally["roster"]
-    lenient = strict + tally["fomo_code"]
-    print(f"precision: roster-confirmed {strict}/{len(fomo)} = {strict / max(len(fomo), 1):.3f}; "
-          f"roster or FOMO wallet code {lenient}/{len(fomo)} = {lenient / max(len(fomo), 1):.3f}; "
-          f"no FOMO identity (other 7702 / EOA / contract / none) {len(fomo) - lenient}")
-    for h in sorted(fomo):
-        if best[h] not in ("roster", "fomo_code"):
-            env = envelopes[h]
-            print("  non-FOMO relay trade", h, "to", env.to, best[h],
-                  "sell" if h in sells else "fill", sorted(counterparties[h])[:2])
+    best = {
+        h: min((classes[w] for w in counterparties[h]), key=rank.get) if counterparties[h] else "no_wallet"
+        for h in relay
+    }
+    print("Relay-footprint transactions by best counterparty wallet class:", dict(Counter(best.values())))
+    sells = {h for h in relay if envelopes[h].deposit_wallets}
+    print(f"  sells ({len(sells)}) by depositor class:", dict(Counter(
+        min((classes[w] for w in envelopes[h].deposit_wallets), key=rank.get) for h in sells
+    )))
+    print(f"  fills ({len(relay - sells)}) by best recipient class:", dict(Counter(best[h] for h in relay - sells)))
+    confirmed = {h for h in fomo if best[h] == "roster"}
+    print(f"precision vs FOMO-code identity: {len(fomo)}/{len(fomo)} = 1.000 by construction; "
+          f"roster-confirmed {len(confirmed)}/{len(fomo)}; generic Relay trades excluded {len(relay - fomo)}/{len(relay)}")
+    for h in sorted(relay - fomo):
+        env = envelopes[h]
+        print("  excluded relay trade", h, "to", env.to, best[h],
+              "sell" if h in sells else "fill", sorted(counterparties[h])[:2])
+    zero_gas = {h for h, env in envelopes.items() if env.zero_gas_senders}
     gas_by_class = Counter(
-        (min((classes[w] for w in senders[h]), key=rank.get), "zero_gas" if zero_gas[h] else "paid_gas")
-        for h in zero_gas
+        (min((classes[w] for w in senders[h]), key=rank.get), "zero_gas" if h in zero_gas else "paid_or_none")
+        for h in hashes if len(senders[h]) > 1
     )
     print("user-op transactions by sender class and gas:", dict(gas_by_class))
-    zero_gas_fomo = sum(1 for h in zero_gas if zero_gas[h] and h in fomo)
-    print(f"  zero-gas user-op transactions tagged FOMO: {zero_gas_fomo}/{sum(zero_gas.values())}")
+    print(f"  zero-gas user-op transactions tagged FOMO: {len(zero_gas & fomo)}/{len(zero_gas)}")
 
-    roster_txs = {h for h in hashes if any(classes[w] == "roster" for w in senders[h] | counterparties.get(h, set()))}
-    tagged = len(roster_txs & fomo)
+    roster_txs = {h for h in hashes if any(classes[w] == "roster" for w in senders[h] | counterparties[h])}
     print(f"reverse: {len(roster_txs)} sampled transactions involve a rostered FOMO wallet; "
-          f"{tagged} tagged FOMO ({tagged / max(len(roster_txs), 1):.3f})")
+          f"{len(roster_txs & fomo)} tagged FOMO")
     for h in sorted(roster_txs - fomo):
-        print("  rostered wallet without Relay footprint", h, "to", envelopes[h].to)
-
-    code_only = {h for h in hashes if any(classes[w] == "fomo_code" for w in senders[h])}
-    print(f"extra condition check: {len(code_only & fomo)}/{len(code_only)} transactions whose sender carries "
-          f"the FOMO wallet code are tagged FOMO; {len(fomo & code_only)} of {len(fomo)} FOMO tags have such a sender")
-    narrowed = {h for h in fomo if best[h] in ("roster", "fomo_code")}
-    print(f"narrowed rule (Relay footprint AND counterparty carries FOMO wallet code or is rostered): "
-          f"{len(narrowed)}/{len(fomo)} kept; drops {len(fomo - narrowed)}")
+        print("  rostered wallet without FOMO tag", h, "to", envelopes[h].to)
+    code_senders = {h for h in hashes if any(classes[w] == "fomo_code" for w in senders[h])}
+    print(f"{len(code_senders & fomo)}/{len(code_senders)} transactions with a FOMO-code sender are tagged FOMO")
 
     reported_end = connection.execute(
         "SELECT max(observed_at) FROM fomo_public_trade_observation"
@@ -512,8 +460,8 @@ def evidence(args: argparse.Namespace) -> int:
           f"{len(signatures)} signatures, {len(orders)} matched Relay orders, "
           f"{len(fills)} Robinhood fill transactions in the ledger ({len(ledger)} ledger rows scanned)")
     if fills:
-        envelopes = classify_hashes(rpc, sorted(fills))
-        tagged_fills = [h for h, env in envelopes.items() if env.deposit_order_ids or env.executor_fill]
+        fill_tags = classify_hashes(rpc, sorted(fills))
+        tagged_fills = [h for h, tag in fill_tags.items() if tags.FOMO in tag.tags]
         print(f"  {len(tagged_fills)}/{len(fills)} FOMO-reported fills tagged FOMO by the on-chain rule")
         for h in sorted(fills - set(tagged_fills)):
             print("  reported fill not tagged", h)
