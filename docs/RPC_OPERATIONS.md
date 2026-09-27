@@ -274,6 +274,18 @@ Metadata, identity replay, and bounded source repairs run separately from receip
 scheduling. Follow `pending_accounting` as well as enrichment and repricing queues;
 a small block gap does not prove those queues are complete.
 
+After deployment, the metadata worker revisits V4 pools with missing
+`tick_spacing` in four-row pages. It derives the spacing only when the full
+PoolKey hash matches the stored pool ID, then commits the repaired row through
+the service's normal writer and publishes it. At the end of a pass it waits
+five minutes before starting another pass, so incomplete rows added after
+startup are eventually considered. The worker pauses with bulk work under WAL
+backpressure. No direct database edit or standalone repair command is needed.
+Until a row is repaired, LP requests return `incomplete_pool` with the missing
+identity field rather than treating the pool as unknown. Dynamic-fee V4 routes
+use `metadata_json.configured_fee` (`0x800000`) for PoolKey verification instead
+of the nullable effective `fee_ppm` column.
+
 Metadata RPC fetches remain bounded and commit one batch.
 V3 balances have an independent worker rather than waiting behind repricing or
 WAL checkpoints. Each wave selects at most 64 exact `(pool,block)` obligations,

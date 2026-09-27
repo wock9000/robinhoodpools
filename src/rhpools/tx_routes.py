@@ -6,6 +6,7 @@ hook is either absent or the Pons launch hook.
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from collections.abc import Callable
@@ -123,9 +124,28 @@ class UnknownHook(RuntimeError):
     """The pool's hook is registered as Pons but has no launch policy."""
 
 
-def _pool_from_row(row: tuple[Any, ...]) -> Pool | None:
-    """A V4 row whose id is not keccak(PoolKey) describes a pool it is not and is dropped."""
-    id_, protocol, address, token0, token1, fee_ppm, tick_spacing, hook, factory = row[:9]
+class IncompletePool(ValueError):
+    def __init__(self, field: str) -> None:
+        self.field = field
+        super().__init__(f"V4 pool has no verified {field}")
+
+
+def _pool_from_row(row: tuple[Any, ...], *, strict: bool = False) -> Pool | None:
+    id_, protocol, address, token0, token1, fee_ppm, tick_spacing, hook, factory, metadata_json = row[:10]
+    if protocol == "v4":
+        if tick_spacing is None:
+            if strict:
+                raise IncompletePool("tick_spacing")
+            return None
+        metadata = json.loads(metadata_json) if metadata_json else {}
+        configured_fee = metadata.get("configured_fee")
+        if configured_fee is None:
+            configured_fee = fee_ppm
+        if configured_fee is None:
+            if strict:
+                raise IncompletePool("configured_fee")
+            return None
+        fee_ppm = configured_fee
     pool = Pool(
         venue=Venue(protocol),
         id=id_.lower(),
@@ -138,6 +158,8 @@ def _pool_from_row(row: tuple[Any, ...]) -> Pool | None:
         factory=(factory or "").lower(),
     )
     if pool.venue is Venue.V4 and pool.key.id() != pool.id:
+        if strict:
+            raise IncompletePool("PoolKey identity")
         return None
     return pool
 
@@ -152,7 +174,7 @@ DEFAULT_BRIDGES: tuple[Pool, ...] = (
     v4_pool(PoolKey(NATIVE, USDG, 500, 10, NATIVE)),
 )
 
-_POOL_COLUMNS = "p.id, p.protocol, p.address, p.token0, p.token1, p.fee_ppm, p.tick_spacing, p.hook, p.factory"
+_POOL_COLUMNS = "p.id, p.protocol, p.address, p.token0, p.token1, p.fee_ppm, p.tick_spacing, p.hook, p.factory, p.metadata_json"
 _CANDIDATE_SQL = (
     f"SELECT {_POOL_COLUMNS}, s.block_number FROM pools p "
     "LEFT JOIN lp_pool_state s ON s.pool_id = p.id "
@@ -179,7 +201,7 @@ class RouteBook:
     def pool(self, pool_id: str) -> Pool | None:
         with self._reader() as connection:
             row = connection.execute(_BY_ID_SQL, (pool_id.lower(),)).fetchone()
-        return _pool_from_row(row) if row else None
+        return _pool_from_row(row, strict=True) if row else None
 
     def position_candidates(self, wallet: str, pool_id: str, limit: int = 50) -> list[int]:
         """Token ids the accounting index attributes to wallet in pool; the chain is the authority."""
@@ -232,7 +254,7 @@ class RouteBook:
     def token_pools(self, token: str) -> list[Pool]:
         with self._reader() as connection:
             rows = connection.execute(_CANDIDATE_SQL, (token, token)).fetchall()
-        rows.sort(key=lambda row: -(row[9] or 0))
+        rows.sort(key=lambda row: -(row[10] or 0))
         return [pool for pool in map(_pool_from_row, rows) if pool is not None]
 
     def candidates(self, token: str, quote_currency: str, side: Side) -> list[Route]:
@@ -270,5 +292,5 @@ class RouteBook:
 
 __all__ = [
     "DEFAULT_BRIDGES", "Hop", "HookPolicy", "MAX_CANDIDATES", "NO_HOOK", "Pool", "QUOTE_CURRENCIES",
-    "Route", "RouteBook", "Side", "UnknownHook", "Venue", "same_asset", "v4_pool",
+    "Route", "RouteBook", "Side", "UnknownHook", "IncompletePool", "Venue", "same_asset", "v4_pool",
 ]

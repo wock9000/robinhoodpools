@@ -28,7 +28,7 @@ from .tx_plan import (
     PositionState, Signatures, SwapIntent, SwapPlanner, SwapShape, TxError, TxPolicy,
     TxRefusal, impact_bps, min_out_for, swap_amounts,
 )
-from .tx_routes import QUOTE_CURRENCIES, Hop, Pool, Route, RouteBook, Side, Venue, v4_pool
+from .tx_routes import QUOTE_CURRENCIES, Hop, IncompletePool, Pool, Route, RouteBook, Side, Venue, v4_pool
 
 DEADLINE_GRACE_S = 60
 IMPACT_DIVISOR = 100
@@ -545,7 +545,10 @@ class TxCore:
         are the client's own recent mints; V4 managers are not enumerable and the accounting
         index can lag, so every candidate is verified on chain before it is listed."""
         wallet = _address(wallet, "wallet")
-        pool = self.routes.pool(str(pool_id).lower())
+        try:
+            pool = self.routes.pool(str(pool_id).lower())
+        except IncompletePool as exc:
+            raise TxRefusal("incomplete_pool", str(exc)) from exc
         if pool is None:
             raise TxRefusal("unknown_pool", "pool_id is not in the market index")
         manager = self.lps.manager_for(pool)
@@ -590,7 +593,10 @@ class TxCore:
 
     def _quote_lp(self, intent: LpIntent) -> LpQuote:
         intent = self._validate_lp(intent)
-        pool = self.routes.pool(intent.pool_id)
+        try:
+            pool = self.routes.pool(intent.pool_id)
+        except IncompletePool as exc:
+            raise TxRefusal("incomplete_pool", str(exc)) from exc
         if pool is None:
             raise TxRefusal("unknown_pool", "pool_id is not in the market index")
         manager = self.lps.manager_for(pool)
