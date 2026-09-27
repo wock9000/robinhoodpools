@@ -10,6 +10,7 @@
   <title>Robinhood Pools / Chain 4663</title>
   <link rel="stylesheet" href="/static/lp_terminal.css">
   <link rel="stylesheet" href="/static/lp_gate.css">
+  <link rel="stylesheet" href="/static/lp_trade.css">
 </head>
 <body>
   <header class="terminal-header">
@@ -50,6 +51,7 @@
       <a href="#tape-section">FEED</a>
       <a href="#owners-section">WALLETS</a>
       <a href="#pools-section">POOLS</a>
+      <a href="#trade" id="trade-nav">TRADE</a>
       <a href="/guide">GUIDE</a>
       <a href="/research">RESEARCH</a>
       <a href="/flow">FLOW</a>
@@ -273,7 +275,16 @@
       <section id="gate-policy" class="gate-section" hidden></section>
     </div>
   </dialog>
+  <dialog id="trade-dialog" class="gate-dialog trade-dialog" aria-labelledby="trade-dialog-title">
+    <header class="pool-inspector-head">
+      <h2 id="trade-dialog-title">TRADE</h2>
+      <span id="trade-dialog-wallet"></span>
+      <button id="trade-dialog-close" type="button" aria-label="Close trade ticket">CLOSE</button>
+    </header>
+    <form id="trade-body" class="gate-body" novalidate></form>
+  </dialog>
   <script src="/static/lp_terminal.js" defer></script>
   <script src="/static/lp_gate.js" defer></script>
+  <script src="/static/lp_trade.js" defer></script>
 </body>
 </html>

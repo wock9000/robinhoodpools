@@ -39,7 +39,7 @@ _ASSETS = {
     "/api/v1/openapi.json": ("openapi.json", "application/json; charset=utf-8"),
 }
 for _name in (
-    "lp_theme.css", "lp_terminal.css", "lp_terminal.js", "lp_panes_boot.js", "lp_gate.css", "lp_gate.js",
+    "lp_theme.css", "lp_terminal.css", "lp_terminal.js", "lp_panes_boot.js", "lp_gate.css", "lp_gate.js", "lp_trade.css", "lp_trade.js",
     "workbench.css", "workbench.js", "lp_guide.css",
     "lp_research.css", "lp_research.js", "lp_flow.css", "lp_flow.js",
 ):

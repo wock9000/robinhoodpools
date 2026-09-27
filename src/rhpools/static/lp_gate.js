@@ -324,6 +324,11 @@
   function render() {
     renderChip();
     if (dialog.open) renderDialog();
+    document.dispatchEvent(new CustomEvent("rhp:gate", { detail: snapshot() }));
+  }
+
+  function snapshot() {
+    return { wallet: state.wallet, chain: state.chain, me: state.me, phase: state.phase };
   }
 
   async function refreshMe() {
@@ -505,5 +510,13 @@
     setInterval(() => { if (state.me && state.me.signed_in) refreshMe(); }, 30000);
   }
 
+  window.rhpGate = {
+    snapshot: snapshot,
+    connect: () => connect(),
+    switchChain: () => switchChain(),
+    signIn: () => signIn(),
+    refresh: () => refreshMe(),
+    open: () => onChip(),
+  };
   boot();
 })();
