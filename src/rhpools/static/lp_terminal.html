@@ -20,10 +20,9 @@
         <span class="strip-label">BLOCK</span>
         <a id="live-block-link" rel="noopener noreferrer" target="_blank">#—</a>
         <span id="live-block-age">—</span>
-        <span id="live-block-gap" class="block-gap" hidden>GAP</span>
       </span>
       <span id="stream-state" class="strip-state" role="status">CONNECTING</span>
-      <span id="strip-freshness" title="Age of the last index status response. Live head, durable index head, and the actual catch-up gap are shown below.">STATUS —</span>
+      <span id="strip-freshness" title="Age of the last index status response. Select INDEX STATUS for full diagnostics.">STATUS —</span>
       <time id="terminal-clock" datetime="">--:--:-- UTC</time>
       <nav id="key-strip" class="key-strip" aria-label="Window, tape, and pane controls">
         <label class="mobile-only sr-only" for="mobile-window">Accounting window</label>
@@ -68,7 +67,7 @@
 
   <main id="terminal-main">
     <section class="readout" aria-label="LP market status">
-      <button id="status-readout" type="button" class="readout-line" aria-label="Open index status details" aria-live="polite" aria-haspopup="dialog" aria-controls="index-status-shell" title="Open index status details">index connecting</button>
+      <button id="status-readout" type="button" class="readout-line" aria-label="Open index status details" aria-live="polite" aria-haspopup="dialog" aria-controls="index-status-shell" title="Open index status details">INDEX STATUS</button>
       <div id="overview-readout" class="readout-line dim">24h · metrics —</div>
       <div id="endpoint-health" class="sr-only" role="status" aria-live="polite"></div>
     </section>
@@ -110,8 +109,8 @@
           <p id="owner-curve-note" class="curve-note">—</p>
         </section>
         <section aria-labelledby="owner-positions-title">
-          <h3 id="owner-positions-title" class="modal-section-title">OPEN POSITIONS · DEPTH</h3>
-          <div class="table-wrap modal-table-wrap" tabindex="0" aria-label="Owner open positions, horizontally scrollable">
+          <h3 id="owner-positions-title" class="modal-section-title">POSITIONS · DEPTH</h3>
+          <div class="table-wrap modal-table-wrap" tabindex="0" aria-label="Owner positions, horizontally scrollable">
             <table class="terminal-table"><thead><tr><th>pair</th><th>proto</th><th>position / range</th><th class="numeric">liquidity</th><th class="numeric">principal</th><th class="numeric">uncollected fees</th><th class="numeric">equity</th><th>valuation</th><th>status</th><th>depth</th></tr></thead><tbody id="owner-positions-body"></tbody></table>
           </div>
         </section>
@@ -258,7 +257,7 @@
     </div>
   </section>
 
-  <footer class="terminal-footer"><span id="footer-state">index —</span><a class="sponsor-link" href="https://www.quicknode.com/" target="_blank" rel="noopener noreferrer">Powered by Quicknode</a><span class="footer-meta"><span class="read-only-label">READ ONLY · </span><a class="source-link" href="https://github.com/wock9000/robinhoodpools" target="_blank" rel="noopener noreferrer" title="RobinhoodPools on GitHub · Copyright 2026 RobinhoodPools contributors · AGPL-3.0-only · no warranty">GITHUB</a></span></footer>
+  <footer class="terminal-footer"><span id="footer-state">INDEX STATUS</span><span class="sponsor-credit">Powered by <a class="sponsor-link" href="https://goldsky.com/" target="_blank" rel="noopener noreferrer">Goldsky</a> and <a class="sponsor-link" href="https://www.quicknode.com/" target="_blank" rel="noopener noreferrer">Quicknode</a></span><span class="footer-meta"><span class="read-only-label">READ ONLY · </span><a class="source-link" href="https://github.com/wock9000/robinhoodpools" target="_blank" rel="noopener noreferrer" title="RobinhoodPools on GitHub · Copyright 2026 RobinhoodPools contributors · AGPL-3.0-only · no warranty">GITHUB</a></span></footer>
   <div id="copy-status" class="sr-only" role="status" aria-live="polite"></div>
   <script src="/static/lp_terminal.js" defer></script>
 </body>

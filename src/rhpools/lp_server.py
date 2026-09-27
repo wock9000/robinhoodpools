@@ -163,8 +163,67 @@ def _load_assets():
     return assets
 
 
+def _startup_activity(tid: int) -> dict[str, int] | None:
+    """Work counters that grow only while initialization really advances.
+
+    CPU is the initializing thread's own, so serving probes never masquerades
+    as progress; storage bytes are process-wide because SQLite performs the
+    reads of a long WAL recovery from whichever thread the store chooses.
+    """
+    try:
+        with open(f"/proc/self/task/{tid}/stat", "rb") as handle:
+            stat = handle.read()
+        with open("/proc/self/io", "rb") as handle:
+            io = handle.read()
+        fields = stat[stat.rindex(b")") + 2:].split()
+        ticks = int(fields[11]) + int(fields[12])
+        counters = dict(line.split(b":", 1) for line in io.splitlines() if b":" in line)
+        return {
+            "cpu_ms": ticks * 1000 // os.sysconf("SC_CLK_TCK"),
+            "read_bytes": int(counters[b"read_bytes"]),
+            "write_bytes": int(counters[b"write_bytes"]),
+        }
+    except (OSError, ValueError, IndexError, KeyError):
+        return None
+
+
+class Startup:
+    """What the process can say for itself before the runtime exists.
+
+    Opening a large store is a single blocking call that can run for hours,
+    so the socket is served from the start and every request that needs
+    data gets this record instead of a queued connection that times out.
+    """
+
+    def __init__(self, assets: dict) -> None:
+        self.assets = assets
+        self.started_at = time.time()
+        self.tid = threading.get_native_id()
+        self._clock = time.monotonic()
+        self._phase = "starting"
+
+    def phase(self, name: str) -> None:
+        self._phase = name
+        print(f"RobinhoodPools startup: {name}", flush=True)
+
+    def snapshot(self) -> dict:
+        elapsed = int(time.monotonic() - self._clock)
+        return {
+            "chain_id": 4663,
+            "state": "starting",
+            "error": f"Service is starting: {self._phase} ({elapsed}s elapsed)",
+            "startup": {
+                "started_at": self.started_at,
+                "phase": self._phase,
+                "elapsed_s": elapsed,
+                "activity": _startup_activity(self.tid),
+            },
+            "as_of": time.time(),
+        }
+
+
 class Runtime:
-    def __init__(self, args: argparse.Namespace) -> None:
+    def __init__(self, args: argparse.Namespace, startup: Startup) -> None:
         from .lp_market_service import LPMarketService
         from .lp_public_api import PublicMarketAPI
         from .lp_research import LPResearchService
@@ -175,20 +234,23 @@ class Runtime:
         self.stopping = threading.Event()
         self.origins = frozenset(args.public_origin)
         self.enable_prepare = args.enable_transaction_prepare
-        self.assets = _load_assets()
+        self.assets = startup.assets
         self._resources = ExitStack()
         self._close_lock = threading.Lock()
         try:
+            startup.phase("market")
             self.market = MarketService(
                 args.rpc_url, data_dir=args.data_dir, external_index=True,
             )
             self._resources.callback(self.market.close)
+            startup.phase("store")
             self.lp = LPMarketService(
                 self.market, args.rpc_url, args.database,
                 history_days=args.history_days,
                 history_disk_reserve_bytes=int(args.disk_reserve_gib * 1024**3),
             )
             self._resources.callback(self.lp.close)
+            startup.phase("services")
             self.actions = ActionService(self.market.rpc)
             self._resources.callback(self.actions.close)
             self.public = PublicMarketAPI(self.lp)
@@ -215,7 +277,10 @@ class LPHTTPServer(ThreadingHTTPServer):
 
 
 class Handler(BaseHTTPRequestHandler):
-    runtime: Runtime
+    # `runtime` stays None until initialization finishes; `startup` answers
+    # for it meanwhile. Data routes report 503 "starting", never a hang.
+    runtime: Runtime | None = None
+    startup: Startup | None = None
     # Keep-alive lets cloudflared reuse origin connections instead of paying a
     # handshake and a new thread per poll. Every response carries Content-Length
     # or closes the connection.
@@ -278,7 +343,8 @@ class Handler(BaseHTTPRequestHandler):
         return {tag.strip() for tag in str(self.headers.get("If-None-Match") or "").split(",")}
 
     def _asset(self, path: str, head: bool = False) -> bool:
-        item = self.runtime.assets.get(path)
+        owner = self.runtime if self.runtime is not None else self.startup
+        item = owner.assets.get(path)
         if item is None:
             return False
         raw, content_type, etag, zipped = item
@@ -318,6 +384,9 @@ class Handler(BaseHTTPRequestHandler):
             key: values[-1]
             for key, values in parse_qs(parsed.query, max_num_fields=64).items()
         }
+
+    def _starting(self) -> None:
+        self._json(503, self.startup.snapshot(), retry=15)
 
     def _bounded(self, route: Route, path: str, query: dict[str, str]) -> None:
         slots = self.api_slots[route.lane]
@@ -523,6 +592,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             route = _ROUTES.get(path)
+            if route is None and path not in {"/api/workbench/capabilities", "/api/lp/stream", "/api/workbench/stream"}:
+                return self._json(404, {"error": "Not found"})
+            if self.runtime is None:
+                return self._starting()
             if route is not None:
                 return self._bounded(route, path, query)
             if path == "/api/workbench/capabilities":
@@ -530,9 +603,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"allocation_preview": True, "simulate": local, "prepare": local and self.runtime.enable_prepare, "broadcast": False, "server_signing": False})
             if path == "/api/lp/stream":
                 return self._sse(False, query)
-            if path == "/api/workbench/stream":
-                return self._sse(True, query)
-            self._json(404, {"error": "Not found"})
+            return self._sse(True, query)
         except ValueError as exc:
             self._json(400, {"error": str(exc)})
         except (BrokenPipeError, ConnectionResetError, TimeoutError):
@@ -576,6 +647,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"error": str(exc)})
         if path not in {"/api/lp/allocation", "/api/workbench/simulate", "/api/workbench/prepare"}:
             return self._json(404, {"error": "Not found"})
+        if self.runtime is None:
+            return self._starting()
         if not self._same_origin():
             return self._json(403, {"error": "Configured same-origin request required"})
         if path != "/api/lp/allocation" and not self._loopback():
@@ -619,7 +692,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             super().finish()
         finally:
-            if hasattr(self, "runtime"):
+            if self.runtime is not None:
                 self.runtime.lp.store.close_reader()
 
 
@@ -646,25 +719,35 @@ def main() -> None:
     data_dir.mkdir(parents=True, exist_ok=True)
     args.data_dir = data_dir
     args.database = Path(args.database).expanduser() if args.database else data_dir / "lp_market.sqlite"
-    server = LPHTTPServer((args.host, args.port), Handler)
-    try:
-        runtime = Runtime(args)
-    except BaseException:
-        server.server_close()
-        raise
-    Handler.runtime = runtime
+    startup = Startup(_load_assets())
+    Handler.startup = startup
     Handler.api_slots = lane_slots(args.api_slots)
+    server = LPHTTPServer((args.host, args.port), Handler)
+    stopping = threading.Event()
+
     def halt(_signum=None, _frame=None):
-        runtime.stopping.set()
-        threading.Thread(target=server.shutdown, daemon=True).start()
+        stopping.set()
     signal.signal(signal.SIGINT, halt)
     signal.signal(signal.SIGTERM, halt)
-    print(f"RobinhoodPools listening on http://{args.host}:{args.port}", flush=True)
+    # The socket is served from the first moment so probes learn "starting"
+    # instead of queueing in the backlog; initialization keeps the main
+    # thread, where a stop signal lands as soon as the store returns.
+    threading.Thread(target=server.serve_forever, name="lp-http", daemon=True).start()
+    print(f"RobinhoodPools listening on http://{args.host}:{args.port} (starting)", flush=True)
+    runtime = None
     try:
-        server.serve_forever()
+        runtime = Runtime(args, startup)
+        if not stopping.is_set():
+            Handler.runtime = runtime
+            startup.phase("ready")
+            stopping.wait()
     finally:
+        if runtime is not None:
+            runtime.stopping.set()
+        server.shutdown()
         server.server_close()
-        runtime.close()
+        if runtime is not None:
+            runtime.close()
 
 
 if __name__ == "__main__":

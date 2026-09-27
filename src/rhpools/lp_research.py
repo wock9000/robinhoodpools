@@ -79,8 +79,13 @@ def _fee(metadata: Mapping[str, Any], protocol: str) -> dict[str, Any]:
     }
 
 
+def _projection_stale(row: Mapping[str, Any]) -> bool:
+    projection = row.get("projection")
+    return isinstance(projection, Mapping) and projection.get("state") == "stale"
+
+
 def _is_current(row: Mapping[str, Any]) -> bool:
-    if str(row.get("status") or "").lower() == "historical":
+    if str(row.get("status") or "").lower() == "historical" or _projection_stale(row):
         return False
     episodes = row.get("episodes")
     if isinstance(episodes, Sequence) and not isinstance(episodes, (str, bytes)):
@@ -215,6 +220,7 @@ class LPResearchService:
             str(row.get("pool_id") or "").lower() for row in positions
         ])
         current_rows = [row for row in positions if _is_current(row)]
+        stale = [row for row in positions if _projection_stale(row)]
         direct = [row for row in current_rows if _ownership_match(row, owner) == "beneficial_owner"]
         custody = [row for row in current_rows if _ownership_match(row, owner) == "custody"]
 
@@ -372,6 +378,7 @@ class LPResearchService:
                 "identity_basis": row.get("identity_basis"),
                 "current": _is_current(row),
                 "status": row.get("status"),
+                "projection": dict(row.get("projection") or {}) or None,
                 "range": {
                     "tick_lower": lower, "tick_upper": upper,
                     "width_ticks": width, "current_tick": current_tick,
@@ -452,6 +459,10 @@ class LPResearchService:
             limitations.append("Indexed history does not prove complete coverage of the requested window.")
         if custody:
             limitations.append("Custody-observed positions may represent multiple beneficial owners and receive no custody-level value subtotal.")
+        if stale:
+            limitations.append(
+                f"{len(stale)} returned position(s) have canonical events newer than their published accounting projection; they are excluded from current allocation until replay lands."
+            )
 
         return {
             "owner": owner,
@@ -483,6 +494,7 @@ class LPResearchService:
                 ),
                 "source_position_limit": _OWNER_POSITION_LIMIT,
                 "possible_position_truncation": source_limit_hit,
+                "stale_projection_positions": len(stale),
                 "valuation": {
                     "basis": _USDG_BASIS,
                     "scope": "returned current beneficial-owner positions only",

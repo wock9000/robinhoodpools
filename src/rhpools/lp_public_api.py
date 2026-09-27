@@ -273,7 +273,8 @@ class PublicMarketAPI:
                     search_ready = False
             if search_ready:
                 indexed = connection.execute(
-                    "SELECT id FROM lp_catalog_search WHERE token0=? OR token1=? ORDER BY id",
+                    "SELECT id FROM lp_catalog_search "
+                    "WHERE token0=? COLLATE NOCASE OR token1=? COLLATE NOCASE ORDER BY id",
                     (token, token),
                 ).fetchall()
                 catalog_ids = [str(row["id"]).lower() for row in indexed]
@@ -465,7 +466,7 @@ class PublicMarketAPI:
         try:
             universe = self.market.universe
             by_id = getattr(universe, "by_id", {}) or {}
-            discovered = getattr(self.market, "_discovered", {}) or {}
+            discovered = self.market._discovered
             if catalog_ids:
                 catalog_raw = [
                     by_id.get(pool_id) or discovered.get(pool_id)
@@ -476,14 +477,7 @@ class PublicMarketAPI:
                     raw for raw in (getattr(universe, "pools", ()) or ())
                     if self._source_contains_token(raw, token)
                 ]
-            # The durable catalog-search projection may trail live discoveries.
-            # Copy only matching identities while holding the producer's lock;
-            # normalizing the complete live catalog made hub-token lookups scale
-            # with every known pool rather than with their returned result.
-            catalog_raw.extend(
-                raw for raw in discovered.values()
-                if self._source_contains_token(raw, token)
-            )
+            catalog_raw.extend(discovered.containing(token))
         finally:
             if lock is not None:
                 lock.release()
@@ -780,23 +774,17 @@ class PublicMarketAPI:
         # None means every matching pool is read.
         if len(pools) <= _STATE_READ_BUDGET:
             return None
-        wanted = {pool["id"] for pool in pools}
         selected: list[str] = []
         connection = self.store.read()
         try:
-            cursor = connection.execute(
-                "SELECT pool_id FROM lp_pool_state "
-                "ORDER BY block_number DESC, tx_index DESC, log_index DESC"
-            )
-            try:
-                for row in cursor:
-                    pool_id = row[0]
-                    if pool_id in wanted:
-                        selected.append(pool_id)
-                        if len(selected) >= _STATE_READ_BUDGET:
-                            break
-            finally:
-                cursor.close()
+            selected = [
+                row[0] for row in connection.execute(
+                    "SELECT s.pool_id FROM json_each(?) wanted CROSS JOIN lp_pool_state s "
+                    "ON s.pool_id=wanted.value "
+                    "ORDER BY s.block_number DESC,s.tx_index DESC,s.log_index DESC LIMIT ?",
+                    (json.dumps([pool["id"] for pool in pools]), _STATE_READ_BUDGET),
+                )
+            ]
         finally:
             self._close_reader()
         chosen = set(selected)

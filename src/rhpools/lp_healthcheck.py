@@ -33,6 +33,7 @@ MAX_HTML_BYTES = 512 * 1024
 MAX_JSON_BYTES = 128 * 1024
 FAILURE_THRESHOLD = 3
 STARTUP_GRACE_SECONDS = 120
+STARTUP_STALL_SECONDS = 600
 RECOVERY_COOLDOWN_SECONDS = 600
 RECOVERY_WINDOW_SECONDS = 3600
 MAX_RECOVERIES_PER_WINDOW = 3
@@ -140,11 +141,20 @@ def _fetch(base_url: str, path: str, max_bytes: int, timeout: float) -> tuple[di
     )
     try:
         with _request_deadline(timeout):
-            with _OPENER.open(request, timeout=timeout) as response:
+            try:
+                response = _OPENER.open(request, timeout=timeout)
+            except urlerror.HTTPError as exc:
+                response = exc
+            with response:
                 result["status"] = int(response.getcode())
+                # A starting origin explains itself in a 503 status body; every
+                # other non-200 answer is a failure whose body is never trusted.
+                readable = result["status"] == 200 or (
+                    result["status"] == 503 and path == STATUS_PATH
+                )
                 if result["status"] != 200:
                     result["error"] = "http_status"
-                else:
+                if readable:
                     content_length = response.headers.get("Content-Length")
                     if content_length is not None:
                         try:
@@ -155,16 +165,13 @@ def _fetch(base_url: str, path: str, max_bytes: int, timeout: float) -> tuple[di
                                 result["error"] = "body_too_large"
                         except ValueError:
                             result["error"] = "invalid_content_length"
-                    if "error" not in result:
+                    if result.get("error") in {None, "http_status"}:
                         body = response.read(max_bytes + 1)
                         if len(body) > max_bytes:
                             body = None
                             result["error"] = "body_too_large"
-                        else:
+                        elif result["status"] == 200:
                             result["ok"] = True
-    except urlerror.HTTPError as exc:
-        result["status"] = int(exc.code)
-        result["error"] = "http_status"
     except BaseException as exc:
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
             raise
@@ -221,6 +228,41 @@ def _validate_status(body: bytes) -> tuple[dict[str, Any] | None, str | None]:
     return payload, None
 
 
+def _finite(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _validate_starting(body: bytes) -> dict[str, Any] | None:
+    """Accept only the origin's own explicit startup record."""
+    try:
+        payload = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("chain_id") != CHAIN_ID
+        or isinstance(payload.get("chain_id"), bool)
+        or payload.get("state") != "starting"
+    ):
+        return None
+    startup = payload.get("startup")
+    if (
+        not isinstance(startup, dict)
+        or not _finite(startup.get("started_at"))
+        or not _valid_int(startup.get("elapsed_s"))
+        or not isinstance(startup.get("phase"), str)
+        or not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", startup["phase"])
+    ):
+        return None
+    activity = startup.get("activity")
+    if activity is not None and (
+        not isinstance(activity, dict)
+        or not all(_valid_int(activity.get(key)) for key in ("cpu_ms", "read_bytes", "write_bytes"))
+    ):
+        return None
+    return payload
+
+
 def _probe_target(base_url: str, timeout: float) -> tuple[dict[str, Any], dict[str, Any] | None]:
     root, root_body = _fetch(base_url, "/", MAX_HTML_BYTES, timeout)
     if root["ok"] and (root_body is None or TERMINAL_MARKER not in root_body):
@@ -229,14 +271,20 @@ def _probe_target(base_url: str, timeout: float) -> tuple[dict[str, Any], dict[s
 
     status_check, status_body = _fetch(base_url, STATUS_PATH, MAX_JSON_BYTES, timeout)
     payload: dict[str, Any] | None = None
+    starting = False
     if status_check["ok"]:
         payload, schema_error = _validate_status(status_body or b"")
         if schema_error is not None:
             status_check["ok"] = False
             status_check["error"] = schema_error
+    elif status_check["status"] == 503 and status_body is not None:
+        payload = _validate_starting(status_body)
+        if payload is not None:
+            starting = True
+            status_check["error"] = "starting"
 
     checks = [root, status_check]
-    return {"ok": all(check["ok"] for check in checks), "checks": checks}, payload
+    return {"ok": all(check["ok"] for check in checks), "starting": starting, "checks": checks}, payload
 
 
 def _empty_state() -> dict[str, Any]:
@@ -385,6 +433,44 @@ def _status_diagnostic(
             state[state_key] = current
             state[progress_key] = progress_at
     return diagnostic
+
+
+def _startup_diagnostic(
+    payload: dict[str, Any],
+    state: dict[str, Any],
+    checked_at: int,
+    *,
+    update: bool,
+) -> dict[str, Any]:
+    """Track whether a starting origin keeps doing work between checks.
+
+    Progress is any change in the origin's startup phase or work counters
+    since the previous check of the same startup. Without counters the origin
+    cannot vouch for itself and the check counts as a plain failure.
+    """
+    startup = payload["startup"]
+    activity = startup.get("activity")
+    signature = [startup["started_at"], startup["phase"]]
+    if activity is not None:
+        signature.extend(activity[key] for key in ("cpu_ms", "read_bytes", "write_bytes"))
+    previous = state.get("startup_signature")
+    progress_at = state.get("startup_progress_at")
+    same_startup = isinstance(previous, list) and previous[:1] == signature[:1]
+    progressing = None if not same_startup else previous != signature
+    if progressing is not False or not _finite(progress_at):
+        progress_at = checked_at
+    diagnostic = {
+        "phase": startup["phase"],
+        "elapsed_s": startup["elapsed_s"],
+        "activity": activity,
+        "progressing": progressing,
+        "stalled_s": max(0, int(checked_at - progress_at)),
+    }
+    if update:
+        state["startup_signature"] = signature
+        state["startup_progress_at"] = progress_at
+    return diagnostic
+
 
 
 def _prune_attempts(state: dict[str, Any], key: str, now: int) -> list[float]:
@@ -566,6 +652,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout", type=float, default=3.0, help="per-operation timeout in seconds (0.1 to 30)")
     parser.add_argument("--app-unit", default=DEFAULT_APP_UNIT, help="exact systemd user app service")
     parser.add_argument("--tunnel-unit", default=DEFAULT_TUNNEL_UNIT, help="exact systemd user tunnel service")
+    parser.add_argument(
+        "--startup-stall-seconds", type=int, default=STARTUP_STALL_SECONDS,
+        help="restart a starting app only after this long without startup progress (60 to 86400)",
+    )
     return parser
 
 
@@ -575,6 +665,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if not 0.1 <= args.timeout <= 30:
             raise ValueError("timeout_out_of_range")
+        if not 60 <= args.startup_stall_seconds <= 86_400:
+            raise ValueError("startup_stall_out_of_range")
         args.origin_url = _normalize_base_url(args.origin_url)
         args.public_url = _normalize_base_url(args.public_url)
         args.app_unit = _validate_unit(args.app_unit)
@@ -592,14 +684,31 @@ def main(argv: list[str] | None = None) -> int:
         origin, origin_payload = _probe_target(args.origin_url, args.timeout)
         public, public_payload = _probe_target(args.public_url, args.timeout)
         state, state_ok = _load_state(state_path)
-        status_diagnostic = _status_diagnostic(
-            origin_payload, state, checked_at, update=not args.check_only and state_ok
+        update = not args.check_only and state_ok
+        startup_diagnostic = None
+        if origin.get("starting"):
+            startup_diagnostic = _startup_diagnostic(origin_payload, state, checked_at, update=update)
+            origin["startup"] = startup_diagnostic
+        else:
+            if update and origin["ok"]:
+                state.pop("startup_signature", None)
+                state.pop("startup_progress_at", None)
+            status_diagnostic = _status_diagnostic(origin_payload, state, checked_at, update=update)
+            if status_diagnostic is not None:
+                origin["status"] = status_diagnostic
+        if public.get("starting"):
+            public["startup"] = _startup_diagnostic(public_payload, {}, checked_at, update=False)
+        else:
+            public_status = _status_diagnostic(public_payload, {}, checked_at, update=False)
+            if public_status is not None:
+                public["status"] = public_status
+        # A starting origin that keeps working is alive, not failing; it only
+        # accrues failures once its own counters stop moving for the stall window.
+        origin_alive = origin["ok"] or (
+            startup_diagnostic is not None
+            and startup_diagnostic["activity"] is not None
+            and startup_diagnostic["stalled_s"] < args.startup_stall_seconds
         )
-        public_status = _status_diagnostic(public_payload, {}, checked_at, update=False)
-        if status_diagnostic is not None:
-            origin["status"] = status_diagnostic
-        if public_status is not None:
-            public["status"] = public_status
 
         output: dict[str, Any] = {
             "checked_at": checked_at,
@@ -620,7 +729,7 @@ def main(argv: list[str] | None = None) -> int:
             _emit(output)
             return 2
 
-        state["origin_failures"] = 0 if origin["ok"] else min(state["origin_failures"] + 1, 1_000_000)
+        state["origin_failures"] = 0 if origin_alive else min(state["origin_failures"] + 1, 1_000_000)
         state["public_failures"] = 0 if public["ok"] else min(state["public_failures"] + 1, 1_000_000)
         state["last_checked_at"] = checked_at
         _prune_attempts(state, "app_attempts", checked_at)
@@ -642,6 +751,17 @@ def main(argv: list[str] | None = None) -> int:
             tunnel_report = _tunnel_recovery(
                 args, state, checked_at, state_path, origin_ok=True
             )
+        elif origin_alive:
+            app_report = {
+                "attempted": False,
+                "consecutive_failures": state["origin_failures"],
+                "reason": "startup_progressing",
+            }
+            tunnel_report = {
+                "attempted": False,
+                "consecutive_failures": state["public_failures"],
+                "reason": "origin_starting",
+            }
         else:
             app_report = _app_recovery(args, state, checked_at, state_path)
             tunnel_report = {

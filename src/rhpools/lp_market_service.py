@@ -63,6 +63,9 @@ _OWNER_SNAPSHOT_SECONDS = 900.0
 _WARM_PAUSE_SECONDS = 3.0
 _WARM_IDLE_SECONDS = 5.0
 _WARM_ACCOUNTING_LATENCY_LIMIT_SECONDS = 30.0
+# Synchronous catalog restore in __init__ blocks HTTP and every maintenance
+# thread; a multi-hundred-GiB pools table finishes on the metadata lane.
+_STORED_POOL_RESTORE_SECONDS = 5.0
 _BUCKET_INCREMENTAL_POOL_LIMIT = 8_192
 _BUCKET_INDEXED_POOL_LIMIT = 1_024
 _WARM_WINDOWS = ("24h", "1h", "7d", "30d", "all")
@@ -1217,6 +1220,7 @@ class LPMarketService:
         self.prices = PriceProjection(self.store)
         self.book = AccountBook(
             self.store, deferred=start, preparation_workers=3 if start else 0,
+            storage_reserve_bytes=history_disk_reserve_bytes,
         )
         self.book.install()
         self._current_activity_lock = threading.RLock()
@@ -1244,12 +1248,12 @@ class LPMarketService:
         self.claims = PositionClaims(
             self.store, self.book, self.prices, self.indexer._worker_rpc,
         )
-        # Restore the durable catalog before serving requests. Exact cold
-        # inspectors can then reuse an already-qualified stored identity even
-        # when the workbench checkpoint is absent and no new event arrives.
+        # Restore as much of the durable catalog as a short budget allows
+        # before serving requests; the metadata lane finishes the walk. Exact
+        # cold inspectors can then reuse an already-qualified stored identity
+        # even when the workbench checkpoint is absent and no new event arrives.
         try:
-            while self.indexer._publish_stored_pool_page():
-                pass
+            self.indexer.publish_stored_pools(seconds=_STORED_POOL_RESTORE_SECONDS)
         finally:
             self.store.close_reader()
         self._cache = OrderedDict()
@@ -1862,6 +1866,7 @@ class LPMarketService:
     def close(self):
         self._search_stop.set()
         self._warm_stop.set()
+        self.book.cancel_preparation()
         if self._search_thread is not None:
             self._search_thread.join()
         self.claims.close()
@@ -2328,8 +2333,6 @@ class LPMarketService:
         return True
 
     def _filtered_bucket_pool_ids(self, connection, frame, where, filters):
-        if where == "1":
-            return frame.aggregates.keys()
         matched = set()
         batch = []
         for pool_id in frame.aggregates:
@@ -2526,7 +2529,8 @@ class LPMarketService:
                     "priced_flows": priced_flows,
                     "unpriced_flows": int(total("flows")) - priced_flows,
                 },
-                "revision": frame.revision,
+                "revision": int(status.get("revision") or 0),
+                "aggregate_revision": frame.revision,
                 "events_revision": frame.events_revision,
                 "epoch": frame.epoch,
                 "as_of": frame.as_of,
@@ -2852,6 +2856,9 @@ class LPMarketService:
                 "rows": result, "total": total, "window": execution_name,
                 "sort": sort, "order": order, "coverage": coverage,
                 "revision": snapshot_revision,
+                "aggregate_revision": (
+                    execution.get("aggregate_revision", snapshot_revision)
+                ),
                 "events_revision": (
                     bucket_frame.events_revision
                     if bucket_frame is not None else snapshot_events_revision
@@ -2909,10 +2916,12 @@ class LPMarketService:
                                 bucket_frame.start, bucket_frame.end,
                                 bucket_frame.coverage,
                             )
-                            execution["revision"] = bucket_frame.revision
-                            execution["events_revision"] = (
-                                bucket_frame.events_revision
-                            )
+                            # The frame is reused while events stand still,
+                            # but the page body also carries pool metadata
+                            # and balances that bump the store revision on
+                            # their own. Publication identity must follow
+                            # the page snapshot; the frame stays provenance.
+                            execution["aggregate_revision"] = bucket_frame.revision
                             result = materialize(
                                 conn, bucket_frame, execution,
                             )

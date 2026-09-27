@@ -63,8 +63,7 @@ The response contains:
 - `coverage.history`, which separately describes indexed canonical event
   history; and
 - `coverage.state`, which counts available and unavailable current liquidity
-  reads, reports the per-request state-read limit, and counts matching pools
-  beyond that limit.
+  reads.
 
 “Every verified known match” does not mean every pool deployed on-chain.
 `coverage.catalog.complete_for_known_catalog` applies only to supported known
@@ -74,12 +73,8 @@ Verified pool identities are cached separately from current liquidity snapshots
 and invalidated when pool or token metadata changes. Recovering an omitted V4
 tick spacing reuses candidates from previously verified PoolKeys, but each
 candidate must still reproduce the requested pool hash. Large-token responses
-remain complete rather than silently capped: every matching pool is returned.
-Block-pinned state reads are bounded to the 512 most recently active matching
-pools per request, selected by latest indexed pool activity; `coverage.state`
-reports the bound as `state_read_limit` and the unmatched remainder as
-`pools_over_limit`. Attempted state reads use bounded RPC batches and retain
-the exact-block confirmation described above.
+remain complete rather than silently capped; state reads use bounded RPC
+batches and retain the exact-block confirmation described above.
 
 ### Pool identity and dynamic fees
 
@@ -118,14 +113,6 @@ A successful zero is `"0"`. A failed, reverted, or malformed contract read has
 `status: "unavailable"`, null value fields, and an `unavailable_reason`.
 Unavailable state is never converted to zero. One unavailable pool does not
 discard successful reads for other pools.
-
-A pool beyond the per-request state-read bound (`coverage.state.pools_over_limit`
-greater than zero) has not been read at all: it keeps its complete catalog row
-but returns `liquidity.status: "unavailable"` with `unavailable_reason:
-"state_read_budget"`, `availability.reasons: ["state_read_budget"]`, and, for
-dynamic V4, `fee.current_status: "unavailable"`. Selection is most
-recently active first; such pools are never dropped, zeroed, or hidden from
-counts.
 
 ### `GET /api/v1/assets`
 
@@ -236,14 +223,6 @@ exact same-transaction pool route, so trades are not attributed as LP activity.
 Use `occurred_at` and, when available, `observed_at` as evidence times.
 `read_at` is server read time and is not evidence time.
 
-Pages are cached for 30 seconds per query. When a refresh fails after one
-retry, the last successfully fetched page for that query is served with
-`provenance.stale: true`, `provenance.stale_reason`, and its original
-`provenance.retrieved_at`. After three consecutive failures the publisher's
-upstream is skipped for 60 seconds and `coverage.publisher_circuit` reports
-the open breaker; it is `null` otherwise. A `503` is returned only when no last-good page
-exists for the query.
-
 ## Freshness and completeness
 
 For pool and asset responses, the service obtains the Robinhood Chain head,
@@ -263,66 +242,6 @@ Coverage dimensions are independent:
   identity scope, omissions, and evidence.
 
 Preserve nulls and these qualifications in derived data.
-
-### HTTP caching
-
-Every successful JSON response carries `Cache-Control: public, max-age=N,
-stale-while-revalidate=M`, a weak `ETag`, and `Vary: Accept-Encoding`. `N`
-equals the service's own response cache lifetime for that route, so a shared
-cache in front of the origin never serves data older than the origin itself
-would. A request with a matching `If-None-Match` receives `304 Not Modified`
-with no body.
-
-| Route | `max-age` | `stale-while-revalidate` |
-| --- | ---: | ---: |
-| `/api/lp/status` | 1 | 2 |
-| `/api/lp/overview`, `/api/lp/pools` with `window=1h` or `24h` | 3 | 30 |
-| `/api/lp/overview`, `/api/lp/pools` with `window=7d` | 30 | 120 |
-| `/api/lp/overview`, `/api/lp/pools` with `window=30d` or `all` | 120 | 600 |
-| `/api/lp/tape`, `/api/lp/dislocations` | 2 | 10 |
-| `/api/lp/owners`, `/api/lp/owner`, `/api/v1/research/owner` | 5 | 60 |
-| `/api/lp/search`, `/api/workbench/pools` | 5 | 30 |
-| `/api/lp/closed` | 15 | 60 |
-| `/api/v1/pools`, `/api/v1/assets` | 2 | 10 |
-| `/api/v1/fomo/flow` | 10 | 60 |
-
-Error responses and the `/api/lp/stream` event stream are `no-store`.
-
-### Cross-pool dislocations
-
-`GET /api/lp/dislocations` compares the last indexed price of every pool
-that shares a token pair and returns the pairs whose pools disagree. It is a
-read of indexed state, not an executable quote, and it never submits or
-recommends a trade.
-
-| Parameter | Default | Behavior |
-| --- | --- | --- |
-| `min_bps` | `30` | Minimum `spread_bps` (max pool price over min pool price, in basis points) |
-| `min_depth_usd` | `100` | Minimum `depth_usd`; `0` keeps pairs whose depth cannot be priced |
-| `max_age_s` | `3600` | A pair qualifies when at least one of its pools has indexed state this recent; clamped to 60–86400 |
-| `max_stale_s` | `86400` | Excludes older pool states before selecting buy/sell legs; `0` explicitly disables this cutoff |
-| `protocol` | | `v2`, `v3`, or `v4`; compares only pools of that protocol |
-| `token` | | 20-byte address; keeps pairs containing it |
-| `q` | | Substring over pool id, token addresses, and symbols |
-| `sort` | `net` | `net`, `spread`, or `depth`, descending |
-| `limit`, `offset` | `50`, `0` | Page bounds; `limit` is at most 150 |
-
-Each row carries the pair's tokens, `pool_count`, `spread_bps`, `fee_bps`
-(the configured fee of the buy and sell pools, summed; `null` when either fee
-is unknown), `net_bps` (`spread_bps - fee_bps`, ignoring gas and slippage),
-`depth_usd`, a `buy` leg (lowest price of token0 in token1), a `sell` leg
-(highest), and up to 25 `pools` ordered by depth with `pools_omitted`. Every
-leg exposes `id`, `protocol`, `address`, `fee_ppm`, `tick_spacing`, `hook`,
-`price`, `sqrt_price_x96`, `tick`, `liquidity`, V2 `reserve0`/`reserve1`,
-`price0_usd`/`price1_usd`, `depth_usd`, `block_number`, `timestamp`, and
-`age_s` relative to the indexed head.
-
-`depth_usd` is the USDG-quote value required to move a leg to the geometric
-mid of the buy and sell prices assuming no tick crossing (V3/V4) or constant
-product (V2); the row value is the thinner leg. Pools with zero active
-liquidity or reserves, and pools at a tick limit, are excluded before
-comparison. A stale leg (large `age_s`) is the side that has not repriced;
-treat token transfer restrictions, hooks, and pool honesty as unverified.
 
 ### Terminal wallet accounting
 
@@ -367,10 +286,7 @@ All errors use a JSON object with an `error` string.
 A canonical block changing before publication is `503`; retry the whole request.
 No result from that attempt is published. Individual pool contract-call
 failures remain a `200` response with explicit per-pool nulls and reasons.
-Capacity errors include `Retry-After`. The origin bounds concurrent requests in
-two lanes so a burst of slow owner and research reads cannot starve the
-status, overview, pool, and tape routes. The lane sizes derive from the
-`--api-slots` option (default four per CPU; the slow lane holds half).
+Capacity errors may include `Retry-After`.
 
 Deployment edge limits may additionally return `429`. Clients should honor
 `Retry-After`, use exponential backoff, and avoid aggressive polling.

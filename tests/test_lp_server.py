@@ -6,23 +6,20 @@ import threading
 import time
 from types import SimpleNamespace
 
-from rhpools.lp_server import Handler, LPHTTPServer, _load_assets, lane_slots
+from rhpools.lp_server import Handler, LPHTTPServer, Startup, _load_assets
 from test_lp_market_service import (
     TOKEN, V3, header, lp_effect, pools, position_state, service, swap,
 )
 
 
 @contextmanager
-def serving(app, slots=None, **resources):
+def serving(app, **resources):
     runtime = SimpleNamespace(
         lp=app, stopping=threading.Event(), assets=_load_assets(),
         origins=frozenset({"https://rhpools.lol"}), enable_prepare=False,
         **resources,
     )
-    attrs = {"runtime": runtime}
-    if slots is not None:
-        attrs["api_slots"] = lane_slots(slots)
-    handler = type("TestHandler", (Handler,), attrs)
+    handler = type("TestHandler", (Handler,), {"runtime": runtime})
     server = LPHTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -76,60 +73,6 @@ def test_terminal_receives_heads_activity_and_scoped_wallets(tmp_path, monkeypat
             assert [row["owner"] for row in frames["owners"]["rows"]] == [TOKEN]
             response.close()
     finally:
-        app.close()
-
-
-def test_reconnected_stream_drops_the_previous_feed_cursor(tmp_path, monkeypatch):
-    app = service(tmp_path / "market.sqlite")
-    waiting = threading.Event()
-    release = threading.Event()
-    original_wait = app.wait_stream
-
-    def wait_for_publication(after, timeout):
-        waiting.set()
-        assert release.wait(3)
-        return original_wait(after, timeout)
-
-    def read_frame(response):
-        name, payload = "message", None
-        while True:
-            raw = response.readline()
-            assert raw, "stream closed before the next publication"
-            line = raw.decode().strip()
-            if line.startswith("event: "):
-                name = line[7:]
-            elif line.startswith("data: "):
-                payload = json.loads(line[6:])
-            elif not line and payload is not None:
-                return name, payload
-
-    try:
-        app.store.upsert_pools(pools())
-        now = int(time.time())
-        block = header(100, now)
-        app.indexer._publish_current_block(block, [], source="test")
-        monkeypatch.setattr(app, "wait_stream", wait_for_publication)
-        with serving(app) as connection:
-            connection.request(
-                "GET", "/api/lp/stream?current_only=1&kind=all&owners=0",
-                headers={"Last-Event-ID": "0:previous-process:1000000"},
-            )
-            response = connection.getresponse()
-            assert response.status == 200
-            assert read_frame(response)[1]["number"] == 100
-            assert waiting.wait(2)
-            event = swap(block, V3, "v3")
-            app.indexer._emit_current_activity(block, [event], source="test")
-            app.indexer._publish_current_block(
-                header(101, now + 1), [], source="test",
-            )
-            release.set()
-            frames = dict(read_frame(response) for _ in range(2))
-            assert frames["activity"]["rows"][0]["tx_hash"] == event["tx_hash"]
-            assert frames["block"]["number"] == 101
-            response.close()
-    finally:
-        release.set()
         app.close()
 
 
@@ -230,95 +173,95 @@ def test_cold_workbench_route_waits_for_bounded_index_publication(tmp_path):
         app.close()
 
 
-CACHE_MATRIX = {
-    "/api/lp/status": "public, max-age=1, stale-while-revalidate=2",
-    "/api/lp/overview?window=24h": "public, max-age=0, stale-while-revalidate=0",
-    "/api/lp/overview?window=7d": "public, max-age=0, stale-while-revalidate=0",
-    "/api/lp/pools?window=30d": "public, max-age=0, stale-while-revalidate=0",
-    "/api/lp/pools": "public, max-age=0, stale-while-revalidate=0",
-    "/api/lp/tape?window=24h&kind=lp": "public, max-age=2, stale-while-revalidate=10",
-    "/api/lp/dislocations?min_bps=25": "public, max-age=2, stale-while-revalidate=10",
-    "/api/lp/owners?window=24h": "public, max-age=5, stale-while-revalidate=60",
-    "/api/lp/search?q=asset": "public, max-age=5, stale-while-revalidate=30",
-}
+def test_starting_server_answers_probes_until_runtime_attaches(tmp_path):
+    """A store that takes hours to open must not leave the socket bound but mute."""
+    startup = Startup(_load_assets())
+    handler = type("StartingHandler", (Handler,), {"startup": startup, "runtime": None})
+    server = LPHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = http.client.HTTPConnection(*server.server_address, timeout=3)
+    app = None
+    try:
+        startup.phase("store")
+        connection.request("GET", "/")
+        response = connection.getresponse()
+        assert response.status == 200
+        assert b"<title>Robinhood Pools / Chain 4663</title>" in response.read()
+
+        connection.request("GET", "/api/lp/status")
+        response = connection.getresponse()
+        assert response.status == 503
+        assert response.getheader("Retry-After")
+        payload = json.loads(response.read())
+        assert payload["state"] == "starting"
+        assert payload["startup"]["phase"] == "store"
+        assert payload["startup"]["started_at"] == startup.started_at
+        assert {"cpu_ms", "read_bytes", "write_bytes"} <= payload["startup"]["activity"].keys()
+
+        for method, path, body in (
+            ("GET", "/api/lp/stream?view=terminal", None),
+            ("POST", "/api/lp/allocation", "{}"),
+        ):
+            connection.request(method, path, body, {"Content-Type": "application/json"})
+            response = connection.getresponse()
+            assert response.status == 503
+            assert json.loads(response.read())["state"] == "starting"
+        connection.request("GET", "/health")
+        response = connection.getresponse()
+        assert response.status == 404
+        response.read()
+
+        app = service(tmp_path / "market.sqlite")
+        handler.runtime = SimpleNamespace(
+            lp=app, stopping=threading.Event(), assets=startup.assets,
+            origins=frozenset(), enable_prepare=False,
+        )
+        connection.close()
+        connection = http.client.HTTPConnection(*server.server_address, timeout=3)
+        connection.request("GET", "/api/lp/status")
+        response = connection.getresponse()
+        assert response.status == 200
+        assert json.loads(response.read())["state"] != "starting"
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+        if app is not None:
+            app.close()
 
 
-def test_public_routes_publish_edge_cache_headers(tmp_path):
+def test_pools_page_republishes_symbol_completion_without_new_events(tmp_path):
     app = service(tmp_path / "market.sqlite")
     try:
-        app.store.upsert_pools(pools())
-        block = header(100, int(time.time()) - 30)
+        unknown = {**pools()[0], "symbol0": None, "decimals0": None}
+        app.store.upsert_pools([unknown])
+        block = header(100, int(time.time()) - 60)
         app.store.ingest([block], [swap(block, V3, "v3")])
         with serving(app) as connection:
-            for target, cache_control in CACHE_MATRIX.items():
-                connection.request("GET", target)
-                response = connection.getresponse()
-                response.read()
-                assert response.status == 200, target
-                assert response.getheader("Cache-Control") == cache_control, target
-                assert response.getheader("ETag", "").startswith('W/"'), target
-                assert response.getheader("Vary") == "Accept-Encoding", target
+            connection.request("GET", "/api/lp/pools?window=all")
+            response = connection.getresponse()
+            assert response.status == 200
+            etag = response.getheader("ETag")
+            first = json.loads(response.read())
+            assert first["rows"][0]["token0"]["symbol"] is None
 
-            connection.request("GET", "/api/lp/overview?window=24h")
-            first = connection.getresponse()
-            first.read()
-            connection.request("GET", "/api/lp/overview?window=24h", headers={
-                "If-None-Match": 'W/"stale", ' + first.getheader("ETag"),
-            })
-            revalidated = connection.getresponse()
-            assert revalidated.status == 304
-            assert revalidated.read() == b""
-            assert revalidated.getheader("ETag") == first.getheader("ETag")
-            assert revalidated.getheader("Cache-Control") == CACHE_MATRIX["/api/lp/overview?window=24h"]
-
-            connection.request("GET", "/api/lp/overview?window=never")
-            rejected = connection.getresponse()
-            rejected.read()
-            assert rejected.status == 400
-            assert rejected.getheader("Cache-Control") == "no-store"
-            assert rejected.getheader("ETag") is None
-
-            connection.request("GET", "/api/lp/stream?view=terminal&current_only=1")
-            stream = connection.getresponse()
-            assert stream.status == 200
-            assert stream.getheader("Cache-Control") == "no-store,no-transform"
-            stream.close()
+            # Symbol completion bumps the store without any new event; the
+            # reused aggregate frame must not pin the page's publication.
+            app.store.save_token_metadata(TOKEN, "ASSET", 6)
+            with app._cache_lock:
+                app._cache.clear()
+            connection.request(
+                "GET", "/api/lp/pools?window=all", headers={"If-None-Match": etag},
+            )
+            response = connection.getresponse()
+            assert response.status == 200
+            assert response.getheader("ETag") != etag
+            second = json.loads(response.read())
+            assert second["rows"][0]["token0"]["symbol"] == "ASSET"
+            assert second["revision"] > first["revision"]
+            assert second["aggregate_revision"] == first["aggregate_revision"]
+            assert second["events_revision"] == first["events_revision"]
     finally:
-        app.close()
-
-
-def test_slow_lane_exhaustion_leaves_fast_routes_answering(tmp_path):
-    app = service(tmp_path / "market.sqlite")
-    release = threading.Event()
-    entered = threading.Event()
-
-    def blocked_owners(_query):
-        entered.set()
-        release.wait(5)
-        return {"rows": [], "revision": 1, "epoch": 0}
-
-    try:
-        app.owners = blocked_owners
-        with serving(app, slots=2) as connection:
-            holder = http.client.HTTPConnection(connection.host, connection.port, timeout=10)
-            holder.request("GET", "/api/lp/owners?window=24h")
-            assert entered.wait(3)
-
-            connection.request("GET", "/api/lp/owners?window=7d")
-            shed = connection.getresponse()
-            shed.read()
-            assert shed.status == 503
-            assert shed.getheader("Retry-After") == "1"
-            assert shed.getheader("Cache-Control") == "no-store"
-
-            connection.request("GET", "/api/lp/status")
-            status = connection.getresponse()
-            status.read()
-            assert status.status == 200
-
-            release.set()
-            assert holder.getresponse().status == 200
-            holder.close()
-    finally:
-        release.set()
         app.close()

@@ -18,6 +18,7 @@ from itertools import groupby, islice
 import json
 import math
 import multiprocessing
+from multiprocessing.synchronize import Event
 from pathlib import Path
 import sqlite3
 import threading
@@ -26,6 +27,8 @@ from typing import Any, Iterable, NamedTuple, Sequence
 
 from .lp_math import principal_raw
 from .lp_market_protocols import core_position_key
+from .lp_market_store import _insert_rows
+from .lp_owner_rollup import DEFAULT_RESERVE_BYTES, RollupReplica, install_journal, prune_journal
 
 
 _ZERO_ADDRESS = "0x" + "0" * 40
@@ -41,7 +44,8 @@ _IDENTITY_BOOTSTRAP_EVENTS = 4096
 _IDENTITY_BOOTSTRAP_KEYS = 256
 _IDENTITY_BOOTSTRAP_PAGE = 256
 _PENDING_PREPARATION_SECONDS = 0.2
-_PENDING_TRANSACTION_SECONDS = 0.2
+_PENDING_TRANSACTION_SECONDS = 2.0
+_IDENTITY_PUBLICATION_SECONDS = 1.0
 _POSITION_INTEREST_LIMIT = 2048
 _POSITION_INTEREST_SECONDS = 180.0
 _PREPARATION_SNAPSHOT_SECONDS = 15.0
@@ -74,6 +78,25 @@ _REPLAY_EVENTS_SQL = (
     "SELECT COUNT(*) FROM (SELECT 1 FROM lp_accounting_effects x "
     "WHERE x.position_key=lp_accounting_pending.position_key "
     f"LIMIT {_PASS_EVENT_BUDGET + 1})) ELSE 0 END END"
+)
+# A queued replay whose newest mapped event orders after the published state
+# supersedes that state.  SQL twin of AccountBook._projection_state: q is the
+# lp_accounting_pending row and p the lp_accounting_positions row.
+_QUEUED_AFTER_PUBLISHED_SQL = (
+    "(q.priority_block>p.last_block OR (q.priority_block=p.last_block AND "
+    "(q.priority_tx_index>p.last_tx_index OR (q.priority_tx_index=p.last_tx_index "
+    "AND q.priority_log_index>p.last_log_index))))"
+)
+_STALE_POSITION_SQL = (
+    "EXISTS(SELECT 1 FROM lp_accounting_pending q "
+    "JOIN lp_accounting_positions p ON p.position_key=q.position_key "
+    "WHERE q.position_key={key} AND q.cost_only=0 AND "
+    + _QUEUED_AFTER_PUBLISHED_SQL + ")"
+)
+_STALE_POSITION_KEYS_SQL = (
+    "SELECT q.position_key FROM lp_accounting_pending q "
+    "JOIN lp_accounting_positions p ON p.position_key=q.position_key "
+    "WHERE q.cost_only=0 AND " + _QUEUED_AFTER_PUBLISHED_SQL
 )
 _OWNER_ACTIVITY_WINDOWS = ("1h", "24h", "7d", "30d", "all")
 _OWNER_ACTIVITY_PROTOCOLS = ("", "v2", "v3", "v4")
@@ -122,11 +145,16 @@ def _snapshot_deadline_error(exc: BaseException) -> bool:
 
 
 class _PoolInventory(NamedTuple):
-    """Compact immutable inputs needed to revalue one pool's open positions."""
+    """Compact immutable inputs needed to revalue one pool's open positions.
+
+    ``positions`` already excludes rows whose published state is superseded
+    by queued canonical events; ``stale_positions`` counts those exclusions.
+    """
 
     positions: tuple[tuple[int | None, int | None, int | None], ...]
     lp_count: int
     history_complete: bool
+    stale_positions: int
 
 
 
@@ -164,6 +192,9 @@ CREATE INDEX IF NOT EXISTS lp_ownership_intervals_owner
     ON lp_ownership_intervals(owner, start_timestamp, end_timestamp);
 CREATE INDEX IF NOT EXISTS lp_ownership_intervals_custody
     ON lp_ownership_intervals(custody) WHERE custody IS NOT NULL;
+CREATE INDEX IF NOT EXISTS lp_ownership_intervals_owner_end
+    ON lp_ownership_intervals(owner,end_block DESC,end_tx_index DESC,end_log_index DESC)
+    WHERE end_block IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS lp_accounting_positions (
     position_key TEXT PRIMARY KEY,
@@ -212,6 +243,11 @@ CREATE INDEX IF NOT EXISTS lp_accounting_positions_active_inventory
     ON lp_accounting_positions(
         pool_id,owner,custody,protocol,liquidity,liquidity_known,
         tick_lower,tick_upper,principal_usd,history_complete
+    ) WHERE active_episode_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS lp_accounting_positions_active_replay
+    ON lp_accounting_positions(
+        pool_id,position_key,last_block,last_tx_index,last_log_index,
+        protocol,liquidity,liquidity_known,tick_lower,tick_upper
     ) WHERE active_episode_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS lp_accounting_positions_owner_active_key
     ON lp_accounting_positions(owner,position_key)
@@ -435,10 +471,9 @@ _EFFECT_COLUMNS = (
     "withdrawal_usd", "fees_usd", "exact", "basis",
 )
 _EFFECT_MUTABLE_COLUMNS = _EFFECT_COLUMNS[1:]
-_EFFECT_WRITE_SQL = (
-    f"INSERT INTO lp_accounting_effects({','.join(_EFFECT_COLUMNS)}) "
-    f"VALUES({','.join('?' for _ in _EFFECT_COLUMNS)}) "
-    "ON CONFLICT(event_id) DO UPDATE SET "
+_EFFECT_WRITE_PREFIX = f"INSERT INTO lp_accounting_effects({','.join(_EFFECT_COLUMNS)})"
+_EFFECT_WRITE_SUFFIX = (
+    " ON CONFLICT(event_id) DO UPDATE SET "
     + ",".join(
         f"{column}=excluded.{column}" for column in _EFFECT_MUTABLE_COLUMNS
     )
@@ -488,7 +523,7 @@ class _ReplayWrites:
     def __init__(self, position_key: str, *, append_only: bool = False) -> None:
         self.position_key = position_key
         self._append_only = bool(append_only)
-        self._statements: dict[str, str] = {}
+        self._statements: dict[str, tuple[str, str]] = {}
         self._rows: dict[str, dict[Any, tuple[Any, ...]]] = {
             group: {} for group in self._GROUPS
         }
@@ -533,12 +568,15 @@ class _ReplayWrites:
         state["episode_ordinal"] = ordinal
 
     def add(
-        self, group: str, key: Any, sql: str, row: tuple[Any, ...],
+        self, group: str, key: Any, prefix: str, row: tuple[Any, ...],
+        *, suffix: str = "",
     ) -> None:
         if self._prepared_rows is not None:
             raise RuntimeError("cannot append to a prepared replay")
-        prior = self._statements.setdefault(group, sql)
-        if prior != sql:
+        prior = self._statements.get(group)
+        if prior is None:
+            self._statements[group] = (prefix, suffix)
+        elif prior[0] != prefix or prior[1] != suffix:
             raise RuntimeError(f"conflicting replay statement for {group}")
         self._rows[group][key] = row
 
@@ -783,7 +821,11 @@ class _ReplayWrites:
             changed_rows = self._prepared_rows[group]
             statement = self._statements.get(group)
             if changed_rows and statement is not None:
-                conn.executemany(statement, changed_rows)
+                prefix, suffix = statement
+                _insert_rows(
+                    conn, prefix, changed_rows,
+                    columns=len(changed_rows[0]), suffix=suffix,
+                )
         conn.execute(
             "DELETE FROM lp_accounting_replay_identities WHERE position_key=?",
             (self.position_key,),
@@ -823,9 +865,11 @@ class _PreparedIdentityHints(NamedTuple):
 class _PreparationReader:
     """Worker-local reader; cannot install schema or publish ledger changes."""
 
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, stop: Event | None = None) -> None:
+        self._stop = stop
+        self.path = Path(path).resolve()
         self._connection = sqlite3.connect(
-            Path(path).resolve().as_uri() + "?mode=ro", uri=True,
+            self.path.as_uri() + "?mode=ro", uri=True,
             isolation_level=None, timeout=5.0,
         )
         self._connection.row_factory = sqlite3.Row
@@ -841,6 +885,8 @@ class _PreparationReader:
     @contextmanager
     def reader_snapshot(self, seconds: float | None = None):
         connection = self.read()
+        if self._stop is not None and self._stop.is_set():
+            raise PreparationDeadlineError("accounting preparation cancelled")
         if connection.in_transaction:
             yield connection
             return
@@ -852,11 +898,16 @@ class _PreparationReader:
         try:
             connection.execute("BEGIN")
             connection.set_progress_handler(
-                lambda: int(time.monotonic() >= deadline),
+                lambda: int(
+                    time.monotonic() >= deadline
+                    or (self._stop is not None and self._stop.is_set())
+                ),
                 _PREPARATION_PROGRESS_STEPS,
             )
             yield connection
-            if time.monotonic() >= deadline:
+            if time.monotonic() >= deadline or (
+                self._stop is not None and self._stop.is_set()
+            ):
                 raise PreparationDeadlineError(
                     "accounting preparation snapshot exceeded its deadline"
                 )
@@ -869,11 +920,21 @@ class _PreparationReader:
 
 
 _preparation_book: AccountBook | None = None
+_rollup_replica: RollupReplica | None = None
 
 
-def _initialize_preparation_worker(path: str) -> None:
+def _initialize_preparation_worker(path: str, stop: Event, reserve_bytes: int) -> None:
     global _preparation_book
-    _preparation_book = AccountBook(_PreparationReader(path), deferred=True)
+    reader = _PreparationReader(path, stop)
+    directory = str(reader.path.parent)
+    reader.read().execute("PRAGMA temp_store_directory='" + directory.replace("'", "''") + "'")
+    selected = reader.read().execute("PRAGMA temp_store_directory").fetchone()
+    if selected is None or selected[0] != directory:
+        reader.read().close()
+        raise RuntimeError("SQLite could not honor the worker temporary-file directory")
+    _preparation_book = AccountBook(
+        reader, deferred=True, storage_reserve_bytes=reserve_bytes,
+    )
 
 
 def _prepare_in_worker(
@@ -884,10 +945,31 @@ def _prepare_in_worker(
     return _preparation_book._prepare_pending(position_key, budget_scale)
 
 
-def _owner_activity_in_worker(now: int) -> dict[str, Any]:
+def _owner_activity_in_worker(generation: int) -> dict[str, Any]:
+    global _rollup_replica
     if _preparation_book is None:
         raise RuntimeError("accounting preparation worker is not initialized")
-    return _preparation_book._owner_activity_snapshot(now)
+    if _rollup_replica is None:
+        reader = _preparation_book.store
+        _rollup_replica = RollupReplica(
+            reader.path.parent, reader._stop,
+            reserve_bytes=_preparation_book._storage_reserve_bytes,
+        )
+    try:
+        _rollup_replica.synchronize(_preparation_book)
+        snapshot = _preparation_book._owner_activity_snapshot(
+            _rollup_replica.built_at, replica=_rollup_replica,
+        )
+        snapshot["requested_generation"] = generation
+        return snapshot
+    except BaseException as error:
+        if not _snapshot_deadline_error(error) or _preparation_book._closing or (
+            _preparation_book.store._stop is not None
+            and _preparation_book.store._stop.is_set()
+        ):
+            _rollup_replica.close()
+            _rollup_replica = None
+        raise
 
 
 def _batches(values: Sequence[Any], size: int = 500) -> Iterable[Sequence[Any]]:
@@ -1060,12 +1142,16 @@ class AccountBook:
     def __init__(
         self, store: Any, *, deferred: bool = False,
         preparation_workers: int = 0,
+        storage_reserve_bytes: int = DEFAULT_RESERVE_BYTES,
     ):
         self.store = store
         self.deferred = bool(deferred)
         self._installed = False
         self._preparation_workers = preparation_workers
+        self._storage_reserve_bytes = storage_reserve_bytes
         self._preparation_pool: ProcessPoolExecutor | None = None
+        self._worker_stop: Event | None = None
+        self._closing = False
         self._projection_lock = threading.Lock()
         self._pending_transaction_batch = 1
         self._cache_lock = threading.RLock()
@@ -1099,8 +1185,26 @@ class AccountBook:
         self._rollup_meta: dict[str, Any] = {}
         self._rollup_views: OrderedDict[tuple[int, str, str], _RollupRows] = OrderedDict()
 
+    def cancel_preparation(self) -> None:
+        self._closing = True
+        if self._worker_stop is not None:
+            self._worker_stop.set()
+
+    def _create_preparation_pool(self, workers: int) -> ProcessPoolExecutor:
+        context = multiprocessing.get_context("spawn")
+        if self._worker_stop is None:
+            self._worker_stop = context.Event()
+        if self._closing:
+            self._worker_stop.set()
+        return ProcessPoolExecutor(
+            max_workers=workers, mp_context=context,
+            initializer=_initialize_preparation_worker,
+            initargs=(str(self.store.path), self._worker_stop, self._storage_reserve_bytes),
+        )
+
     def close(self) -> None:
         """Join preparation after the accounting coordinator has stopped."""
+        self.cancel_preparation()
         with self._projection_lock:
             for name in ("_preparation_pool", "_rollup_pool"):
                 pool = getattr(self, name)
@@ -1193,11 +1297,8 @@ class AccountBook:
     ) -> Future[_PreparedProjection | None]:
         if self._preparation_pool is None:
             # Spawn never inherits the writer connection, locks or web threads.
-            self._preparation_pool = ProcessPoolExecutor(
-                max_workers=self._preparation_workers,
-                mp_context=multiprocessing.get_context("spawn"),
-                initializer=_initialize_preparation_worker,
-                initargs=(str(self.store.path),),
+            self._preparation_pool = self._create_preparation_pool(
+                self._preparation_workers,
             )
         return self._preparation_pool.submit(
             _prepare_in_worker, position_key, self._position_budget_scale(
@@ -1320,6 +1421,7 @@ class AccountBook:
                     "position_state_json TEXT NOT NULL DEFAULT ''"
                 )
             with self.store.transaction() as conn:
+                install_journal(conn)
                 self.store._install_accounting_pending_identities(conn)
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS lp_accounting_pending_identities_pool "
@@ -1505,6 +1607,38 @@ class AccountBook:
                         protocol, pool_id, timestamp,
                     )
 
+    def _add_ledger_identity_hints(
+            self, conn: sqlite3.Connection,
+            hints: dict[tuple[str, str, str, str, str], int],
+            position_keys: Iterable[str],
+    ) -> None:
+        """Hint every identity the published ledger still attributes to a key."""
+        for batch in _batches(sorted(set(position_keys))):
+            marks = ",".join("?" for _ in batch)
+            rows = conn.execute(
+                "SELECT position_key,owner,custody,protocol,pool_id,last_timestamp "
+                f"FROM lp_accounting_episodes WHERE position_key IN ({marks}) "
+                "UNION ALL "
+                "SELECT position_key,owner,custody,protocol,pool_id,last_timestamp "
+                f"FROM lp_accounting_positions WHERE position_key IN ({marks})",
+                (*batch, *batch),
+            )
+            for row in rows:
+                position_key = str(row[0])
+                protocol = str(row[3] or "").strip().lower()
+                pool_id = str(row[4] or "").strip().lower()
+                timestamp = int(row[5] or 0)
+                self._add_identity_hint(
+                    hints, position_key, "scope", "", protocol, pool_id, timestamp,
+                )
+                for kind, value in (("owner", row[1]), ("custody", row[2])):
+                    identity = _address(value)
+                    if identity is not None and identity != _ZERO_ADDRESS:
+                        self._add_identity_hint(
+                            hints, position_key, kind, identity,
+                            protocol, pool_id, timestamp,
+                        )
+
 
     @staticmethod
     def _merge_pending_identity_hints(
@@ -1632,6 +1766,10 @@ class AccountBook:
         self._set_accounting_meta(conn, "dirty", 0)
 
     def _resume_bootstrap(self, limit: int) -> bool:
+        if self._accounting_meta(
+            self.store.read(), "bootstrap_phase", "complete",
+        ) == "complete":
+            return False
         batch_size = max(64, min(2048, int(limit) * 32))
         with self.store.transaction() as conn:
             phase = self._accounting_meta(conn, "bootstrap_phase", "complete")
@@ -1792,6 +1930,10 @@ class AccountBook:
                     (position_key, cursor, page_size),
                 ))
                 hints: dict[tuple[str, str, str, str, str], int] = {}
+                if cursor == 0:
+                    self._add_ledger_identity_hints(
+                        conn, hints, (position_key,),
+                    )
                 for event in events:
                     self._add_event_identity_hints(
                         hints, position_key, event,
@@ -1828,7 +1970,7 @@ class AccountBook:
                     and (
                         published == first
                         or time.monotonic() - acquired_at
-                        < _PENDING_TRANSACTION_SECONDS
+                        < _IDENTITY_PUBLICATION_SECONDS
                     )
                 ):
                     item = prepared[published]
@@ -2188,6 +2330,9 @@ class AccountBook:
             worked = self._resume_bootstrap(bounded)
             if self._preparation_workers:
                 worked = self._advance_rollup() or worked
+            with self.store.transaction(blocking=False) as conn:
+                if conn is not None:
+                    worked = bool(prune_journal(conn)) or worked
             pending = self._pending_rows(bounded)
             if pending:
                 worked = True
@@ -2212,6 +2357,7 @@ class AccountBook:
                 published = 0
                 while published < len(prepared_batch):
                     with self.store.transaction() as conn:
+                        prune_journal(conn)
                         acquired_at = time.monotonic()
                         batch_start = published
                         position_keys: set[str] = set()
@@ -2276,8 +2422,14 @@ class AccountBook:
                                 / max(transaction_seconds, 1e-9)
                             ),
                         ))
-                        if target > transaction_batch:
-                            target = min(target, transaction_batch * 2)
+                        if (
+                            transaction_seconds < _PENDING_TRANSACTION_SECONDS
+                            and published_positions >= transaction_batch
+                        ):
+                            target = min(128, max(
+                                transaction_batch + 1,
+                                min(target, transaction_batch * 2),
+                            ))
                         transaction_batch = target
                         self._pending_transaction_batch = target
             return worked
@@ -2711,6 +2863,10 @@ class AccountBook:
                         batch,
                     ).fetchall()
                 )
+            # Owners recorded by the published ledger stay affected until the
+            # replay lands: an event whose owner was corrected only hints the
+            # new owner, while the prior owner's episode remains visible.
+            self._add_ledger_identity_hints(conn, identity_hints, keys)
             for key in legacy_positions:
                 if key in append_proofs:
                     append_proofs[key] = False
@@ -3933,7 +4089,7 @@ class AccountBook:
         event: Mapping[str, Any], effect: Mapping[str, Any],
         writes: _ReplayWrites | None = None,
     ) -> None:
-        sql = _EFFECT_WRITE_SQL
+        sql = _EFFECT_WRITE_PREFIX
         row = (
             int(event["id"]), state["position_key"], effect.get("episode_id"),
             _address(effect.get("gas_owner") or state.get("owner")),
@@ -3958,9 +4114,13 @@ class AccountBook:
             str(effect.get("basis") or "unknown"),
         )
         if writes is None:
-            conn.execute(sql, row)
+            _insert_rows(
+                conn, sql, (row,), columns=len(row), suffix=_EFFECT_WRITE_SUFFIX,
+            )
         else:
-            writes.add("effects", int(event["id"]), sql, row)
+            writes.add(
+                "effects", int(event["id"]), sql, row, suffix=_EFFECT_WRITE_SUFFIX,
+            )
 
     @staticmethod
     def _save_ownership(
@@ -3971,8 +4131,7 @@ class AccountBook:
             "INSERT OR REPLACE INTO lp_ownership_intervals("
             "position_key,ordinal,token_id,owner,custody,identity_basis,acquired_by,"
             "start_block,start_tx_index,start_log_index,start_timestamp,end_block,"
-            "end_tx_index,end_log_index,end_timestamp,complete) VALUES("
-            + ",".join("?" for _ in range(16)) + ")"
+            "end_tx_index,end_log_index,end_timestamp,complete)"
         )
         row = (
             interval["position_key"], int(interval["ordinal"]), interval.get("token_id"),
@@ -3984,7 +4143,7 @@ class AccountBook:
             interval.get("end_timestamp"), int(bool(interval.get("complete"))),
         )
         if writes is None:
-            conn.execute(sql, row)
+            _insert_rows(conn, sql, (row,), columns=len(row))
         else:
             writes.add(
                 "ownership",
@@ -4027,8 +4186,7 @@ class AccountBook:
             "deposit0,deposit1,proceeds0,proceeds1,principal_withdrawal0,"
             "principal_withdrawal1,fees0,fees1,deposit_usd,proceeds_usd,withdrawal_usd,fees_usd,"
             "close_price0_usd,close_price1_usd,current_equity_usd,lp_value_usd,hold_value_usd,"
-            "lp_vs_hold_usd,gross_pnl_usd,gas_usd,net_pnl_usd,return_pct,accounting_basis,qualifiers) "
-            "VALUES(" + ",".join("?" for _ in range(54)) + ")"
+            "lp_vs_hold_usd,gross_pnl_usd,gas_usd,net_pnl_usd,return_pct,accounting_basis,qualifiers)"
         )
         row = (
             episode["id"], episode["position_key"], int(episode["ordinal"]),
@@ -4065,7 +4223,7 @@ class AccountBook:
             json.dumps(qualifiers, separators=(",", ":")),
         )
         if writes is None:
-            conn.execute(sql, row)
+            _insert_rows(conn, sql, (row,), columns=len(row))
         else:
             writes.add("episodes", str(episode["id"]), sql, row)
 
@@ -4091,8 +4249,7 @@ class AccountBook:
             "pending_known,tokens_owed0,tokens_owed1,owed_known,active_episode_id,status,"
             "history_complete,first_block,first_timestamp,last_block,last_tx_index,last_log_index,"
             "last_timestamp,principal0,principal1,principal_usd,uncollected_fees_usd,equity_usd,"
-            "valuation_block,valuation_timestamp,valuation_basis,state_json) VALUES("
-            + ",".join("?" for _ in range(35)) + ")"
+            "valuation_block,valuation_timestamp,valuation_basis,state_json)"
         )
         row = (
             state["position_key"], state.get("token_id"), state.get("pool_id"),
@@ -4112,7 +4269,7 @@ class AccountBook:
             json.dumps(state, separators=(",", ":"), sort_keys=True),
         )
         if writes is None:
-            conn.execute(sql, row)
+            _insert_rows(conn, sql, (row,), columns=len(row))
         else:
             writes.add("positions", str(state["position_key"]), sql, row)
 
@@ -5196,8 +5353,9 @@ class AccountBook:
                 args.extend([term] * 13)
             aggregate = (
                 "COUNT(DISTINCT e.position_key) AS positions,"
-                "COUNT(DISTINCT CASE WHEN e.closed_at IS NULL THEN e.position_key END) "
-                "AS open_positions,"
+                "COUNT(DISTINCT CASE WHEN e.closed_at IS NULL AND NOT "
+                + _STALE_POSITION_SQL.format(key="e.position_key")
+                + " THEN e.position_key END) AS open_positions,"
                 "SUM(e.status='complete') AS closed_episodes,"
                 "CASE WHEN COUNT(e.gross_pnl_usd)=COUNT(*) "
                 "THEN SUM(e.gross_pnl_usd) END AS gross_pnl_usd,"
@@ -5230,8 +5388,9 @@ class AccountBook:
             )
             custody_aggregate = (
                 "COUNT(DISTINCT e.position_key) AS positions,"
-                "COUNT(DISTINCT CASE WHEN e.closed_at IS NULL "
-                "THEN e.position_key END) AS open_positions,"
+                "COUNT(DISTINCT CASE WHEN e.closed_at IS NULL AND NOT "
+                + _STALE_POSITION_SQL.format(key="e.position_key")
+                + " THEN e.position_key END) AS open_positions,"
                 "SUM(e.status='complete') AS closed_episodes,"
                 "CASE WHEN MIN(e.history_complete AND e.pricing_complete)=1 "
                 "AND COUNT(e.deposit_usd)=COUNT(*) "
@@ -5354,7 +5513,9 @@ class AccountBook:
             else:
                 total[index] += values[index]
 
-    def _owner_activity_snapshot(self, now: int) -> dict[str, Any]:
+    def _owner_activity_snapshot(
+        self, now: int, *, replica: RollupReplica | None = None,
+    ) -> dict[str, Any]:
         """Roll every episode up by identity, protocol and recency tier.
 
         Five covering-index scans on one read snapshot replace the per-request
@@ -5368,8 +5529,17 @@ class AccountBook:
             " FROM lp_accounting_episodes "
             "INDEXED BY lp_accounting_episodes_owner_window_cover "
         )
-        with self.store.reader_snapshot(_OWNER_ACTIVITY_SNAPSHOT_SECONDS) as conn:
-            epoch = self._store_metadata_int(conn, "epoch")
+        reader = self.store if replica is None else replica
+        with reader.reader_snapshot(_OWNER_ACTIVITY_SNAPSHOT_SECONDS) as conn:
+            epoch = self._store_metadata_int(conn, "epoch") if replica is None else replica.epoch
+            # The replica carries only episodes, effects and costs; superseded
+            # positions are read from the ledger's pending queue instead.
+            if replica is None:
+                stale_keys = self._stale_position_keys(conn)
+            else:
+                with self.store.reader_snapshot() as ledger:
+                    stale_keys = self._stale_position_keys(ledger)
+            stale_json = json.dumps(stale_keys, separators=(",", ":"))
             for kind, fields, components in (
                 ("owner", _OWNER_ACTIVITY_FIELDS, (
                     "COUNT(*),SUM(status='complete'),"
@@ -5421,11 +5591,14 @@ class AccountBook:
                 positions_at = fields.index("positions")
                 open_at = fields.index("open_positions")
                 for row in conn.execute(
-                    "WITH p(identity,protocol,position_key,max_ts,open_ts) "
+                    "WITH stale(position_key) AS MATERIALIZED ("
+                    "SELECT value FROM json_each(?)),"
+                    "p(identity,protocol,position_key,max_ts,open_ts) "
                     "AS MATERIALIZED ("
                     f"SELECT {kind},COALESCE(protocol,'?'),position_key,"
                     "MAX(last_timestamp),"
-                    "MAX(CASE WHEN closed_at IS NULL THEN last_timestamp END)"
+                    "MAX(CASE WHEN closed_at IS NULL AND position_key NOT IN "
+                    "(SELECT position_key FROM stale) THEN last_timestamp END)"
                     + source + f"WHERE {kind} IS NOT NULL "
                     "GROUP BY 1,2,position_key),"
                     "q(identity,max_ts,open_ts) AS MATERIALIZED ("
@@ -5443,7 +5616,7 @@ class AccountBook:
                     "UNION ALL SELECT identity,'',"
                     + self._activity_tier_sql("open_ts")
                     + ",0,COUNT(*) FROM q WHERE open_ts IS NOT NULL GROUP BY 1,2,3",
-                    cuts * 4,
+                    (stale_json, *cuts * 4),
                 ):
                     key = (kind, str(row[0]), str(row[1]), int(row[2]))
                     values = partials.setdefault(key, list(blank))
@@ -5485,13 +5658,17 @@ class AccountBook:
                     values[0] += int(row[5])
                     values[1] += int(row[6])
                     values[2] = _sql_sum(values[2], row[7])
-            through_order, through_as_of, _owners, _custodies, complete = (
-                self._scoped_owner_financial_state(conn, {}, None, ())
-            )
+            if replica is None:
+                through_order, through_as_of, _owners, _custodies, complete = (
+                    self._scoped_owner_financial_state(conn, {}, None, ())
+                )
+            else:
+                through_order, through_as_of, complete = replica.financial
         return {
             "built_at": int(now), "epoch": epoch,
             "financial": [through_order, through_as_of, complete],
             "rows": [(*key, values) for key, values in partials.items()],
+            "journal_through": None if replica is None else replica.through,
         }
 
     def _load_rollup(self, conn: sqlite3.Connection) -> None:
@@ -5519,6 +5696,7 @@ class AccountBook:
         with self.store.transaction() as conn:
             if self._store_metadata_int(conn, "epoch") != int(snapshot["epoch"]):
                 return False
+            source_generation = self.owners_revision
             if self._rollup_partials is None:
                 self._load_rollup(conn)
             previous = self._rollup_partials or {}
@@ -5543,12 +5721,20 @@ class AccountBook:
                 "financial": list(snapshot["financial"]),
             }
             self._set_accounting_meta(conn, "owner_activity", json.dumps(meta))
+            if snapshot.get("journal_through") is not None:
+                self._set_accounting_meta(conn, "owner_rollup_ack", int(snapshot["journal_through"]))
+                prune_journal(conn)
             self._invalidate_cache(conn, ())
+            published_generation = (
+                self.owners_revision
+                if snapshot.get("requested_generation", source_generation) == source_generation
+                else -1
+            )
         with self._cache_lock:
             self._rollup_partials = rows
             self._rollup_meta = meta
             self._rollup_views.clear()
-            self._rollup_generation = self._owners_generation
+            self._rollup_generation = published_generation
         return True
 
     def _advance_rollup(self) -> bool:
@@ -5578,14 +5764,9 @@ class AccountBook:
             return False
         self._rollup_started = now
         if self._rollup_pool is None:
-            self._rollup_pool = ProcessPoolExecutor(
-                max_workers=1,
-                mp_context=multiprocessing.get_context("spawn"),
-                initializer=_initialize_preparation_worker,
-                initargs=(str(self.store.path),),
-            )
+            self._rollup_pool = self._create_preparation_pool(1)
         self._rollup_future = self._rollup_pool.submit(
-            _owner_activity_in_worker, int(time.time()),
+            _owner_activity_in_worker, self.owners_revision,
         )
         return False
 
@@ -5936,8 +6117,8 @@ class AccountBook:
                     "SELECT s.identity AS _identity," + columns
                     + " FROM selected s JOIN events e ON e.id=("
                     "SELECT a.id FROM lp_ownership_intervals i "
-                    "INDEXED BY lp_ownership_intervals_owner "
-                    "JOIN events a INDEXED BY events_block_idx "
+                    "INDEXED BY lp_ownership_intervals_owner_end "
+                    "CROSS JOIN events a INDEXED BY events_block_idx "
                     "ON a.block_number=i.end_block "
                     "AND a.tx_index=i.end_tx_index "
                     "AND a.log_index=i.end_log_index "
@@ -6352,6 +6533,41 @@ class AccountBook:
             bool(row["coverage"]["qualified"]) for row in selected)})
         return {"rows": selected, "total": total, "coverage": coverage}
 
+    @staticmethod
+    def _projection_state(row: Mapping[str, Any]) -> dict[str, Any]:
+        """Classify a published position against its queued deferred replay.
+
+        ``stale`` means canonical events ordered after the published state are
+        mapped to the position and await replay; the persisted inventory is
+        superseded.  ``pending`` means a replay is queued for earlier or
+        re-delivered facts, so the tail state stands but its history may move.
+        """
+        published = (
+            int(row.get("last_block") or 0), int(row.get("last_tx_index") or 0),
+            int(row.get("last_log_index") or 0),
+        )
+        queued_block = row.get("pending_block")
+        if queued_block is None or row.get("pending_cost_only"):
+            return {
+                "state": "current", "published_block": published[0],
+                "queued_block": None,
+            }
+        queued = (
+            int(queued_block), int(row.get("pending_tx_index") or 0),
+            int(row.get("pending_log_index") or 0),
+        )
+        return {
+            "state": "stale" if queued > published else "pending",
+            "published_block": published[0], "queued_block": queued[0],
+        }
+
+    @staticmethod
+    def _stale_position_keys(conn: sqlite3.Connection) -> list[str]:
+        """Keys whose published state is superseded by queued canonical events."""
+        return [
+            str(row[0]) for row in conn.execute(_STALE_POSITION_KEYS_SQL)
+        ]
+
     def positions(self, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
         params = params or {}
         limit, offset = _limit_offset(params)
@@ -6375,16 +6591,24 @@ class AccountBook:
         elif state_filter == "closed":
             clauses.append("p.active_episode_id IS NULL")
         sql = (
-            "SELECT p.*,m.symbol0,m.symbol1,m.token0,m.token1 FROM lp_accounting_positions p "
-            "LEFT JOIN pools m ON m.id=p.pool_id" +
+            "SELECT p.*,m.symbol0,m.symbol1,m.token0,m.token1,"
+            "q.cost_only AS pending_cost_only,q.priority_block AS pending_block,"
+            "q.priority_tx_index AS pending_tx_index,"
+            "q.priority_log_index AS pending_log_index "
+            "FROM lp_accounting_positions p "
+            "LEFT JOIN pools m ON m.id=p.pool_id "
+            "LEFT JOIN lp_accounting_pending q ON q.position_key=p.position_key" +
             (" WHERE " + " AND ".join(clauses) if clauses else "") +
             " ORDER BY p.last_timestamp DESC,p.position_key"
         )
         with self.store.reader_snapshot() as conn:
             rows = _dict_rows(conn.execute(sql, args))
+            for row in rows:
+                row["projection"] = self._projection_state(row)
             active_keys = [
                 str(row["position_key"]) for row in rows
                 if row.get("active_episode_id") is not None
+                and row["projection"]["state"] != "stale"
             ]
             values: dict[str, dict[str, Any]] = {}
             for batch in _batches(active_keys):
@@ -6397,6 +6621,8 @@ class AccountBook:
                                                 str(row.get("custody") or ""), pair.lower(),
                                                 str(row.get("position_key") or ""))):
                 continue
+            projection = row["projection"]
+            stale = projection["state"] == "stale"
             value = values.get(str(row["position_key"])) or {
                 "principal0": row.get("principal0"), "principal1": row.get("principal1"),
                 "principal_usd": row.get("principal_usd"),
@@ -6408,12 +6634,30 @@ class AccountBook:
                 "valuation_timestamp": row.get("valuation_timestamp"),
                 "valuation_basis": row.get("valuation_basis"),
             }
-            liquidity = row.get("liquidity") if row.get("liquidity_known") else None
+            if stale:
+                # Canonical events newer than the published state are queued.
+                # The persisted inventory is known to be superseded, so it must
+                # not be presented as a current holding or valued.
+                value = {
+                    "principal0": None, "principal1": None, "principal_usd": None,
+                    "claim_principal_usd": None, "uncollected_fees_usd": None,
+                    "equity_usd": None, "valuation_block": None,
+                    "valuation_timestamp": None,
+                    "valuation_basis": "unprojected_events_pending",
+                }
+            known = not stale
+            liquidity = (
+                row.get("liquidity") if known and row.get("liquidity_known") else None
+            )
             reasons: list[str] = []
             if not row.get("history_complete"):
                 reasons.append("partial_history")
             if row.get("owner") is None:
                 reasons.append("unknown_identity")
+            if stale:
+                reasons.append("projection_stale")
+            elif projection["state"] == "pending":
+                reasons.append("projection_pending")
             if value.get("principal_usd") is None and row.get("active_episode_id"):
                 reasons.append("principal_unvalued")
             elif value.get("equity_usd") is None and row.get("active_episode_id"):
@@ -6431,11 +6675,13 @@ class AccountBook:
                 "tick_lower": row.get("tick_lower"), "tick_upper": row.get("tick_upper"),
                 "liquidity": liquidity,
                 "pending_principal0": row.get("pending_principal0")
-                if row.get("pending_known") else None,
+                if known and row.get("pending_known") else None,
                 "pending_principal1": row.get("pending_principal1")
-                if row.get("pending_known") else None,
-                "tokens_owed0": row.get("tokens_owed0") if row.get("owed_known") else None,
-                "tokens_owed1": row.get("tokens_owed1") if row.get("owed_known") else None,
+                if known and row.get("pending_known") else None,
+                "tokens_owed0": row.get("tokens_owed0")
+                if known and row.get("owed_known") else None,
+                "tokens_owed1": row.get("tokens_owed1")
+                if known and row.get("owed_known") else None,
                 "principal0": value.get("principal0"), "principal1": value.get("principal1"),
                 "principal_usd": value.get("principal_usd"),
                 "claim_principal_usd": value.get("claim_principal_usd"),
@@ -6444,7 +6690,9 @@ class AccountBook:
                 "valuation_block": value.get("valuation_block"),
                 "valuation_timestamp": value.get("valuation_timestamp"),
                 "valuation_basis": value.get("valuation_basis") or "unknown",
-                "status": row.get("status"), "last_event_at": row.get("last_timestamp"),
+                "status": "stale" if stale else row.get("status"),
+                "last_event_at": row.get("last_timestamp"),
+                "projection": projection,
                 "coverage": {
                     "history": "full" if row.get("history_complete") else "partial",
                     "identity": "verified" if row.get("owner") else "unknown",
@@ -6495,6 +6743,20 @@ class AccountBook:
             interval["complete"] = bool(interval.get("complete"))
             ownership_by_key[str(interval["position_key"])].append(interval)
         current_by_key = {str(row["position_key"]): row for row in position_rows}
+        stale_keys = {
+            key for key, row in current_by_key.items()
+            if row.get("projection", {}).get("state") == "stale"
+        }
+        for view in views:
+            if (
+                str(view["position_key"]) in stale_keys
+                and view.get("closed_at") is None
+            ):
+                # The open episode's closing events are mapped but unreplayed.
+                view["coverage"]["reasons"] = sorted({
+                    *view["coverage"]["reasons"], "projection_stale",
+                })
+                view["coverage"]["qualified"] = False
         for key, history in history_by_key.items():
             if key in current_by_key:
                 current_by_key[key]["episodes"] = history
@@ -6582,8 +6844,12 @@ class AccountBook:
             "custody": identity if custody_matches else None,
             "identity_basis": identity_basis,
             "positions": len({row["position_key"] for row in episodes}),
-            "open_positions": len({row["position_key"] for row in episodes
-                                   if row.get("closed_at") is None}),
+            "open_positions": len({
+                str(row["position_key"]) for row in episodes
+                if row.get("closed_at") is None
+                and str(row["position_key"]) not in stale_keys
+            }),
+            "stale_positions": len(stale_keys),
             "closed_episodes": len(completed), "fees_usd": fees,
             "observed_collected_fees_usd": observed_fees,
             "gross_pnl_usd": gross, "gas_usd": gas, "net_pnl_usd": net,
@@ -6658,6 +6924,30 @@ class AccountBook:
         )
         return liquidity, _raw_int(row[4]), _raw_int(row[5])
 
+    def _superseded_pool_inventory(
+        self, conn: sqlite3.Connection, pool_ids: Sequence[str],
+    ) -> dict[str, dict[tuple[int | None, int | None, int | None], int]]:
+        """Inventory tuples of active rows superseded by queued canonical events."""
+        superseded: dict[str, dict[tuple[int | None, int | None, int | None], int]] = {}
+        for batch in _batches(list(pool_ids)):
+            marks = ",".join("?" for _ in batch)
+            rows = conn.execute(
+                "SELECT p.pool_id,p.protocol,p.liquidity,p.liquidity_known,"
+                "p.tick_lower,p.tick_upper "
+                "FROM lp_accounting_positions p "
+                "INDEXED BY lp_accounting_positions_active_replay "
+                "CROSS JOIN lp_accounting_pending q "
+                "WHERE q.position_key=p.position_key "
+                f"AND p.active_episode_id IS NOT NULL AND p.pool_id IN ({marks}) "
+                "AND q.cost_only=0 AND " + _QUEUED_AFTER_PUBLISHED_SQL,
+                batch,
+            )
+            for row in rows:
+                pool = superseded.setdefault(str(row[0]).lower(), {})
+                position = self._pool_inventory_position(row)
+                pool[position] = pool.get(position, 0) + 1
+        return superseded
+
     @staticmethod
     def _reduce_pool_inventory(
         positions: Iterable[tuple[int | None, int | None, int | None]],
@@ -6669,6 +6959,8 @@ class AccountBook:
         history_from: int | None,
         backfill_done: bool,
         retain_inventory: bool,
+        excluded: dict[tuple[int | None, int | None, int | None], int] | None = None,
+        stale_positions: int = 0,
     ) -> tuple[dict[str, Any], _PoolInventory | None]:
         sqrt = _raw_int(mark.get("sqrt_price_x96"))
         mark_tick = _raw_int(mark.get("tick"))
@@ -6688,6 +6980,12 @@ class AccountBook:
         active_total = 0.0
         active_error = 0.0
         for position in positions:
+            if excluded and excluded.get(position, 0) > 0:
+                # The covering scan cannot name rows; a superseded row is
+                # removed by its exact inventory tuple instead.
+                excluded[position] -= 1
+                stale_positions += 1
+                continue
             open_positions += 1
             # Stop retaining as soon as one pool exceeds the global cache budget;
             # the remaining rows still flow through this single-pass reduction.
@@ -6764,7 +7062,9 @@ class AccountBook:
                 0.0 if not open_positions and inventory_complete else None
             )
         inventory = (
-            _PoolInventory(tuple(retained), lp_count, history_complete)
+            _PoolInventory(
+                tuple(retained), lp_count, history_complete, stale_positions,
+            )
             if retained is not None
             else None
         )
@@ -6773,6 +7073,7 @@ class AccountBook:
             "observed_active_tvl_usd": observed_active,
             "lp_count": lp_count,
             "open_positions": open_positions,
+            "stale_positions": stale_positions,
             "complete_inventory": inventory_complete,
         }, inventory
 
@@ -6829,6 +7130,7 @@ class AccountBook:
             "observed_active_tvl_usd": None,
             "lp_count": 0,
             "open_positions": 0,
+            "stale_positions": 0,
             "complete_inventory": False,
         }
         results: dict[str, dict[str, Any]] = {}
@@ -6941,6 +7243,7 @@ class AccountBook:
                     history_from=history_from,
                     backfill_done=pool_id in complete_pools,
                     retain_inventory=False,
+                    stale_positions=inventory.stale_positions,
                 )
                 results[pool_id] = result
                 self._cache_pool_stats(
@@ -6968,6 +7271,9 @@ class AccountBook:
                         missing_inventory,
                     ))
                 }
+                superseded = self._superseded_pool_inventory(
+                    conn, missing_inventory,
+                )
                 position_rows = conn.execute(
                     f"SELECT pool_id,protocol,liquidity,liquidity_known,"
                     f"tick_lower,tick_upper FROM lp_accounting_positions "
@@ -6996,6 +7302,7 @@ class AccountBook:
                         history_from=history_from,
                         backfill_done=pool_id in complete_pools,
                         retain_inventory=True,
+                        excluded=superseded.get(pool_id),
                     )
                     evaluated.add(pool_id)
                     results[pool_id] = result

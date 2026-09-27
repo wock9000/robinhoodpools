@@ -2010,7 +2010,7 @@
     }
     try {
       await Promise.all(requests);
-      if (reason === "timer" && !elements.modal.hidden && state.ownerFollow && state.ownerAddress) {
+      if (reason === "timer" && !elements.modal.hidden && state.ownerFollow && state.ownerAddress && !state.ownerController) {
         loadOwner(state.ownerAddress);
       }
     } finally {

@@ -94,6 +94,8 @@ ENRICH_WORKERS = 8
 ENRICH_TRACE_WORKERS = 4
 ENRICH_REGULAR_INFLIGHT_LIMIT = ENRICH_BATCH * ENRICH_WORKERS
 ENRICH_TRACE_INFLIGHT_LIMIT = ENRICH_TRACE_BATCH * ENRICH_TRACE_WORKERS
+ENRICH_MAX_PUBLICATION_BATCH = ENRICH_REGULAR_INFLIGHT_LIMIT + ENRICH_TRACE_INFLIGHT_LIMIT
+ENRICH_MAX_STORE_SECONDS = 2.0
 REPROJECT_MIN_BATCH = 1
 REPROJECT_INITIAL_BATCH = 128
 REPROJECT_MAX_BATCH = 2048
@@ -117,6 +119,8 @@ DEFERRED_POOL_IDENTITY_PREFIX = "pool_identity_pending:"
 # A bounded snapshot wave shares exact-block state roots through Multicall3.
 # The shared endpoint gate, not a fixed lane quota, limits archive traffic.
 BALANCE_BATCH = 64
+BALANCE_MAX_BATCH = 128
+BALANCE_MAX_STORE_SECONDS = 1.0
 BALANCE_OF_SELECTOR = "0x70a08231"
 SYMBOL_SELECTOR = "0x95d89b41"
 DECIMALS_SELECTOR = "0x313ce567"
@@ -135,6 +139,11 @@ WAL_RESET_RETRY_S = 60.0
 DEFAULT_WAL_BACKLOG_PAUSE_BYTES = 512 * 1024 ** 2
 DEFAULT_WAL_BACKLOG_RESUME_BYTES = 128 * 1024 ** 2
 DEFAULT_WAL_RESET_BYTES = 1024 ** 3
+# Above this WAL size every writer, including live, waits at its next
+# transaction boundary until a drained TRUNCATE succeeds. A fresh process must
+# read the whole WAL before its first statement, so an unbounded WAL turns
+# every restart into hours of recovery that a watchdog then interrupts.
+DEFAULT_WAL_HOLD_BYTES = 4 * 1024 ** 3
 DEFAULT_STORAGE_RECOVERY_BYTES = 1024 ** 3
 MAX_POOL_CACHE_ENTRIES = 16_384
 MAX_POOL_MISSES = 8_192
@@ -154,7 +163,7 @@ CURRENT_UNKNOWN_POOL_MAX = 8
 CURRENT_POOL_RESOLUTION_MAX_PENDING = 32
 CURRENT_POOL_FAILURE_CACHE_SIZE = 2048
 CURRENT_POOL_FAILURE_RETRY_S = 30.0
-CURRENT_POOL_TRACE_MAX_FRAMES = 256
+CURRENT_POOL_TRACE_BUDGET_SECONDS = 1.0
 V4_DONATE_SELECTOR = "0x" + keccak(
     text="donate((address,address,uint24,int24,address),uint256,uint256,bytes)"
 ).hex()[:8]
@@ -387,6 +396,7 @@ class MarketIndexer:
         wal_backlog_pause_bytes: int = DEFAULT_WAL_BACKLOG_PAUSE_BYTES,
         wal_backlog_resume_bytes: int = DEFAULT_WAL_BACKLOG_RESUME_BYTES,
         wal_reset_bytes: int = DEFAULT_WAL_RESET_BYTES,
+        wal_hold_bytes: int = DEFAULT_WAL_HOLD_BYTES,
         maintenance_interval_s: float = WAL_CHECKPOINT_INTERVAL_S,
         current_observer: Any | None = None,
         accounting_projector: Callable[[], bool] | None = None,
@@ -406,6 +416,10 @@ class MarketIndexer:
             raise ValueError("WAL resume threshold must not exceed pause threshold")
         if wal_reset_bytes < 0:
             raise ValueError("wal_reset_bytes must be nonnegative")
+        if wal_hold_bytes < 0:
+            raise ValueError("wal_hold_bytes must be nonnegative")
+        if wal_hold_bytes and wal_hold_bytes < wal_reset_bytes:
+            raise ValueError("wal_hold_bytes must not be below wal_reset_bytes")
         if maintenance_interval_s <= 0:
             raise ValueError("maintenance_interval_s must be positive")
         self.store = store
@@ -431,6 +445,7 @@ class MarketIndexer:
         self.wal_backlog_pause_bytes = int(wal_backlog_pause_bytes)
         self.wal_backlog_resume_bytes = int(wal_backlog_resume_bytes)
         self.wal_reset_bytes = int(wal_reset_bytes)
+        self.wal_hold_bytes = int(wal_hold_bytes)
         self.maintenance_interval_s = float(maintenance_interval_s)
         self._rpc_factory = rpc if callable(rpc) and not hasattr(rpc, "call") else None
         self._owns_clients = rpc is None or (callable(rpc) and not hasattr(rpc, "call"))
@@ -514,6 +529,9 @@ class MarketIndexer:
         # concurrent archive pages so each stays under the response cap.
         self._history_density = 8.0
         self._reproject_batch = REPROJECT_INITIAL_BATCH
+        self._history_projection_resume_at: int | None = None
+        self._enrichment_publication_batch = max(ENRICH_BATCH, ENRICH_TRACE_BATCH)
+        self._balance_batch = BALANCE_BATCH
         self._metadata_failures: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._threads: list[threading.Thread] = []
         self._bulk_paused = False
@@ -526,11 +544,12 @@ class MarketIndexer:
         self._wal_checkpoint_stall_observations = 0
         self._wal_last_progress_at: float | None = None
         self._wal_reset_after = 0.0
+        self._wal_held_since: float | None = None
         self._process_lock_fd: int | None = None
         self._history_verified = False
         self._enrichment_verified = False
         self._balance_verified = False
-        self._publish_after_id = ""
+        self._publish_after_rowid = 0
         self._market_epoch = int(self.store.status().get("epoch", 0))
         self._enrichment_local = threading.local()
         self._enrichment_jobs: dict[
@@ -558,7 +577,9 @@ class MarketIndexer:
         self._activity_backlog_recovery_through: int | None = None
         self._activity_backpressure_disconnects = 0
         self._deferred_identity_seed_at = 0.0
-        self._deferred_identity_seed_after_id = ""
+        self._deferred_identity_seed_after_id = 0
+        self._deferred_identity_seed_kind = 0
+        self._deferred_identity_seed_through_id: int | None = None
         self._legacy_v4_identity_after_id = ""
         self._legacy_v4_identity_complete = False
         self._deferred_identity_seed_complete = False
@@ -1245,11 +1266,12 @@ class MarketIndexer:
     ) -> dict[str, dict[str, Any]]:
         pools: dict[str, dict[str, Any]] = {}
         remaining = set(requested_pool_ids)
+        deadline = time.monotonic() + CURRENT_POOL_TRACE_BUDGET_SECONDS
         try:
-            for index, (_path, frame, failed) in enumerate(_walk_trace(trace)):
-                if index >= CURRENT_POOL_TRACE_MAX_FRAMES:
+            for _path, frame, failed in _walk_trace(trace):
+                if time.monotonic() >= deadline:
                     raise RpcError(
-                        "PoolKey call trace exceeds the bounded frame limit"
+                        "PoolKey call trace exceeded its processing deadline"
                     )
                 encoded = frame.get("input")
                 selector = (
@@ -1457,10 +1479,9 @@ class MarketIndexer:
             if entry["cached"]:
                 with self._feed_condition:
                     current = self._observed_blocks.get(entry["number"])
-                    if (
-                        current is None
-                        or current[0]["hash"] != entry["block_hash"]
-                    ):
+                    if current is None:
+                        recheck_ids.append(pool_id)
+                    elif current[0]["hash"] != entry["block_hash"]:
                         errors[pool_id] = CanonicalConflict(
                             "PoolKey transaction changed during identity recovery"
                         )
@@ -1560,10 +1581,9 @@ class MarketIndexer:
             if entry["cached"]:
                 with self._feed_condition:
                     current = self._observed_blocks.get(entry["number"])
-                    if (
-                        current is None
-                        or current[0]["hash"] != entry["block_hash"]
-                    ):
+                    if current is None:
+                        trace_recheck_ids.append(pool_id)
+                    elif current[0]["hash"] != entry["block_hash"]:
                         errors[pool_id] = CanonicalConflict(
                             "PoolKey transaction changed during trace recovery"
                         )
@@ -2743,6 +2763,7 @@ class MarketIndexer:
                     storage_assessment_pending=True,
                     storage_pause_reasons=["assessment_pending"],
                     storage_pressure={
+                        "wal_ceiling": False,
                         "wal_backlog": False,
                         "free_space": False,
                         "disk_measurement": False,
@@ -2756,6 +2777,8 @@ class MarketIndexer:
                     wal_backlog_pause_bytes=self.wal_backlog_pause_bytes,
                     wal_backlog_resume_bytes=self.wal_backlog_resume_bytes,
                     wal_reset_bytes=self.wal_reset_bytes,
+                    wal_hold_bytes=self.wal_hold_bytes,
+                    wal_held_seconds=None,
                     wal_checkpoint_interval_seconds=self.maintenance_interval_s,
                     bulk_work="paused",
                 )
@@ -3867,7 +3890,8 @@ class MarketIndexer:
 
     def _queue_deferred_pool_identities(
         self, connection: Any, logs: list[dict[str, Any]],
-        events: Iterable[Mapping[str, Any]],
+        events: Iterable[Mapping[str, Any]], *,
+        per_pool_limit: int = DEFERRED_POOL_IDENTITY_CANDIDATES_PER_POOL,
     ) -> int:
         pools = self._verified_pools_for_deferred_logs(logs, events)
         unknown = self._unresolved_pool_identities(logs, pools)
@@ -3882,7 +3906,7 @@ class MarketIndexer:
                 for identity in self._pool_identity_candidates(log).intersection(unknown)
                 if tx_hash in assigned.get(identity, set())
                 or len(assigned.get(identity, set()))
-                < DEFERRED_POOL_IDENTITY_CANDIDATES_PER_POOL
+                < per_pool_limit
             }
             if not identities:
                 continue
@@ -4039,58 +4063,56 @@ class MarketIndexer:
             or now < self._deferred_identity_seed_at
         ):
             return 0
-        pool_rows = self.store.read().execute(
-            "SELECT DISTINCT pool_id FROM events INDEXED BY events_pool_time_idx "
-            "WHERE pool_id>? AND protocol='v4' "
-            "AND kind IN ('add','remove','collect') "
-            "ORDER BY pool_id LIMIT ?",
+        if self._deferred_identity_seed_through_id is None:
+            self._deferred_identity_seed_through_id = int(
+                self.store.read().execute("SELECT COALESCE(MAX(id),0) FROM events").fetchone()[0]
+            )
+        kinds = ("add", "remove", "collect")
+        rows = self.store.read().execute(
+            "SELECT e.*,p.last_error AS enrichment_error "
+            "FROM events e INDEXED BY events_kind_id_idx "
+            "LEFT JOIN pending_enrichment p ON p.tx_hash=e.tx_hash "
+            "WHERE e.kind=? AND e.id>? AND e.id<=? ORDER BY e.id LIMIT ?",
             (
+                kinds[self._deferred_identity_seed_kind],
                 self._deferred_identity_seed_after_id,
+                self._deferred_identity_seed_through_id,
                 DEFERRED_POOL_IDENTITY_RPC_BATCH,
             ),
         ).fetchall()
-        if not pool_rows:
-            self._deferred_identity_seed_complete = True
+        if not rows:
+            self._deferred_identity_seed_kind += 1
+            self._deferred_identity_seed_after_id = 0
+            self._deferred_identity_seed_complete = (
+                self._deferred_identity_seed_kind == len(kinds)
+            )
             return 0
-        next_after = _lower(pool_rows[-1]["pool_id"])
         logs: list[dict[str, Any]] = []
-        reader = self.store.read()
-        for pool_row in pool_rows:
-            pool_id = _lower(pool_row["pool_id"])
-            stored = self.store.pool(pool_id)
-            if stored is not None and self._identity_verified(stored):
+        verified: dict[str, bool] = {}
+        for row in rows:
+            if row["protocol"] != "v4":
                 continue
-            rows = reader.execute(
-                "SELECT e.*,p.last_error AS enrichment_error FROM events e "
-                "LEFT JOIN pending_enrichment p ON p.tx_hash=e.tx_hash "
-                "WHERE e.pool_id=? AND e.protocol='v4' "
-                "AND e.kind IN ('add','remove','collect') "
-                "ORDER BY e.timestamp DESC,e.id DESC LIMIT ?",
-                (
-                    pool_id,
-                    DEFERRED_POOL_IDENTITY_CANDIDATES_PER_POOL,
-                ),
-            ).fetchall()
-            for row in rows:
-                # Check only this canonical candidate's job, not every
-                # serialized error payload in the global receipt backlog.
-                pending = self._pool_identity_marker(row["enrichment_error"])
-                if pending is not None and pool_id in pending["addresses"]:
-                    continue
-                log = self._stored_v4_modify_log(dict(row))
-                if log is not None:
-                    logs.append(log)
+            pool_id = _lower(row["pool_id"])
+            if pool_id not in verified:
+                stored = self.store.pool(pool_id)
+                verified[pool_id] = stored is not None and self._identity_verified(stored)
+            if verified[pool_id]:
+                continue
+            pending = self._pool_identity_marker(row["enrichment_error"])
+            if pending is not None and pool_id in pending["addresses"]:
+                continue
+            log = self._stored_v4_modify_log(dict(row))
+            if log is not None:
+                logs.append(log)
         if logs:
             with self.store.transaction() as connection:
                 queued = self._queue_deferred_pool_identities(
-                    connection, logs, (),
+                    connection, logs, (), per_pool_limit=DEFERRED_POOL_IDENTITY_RPC_BATCH,
                 )
         else:
             queued = 0
-        self._deferred_identity_seed_after_id = next_after
-        self._deferred_identity_seed_at = (
-            now + DEFERRED_POOL_IDENTITY_SEED_BUSY_S
-        )
+        self._deferred_identity_seed_after_id = int(rows[-1]["id"])
+        self._deferred_identity_seed_at = now + DEFERRED_POOL_IDENTITY_SEED_BUSY_S
         return queued
 
 
@@ -4795,7 +4817,7 @@ class MarketIndexer:
                     register(dict(pool))
                     published.add(pool_id)
         except BaseException:
-            self._publish_after_id = ""
+            self._publish_after_rowid = 0
             raise
 
     @staticmethod
@@ -4813,18 +4835,36 @@ class MarketIndexer:
         register = getattr(self.market, "register_index_pool", None)
         if not callable(register):
             return False
+        # A rowid walk reads the table sequentially. Ordering by the text
+        # primary key would fetch every row through its index at random.
         rows = self.store.read().execute(
-            "SELECT * FROM pools WHERE id>? ORDER BY id LIMIT ?",
-            (self._publish_after_id, max(1, min(int(limit), 1024))),
+            "SELECT rowid AS pool_rowid,* FROM pools WHERE rowid>? "
+            "ORDER BY rowid LIMIT ?",
+            (self._publish_after_rowid, max(1, min(int(limit), 1024))),
         ).fetchall()
         if not rows:
             return False
         for row in rows:
             pool = self._stored_pool(row)
+            pool.pop("pool_rowid", None)
             if self._identity_verified(pool):
                 register(pool)
-        self._publish_after_id = str(rows[-1]["id"])
+        self._publish_after_rowid = int(rows[-1]["pool_rowid"])
         return True
+
+    def publish_stored_pools(self, *, seconds: float | None = None) -> bool:
+        """Publish stored pools page by page; True once the walk is complete.
+
+        The metadata lane resumes the same walk after ``seconds`` elapse, so a
+        caller may bound its synchronous share of a large catalog.
+        """
+        deadline = None if seconds is None else time.monotonic() + max(0.0, seconds)
+        while not self._stop.is_set():
+            if not self._publish_stored_pool_page():
+                return True
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
+        return False
 
 
     def _recover_legacy_v4_pool_page(
@@ -5152,7 +5192,6 @@ class MarketIndexer:
         # A lagging provider is not reorg evidence. Keep the durable cursor and
         # retry until this provider can show either the cursor or its child.
         if head_number < current_number:
-            self.store.set_writer_pressure(None)
             self._set_runtime(
                 "live", latency=time.monotonic() - started,
                 error="head provider is behind the durable live cursor",
@@ -5316,34 +5355,88 @@ class MarketIndexer:
         with self._status_lock:
             return not self._bulk_paused
 
+    def _engage_wal_hold(self, wal_bytes: int, now: float) -> None:
+        if (
+            not self.wal_hold_bytes
+            or self._wal_held_since is not None
+            or wal_bytes < self.wal_hold_bytes
+        ):
+            return
+        self._wal_held_since = now
+        with self._status_lock:
+            self._bulk_paused = True
+            assessment_pending = self._storage_assessment_pending
+            wal_paused = self._wal_backlog_paused
+            disk_paused = self._disk_free_paused
+        # Publish before closing admission: the passive backfill that follows
+        # can run for hours and the status write itself needs a writer turn.
+        self._set_runtime(
+            "storage",
+            error=(
+                f"writers held: WAL {wal_bytes} bytes at or above the "
+                f"{self.wal_hold_bytes} byte ceiling; every writer waits for "
+                "a drained reset"
+            ),
+            storage_observed_at=time.time(),
+            storage_paused=True,
+            storage_pause_reasons=(
+                ["wal_ceiling", "assessment_pending"]
+                if assessment_pending else ["wal_ceiling"]
+            ),
+            storage_pressure={
+                "wal_ceiling": True,
+                "wal_backlog": wal_paused,
+                "free_space": disk_paused,
+                "disk_measurement": False,
+                "checkpoint_error": False,
+                "reader_drain": False,
+                "assessment_pending": assessment_pending,
+            },
+            wal_hold_bytes=self.wal_hold_bytes,
+            wal_held_seconds=0.0,
+            bulk_work="paused",
+        )
+        self.store.hold_writers("wal_ceiling")
+        logger.warning(
+            "WAL %d bytes reached the %d byte ceiling; holding every "
+            "writer until a drained reset succeeds",
+            wal_bytes, self.wal_hold_bytes,
+        )
+
     def _storage_maintenance_once(self) -> None:
         started = time.monotonic()
+        # An inherited WAL can take hours to backfill. Stop writers adding to
+        # it before that passive pass, not after.
+        self._engage_wal_hold(self.store.wal_bytes(), started)
         passive = self.store.checkpoint("PASSIVE")
         if passive["busy"]:
             raise RuntimeError("another connection owns the WAL checkpoint")
         checkpoint = passive
         reset_mode: str | None = None
         now = time.monotonic()
+        self._engage_wal_hold(checkpoint["wal_bytes"], now)
+        wal_held = self._wal_held_since is not None
         drain_needed = bool(
-            checkpoint["reader_drain_pending"]
+            wal_held
+            or checkpoint["reader_drain_pending"]
             or (
                 self.wal_backlog_pause_bytes
                 and checkpoint["backlog_bytes"] >= self.wal_backlog_pause_bytes
             )
         )
-        if (
+        if wal_held or (
             self.wal_reset_bytes
             and (
-                checkpoint["log_bytes"] >= self.wal_reset_bytes
+                checkpoint["wal_bytes"] >= self.wal_reset_bytes
                 or drain_needed
             )
             and (now >= self._wal_reset_after or drain_needed)
         ):
-            # Reuse the allocated journal. Truncating a large WAL while serving
-            # traffic can stall the filesystem and contend with live BEGINs.
-            reset = self.store.checkpoint("RESTART", drain_readers=True)
-            if not reset["busy"]:
-                self._wal_reset_after = now + WAL_RESET_RETRY_S
+            reset = self.store.checkpoint(
+                "TRUNCATE",
+                drain_readers=drain_needed or checkpoint["wal_bytes"] >= 2 * self.wal_reset_bytes,
+            )
+            self._wal_reset_after = now + WAL_RESET_RETRY_S
             checkpoint = (
                 {
                     **reset,
@@ -5354,7 +5447,16 @@ class MarketIndexer:
                 }
                 if reset["busy"] else reset
             )
-            reset_mode = "RESTART"
+            reset_mode = "TRUNCATE"
+        held_since = self._wal_held_since
+        if held_since is not None and checkpoint["wal_bytes"] < self.wal_hold_bytes:
+            self._wal_held_since = None
+            wal_held = False
+            self.store.hold_writers(None)
+            logger.warning(
+                "WAL reset to %d bytes; writers resume after %.0fs held",
+                checkpoint["wal_bytes"], now - held_since,
+            )
 
         free: int | None = None
         disk_error: OSError | None = None
@@ -5430,6 +5532,8 @@ class MarketIndexer:
 
         reader_draining = bool(checkpoint["reader_drain_pending"])
         reasons = []
+        if wal_held:
+            reasons.append("wal_ceiling")
         if wal_paused:
             reasons.append("wal_backlog")
         if reader_draining:
@@ -5446,6 +5550,12 @@ class MarketIndexer:
             self._bulk_paused = paused
 
         details = []
+        if wal_held:
+            details.append(
+                f"WAL {checkpoint['wal_bytes']} bytes at or above the "
+                f"{self.wal_hold_bytes} byte ceiling; every writer waits for a "
+                f"drained reset ({now - (self._wal_held_since or now):.0f}s so far)"
+            )
         if wal_paused:
             if was_wal_paused:
                 details.append(
@@ -5491,12 +5601,16 @@ class MarketIndexer:
             checkpoint_status["passive"] = passive
         self._set_runtime(
             "storage",
-            error=("bulk work paused: " + "; ".join(details)) if paused else None,
+            error=(
+                ("writers held: " if wal_held else "bulk work paused: ")
+                + "; ".join(details)
+            ) if paused else None,
             storage_observed_at=observed_at,
             storage_paused=paused,
             storage_assessment_pending=False,
             storage_pause_reasons=reasons,
             storage_pressure={
+                "wal_ceiling": wal_held,
                 "wal_backlog": wal_paused,
                 "free_space": disk_paused and disk_error is None,
                 "disk_measurement": disk_error is not None,
@@ -5510,6 +5624,11 @@ class MarketIndexer:
             wal_backlog_pause_bytes=self.wal_backlog_pause_bytes,
             wal_backlog_resume_bytes=self.wal_backlog_resume_bytes,
             wal_reset_bytes=self.wal_reset_bytes,
+            wal_hold_bytes=self.wal_hold_bytes,
+            wal_held_seconds=(
+                None if self._wal_held_since is None
+                else round(now - self._wal_held_since, 3)
+            ),
             wal_checkpoint_interval_seconds=self.maintenance_interval_s,
             wal_checkpoint=checkpoint_status,
             bulk_work="paused" if paused else "running",
@@ -5521,7 +5640,6 @@ class MarketIndexer:
     def _recent_catchup_pending(self) -> bool:
         cursor = self.store.cursor("live")
         if not cursor or cursor.get("block_number") is None:
-            self.store.set_writer_pressure(None)
             return False
         with self._feed_condition:
             observed = self._observed_last_header
@@ -5555,7 +5673,6 @@ class MarketIndexer:
                 "recent_catchup_lag_seconds": lag_seconds,
                 "history_scheduling": "recent_gap_first" if pending else "concurrent",
             })
-        self.store.set_writer_pressure("live" if pending else None)
         return pending
 
     def _scan_history_once(self) -> bool:
@@ -5563,6 +5680,17 @@ class MarketIndexer:
             return False
         if not self._storage_allows_history():
             return False
+        projection_pending = int(self.store.status().get("pending_reprojection", 0))
+        if (
+            self._history_projection_resume_at is not None
+            and projection_pending > self._history_projection_resume_at
+        ):
+            self._set_runtime(
+                "history", history_wait_reason="projection_backlog",
+                history_projection_resume_at=self._history_projection_resume_at,
+            )
+            return False
+        self._set_runtime("history", history_wait_reason=None)
         started = time.monotonic()
         cursor, cursor_epoch = self.store.cursor_state("history")
         if not cursor or cursor.get("next_to") is None:
@@ -5635,6 +5763,18 @@ class MarketIndexer:
             self._history_chunk = max(
                 HISTORY_MIN_CHUNK, min(self._history_chunk, end - start + 1),
             )
+            if start != fetched_start:
+                # Only the fetched boundaries were confirmed canonical. An
+                # interior event header may be archive-only; it must not
+                # become the history cursor hash that later reorg recovery
+                # trusts as an anchor.
+                canonical_start = self._block("history_header", start)
+                if canonical_start["hash"] != headers[start]["hash"]:
+                    raise RpcError(
+                        f"trimmed history start {start} header "
+                        f"{headers[start]['hash']} disagrees with canonical "
+                        f"header {canonical_start['hash']}"
+                    )
         # The live head can advance while archive RPC work is in flight. Do
         # not take the shared writer after that work creates recent live debt.
         if self._recent_catchup_pending():
@@ -5693,6 +5833,10 @@ class MarketIndexer:
                     "complete": complete,
                     "has_coverage": True,
                 },
+            )
+        if inserted:
+            self._history_projection_resume_at = max(
+                REPROJECT_MAX_BATCH, projection_pending - len(inserted),
             )
         store_s = time.monotonic() - store_acquired
         publish_started = time.monotonic()
@@ -6285,20 +6429,15 @@ class MarketIndexer:
             timeout=0.05,
             return_when=FIRST_COMPLETED,
         )
-        # Publish one completed fetch job per writer turn. Fetch concurrency is
-        # retained, but a wave of completed RPC jobs cannot become one
-        # unbounded enrichment transaction ahead of live ingestion.
-        completed = next(
-            (
-                key for key, job in self._enrichment_jobs.items()
-                if job[1].done()
-            ),
-            None,
-        )
-        jobs = (
-            [self._enrichment_jobs.pop(completed)]
-            if completed is not None else []
-        )
+        completed = []
+        remaining = self._enrichment_publication_batch
+        for key, job in self._enrichment_jobs.items():
+            if job[1].done() and len(job[0]) <= remaining:
+                completed.append(key)
+                remaining -= len(job[0])
+                if not remaining:
+                    break
+        jobs = [self._enrichment_jobs.pop(key) for key in completed]
         if not jobs:
             return False
         started = min(job[2] for job in jobs)
@@ -6361,25 +6500,28 @@ class MarketIndexer:
         # provider while completed evidence waits behind live/history commits.
         self._fill_enrichment_jobs(completed_hashes)
         batch_error: Exception | None = None
-        for row, exc in failures:
-            attempts = int(row.get("attempts", 0)) + 1
-            if not self._mark_enrichment_failure(
-                row,
-                exc,
-                delay=(
-                    ENRICHMENT_CAPABILITY_RECHECK_S
-                    if self._trace_capability_error(exc)
-                    else min(300.0, 2.0 ** min(attempts, 8))
-                ),
-            ):
-                continue
-            batch_error = exc
-            self._set_runtime("enrichment", error=exc)
+        if failures:
+            with self.store.transaction():
+                for row, exc in failures:
+                    attempts = int(row.get("attempts", 0)) + 1
+                    if self._mark_enrichment_failure(
+                        row,
+                        exc,
+                        delay=(
+                            ENRICHMENT_CAPABILITY_RECHECK_S
+                            if self._trace_capability_error(exc)
+                            else min(300.0, 2.0 ** min(attempts, 8))
+                        ),
+                    ):
+                        batch_error = exc
+            if batch_error is not None:
+                self._set_runtime("enrichment", error=batch_error)
 
         if transactions:
             _, enrichment_epoch = self.store.cursor_state("live")
             try:
                 with self.store.transaction() as conn:
+                    acquired = time.monotonic()
                     # Identity replay may have added canonical inputs while
                     # this receipt was in flight. Never clear that newer job.
                     ready = self._current_enrichment_jobs(conn, successful_rows)
@@ -6413,15 +6555,30 @@ class MarketIndexer:
                     supplied_anchor=True,
                 )
             except Exception as exc:
-                for row in successful_rows:
-                    attempts = int(row.get("attempts", 0)) + 1
-                    self._mark_enrichment_failure(
-                        row,
-                        exc,
-                        delay=min(300.0, 2.0 ** min(attempts, 8)),
-                    )
+                with self.store.transaction():
+                    for row in successful_rows:
+                        attempts = int(row.get("attempts", 0)) + 1
+                        self._mark_enrichment_failure(
+                            row,
+                            exc,
+                            delay=min(300.0, 2.0 ** min(attempts, 8)),
+                        )
                 self._set_runtime("enrichment", error=exc)
             else:
+                store_seconds = max(time.monotonic() - acquired, 1e-9)
+                current = self._enrichment_publication_batch
+                target = max(
+                    max(ENRICH_BATCH, ENRICH_TRACE_BATCH),
+                    int(len(outcomes) * ENRICH_MAX_STORE_SECONDS / store_seconds)
+                    // max(ENRICH_BATCH, ENRICH_TRACE_BATCH)
+                    * max(ENRICH_BATCH, ENRICH_TRACE_BATCH),
+                )
+                if store_seconds > ENRICH_MAX_STORE_SECONDS:
+                    self._enrichment_publication_batch = min(current, target)
+                elif len(outcomes) >= current:
+                    self._enrichment_publication_batch = min(
+                        ENRICH_MAX_PUBLICATION_BATCH, current * 2, target,
+                    )
                 with self._reorg_lock:
                     _, publish_epoch = self.store.cursor_state("live")
                     if publish_epoch == enrichment_epoch:
@@ -6563,7 +6720,7 @@ class MarketIndexer:
                 try:
                     self._publish_token_pools(address, register)
                 except BaseException:
-                    self._publish_after_id = ""
+                    self._publish_after_rowid = 0
                     raise
         self._set_runtime(
             "metadata",
@@ -6657,7 +6814,7 @@ class MarketIndexer:
     def _balances_once(self) -> bool:
         if not self.v3_balances or self._stop.is_set():
             return False
-        pending = self.store.pending_v3_balances(BALANCE_BATCH)
+        pending = self.store.pending_v3_balances(self._balance_batch)
         if not pending:
             return False
         started = time.monotonic()
@@ -6697,13 +6854,22 @@ class MarketIndexer:
                     completed.append((row, balance0, balance1))
         saved = 0
         if completed:
-            outcomes = self.store.save_v3_balances([
-                (
-                    str(row["pool_id"]), int(row["block_number"]),
-                    str(row["block_hash"]), balance0, balance1,
-                )
-                for row, balance0, balance1 in completed
-            ])
+            with self.store.transaction():
+                acquired = time.monotonic()
+                outcomes = self.store.save_v3_balances([
+                    (
+                        str(row["pool_id"]), int(row["block_number"]),
+                        str(row["block_hash"]), balance0, balance1,
+                    )
+                    for row, balance0, balance1 in completed
+                ])
+            store_seconds = max(time.monotonic() - acquired, 1e-9)
+            current = self._balance_batch
+            target = max(1, int(len(completed) * BALANCE_MAX_STORE_SECONDS / store_seconds))
+            if store_seconds > BALANCE_MAX_STORE_SECONDS:
+                self._balance_batch = min(current, target)
+            elif len(completed) >= current:
+                self._balance_batch = min(BALANCE_MAX_BATCH, current * 2, target)
             for (row, _balance0, _balance1), outcome in zip(completed, outcomes):
                 if outcome is None:
                     saved += 1
@@ -6746,9 +6912,11 @@ class MarketIndexer:
                         wal_paused = self._wal_backlog_paused
                         disk_paused = self._disk_free_paused
                     reasons = (
-                        ["assessment_pending", "checkpoint_error"]
-                        if assessment_pending else ["checkpoint_error"]
+                        ["wal_ceiling"] if self._wal_held_since is not None else []
                     )
+                    if assessment_pending:
+                        reasons.append("assessment_pending")
+                    reasons.append("checkpoint_error")
                     self._set_runtime(
                         "storage",
                         error=f"WAL maintenance failed: {exc}",
@@ -6757,6 +6925,7 @@ class MarketIndexer:
                         storage_assessment_pending=assessment_pending,
                         storage_pause_reasons=reasons,
                         storage_pressure={
+                            "wal_ceiling": self._wal_held_since is not None,
                             "wal_backlog": wal_paused,
                             "free_space": disk_paused,
                             "disk_measurement": False,
@@ -6769,6 +6938,11 @@ class MarketIndexer:
                         wal_backlog_pause_bytes=self.wal_backlog_pause_bytes,
                         wal_backlog_resume_bytes=self.wal_backlog_resume_bytes,
                         wal_reset_bytes=self.wal_reset_bytes,
+                        wal_hold_bytes=self.wal_hold_bytes,
+                        wal_held_seconds=(
+                            None if self._wal_held_since is None
+                            else round(time.monotonic() - self._wal_held_since, 3)
+                        ),
                         wal_checkpoint_interval_seconds=self.maintenance_interval_s,
                         bulk_work="paused",
                     )
@@ -6779,6 +6953,9 @@ class MarketIndexer:
                     self._stop.wait(self.maintenance_interval_s)
         finally:
             self.store.cancel_checkpoint_drain()
+            if self._wal_held_since is not None:
+                self._wal_held_since = None
+                self.store.hold_writers(None)
 
     def _balance_run(self) -> None:
         backoff = 0.5
@@ -6816,7 +6993,6 @@ class MarketIndexer:
                     )
                 worked = self._scan_live_once()
             except Exception as exc:
-                self.store.set_writer_pressure(None)
                 lane = "live" if self._initialized.is_set() else "startup"
                 self._set_runtime(lane, error=exc)
                 self._stop.wait(backoff)
@@ -6870,17 +7046,23 @@ class MarketIndexer:
         backoff = 0.5
         verified = False
         while not self._stop.is_set():
-            if not self._initialized.wait(0.5):
+            # Restoring the stored catalog only reads pools; it must not wait
+            # for RPC bootstrap or a paused bulk lane.
+            try:
+                published = self._publish_stored_pool_page()
+            except Exception as exc:
+                self._set_runtime("metadata", error=exc)
+                self._stop.wait(backoff)
+                backoff = min(30.0, backoff * 2.0)
                 continue
-            if not self._bulk_work_allowed():
-                self._stop.wait(0.5)
+            if not self._initialized.is_set() or not self._bulk_work_allowed():
+                self._stop.wait(0.01 if published else 0.5)
                 continue
             try:
                 if not verified:
                     self._verify_chain("enrichment")
                     verified = True
-                worked = self._publish_stored_pool_page()
-                worked = self._resolve_deferred_pool_identities_once() or worked
+                worked = self._resolve_deferred_pool_identities_once() or published
                 worked = self._metadata_once() or worked
                 worked = self._recover_legacy_v4_pool_page() or worked
             except Exception as exc:
@@ -6973,6 +7155,7 @@ class MarketIndexer:
                     V3_BIRTH_REPAIR_PREFIXES,
                 )
                 worked = self._repair_v4_owners_once() or worked
+                worked = self.store.recover_missing_enrichment() or worked
                 if worked:
                     self._set_runtime("repair", latency=time.monotonic() - started)
             except Exception as exc:
@@ -7059,11 +7242,9 @@ class MarketIndexer:
     def close(self) -> None:
         with self._lifecycle_lock:
             if self._stop.is_set():
-                self.store.set_writer_pressure(None)
                 return
             was_started = self._started
             self._stop.set()
-            self.store.set_writer_pressure(None)
             self._live_wakeup.set()
             try:
                 current = threading.current_thread()

@@ -5,7 +5,6 @@ from types import SimpleNamespace
 
 from rhpools.lp_market_index import (
     HISTORY_MAX_INTERVAL_STORE_SECONDS,
-    RECENT_CATCHUP_YIELD_SECONDS,
     MarketIndexer,
 )
 
@@ -13,35 +12,22 @@ from rhpools.lp_market_index import (
 def test_background_work_uses_adaptive_live_batch_as_recent_gap_threshold():
     index = MarketIndexer.__new__(MarketIndexer)
     cursor = {"block_number": 1000}
-    index.store = SimpleNamespace(
-        cursor=lambda _lane: cursor,
-        set_writer_pressure=lambda _priority: None,
-    )
+    index.store = SimpleNamespace(cursor=lambda _lane: cursor)
     index._feed_condition = threading.Condition()
     index._status_lock = threading.RLock()
     index._observed_last_header = None
     index._live_chunk = 64
-    deep = index._live_chunk  # Without timestamps, use the conservative block budget.
-    index._runtime_status = {"head": 1000 + deep + 1}
+    index._runtime_status = {"head": 1065}
 
     assert index._recent_catchup_pending()
-    assert index._runtime_status["recent_catchup_lag_blocks"] == deep + 1
+    assert index._runtime_status["recent_catchup_lag_blocks"] == 65
     assert index._runtime_status["history_scheduling"] == "recent_gap_first"
 
-    index._runtime_status["head"] = 1000 + deep
+    index._runtime_status["head"] = 1064
     assert not index._recent_catchup_pending()
     assert index._runtime_status["history_scheduling"] == "concurrent"
 
     index._runtime_status["head"] = 1002
-    assert not index._recent_catchup_pending()
-
-    cursor["timestamp"] = 100
-    limit = int(RECENT_CATCHUP_YIELD_SECONDS)
-    index._runtime_status.update({"head": 1064, "head_timestamp": 100 + limit + 1})
-    assert index._recent_catchup_pending()
-    assert index._runtime_status["recent_catchup_lag_seconds"] == limit + 1
-
-    index._runtime_status["head_timestamp"] = 100 + limit
     assert not index._recent_catchup_pending()
 
 
@@ -59,7 +45,7 @@ def test_history_rechecks_recent_gap_after_rpc_preparation():
     class RacingRpc:
         def call(self, method, params):
             if method == "eth_getLogs":
-                index._set_runtime("head", head=2_000)
+                index._set_runtime("head", head=1_100)
                 return []
             if method == "eth_getBlockByNumber":
                 return header(int(params[0], 16))
@@ -121,7 +107,6 @@ def test_history_rechecks_recent_gap_after_rpc_preparation():
 
 def test_background_batch_growth_respects_observed_write_time():
     index = MarketIndexer.__new__(MarketIndexer)
-    index._clients = {}
     sample_blocks = 8
     sample_seconds = HISTORY_MAX_INTERVAL_STORE_SECONDS * 0.9
     index._history_chunk = sample_blocks

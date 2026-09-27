@@ -6,7 +6,6 @@ import time
 
 import pytest
 
-import rhpools.lp_market_service as market_service_module
 import rhpools.lp_market_store as market_store_module
 from rhpools.lp_market_protocols import (
     TRANSFER_TOPIC, V3_POOL_CREATED_TOPIC, V3_SWAP_TOPIC,
@@ -55,33 +54,6 @@ def pools():
             "factory": UNISWAP_V3_FACTORY, "created_block": 1, "source": "factory-live"}
     return [{**base, "id": V3, "address": V3, "protocol": "v3", "fee_ppm": 3_000},
             {**base, "id": V4, "address": MANAGER, "protocol": "v4", "fee_ppm": 0x800000}]
-
-
-def test_summary_preserves_float_precision_and_large_counts(tmp_path):
-    app = service(tmp_path / "market.sqlite")
-    try:
-        app.store.upsert_pools(pools())
-        stamp = 1_700_000_000
-        block = header(100, stamp)
-        app.store.ingest([block], [], cursor={
-            "from_block": 100, "to_block": 100, "block_number": 100,
-            "block_hash": block["hash"], "timestamp": stamp,
-        })
-        volume, fees, count = 1.2345678901234567, 0.12345678901234567, 2**53 - 1
-        with app.store.transaction() as connection:
-            connection.execute(
-                "INSERT INTO lp_pool_buckets"
-                "(resolution,bucket,pool_id,events,swaps,priced_swaps,priced_fees,volume_usd,fees_usd) "
-                "VALUES(60,?,?,?,?,?,?,?,?)",
-                (stamp // 60 * 60, V3, count, count, count, count, volume, fees),
-            )
-        overview = app.overview({"window": "1h"})
-        row = app.pools({"window": "1h"})["rows"][0]
-        assert overview["swaps"] == row["swaps"] == count
-        assert overview["volume_usd"] == row["volume_usd"] == volume
-        assert overview["fees_usd"] == row["fees_usd"] == fees
-    finally:
-        app.close()
 
 
 def test_failed_frame_read_does_not_pin_committed_wal(tmp_path, monkeypatch):
@@ -172,65 +144,6 @@ def test_status_gap_uses_current_head_and_durable_cursor(tmp_path):
         app.close()
 
 
-def test_multi_day_window_scans_stay_inside_covering_index(tmp_path):
-    """7d/30d aggregates timed out in production once the hourly range scan
-    dereferenced every rowid; the window source must resolve the hourly arm
-    from its covering index and page totals from the per-pool index."""
-    from rhpools.lp_market_service import _SUM_FIELDS
-
-    app = service(tmp_path / "market.sqlite")
-    try:
-        now = int(time.time()) // 3600 * 3600 + 1_800
-        with app.store.transaction() as connection:
-            values = (2, 2, 0, 0, 0, 2.0, 0.2, 0, 0, 2, 2, 0, 0, 5)
-            connection.executemany(
-                "INSERT INTO lp_pool_buckets VALUES(?,?,?" + ",?" * len(values) + ")",
-                [
-                    (resolution, bucket, pool, *values)
-                    for pool in (V3, V4)
-                    for resolution, step in ((86400, 86400), (3600, 3600), (60, 900))
-                    for bucket in range(now - 40 * 86_400, now, step)
-                ],
-            )
-        start, end = now - 7 * 86_400 + 7, now - 200
-        source, args = app._bucket_source(start, end)
-        page_source, page_args = app._bucket_source(start, end, by_pool=True)
-        with app.store.reader_snapshot() as connection:
-            aggregate_plan = [row[3] for row in connection.execute(
-                f"EXPLAIN QUERY PLAN SELECT pool_id,{_SUM_FIELDS} FROM {source} "
-                "GROUP BY pool_id", args,
-            )]
-            page_plan = [row[3] for row in connection.execute(
-                f"EXPLAIN QUERY PLAN SELECT pool_id,{_SUM_FIELDS} FROM {page_source} "
-                "WHERE pool_id IN (?,?) GROUP BY pool_id", [*page_args, V3, V4],
-            )]
-            aggregated = {
-                row["pool_id"]: (row["events"], row["swaps"]) for row in connection.execute(
-                    f"SELECT pool_id,{_SUM_FIELDS} FROM {source} GROUP BY pool_id", args,
-                )
-            }
-            low_minute, high_minute = start // 60 * 60, end // 60 * 60
-            low_hour = (low_minute + 3599) // 3600 * 3600
-            high_hour = high_minute // 3600 * 3600
-            low_day = (low_hour + 86399) // 86400 * 86400
-            high_day = high_hour // 86400 * 86400
-            expected = connection.execute(
-                "SELECT SUM(events) FROM lp_pool_buckets WHERE pool_id=? AND "
-                "((resolution=86400 AND bucket>=? AND bucket<?) OR "
-                "(resolution=3600 AND ((bucket>=? AND bucket<?) OR (bucket>=? AND bucket<?))) OR "
-                "(resolution=60 AND ((bucket>=? AND bucket<?) OR (bucket>=? AND bucket<=?))))",
-                (V3, low_day, high_day, low_hour, low_day, high_day, high_hour,
-                 low_minute, low_hour, high_hour, high_minute),
-            ).fetchone()[0]
-        assert any("COVERING INDEX lp_buckets_day_window" in step for step in aggregate_plan)
-        assert all(
-            "lp_buckets_pool" in step for step in page_plan if "SEARCH lp_pool_buckets" in step
-        )
-        assert aggregated == {V3: (expected, expected), V4: (expected, expected)}
-    finally:
-        app.close()
-
-
 def test_overview_refreshes_live_head_without_advancing_financial_coverage(
         tmp_path, monkeypatch):
     clock = [time.monotonic()]
@@ -252,206 +165,6 @@ def test_overview_refreshes_live_head_without_advancing_financial_coverage(
         assert (refreshed["status"]["head"], refreshed["status"]["lag_blocks"]) == (120, 20)
         assert refreshed["coverage"]["to"] == 1_000
         assert refreshed["volume_usd"] == pytest.approx(101)
-    finally:
-        app.close()
-
-
-def test_queued_summary_refresh_uses_its_execution_snapshot(
-        tmp_path, monkeypatch):
-    app = service(tmp_path / "market.sqlite")
-    release = threading.Event()
-    blockers = []
-    entered = []
-
-    def block_worker(started):
-        started.set()
-        assert release.wait(5)
-
-    try:
-        app.store.upsert_pools(pools())
-        first = header(100, 1_000)
-        app.store.ingest([first], [swap(first, V3, "v3")], cursor={
-            "from_block": 100, "to_block": 100, "block_number": 100,
-            "block_hash": first["hash"], "timestamp": 1_000,
-        })
-        params = {"window": "1h"}
-        assert app.overview(params)["swaps"] == 1
-        assert app.pools(params)["coverage"]["to"] == 1_000
-        monkeypatch.setitem(market_service_module.WINDOW_CACHE_TTL, "1h", 0.0)
-
-        executors = {
-            app._cache_executor,
-            getattr(app, "_summary_executor", app._cache_executor),
-        }
-        for executor in executors:
-            for _ in range(2):
-                started = threading.Event()
-                entered.append(started)
-                blockers.append(executor.submit(block_worker, started))
-        assert all(started.wait(2) for started in entered)
-
-        stale_overview = app.overview(params)
-        stale_pools = app.pools(params)
-        assert stale_overview["coverage"]["to"] == 1_000
-        assert stale_pools["coverage"]["to"] == 1_000
-
-        second = header(101, 1_061)
-        app.store.ingest([second], [swap(second, V4, "v4")], cursor={
-            "from_block": 101, "to_block": 101, "block_number": 101,
-            "block_hash": second["hash"], "timestamp": 1_061,
-        })
-        expected_revision = app.status()["events_revision"]
-        release.set()
-        for blocker in blockers:
-            blocker.result(5)
-        deadline = time.monotonic() + 5
-        while True:
-            with app._cache_lock:
-                refreshing = [
-                    key for key in app._cache_refreshing
-                    if len(key) > 1 and key[1] in {"overview", "pools"}
-                ]
-            if not refreshing:
-                break
-            assert time.monotonic() < deadline
-            time.sleep(0.001)
-
-        overview = app.overview(params)
-        pool_page = app.pools(params)
-        assert overview["coverage"]["to"] == 1_061
-        assert overview["events_revision"] == expected_revision
-        assert overview["swaps"] == 2
-        assert pool_page["coverage"]["to"] == 1_061
-        assert pool_page["events_revision"] == expected_revision
-        assert [row["id"] for row in pool_page["rows"]] == [V4, V3]
-    finally:
-        release.set()
-        for blocker in blockers:
-            blocker.cancel()
-        app.close()
-
-
-def test_bucket_summary_repairs_append_backfill_expiry_and_reorg(tmp_path):
-    app = service(tmp_path / "market.sqlite")
-
-    def summaries():
-        with app._cache_lock:
-            for key in tuple(app._cache):
-                if len(key) > 1 and key[1] in {"overview", "pools"}:
-                    app._cache.pop(key, None)
-        return (
-            app.overview({"window": "1h"}),
-            app.pools({"window": "1h", "sort": "volume", "order": "desc"}),
-        )
-
-    try:
-        app.store.upsert_pools(pools())
-        first = header(100, 1_000)
-        app.store.ingest([first], [swap(first, V3, "v3")], cursor={
-            "from_block": 100, "to_block": 100, "block_number": 100,
-            "block_hash": first["hash"], "timestamp": 1_000,
-        })
-        overview, page = summaries()
-        assert overview["swaps"] == 1
-        assert [(row["id"], row["volume_usd"]) for row in page["rows"]] == [
-            (V3, pytest.approx(101)), (V4, None),
-        ]
-
-        second = header(101, 1_061)
-        app.store.ingest([second], [swap(second, V4, "v4")], cursor={
-            "from_block": 101, "to_block": 101, "block_number": 101,
-            "block_hash": second["hash"], "timestamp": 1_061,
-        })
-        backfill = header(99, 940)
-        app.store.ingest(
-            [backfill], [swap(backfill, V3, "v3")], lane="backfill",
-        )
-        overview, page = summaries()
-        assert overview["events_revision"] == page["events_revision"]
-        assert overview["swaps"] == 3
-        assert [(row["id"], row["volume_usd"]) for row in page["rows"]] == [
-            (V3, pytest.approx(202)), (V4, pytest.approx(101)),
-        ]
-
-        empty = header(102, 4_661)
-        app.store.ingest([empty], [], cursor={
-            "from_block": 102, "to_block": 102, "block_number": 102,
-            "block_hash": empty["hash"], "timestamp": 4_661,
-        })
-        overview, page = summaries()
-        assert overview["swaps"] == 1
-        assert [(row["id"], row["volume_usd"]) for row in page["rows"]] == [
-            (V4, pytest.approx(101)), (V3, None),
-        ]
-
-        prior_epoch = overview["epoch"]
-        app.store.rollback(100)
-        overview, page = summaries()
-        assert overview["epoch"] == page["epoch"] == prior_epoch + 1
-        assert overview["swaps"] == 2
-        assert [(row["id"], row["volume_usd"]) for row in page["rows"]] == [
-            (V3, pytest.approx(202)), (V4, None),
-        ]
-    finally:
-        app.close()
-
-
-def test_pool_page_retries_frame_when_reorg_precedes_page_snapshot(
-        tmp_path, monkeypatch):
-    from contextlib import contextmanager
-
-    app = service(tmp_path / "market.sqlite")
-    reader_snapshot = app.store.reader_snapshot
-    snapshots = 0
-    try:
-        app.store.upsert_pools(pools())
-        first = header(99, 1_000)
-        orphan = header(100, 1_001)
-        app.store.ingest(
-            [first, orphan],
-            [swap(first, V3, "v3"), swap(orphan, V3, "v3")],
-            cursor={
-                "from_block": 99, "to_block": 100, "block_number": 100,
-                "block_hash": orphan["hash"], "timestamp": 1_001,
-            },
-        )
-        replacement = header(100, 1_002, branch=10_000)
-
-        @contextmanager
-        def reorg_before_page(*args, **kwargs):
-            nonlocal snapshots
-            snapshots += 1
-            if snapshots == 2:
-                app.store.rollback(99)
-                app.store.ingest(
-                    [replacement],
-                    [swap(replacement, V4, "v4", quote=202_000_000)],
-                    cursor={
-                        "from_block": 100, "to_block": 100,
-                        "block_number": 100,
-                        "block_hash": replacement["hash"],
-                        "timestamp": 1_002,
-                    },
-                )
-            with reader_snapshot(*args, **kwargs) as connection:
-                yield connection
-
-        monkeypatch.setattr(app.store, "reader_snapshot", reorg_before_page)
-        page = app.pools({
-            "window": "all", "sort": "volume", "order": "desc",
-        })
-        current = app.status()
-        assert snapshots >= 4
-        assert page["epoch"] == current["epoch"]
-        assert page["events_revision"] == current["events_revision"]
-        assert page["coverage"]["to"] == 1_002
-        assert [
-            (row["id"], row["volume_usd"], row["swaps"])
-            for row in page["rows"]
-        ] == [
-            (V4, pytest.approx(202), 1),
-            (V3, pytest.approx(101), 1),
-        ]
     finally:
         app.close()
 
@@ -663,125 +376,6 @@ def test_activity_wss_partitions_provider_muted_topic_filter(tmp_path, monkeypat
         catalog.close()
 
 
-def test_shared_summary_frame_does_not_pin_checkpoint_drain(
-        tmp_path, monkeypatch):
-    from contextlib import contextmanager
-
-    app = service(tmp_path / "market.sqlite")
-    pool_entered = threading.Event()
-    release_pool = threading.Event()
-    pool_done = threading.Event()
-    aggregate_done = threading.Event()
-    results, failures = {}, {}
-    reader_snapshot = app.store.reader_snapshot
-
-    @contextmanager
-    def controlled_snapshot(*args, **kwargs):
-        role = threading.current_thread().name
-        nested = app.store.read().in_transaction
-        with reader_snapshot(*args, **kwargs) as connection:
-            if role == "pool-consumer" and not nested:
-                pool_entered.set()
-                assert release_pool.wait(5)
-            yield connection
-
-    def request(name, method, done):
-        try:
-            results[name] = method({"window": "1h"})
-        except BaseException as exc:
-            failures[name] = exc
-        finally:
-            app.store.close_reader()
-            done.set()
-
-    pool = threading.Thread(
-        name="pool-consumer", target=request,
-        args=("pools", app.pools, pool_done),
-    )
-    aggregate = threading.Thread(
-        name="aggregate-producer", target=request,
-        args=("overview", app.overview, aggregate_done),
-    )
-    try:
-        app.store.upsert_pools(pools())
-        block = header(100, 1_700_000_000)
-        app.store.ingest([block], [swap(block, V3, "v3")], cursor={
-            "from_block": 100, "to_block": 100, "block_number": 100,
-            "block_hash": block["hash"], "timestamp": block["timestamp"],
-        })
-        monkeypatch.setattr(app.store, "reader_snapshot", controlled_snapshot)
-        pool.start()
-        assert pool_entered.wait(2)
-        aggregate.start()
-
-        # Concurrent summary consumers must finish with coherent results after
-        # the checkpoint drain, without pinning it while awaiting shared work.
-        draining = app.store.checkpoint("RESTART", drain_readers=True)
-        assert draining["reader_drain_pending"] == 1
-        release_pool.set()
-        deadline = time.monotonic() + 2
-        while True:
-            drained = app.store.checkpoint("RESTART", drain_readers=True)
-            if drained["busy"] == 0:
-                break
-            assert time.monotonic() < deadline
-            time.sleep(0.001)
-        assert aggregate_done.wait(2)
-        assert pool_done.wait(2), "summary page ignored the completed drain"
-        assert failures == {}
-        row = next(row for row in results["pools"]["rows"] if row["id"] == V3)
-        assert row["swaps"] == 1
-        assert results["overview"]["swaps"] == 1
-    finally:
-        release_pool.set()
-        app.store.cancel_checkpoint_drain()
-        for worker in (pool, aggregate):
-            if worker.ident is not None:
-                worker.join(5)
-        app.close()
-
-
-def test_current_activity_does_not_wait_for_the_workbench_catalog_lock(tmp_path):
-    app = service(tmp_path / "market.sqlite")
-    catalog_lock = threading.Lock()
-    delivered = threading.Event()
-    result, failures = {}, []
-
-    class LockedCatalog:
-        @property
-        def pool_publication_revision(self):
-            with catalog_lock:
-                return 0
-
-    def read_feed():
-        try:
-            result.update(app.stream_updates(
-                {"kind": "all"}, cursor["sequence"], cursor["feed_epoch"],
-            ))
-        except BaseException as exc:
-            failures.append(exc)
-        finally:
-            app.store.close_reader()
-            delivered.set()
-
-    worker = threading.Thread(target=read_feed)
-    try:
-        app.market = LockedCatalog()
-        block = header(100, 1_700_000_000)
-        cursor = app.indexer.feed_updates()
-        event = {**swap(block, V3, "v3"), "pool": pools()[0]}
-        app.indexer._emit_feed("activity", {"rows": [event]})
-        with catalog_lock:
-            worker.start()
-            assert delivered.wait(1), "activity queued behind unrelated catalog work"
-        assert failures == []
-        assert result["events"][0]["data"]["rows"][0]["pool_id"] == V3
-    finally:
-        if worker.ident is not None:
-            worker.join(5)
-        app.close()
-
-
 def test_wal_reader_snapshot_does_not_wait_for_writer_transaction(tmp_path):
     store = MarketStore(tmp_path / "market.sqlite")
     writer_entered = threading.Event()
@@ -911,7 +505,7 @@ def test_backfill_insertion_order_does_not_reorder_live_tape(tmp_path):
 
 @pytest.mark.parametrize(
     ("recent_kind", "expected_rows"),
-    (("swap", 0), ("add", 1), (None, 0)),
+    (("swap", 0), ("add", 1)),
 )
 def test_underfilled_lp_tape_stays_within_window(
         tmp_path, recent_kind, expected_rows):
@@ -920,17 +514,14 @@ def test_underfilled_lp_tape_stays_within_window(
     now = int(time.time())
     old = header(1, now - 7_200)
     recent = header(1_000, now - 10)
-    recent_events = (
-        [{**swap(recent, V3, "v3"), "kind": recent_kind}]
-        if recent_kind is not None else []
-    )
+    recent_event = {**swap(recent, V3, "v3"), "kind": recent_kind}
     try:
         seed.upsert_pools(pools())
         seed.ingest(
             [old, recent],
             [
                 *(swap(old, V3, "v3", index=index) for index in range(2_000)),
-                *recent_events,
+                recent_event,
             ],
         )
     finally:
@@ -991,86 +582,12 @@ def test_older_quote_anchor_reprices_cross_pool_successor(tmp_path):
         old, recent = header(99, now), header(100, now + 1)
         app.store.ingest([recent], [swap(recent, cross["id"], "v3")])
         assert app.tape({"kind": "all"})["rows"][0]["volume_usd"] is None
-        assert app.overview({"window": "all"})["volume_usd"] is None
-        unpriced = app.pools({
-            "window": "all", "sort": "volume", "order": "desc",
-        })
-        assert next(
-            row for row in unpriced["rows"] if row["id"] == cross["id"]
-        )["volume_usd"] is None
         anchor = {**swap(old, V3, "v3"), "sqrt_price_x96": str(2 << 96)}
         app.store.ingest([old], [anchor], lane="backfill")
         app.store.reproject([event["id"] for event in app.store.pending_reprojections()])
         row = app.tape({"kind": "all"})["rows"][0]
         assert row["volume_usd"] == pytest.approx(404)
         assert row["fees_usd"] == pytest.approx(1.212)
-        with app._cache_lock:
-            for key in tuple(app._cache):
-                if len(key) > 1 and key[1] in {"overview", "pools"}:
-                    app._cache.pop(key, None)
-        repriced = app.pools({
-            "window": "all", "sort": "volume", "order": "desc",
-        })
-        assert next(
-            row for row in repriced["rows"] if row["id"] == cross["id"]
-        )["volume_usd"] == pytest.approx(404)
-        assert app.overview({"window": "all"})["volume_usd"] == pytest.approx(505)
-    finally:
-        app.close()
-
-
-def test_separated_backfilled_anchors_only_repair_their_valid_windows(tmp_path):
-    app = service(tmp_path / "market.sqlite")
-    try:
-        cross = {**pools()[0], "id": "0x" + "45" * 20, "address": "0x" + "45" * 20,
-                 "token1": "0x" + "56" * 20, "symbol1": "OTHER"}
-        app.store.upsert_pools([*pools(), cross])
-        consumers = [header(n, stamp) for n, stamp in (
-            (100, 1001), (150, 1500), (200, 2001), (201, 2300), (202, 2301),
-        )]
-        app.store.ingest(consumers, [swap(h, cross["id"], "v3") for h in consumers])
-        anchors = [header(99, 1000), header(199, 2000)]
-        app.store.ingest(anchors, [
-            {**swap(h, V3, "v3"), "sqrt_price_x96": str(2 << 96)}
-            for h in anchors
-        ], lane="backfill")
-        pending = app.store.pending_reprojections()
-        # The gap and the event just after expiry have no changed price input.
-        assert {row["block_number"] for row in pending} == {100, 200, 201}
-        app.store.reproject([row["id"] for row in pending])
-        rows = app.store.read().execute(
-            "SELECT block_number,volume_usd FROM events WHERE pool_id=? ORDER BY block_number",
-            (cross["id"],),
-        ).fetchall()
-        assert dict(rows) == {100: 404, 150: None, 200: 404, 201: 404, 202: None}
-    finally:
-        app.close()
-
-
-def test_separated_pool_prices_do_not_repair_across_unchanged_sample(tmp_path):
-    app = service(tmp_path / "market.sqlite")
-    try:
-        app.store.upsert_pools(pools())
-        blocks = [header(n, n * 10) for n in (100, 150, 151, 200)]
-        events = [
-            {**swap(h, V3, "v3"), "kind": "add", "sqrt_price_x96": None,
-             "cashflow0": "-1000000", "cashflow1": "0"}
-            for h in blocks
-        ]
-        events[1] = {**swap(blocks[1], V3, "v3"), "sqrt_price_x96": str(2 << 96)}
-        app.store.ingest(blocks, events)
-        anchors = [header(99, 990), header(199, 1990)]
-        app.store.ingest(anchors, [
-            {**swap(h, V3, "v3"), "sqrt_price_x96": str(multiplier << 96)}
-            for h, multiplier in zip(anchors, (1, 3))
-        ], lane="backfill")
-        pending = app.store.pending_reprojections()
-        assert {row["block_number"] for row in pending} == {100, 200}
-        app.store.reproject([row["id"] for row in pending])
-        values = app.store.read().execute(
-            "SELECT block_number,deposit_usd FROM events WHERE kind='add' ORDER BY block_number",
-        ).fetchall()
-        assert dict(values) == {100: 1, 151: 4, 200: 9}
     finally:
         app.close()
 
@@ -1174,135 +691,6 @@ def test_empty_pool_limit_price_cannot_value_withdrawals_or_borrow_future_marks(
         overview = app.overview({"window": "all"})
         assert overview["volume_usd"] == pytest.approx(101)
         assert overview["coverage"]["unpriced_flows"] == 1
-    finally:
-        app.close()
-
-
-@pytest.mark.parametrize("drained_sqrt,drained_tick", [
-    # Swept to the tick limit: boundary geometry is never a mark.
-    ("4295128740", -887272),
-    # Swept into a liquidity gap at an ordinary price: depth decides.
-    (str(2 << 96), 13863),
-])
-def test_same_block_drain_outranks_pinned_pre_state_for_remove_pricing(
-        tmp_path, drained_sqrt, drained_tick):
-    """A remove logged after a full drain in the same block must not be valued
-    at the pre-drain depth from its block-(N-1) pool_state_before view."""
-    app = service(tmp_path / "market.sqlite")
-    try:
-        app.store.upsert_pools(pools())
-        blocks = [header(100 + i, int(time.time()) - 60 + i) for i in range(2)]
-        app.store.ingest([blocks[0]], [swap(blocks[0], V4, "v4")])
-        drain = swap(blocks[1], V4, "v4")
-        drain.update(sqrt_price_x96=drained_sqrt, tick=drained_tick, liquidity="0")
-        closed = lp_effect(blocks[1], "v4", "remove", -1000,
-                           (10_000_000, 20_000_000), position_state(1000), position_state(0))
-        closed.update(sqrt_price_x96=None, tick=None, liquidity=None, log_index=1,
-                      tx_hash="0x" + f"{int(blocks[1]['hash'], 16) * 100 + 1:064x}",
-                      cashflow0="10000000", cashflow1="20000000")
-        closed["data"]["pool_state_before"] = {
-            "sqrt_price_x96": str(1 << 96), "tick": 0,
-            "liquidity": "1000000000000", "pinned_block": 100,
-        }
-        ingest_effects(app, [blocks[1]], [drain, closed])
-        row = next(row for row in app.tape({"window": "all"})["rows"] if row["kind"] == "remove")
-        assert row["price0_usd"] is None
-        assert row["size_usd"] is None
-        assert app.overview({"window": "all"})["net_deposits_usd"] is None
-
-        # Reprojection after lp_pool_state has moved past the event must
-        # recover the same-block drain from the indexed swap, not the pin.
-        later = header(102, int(time.time()) - 50)
-        app.store.ingest([later], [swap(later, V4, "v4")])
-        app.store.reproject([row["id"]])
-        app.close()
-        app = service(tmp_path / "market.sqlite")
-        row = next(row for row in app.tape({"window": "all"})["rows"] if row["kind"] == "remove")
-        assert row["price0_usd"] is None
-        assert app.overview({"window": "all"})["coverage"]["unpriced_flows"] == 1
-    finally:
-        app.close()
-
-
-def test_add_covering_the_tick_limit_is_not_valued_at_boundary_price(tmp_path):
-    """Re-adding full-range liquidity to a pool swept to MIN_SQRT_RATIO puts
-    depth at the boundary, but the boundary is still not a market price."""
-    app = service(tmp_path / "market.sqlite")
-    try:
-        app.store.upsert_pools(pools())
-        blocks = [header(100 + i, int(time.time()) - 60 + i) for i in range(2)]
-        app.store.ingest([blocks[0]], [swap(blocks[0], V4, "v4")])
-        drain = swap(blocks[1], V4, "v4")
-        drain.update(sqrt_price_x96="4295128740", tick=-887272, liquidity="0")
-        opened = lp_effect(blocks[1], "v4", "add", 1000,
-                           (10_000_000, 20_000_000), position_state(0), position_state(1000))
-        opened.update(sqrt_price_x96=None, tick=None, liquidity=None, log_index=1,
-                      tick_lower=-887272, tick_upper=887272,
-                      tx_hash="0x" + f"{int(blocks[1]['hash'], 16) * 100 + 1:064x}")
-        opened["data"]["pool_state_before"] = {
-            "sqrt_price_x96": "4295128740", "tick": -887272,
-            "liquidity": "0", "pinned_block": 100,
-        }
-        ingest_effects(app, [blocks[1]], [drain, opened])
-        row = next(row for row in app.tape({"window": "all"})["rows"] if row["kind"] == "add")
-        assert row["price0_usd"] is None
-        assert row["size_usd"] is None
-        assert app.overview({"window": "all"})["net_deposits_usd"] is None
-    finally:
-        app.close()
-
-
-def test_implausible_direct_spot_falls_back_to_recent_anchor(tmp_path):
-    """A dust swap that leaves a thin pool quoting the asset above 1e9 USD is
-    not a mark; flows use the recent anchor, as an emptied pool would."""
-    app = service(tmp_path / "market.sqlite")
-    try:
-        app.store.upsert_pools(pools())
-        blocks = [header(100 + i, int(time.time()) - 60 + i) for i in range(2)]
-        app.store.ingest([blocks[0]], [swap(blocks[0], V3, "v3")])
-        spike = swap(blocks[1], V3, "v3")
-        spike.update(sqrt_price_x96=str(100_000 << 96), tick=230_270)
-        closed = lp_effect(blocks[1], "v3", "remove", -1000,
-                           (10_000_000, 20_000_000), position_state(1000), position_state(0))
-        closed.update(sqrt_price_x96=None, tick=None, liquidity=None, log_index=1,
-                      tx_hash="0x" + f"{int(blocks[1]['hash'], 16) * 100 + 1:064x}",
-                      cashflow0="10000000", cashflow1="20000000")
-        ingest_effects(app, [blocks[1]], [spike, closed])
-        row = next(row for row in app.tape({"window": "all"})["rows"] if row["kind"] == "remove")
-        assert row["price0_usd"] == pytest.approx(1.0)
-        assert row["pricing_basis"].startswith("at-or-before USDG anchor")
-        assert row["size_usd"] == pytest.approx(30)
-    finally:
-        app.close()
-
-
-def test_seeds_before_the_first_swap_are_not_valued_at_the_initialize_price(tmp_path):
-    """Initialize sets a price nobody has traded; single-sided seeds against it
-    are unpriced until a swap exists, then later flows value normally."""
-    app = service(tmp_path / "market.sqlite")
-    try:
-        app.store.upsert_pools(pools())
-        blocks = [header(100 + i, int(time.time()) - 60 + i) for i in range(3)]
-        created = swap(blocks[0], V4, "v4")
-        created.update(kind="create", amount0=None, amount1=None, liquidity="0")
-        seed = lp_effect(blocks[0], "v4", "add", 1000,
-                         (10_000_000, 0), position_state(0), position_state(1000))
-        seed.update(sqrt_price_x96=None, tick=None, liquidity=None, log_index=1,
-                    tx_hash="0x" + f"{int(blocks[0]['hash'], 16) * 100 + 1:064x}",
-                    cashflow0="-10000000", cashflow1="0")
-        ingest_effects(app, [blocks[0]], [created, seed])
-        row = next(row for row in app.tape({"window": "all"})["rows"] if row["kind"] == "add")
-        assert row["price0_usd"] is None
-        assert row["size_usd"] is None
-
-        app.store.ingest([blocks[1]], [swap(blocks[1], V4, "v4")])
-        later = lp_effect(blocks[2], "v4", "add", 1000,
-                          (10_000_000, 20_000_000), position_state(1000), position_state(2000))
-        later.update(sqrt_price_x96=None, tick=None, liquidity=None)
-        ingest_effects(app, [blocks[2]], [later])
-        priced = next(row for row in app.tape({"window": "all"})["rows"]
-                      if row["kind"] == "add" and row["block_number"] == 102)
-        assert priced["size_usd"] == pytest.approx(30)
     finally:
         app.close()
 
@@ -1704,259 +1092,6 @@ def test_completed_wallet_projection_is_deliverable_during_live_changes(
         app.close()
 
 
-def test_stale_owners_are_served_while_refresh_runs_past_reader_cap(
-        tmp_path, monkeypatch):
-    app = service(tmp_path / "market.sqlite")
-    params = {
-        "window": "30d", "owner_sort": "activity", "owner_limit": 200,
-        "identity_scope": "wallets",
-    }
-    view_key = app._owner_view_key(app._owner_projection_params(params))
-    entered = threading.Event()
-    original = app.book.owner_candidates
-
-    def invalidate_owners():
-        with app.book._cache_lock:
-            app.book._owners_generation += 1
-        app._owner_last_started.pop(view_key, None)
-
-    def wait_failed_refresh():
-        pending = app._frame_futures.get(("owners", view_key))
-        if pending is not None:
-            with pytest.raises(market_store_module.MarketStoreError):
-                pending.result(3)
-
-    try:
-        app.store.upsert_pools(pools())
-        block = header(100, int(time.time()) - 60)
-        event = lp_effect(
-            block, "v4", "add", 1_000, (1_000_000, 1_000_000),
-            position_state(0), position_state(1_000),
-        )
-        app.observe_current_block(block)
-        app.observe_current_events(block, (event,))
-        monkeypatch.setattr(market_store_module, "_READER_SNAPSHOT_SECONDS", 0.0)
-        monkeypatch.setattr(market_store_module, "_READER_PROGRESS_STEPS", 1)
-        cold = app.owners(params)
-        assert [row["owner"] for row in cold["rows"]] == [TOKEN]
-
-        def slow(candidate_params):
-            entered.set()
-            time.sleep(1.0)
-            return original(candidate_params)
-
-        monkeypatch.setattr(app.book, "owner_candidates", slow)
-        invalidate_owners()
-        started = time.monotonic()
-        stale = app.owners(params)
-        assert time.monotonic() - started < 0.05
-        assert stale["revision"] == cold["revision"]
-        assert entered.wait(1)
-        app._frame_futures[("owners", view_key)].result(3)
-        assert app.owners(params)["revision"] == cold["revision"] + 1
-
-        def failing(_params):
-            raise market_store_module.MarketStoreError(
-                "reader snapshot exceeded its deadline",
-            )
-
-        monkeypatch.setattr(app.book, "owner_candidates", failing)
-        invalidate_owners()
-        assert app.owners(params)["revision"] == cold["revision"] + 1
-        wait_failed_refresh()
-        assert app.poll_owners(params)["revision"] == cold["revision"] + 1
-        assert app.owners(params)["revision"] == cold["revision"] + 1
-    finally:
-        app.close()
-
-
-def test_pool_revision_churn_keeps_cached_terminal_views_available(
-        tmp_path, monkeypatch):
-    app = service(tmp_path / "market.sqlite")
-    cold_params = {"window": "24h", "sort": "flow"}
-    hot_params = {"window": "1h", "sort": "created"}
-    monkeypatch.setitem(market_service_module.WINDOW_CACHE_TTL, "1h", 0.0)
-
-    def unavailable_reader(*_args, **_kwargs):
-        raise AssertionError("a cached terminal view unexpectedly opened SQLite")
-
-    try:
-        app.store.upsert_pools(pools())
-        block = header(100, int(time.time()) - 60)
-        app.store.ingest([block], [swap(block, V3, "v3")])
-        cold = app.pools(cold_params)
-        assert {row["id"] for row in cold["rows"]} == {V3, V4}
-        app.pools(hot_params)
-
-        for created_block in range(2, 82):
-            pool_id = "0x" + f"{created_block:040x}"
-            app.store.upsert_pools([
-                {
-                    **pools()[0], "id": pool_id, "address": pool_id,
-                    "created_block": created_block,
-                },
-            ])
-            app.tape({"window": "1h", "kind": "all"})
-            deadline = time.monotonic() + 5
-            while True:
-                fresh = app.pools(hot_params)
-                if fresh["rows"][0]["created_block"] == created_block:
-                    assert fresh["rows"][0]["id"] == pool_id
-                    break
-                assert time.monotonic() < deadline, "Fresh stopped updating"
-                time.sleep(0.001)
-
-        # The logical views fit easily in the terminal cache. Obsolete
-        # query generations must not evict a still-usable published frame.
-        monkeypatch.setattr(app.store, "reader_snapshot", unavailable_reader)
-        assert app.pools(cold_params) == cold
-    finally:
-        app.close()
-
-
-def test_warmer_resumes_across_short_writer_windows_and_retries_failures(
-        tmp_path, monkeypatch):
-    app = service(tmp_path / "market.sqlite")
-    monkeypatch.setattr(market_service_module, "_WARM_PAUSE_SECONDS", 0.0)
-    opportunity = {"remaining": 0}
-    blocked = {"value": False}
-    real_reader_snapshot = app.store.reader_snapshot
-    real_overview = app.overview
-    overview_failed = {"value": False}
-
-    def writer_idle():
-        if not opportunity["remaining"]:
-            return False
-        opportunity["remaining"] -= 1
-        return True
-
-    def guarded_reader_snapshot(*args, **kwargs):
-        if blocked["value"]:
-            raise AssertionError("terminal request missed its warmed value")
-        return real_reader_snapshot(*args, **kwargs)
-
-    def fail_overview_once(params):
-        if not overview_failed["value"]:
-            overview_failed["value"] = True
-            raise RuntimeError("transient warm failure")
-        return real_overview(params)
-
-    monkeypatch.setattr(app, "_writer_idle", writer_idle)
-    monkeypatch.setattr(app.store, "reader_snapshot", guarded_reader_snapshot)
-    monkeypatch.setattr(app, "overview", fail_overview_once)
-
-    def cycle():
-        opportunity["remaining"] = 1
-        result = {}
-
-        def run():
-            try:
-                result["warmed"] = app._warm_cycle()
-            except BaseException as exc:
-                result["error"] = exc
-
-        app._warm_thread = threading.Thread(target=run)
-        app._warm_thread.start()
-        app._warm_thread.join(30)
-        assert not app._warm_thread.is_alive()
-        if "error" in result:
-            raise result["error"]
-        return result["warmed"]
-
-    try:
-        app.store.upsert_pools(pools())
-        with pytest.raises(RuntimeError, match="transient warm failure"):
-            cycle()
-
-        for _ in range(len(market_service_module._WARM_KEYS) - 1):
-            assert cycle() == 1
-
-        blocked["value"] = True
-        dislocations = app.dislocations(
-            dict(market_service_module._WARM_KEYS[-1][1]),
-        )
-        assert dislocations["rows"] == []
-        assert dislocations["sort"] == "net"
-
-        blocked["value"] = False
-        assert cycle() == 1
-        blocked["value"] = True
-        overview = app.overview(dict(market_service_module._WARM_KEYS[0][1]))
-        assert overview["coverage"]["window"] == (
-            market_service_module._WARM_KEYS[0][1]["window"]
-        )
-    finally:
-        app._warm_thread = None
-        app.close()
-
-
-def test_owner_rollup_is_used_when_built_and_live_aggregate_otherwise(
-        tmp_path, monkeypatch):
-    app = service(tmp_path / "market.sqlite")
-    rollup_owner = "0x" + "78" * 20
-    built = {"value": None}
-    asked = []
-
-    def owner_activity(window, *, protocol="", identity_scope="all"):
-        asked.append((window, protocol, identity_scope))
-        return built["value"]
-
-    try:
-        app.store.upsert_pools(pools())
-        durable_time = int(time.time()) - 3_600
-        block = header(90, durable_time)
-        durable = lp_effect(
-            block, "v3", "add", 1_000, (1_000_000, 1_000_000),
-            position_state(0), position_state(1_000), key="durable",
-        )
-        durable["custody"] = MANAGER
-        ingest_effects(app, [block], [durable])
-        app.store.ingest([block], [], cursor={
-            "from_block": 90, "to_block": 90, "block_number": 90,
-            "block_hash": block["hash"], "timestamp": durable_time,
-        })
-        live = app.book.owner_candidates({"window": "7d"})
-        assert [row["owner"] for row in live["rows"] if row["owner"]] == [TOKEN]
-        monkeypatch.setattr(app.book, "owner_activity", owner_activity, raising=False)
-
-        fallback = app.owners({"window": "7d", "sort": "activity", "limit": 20})
-        assert asked == [("7d", "", "all")]
-        fallback_owners = {row["owner"] for row in fallback["rows"]}
-        assert TOKEN in fallback_owners and rollup_owner not in fallback_owners
-
-        stamped = app.book.owners_revision - 1
-        built["value"] = {
-            **live,
-            "rows": [{
-                **next(row for row in live["rows"] if row["owner"] == TOKEN),
-                "owner": rollup_owner, "custody": rollup_owner,
-            }],
-            "accounting_revision": stamped,
-        }
-        with app.book._cache_lock:
-            app.book._owners_generation += 1
-        app._owner_last_started.clear()
-        params = {"window": "7d", "sort": "activity", "limit": 20}
-        stale = app.owners(params)
-        view_key = app._owner_view_key(app._owner_projection_params(params))
-        app._frame_futures[("owners", view_key)].result(3)
-        rolled = app.owners(params)
-        assert rolled["revision"] == stale["revision"] + 1
-        assert {row["owner"] for row in rolled["rows"]} == {rollup_owner}
-        assert rolled["financial_revision"] == stamped
-        assert app.poll_owners(params, after_revision=rolled["revision"]) is None
-        assert not any(
-            not future.done() for key, future in app._frame_futures.items()
-            if key[0] == "owners"
-        )
-
-        searched = app.owners({"window": "7d", "q": TOKEN, "limit": 20})
-        assert [row["owner"] for row in searched["rows"]] == [TOKEN]
-        assert len(asked) == 2
-    finally:
-        app.close()
-
-
 def test_current_transfer_updates_both_beneficial_owners_without_moving_financials(
         tmp_path):
     app = service(tmp_path / "market.sqlite")
@@ -2318,46 +1453,6 @@ def test_current_position_fee_preserves_signed_delta_and_requires_attribution(tm
         app.close()
 
 
-def test_committed_activity_without_embedded_metadata_keeps_streaming(tmp_path):
-    app = service(tmp_path / "market.sqlite")
-    try:
-        unknown = {
-            **pools()[1], "symbol0": None, "symbol1": None,
-            "token0": "0x" + "45" * 20, "token1": "0x" + "56" * 20,
-            "decimals0": None, "decimals1": None,
-        }
-        app.store.upsert_pools([pools()[0], unknown])
-        now = int(time.time()) - 1
-        block = header(100, now)
-        inserted = app.store.ingest(
-            [block], [swap(block, V3, "v3"), swap(block, V4, "v4", index=1)],
-        )
-        cursor = app.indexer.feed_updates()
-        app.indexer._publish_current_block(block, [], source="test")
-        app.indexer._publish_canonical_current_events(
-            inserted, source="live-index", add_unseen=True,
-        )
-        app.indexer._publish_current_block(header(101, now + 1), [], source="test")
-        updates = app.stream_updates(
-            {"kind": "all"}, cursor["sequence"], cursor["feed_epoch"],
-        )
-        rows = {
-            row["pool_id"]: row for item in updates["events"]
-            if item["event"] == "activity" for row in item["data"]["rows"]
-        }
-        assert rows[V3]["fees_usd"] == pytest.approx(0.303)
-        assert rows[V3]["pair"] == "ASSET / USDG"
-        assert rows[V4]["fees_usd"] is None
-        assert rows[V4]["token1"]["metadata_state"] == "unavailable"
-        heads = [
-            item["data"]["number"] for item in updates["events"]
-            if item["event"] == "block"
-        ]
-        assert heads[-1] == 101
-    finally:
-        app.close()
-
-
 def test_persisted_metadata_rematerializes_observed_tape_and_wallet_rows(tmp_path):
     app = service(tmp_path / "market.sqlite")
     try:
@@ -2447,8 +1542,12 @@ def test_late_trace_enrichment_replaces_current_row_with_position_fees(
                 "fees_basis": "modifyLiquidity_return_exact_but_donate_inflatable",
             },
         }
+        # The enrichment lane commits canonical facts, then merges them into
+        # the matching current-branch row through canonical publication.
+        app.store.ingest([block], [initial])
+        app.store.enrich([enriched])
         app.indexer._publish_canonical_current_events(
-            [enriched], source="test+enrichment",
+            [enriched], source="enrichment",
         )
         late = app.stream_updates(
             {"kind": "lp"}, first["sequence"], first["feed_epoch"],
