@@ -163,13 +163,23 @@ class SwapQuote(QuoteBase):
     intent: SwapIntent
     route: Route
     amounts: Amounts
+    hop_policies: tuple[tuple[int, int], ...] = ()
 
     def to_json(self) -> dict[str, Any]:
+        policies = self.hop_policies or tuple((0, 0) for _ in self.route.hops)
         return {
             **self._base_json(),
             "kind": "swap",
             "intent": self.intent.to_json(),
             "route": self.route.describe(),
+            "hops": [
+                {
+                    "venue": hop.pool.venue.value, "pool_id": hop.pool.id, "fee_ppm": hop.pool.fee_ppm,
+                    "currency_in": hop.currency_in, "currency_out": hop.currency_out,
+                    "hook_fee_bps": hook_bps, "creator_tax_bps": creator_bps,
+                }
+                for hop, (hook_bps, creator_bps) in zip(self.route.hops, policies)
+            ],
             "amounts": self.amounts.to_json(),
         }
 
@@ -466,6 +476,10 @@ class TxCore:
             intent=intent,
             route=route,
             amounts=amounts,
+            hop_policies=tuple(
+                (policy.hook_fee_bps, policy.creator_tax_bps)
+                for policy in (self.routes.hook_policy(hop.pool) for hop in route.hops)
+            ),
         )
         self._store(quote)
         return quote

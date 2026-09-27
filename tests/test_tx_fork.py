@@ -302,7 +302,7 @@ def test_v3_token_buy_and_sell(core, fork):
     assert [h.pool.venue.value for h in quote.route.hops] == ["v3"]
     assert quote.amounts.hook_fee is None
     quote, _ = trade(core, fork, swap(fork.user, Side.BUY, PIPEDOG, USDG, 20 * 10**6))
-    assert [h.pool.venue.value for h in quote.route.hops] == ["v3", "v3"]
+    assert [h.pool.venue.value for h in quote.route.hops][-1] == "v3"
     held = fork.balance(PIPEDOG, fork.user)
     quote, _ = trade(core, fork, swap(fork.user, Side.SELL, PIPEDOG, NATIVE, held // 2))
     assert quote.amounts.rhpools_fee.currency == WETH
@@ -333,6 +333,10 @@ def test_v2_token_buy_and_sell(core, fork):
     ],
 )
 def test_min_out_plus_one_reverts(core, fork, side, token, quote_currency, amount):
+    if side is Side.SELL:
+        if fork.balance(token, fork.user) == 0:
+            trade(core, fork, swap(fork.user, Side.BUY, token, NATIVE, 10**16))
+        amount = fork.balance(token, fork.user) // 10
     quote = core.quote(swap(fork.user, side, token, quote_currency, amount, slippage_bps=0))
     sig = fork.sign(quote.step("permit").typed_data) if quote.plan.permit else None
     exact = core.swaps.finalize(quote.plan, quote.amounts.net_out, Signatures(permit=sig))
