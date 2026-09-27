@@ -58,6 +58,24 @@ class JsonRpc:
             raise RuntimeError(json.dumps((reply or {}).get("error") if isinstance(reply, dict) else reply))
         return reply["result"]
 
+    def batch(self, calls: Any, size: int = 200) -> list[Any]:
+        calls = list(calls)
+        results: list[Any] = []
+        for start in range(0, len(calls), size):
+            chunk = calls[start:start + size]
+            payload = [{"jsonrpc": "2.0", "id": i, "method": m, "params": list(p)} for i, (m, p) in enumerate(chunk)]
+            with urlopen(Request(self.url, json.dumps(payload).encode(), {"Content-Type": "application/json"}), timeout=self.timeout) as response:
+                replies = json.loads(response.read())
+            if not isinstance(replies, list):
+                raise RuntimeError(json.dumps(replies))
+            by_id = {item.get("id"): item for item in replies}
+            for index in range(len(chunk)):
+                item = by_id.get(index) or {}
+                if "result" not in item:
+                    raise RuntimeError(json.dumps(item.get("error")))
+                results.append(item["result"])
+        return results
+
 
 @dataclass(frozen=True)
 class SimResult:

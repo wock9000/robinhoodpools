@@ -19,6 +19,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from .lp_gate import COOKIE_NAME, Gate, GatePolicy, GateRefusal, Principal
 from .lp_gate_ws import CLOSE_NOT_ENTITLED, WebSocketPush
+from .lp_flow_tags import FlowTagger, PostgresListener, TagStore
 from .tx_core import JsonRpc, TxCore
 from .tx_plan import LpIntent, LpOp, Signatures, SwapIntent, TxError, TxPolicy, TxRefusal
 from .tx_routes import RouteBook, Side
@@ -83,6 +84,8 @@ KEYED_STREAM = "/api/v1/stream"
 _TX_GET = {"/api/tx/status", "/api/tx/receipt", "/api/tx/balances"}
 _TX_POST = {"/api/tx/quote", "/api/tx/prepare"}
 TX_FEE_BPS = 75
+TAGS_PATH = "/api/v1/tags"
+TAGS_MAX_TX = 100
 _MINT_TTL_DEFAULT_S = 90 * 86400
 DEFAULT_API_SLOTS = 4 * (getattr(os, "process_cpu_count", os.cpu_count)() or 1)
 
@@ -291,6 +294,17 @@ class Runtime:
                     self.tx_unavailable = "transaction core failed to start: " + " ".join(str(exc).split())[:160]
                 if self.tx is not None and not self.tx.enabled:
                     self.tx_unavailable = "pinned contract code changed; trading disabled"
+            startup.phase("tags")
+            listener = None
+            if os.environ.get("RHP_LISTENER_DSN"):
+                try:
+                    listener = PostgresListener(os.environ["RHP_LISTENER_DSN"])
+                except Exception:
+                    listener = None
+            self.tags = FlowTagger(
+                JsonRpc(args.gate_rpc_url, timeout=15), TagStore(str(args.data_dir / "tags.sqlite")),
+                _pool_identity_reader(self.lp.store), listener,
+            )
         except BaseException:
             self._resources.close()
             raise
@@ -299,6 +313,14 @@ class Runtime:
         self.stopping.set()
         with self._close_lock:
             self._resources.close()
+
+
+def _pool_identity_reader(store):
+    def lookup(pool_id: str):
+        with store.reader_snapshot() as connection:
+            row = connection.execute("SELECT id,protocol,hook FROM pools WHERE id=?", (pool_id,)).fetchone()
+        return None if row is None else {"id": row[0], "protocol": row[1], "hook": row[2]}
+    return lookup
 
 
 class LPHTTPServer(ThreadingHTTPServer):
@@ -835,7 +857,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             route = _ROUTES.get(path)
-            if route is None and path not in {"/api/workbench/capabilities", "/api/lp/stream", "/api/workbench/stream"} and path not in _GATE_GET and path != KEYED_STREAM and path not in _TX_GET:
+            if route is None and path not in {"/api/workbench/capabilities", "/api/lp/stream", "/api/workbench/stream"} and path not in _GATE_GET and path != KEYED_STREAM and path not in _TX_GET and path != TAGS_PATH:
                 return self._json(404, {"error": "Not found"})
             if self.runtime is None:
                 return self._starting()
@@ -850,6 +872,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._gate_get(path, query)
             if path in _TX_GET:
                 return self._tx_get(path, query)
+            if path == TAGS_PATH:
+                return self._tags(query)
             if path == KEYED_STREAM:
                 return self._keyed_stream(query)
             return self._sse(True, query)
@@ -865,7 +889,7 @@ class Handler(BaseHTTPRequestHandler):
             path, _query = self._query()
         except ValueError as exc:
             return self._json(400, {"error": str(exc)})
-        if path in _GATE_GET or path in _GATE_POST or path == KEYED_STREAM or path in _TX_GET or path in _TX_POST:
+        if path in _GATE_GET or path in _GATE_POST or path == KEYED_STREAM or path in _TX_GET or path in _TX_POST or path == TAGS_PATH:
             self.send_response(204)
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
@@ -907,6 +931,28 @@ class Handler(BaseHTTPRequestHandler):
 
     def _cookie(self, secret: str, max_age: int) -> tuple[str, str]:
         return ("Set-Cookie", f"{COOKIE_NAME}={secret}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age={max_age}")
+
+    def _tags(self, query: dict[str, str]) -> None:
+        try:
+            self.runtime.gate.require(self.headers, "flags")
+        except GateRefusal as refusal:
+            return self._refuse(refusal)
+        hashes = list(dict.fromkeys(h.strip().lower() for h in str(query.get("tx") or "").split(",") if h.strip()))
+        if not hashes or len(hashes) > TAGS_MAX_TX or any(len(h) != 66 or not h.startswith("0x") for h in hashes):
+            return self._json(400, {"error": f"tx must list 1 to {TAGS_MAX_TX} transaction hashes"}, private=True)
+        marks = ",".join("?" for _ in hashes)
+        with self.runtime.lp.store.reader_snapshot() as connection:
+            rows = [
+                {"tx_hash": row[0], "pool_id": row[1], "block_number": row[2], "timestamp": row[3]}
+                for row in connection.execute(
+                    "SELECT DISTINCT tx_hash,pool_id,block_number,timestamp FROM events INDEXED BY events_tx_log_idx "
+                    f"WHERE tx_hash IN ({marks}) AND pool_id IS NOT NULL", hashes,
+                )
+            ]
+        tagged: dict[str, dict[str, dict]] = {h: {} for h in hashes}
+        for tag in self.runtime.tags.tag(rows):
+            tagged.setdefault(tag.tx_hash, {})[tag.pool_id] = {"tags": sorted(tag.tags), "basis": sorted(tag.basis)}
+        return self._json(200, {"tags": tagged}, private=True)
 
     def _tx_principal(self, feature: str) -> Principal:
         principal, _ = self.runtime.gate.require(self.headers, feature)

@@ -445,6 +445,7 @@ select:focus { border-color: var(--text); color: var(--text); }
 .badge.bad { border-color: #752b2b; color: var(--red); }
 .badge.custody { border-color: #763d76; color: var(--magenta); }
 .badge.live { border-color: #19647a; color: var(--cyan); }
+.badge.flow-tag { margin-left: 4px; text-transform: none; }
 .row-link { color: var(--cyan); }
 .owner-activity-age { color: var(--dim); }
 .owner-activity-age.is-live { color: var(--cyan); }

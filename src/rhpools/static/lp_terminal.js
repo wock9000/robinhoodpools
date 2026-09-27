@@ -834,13 +834,44 @@
   }
 
 
+  const flowTags = new Map();
+  const flowTagsPending = new Set();
+
+  function flowTagsEnabled() {
+    const gate = window.rhpGate && window.rhpGate.snapshot();
+    const me = gate && gate.me;
+    return Boolean(me && me.signed_in && (me.features || []).includes("flags"));
+  }
+
+  function tagsFor(item) {
+    if (!flowTagsEnabled()) return null;
+    const byPool = flowTags.get(String(item.tx_hash || "").toLowerCase());
+    return byPool ? byPool[String(item.pool_id || "").toLowerCase()] || null : null;
+  }
+
+  function setKindCell(cell, kind, tags) {
+    if (!tags || !tags.length) {
+      if (cell.dataset.signature) {
+        delete cell.dataset.signature;
+        delete cell.dataset.value;
+      }
+      return setTextCell(cell, kind, "event-kind");
+    }
+    delete cell.dataset.value;
+    setNodeCell(cell, `${kind}|${tags.join(",")}`, "event-kind", () => [document.createTextNode(kind), ...tags.map((tag) => {
+      const badge = el("span", `badge flow-tag ${tag === "PONS" ? "warn" : "live"}`, tag);
+      badge.title = tag === "PONS" ? "Pons launch: pool registered in the Pons V2 hook" : "FOMO app: Relay-routed trade by a FOMO wallet";
+      return badge;
+    })]);
+  }
+
   function patchTapeRow(row, item) {
     const kind = String(item.kind || "unknown").toLowerCase();
     row.className = `event-${kind}`;
     const cells = row.cells;
     const eventTime = eventTimeLabel(item);
     setTextCell(cells[0], eventTime.text, "dim", eventTime.title);
-    setTextCell(cells[1], kind, "event-kind");
+    setKindCell(cells[1], kind, tagsFor(item));
     const poolId = item.pool_id || "";
     setNodeCell(cells[2], `${poolId}|${pairFor(item)}|${item.protocol}`, "pair-symbol", () => {
       const link = internalPoolLink(poolId, "", `${pairFor(item)} ${String(item.protocol || "").toUpperCase()}`, item.tx_hash);
@@ -2697,6 +2728,46 @@
       }
     });
   }
+
+  async function refreshFlowTags() {
+    if (!flowTagsEnabled() || document.hidden) return;
+    const wanted = [];
+    for (const [, item] of tapeTable.items) {
+      const tx = String(item.tx_hash || "").toLowerCase();
+      if (tx.length === 66 && !flowTags.has(tx) && !flowTagsPending.has(tx) && !wanted.includes(tx)) wanted.push(tx);
+      if (wanted.length >= 100) break;
+    }
+    if (!wanted.length) return;
+    wanted.forEach((tx) => flowTagsPending.add(tx));
+    try {
+      const response = await fetch(`/api/v1/tags?tx=${wanted.join(",")}`, { credentials: "same-origin", headers: { Accept: "application/json" } });
+      if (!response.ok) return;
+      const body = await response.json();
+      for (const tx of wanted) {
+        const byPool = {};
+        for (const [pool, value] of Object.entries((body.tags || {})[tx] || {})) if (value.tags.length) byPool[pool] = value.tags;
+        flowTags.set(tx, byPool);
+      }
+      repatchTapeKinds();
+    } catch (_) {
+      return;
+    } finally {
+      wanted.forEach((tx) => flowTagsPending.delete(tx));
+    }
+  }
+
+  function repatchTapeKinds() {
+    for (const [key, item] of tapeTable.items) {
+      const row = tapeTable.rowFor(key);
+      if (row) setKindCell(row.cells[1], String(item.kind || "unknown").toLowerCase(), tagsFor(item));
+    }
+  }
+
+  setInterval(refreshFlowTags, 2000);
+  document.addEventListener("rhp:gate", () => {
+    repatchTapeKinds();
+    refreshFlowTags();
+  });
 
   function refreshVisibleTapeAges() {
     for (const [key, item] of tapeTable.items) {
