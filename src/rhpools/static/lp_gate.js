@@ -14,7 +14,7 @@
     policy: document.getElementById("gate-policy"),
   };
   const addressOut = document.getElementById("gate-dialog-address");
-  const state = { wallet: null, chain: null, me: null, phase: "idle", error: null, secret: null, keys: null, policy: null };
+  const state = { wallet: null, chain: null, me: null, phase: "idle", error: null, secret: null, keys: null, policyKey: null };
   let ticker = null;
 
   function el(tag, attrs, children) {
@@ -42,6 +42,41 @@
     if (!decimals) return whole;
     const frac = (value % base).toString().padStart(decimals, "0").slice(0, 2);
     return frac === "00" ? whole : whole + "." + frac;
+  }
+
+  function toRaw(text, decimals) {
+    const match = /^(\d+)(?:\.(\d+))?$/.exec(String(text).trim());
+    if (!match) throw new Error("amount must be a decimal number");
+    const frac = match[2] || "";
+    if (frac.length > decimals) throw new Error("more than " + decimals + " fractional digits");
+    return (BigInt(match[1]) * 10n ** BigInt(decimals) + BigInt(frac.padEnd(decimals, "0") || "0")).toString();
+  }
+
+  function fromRaw(raw, decimals) {
+    const value = BigInt(raw);
+    const base = 10n ** BigInt(decimals);
+    const frac = (value % base).toString().padStart(decimals, "0").replace(/0+$/, "");
+    return (value / base).toString() + (frac ? "." + frac : "");
+  }
+
+  function fail(error, fallback) {
+    if (!error) return { line: fallback, full: fallback };
+    const full = String(error.message || error);
+    if (error.gate && error.gate.reason) return { line: fallback + ": " + error.gate.reason, full: full };
+    if (error.status) return { line: full, full: full };
+    const code = Number(error.code);
+    if (code === 4001 || /reject|denied|cancel/i.test(full)) return { line: "signature request rejected", full: full };
+    if (code === 4902) return { line: "chain 4663 is not configured in this wallet", full: full };
+    if (error instanceof TypeError) return { line: "server unreachable", full: full };
+    return { line: "wallet error", full: full };
+  }
+
+  function setError(error, fallback) {
+    state.error = error == null ? null : fail(error, fallback);
+  }
+
+  function errorLine(cls) {
+    return el("p", { class: cls + " gate-error", text: state.error.line, title: state.error.full });
   }
 
   function clock(seconds) {
@@ -86,7 +121,7 @@
     if (!me || !me.signed_in) return { key: "connected", text: short(state.wallet) + " sign in" };
     if (me.wallet.toLowerCase() !== state.wallet.toLowerCase()) return { key: "mismatch", text: short(state.wallet) + " ≠ session " + short(me.wallet) + " · sign in" };
     const owner = me.owner ? " owner" : "";
-    if (me.state === "unset") return { key: "unset", text: short(me.wallet) + " gate not live" + owner, dim: !me.owner };
+    if (me.state === "unset") return { key: "unset", text: short(me.wallet) + " token not launched" + owner, dim: !me.owner };
     if (me.state === "holder") return { key: "holder", text: short(me.wallet) + " holder" + owner, cls: "is-holder", features: me.features };
     if (me.state === "grace") return { key: "grace", text: short(me.wallet) + " grace " + clock(graceLeft() || 0) + owner, cls: "is-grace", features: me.features };
     const need = FEATURES.map((f) => BigInt(me.policy.threshold[f])).filter((n) => n > 0n).sort((a, b) => (a < b ? -1 : 1))[0];
@@ -107,7 +142,7 @@
         chipText.append(el("span", { class: "badge" + (current.features.includes(feature) ? "" : " off"), text: feature }));
       }
     }
-    chip.title = state.error || "";
+    chip.title = state.error ? state.error.full : "";
     if (current.key === "grace" && !ticker) ticker = setInterval(renderChip, 1000);
     if (current.key !== "grace" && ticker) { clearInterval(ticker); ticker = null; }
   }
@@ -115,7 +150,7 @@
   function statusSection() {
     const me = state.me;
     const out = [el("h3", { text: "WALLET" })];
-    if (state.error) out.push(el("p", { class: "bad", text: state.error }));
+    if (state.error) out.push(errorLine("bad"));
     if (!window.ethereum) {
       out.push(el("p", { class: "note", text: "no browser wallet detected. sign-in needs an EIP-1193 wallet on chain 4663." }));
       return out;
@@ -137,7 +172,11 @@
     }
     const policy = me.policy;
     if (me.state === "unset") {
-      out.push(el("p", { class: "note", text: "gate not live: no token set in the policy yet." }));
+      out.push(el("p", { class: "note", text: "token not launched: the policy names no token, so every gated feature is off." }));
+      out.push(el("table", { class: "gate-table" }, [
+        el("thead", {}, [el("tr", {}, [el("th", { text: "feature" }), el("th", { text: "state" })])]),
+        el("tbody", {}, FEATURES.map((feature) => el("tr", {}, [el("td", { text: feature }), el("td", { class: "bad", text: "off" })]))),
+      ]));
     } else {
       const have = me.holding ? units(me.holding.balance_raw, policy.decimals) : "unknown (oracle unavailable)";
       out.push(el("p", {}, [
@@ -211,24 +250,73 @@
       fields[name] = el("input", Object.assign({ type: "text", value: value, class: "wide" }, attrs || {}));
       form.append(el("label", { text: name }), fields[name]);
     };
+    const previews = {};
     add("token", policy.token || "", { placeholder: "0x… (empty = unset)" });
-    add("decimals", String(policy.decimals));
-    for (const feature of FEATURES) add(feature, policy.threshold[feature], { title: "raw units" });
-    add("grace_s", String(policy.grace_s));
+    add("decimals", String(policy.decimals), { inputmode: "numeric" });
+    for (const feature of FEATURES) {
+      add(feature, fromRaw(policy.threshold[feature], policy.decimals), { placeholder: "whole tokens, e.g. 1000 or 0.5", inputmode: "decimal" });
+      previews[feature] = el("span", { class: "note gate-preview" });
+      form.append(el("span"), previews[feature]);
+    }
+    add("grace_s", String(policy.grace_s), { inputmode: "numeric" });
+    const summary = el("p", { class: "note" });
+    const preview = () => {
+      const draft = readPolicy(fields, policy.version + 1);
+      for (const feature of FEATURES) {
+        const raw = draft.threshold[feature];
+        previews[feature].textContent = raw instanceof Error ? raw.message : "raw " + raw;
+        previews[feature].className = "gate-preview " + (raw instanceof Error ? "bad" : "note");
+      }
+      summary.textContent = draft.summary;
+      summary.className = draft.valid ? "note" : "bad";
+      apply.disabled = !draft.valid;
+    };
+    const apply = el("button", { type: "button", text: "sign & apply", onclick: () => applyPolicy(readPolicy(fields, policy.version + 1)) });
+    form.addEventListener("input", preview);
     const out = [
       el("h3", { text: "POLICY (owner)" }),
-      el("p", { class: "note", text: "current v" + policy.version + ". signing produces v" + (policy.version + 1) + " with EIP-712 (eth_signTypedData_v4); the server verifies the owner address and audits the change." }),
+      el("p", { class: "note", text: "current v" + policy.version + ". thresholds are whole tokens; the signed message carries raw units. signing uses EIP-712 (eth_signTypedData_v4); the server verifies the owner address and audits the change." }),
       form,
-      el("div", { class: "gate-row" }, [el("button", { type: "button", text: "sign & apply", onclick: () => applyPolicy(fields) })]),
+      summary,
+      el("div", { class: "gate-row" }, [apply]),
     ];
+    preview();
     return out;
+  }
+
+  function readPolicy(fields, version) {
+    const decimals = /^\d{1,2}$/.test(fields.decimals.value.trim()) ? Number(fields.decimals.value.trim()) : null;
+    const grace = /^\d{1,9}$/.test(fields.grace_s.value.trim()) ? Number(fields.grace_s.value.trim()) : null;
+    const token = fields.token.value.trim();
+    const threshold = {};
+    const parts = [];
+    let valid = decimals !== null && grace !== null && (token === "" || ADDRESS_RE.test(token));
+    for (const feature of FEATURES) {
+      try {
+        if (decimals === null) throw new Error("decimals must be 0-99");
+        threshold[feature] = toRaw(fields[feature].value || "0", decimals);
+        parts.push(feature + " ≥ " + units(threshold[feature], decimals));
+      } catch (error) {
+        threshold[feature] = error;
+        parts.push(feature + " ?");
+        valid = false;
+      }
+    }
+    const summary = "v" + version + ": " + parts.join(" · ") + " · grace " + (grace === null ? "?" : grace) + " s" +
+      (token === "" ? " · token unset" : ADDRESS_RE.test(token) ? "" : " · token invalid");
+    return { version: version, token: token, decimals: decimals, grace_s: grace, threshold: threshold, valid: valid, summary: summary };
   }
 
   function renderDialog() {
     addressOut.textContent = state.wallet ? state.wallet : "";
     sections.status.replaceChildren(...statusSection());
     sections.keys.replaceChildren(...keysSection());
-    sections.policy.replaceChildren(...policySection());
+    const me = state.me;
+    const policyKey = me && me.signed_in && me.owner ? me.wallet + "@" + me.policy.version : "";
+    if (policyKey !== state.policyKey) {
+      sections.policy.replaceChildren(...policySection());
+      state.policyKey = policyKey;
+    }
     sections.keys.hidden = !sections.keys.childElementCount;
     sections.policy.hidden = !sections.policy.childElementCount;
   }
@@ -241,9 +329,10 @@
   async function refreshMe() {
     try {
       state.me = await api("/api/gate/me");
-      state.error = null;
+      if (state.error && state.error.refresh) state.error = null;
     } catch (error) {
-      state.error = error.message;
+      setError(error, "status refresh failed");
+      state.error.refresh = true;
     }
     render();
   }
@@ -273,7 +362,7 @@
     try {
       await readWallet(true);
     } catch (error) {
-      state.error = error && error.message ? error.message : "wallet refused";
+      setError(error, "wallet refused");
     }
     state.phase = "idle";
     render();
@@ -285,7 +374,7 @@
       state.chain = normalizeChain(await window.ethereum.request({ method: "eth_chainId" }));
       state.error = null;
     } catch (error) {
-      state.error = error && Number(error.code) === 4902 ? "chain 4663 is not configured in this wallet" : "switch to chain 4663 was not approved";
+      setError(error, "switch to chain 4663 was not approved");
     }
     render();
   }
@@ -314,7 +403,7 @@
       state.secret = null;
       await refreshKeys();
     } catch (error) {
-      state.error = error.gate && error.gate.reason ? "sign-in refused: " + error.gate.reason : (error && error.message) || "sign-in failed";
+      setError(error, "sign-in refused");
     }
     state.phase = "idle";
     render();
@@ -324,7 +413,7 @@
     try {
       await api("/api/gate/logout", {});
     } catch (error) {
-      state.error = error.message;
+      setError(error, "request failed");
     }
     state.me = { signed_in: false };
     state.keys = null;
@@ -337,7 +426,7 @@
       state.secret = await api("/api/gate/keys", { op: "mint", label: label || "key", ttl_s: Math.max(1, Math.min(365, days || 90)) * 86400 });
       state.error = null;
     } catch (error) {
-      state.error = error.message;
+      setError(error, "request failed");
     }
     await refreshKeys();
     render();
@@ -347,27 +436,25 @@
     try {
       await api("/api/gate/keys", { op: "revoke", key_id: keyId });
     } catch (error) {
-      state.error = error.message;
+      setError(error, "request failed");
     }
     if (state.me && state.me.key_id === keyId) return signOut();
     await refreshKeys();
     render();
   }
 
-  async function applyPolicy(fields) {
-    const me = state.me;
-    const token = fields.token.value.trim();
+  async function applyPolicy(draft) {
+    if (!draft.valid) return;
     const policy = {
-      version: me.policy.version + 1,
-      token: token && token !== "0x0000000000000000000000000000000000000000" ? token : null,
-      decimals: Number(fields.decimals.value),
-      threshold: {},
-      grace_s: Number(fields.grace_s.value),
+      version: draft.version,
+      token: draft.token && draft.token !== "0x0000000000000000000000000000000000000000" ? draft.token : null,
+      decimals: draft.decimals,
+      threshold: draft.threshold,
+      grace_s: draft.grace_s,
       issued_at: Math.floor(Date.now() / 1000),
     };
-    for (const feature of FEATURES) policy.threshold[feature] = fields[feature].value.trim() || "0";
     const status = await api("/api/gate/policy").catch(() => null);
-    if (!status) { state.error = "policy template unavailable"; return render(); }
+    if (!status) { setError(new Error("policy template unavailable"), "policy"); return render(); }
     const typed = {
       types: status.typed_data.types,
       primaryType: "GatePolicy",
@@ -386,7 +473,7 @@
       state.error = null;
       await refreshMe();
     } catch (error) {
-      state.error = error.gate && error.gate.reason ? "policy refused: " + error.gate.reason : (error && error.message) || "policy signing failed";
+      setError(error, "policy refused");
     }
     state.phase = "idle";
     render();
@@ -410,7 +497,7 @@
   async function boot() {
     chip.hidden = false;
     if (window.ethereum) {
-      try { await readWallet(false); } catch (error) { state.error = error && error.message; }
+      try { await readWallet(false); } catch (error) { setError(error, "wallet error"); }
       window.ethereum.on && window.ethereum.on("accountsChanged", () => { readWallet(false).then(render, render); });
       window.ethereum.on && window.ethereum.on("chainChanged", () => { readWallet(false).then(render, render); });
     }

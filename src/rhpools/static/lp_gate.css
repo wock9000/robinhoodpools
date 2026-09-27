@@ -63,3 +63,14 @@
 .gate-secret { display: block; margin: 4px 0; padding: 3px 5px; border: 1px solid var(--rhp-yellow); color: var(--rhp-yellow); overflow-wrap: anywhere; user-select: all; }
 .gate-form { display: grid; grid-template-columns: 12ch minmax(0, 1fr); gap: 3px 8px; align-items: baseline; }
 .gate-form label { color: var(--rhp-dim); }
+.gate-error {
+  max-width: 100%;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  line-clamp: 2;
+}
+.gate-chip { max-width: 60ch; overflow: hidden; text-overflow: ellipsis; }
+.gate-preview { font-size: 10px; overflow-wrap: anywhere; }
