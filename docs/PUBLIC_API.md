@@ -351,6 +351,25 @@ receives `event: gate` with the refusal body and the connection ends; a
 WebSocket client receives `{"event":"gate","data":{…}}` and close code `4403`.
 Reconnecting yields the refusal as a normal HTTP error.
 
+## Holder trading and liquidity
+
+These routes need a signed-in wallet entitled to `trade` (swaps) or `lp` (liquidity). The wallet always comes from the credential; a `wallet` field in the body is ignored. Browser sessions must send a same-origin `Origin` on POST.
+
+| Route | Purpose |
+|---|---|
+| `GET /api/tx/status` | `enabled`, `reason`, `fee_bps` (75), `quote_ttl_s` |
+| `POST /api/tx/quote` | `{kind:"swap", side, token, quote_currency, amount_in, slippage_bps}` or `{kind:"lp", op, pool_id, slippage_bps, tick_lower, tick_upper, amount0, amount1, liquidity, token_id}`; amounts are raw integers as strings |
+| `POST /api/tx/prepare` | `{quote_id, permit_signature}`; returns the unsigned transaction after re-simulating its exact bytes |
+| `GET /api/tx/receipt?hash=&feature=` | Fill reconciled from receipt logs: `pending`, `confirmed` with amounts, or `failed` |
+| `GET /api/tx/balances?currencies=&feature=` | Balance, decimals and symbol per currency (up to 8) |
+| `GET /api/tx/pool?pool_id=&ids=&feature=lp` | Pool tokens, tick, spacing, Pons flag and the wallet's positions, each verified on chain; `ids` adds the client's recent mints |
+
+A swap quote lists `hops` (venue, fee tier, Pons hook and creator bps), `amounts` (`amount_in`, `net_out`, `min_out`, `hook_fee`, `creator_tax`, `rhpools_fee`, `impact_bps`) and `steps` in order: `approve` (ERC-20 to Permit2, once per token), `permit` (EIP-712 to sign), `send`. Quotes expire after 60 s. Refusals return 422 with `refusal`: `no_route`, `insufficient_balance`, `impact_over_limit`, `unmodeled_fee`, `pons_add`, `hook_blocked_add`, `allowlist_mismatch`, `trading_disabled`.
+
+## Flow tags: `GET /api/v1/tags?tx=`
+
+Up to 100 transaction hashes, comma-separated, for wallets entitled to `flags`. The server resolves each transaction's pools, block and time from its own events and returns `{tags: {tx: {pool: {tags, basis}}}}`. `PONS` means the pool is registered in the Pons V2 hook. `FOMO` means a Relay-routed trade whose counterparty wallet carries FOMO's EIP-7702 delegation. Other wallets delegating to the same implementation cannot be told apart on chain.
+
 ## Errors
 
 All errors use a JSON object with an `error` string. Gate refusals add a `gate`

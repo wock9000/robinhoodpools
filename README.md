@@ -44,6 +44,8 @@ The equivalent environment settings are `RHP_HTTP_HOST`, `RHP_HTTP_PORT`, `RHP_R
 
 Token-gated features (wallet sign-in, API keys, the keyed `/api/v1/stream`) are configured by three settings: `--gate-owner` / `RHP_GATE_OWNER` pins the EOA whose EIP-712 signature is the only way to change the policy; `--gate-rpc-url` / `RHP_GATE_RPC_URL` (default `http://127.0.0.1:8547`) is the JSON-RPC endpoint the balance oracle reads `balanceOf` from; `--gate-db` / `RHP_GATE_DB` (default `<data-dir>/gate.sqlite`) holds credentials, grace anchors, policy versions and the audit log. With the owner unset or no policy applied, every gated feature refuses and the anonymous site is unchanged. The systemd unit ships these lines commented out.
 
+Trading, liquidity management and flow tags add two settings. `RHP_TX_FEE_RECIPIENT` receives the 75 bps fee on holder trades; unset, `/api/tx/status` reports trading disabled and no quote is served. `RHP_LISTENER_DSN` is an optional read-only Postgres DSN for relay-listener observations (install the `listener` extra for `psycopg`); without it, PONS and FOMO tags come from chain data alone. Tags are cached in `<data-dir>/tags.sqlite` for 7 days.
+
 The owner applies a policy from the terminal's wallet dialog (`eth_signTypedData_v4`) or from the host with the same signature:
 
 ```sh

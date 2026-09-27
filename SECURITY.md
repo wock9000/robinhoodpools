@@ -18,6 +18,8 @@ Robinhood Pools must never receive or store a wallet private key or seed phrase.
 
 Treat credential-bearing RPC URLs as secrets. Store them outside the repository in mode-`0600` files with one URL per line and refer to them through the appropriate `LP_RPC_*_URL_FILES` or `RHP_RPC_URL_FILES` environment variable. Do not put them in command-line arguments, source, `.env` files, tests, browser code or storage, logs, screenshots, or reports. Rotate a credential immediately if it is exposed.
 
+Holder trading and liquidity management keep that boundary. The server builds each transaction (Universal Router swaps, V3 position-manager and V4 PositionManager calls), simulates the exact bytes from the user's address, and hands them to the user's wallet to sign and send. It holds no key and never broadcasts. Targets are pinned by address and runtime code hash, checked at startup and before every prepare; a mismatch disables trading. Every swap carries a minimum output and a deadline, every liquidity change carries amount bounds, and Permit2 allowances are exact and expire with the quote. The 75 bps rhpools fee is paid inside the same transaction to the recipient set in host configuration (`RHP_TX_FEE_RECIPIENT`); without it trading reports disabled. Adds to Pons pools are refused because the hook keeps every swap fee.
+
 Keep the HTTP listener on loopback by default. Binding to a non-loopback address or authorizing an additional browser origin does not add authentication, TLS, request filtering, or host-level access control; those controls must be designed and operated separately.
 
 ## Sessions, API keys and the holder gate
