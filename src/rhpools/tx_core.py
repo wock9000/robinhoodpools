@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import threading
@@ -9,6 +10,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any
+from urllib.request import Request, urlopen
 
 from . import tx_allowlist
 from .tx_chain import (
@@ -36,6 +38,25 @@ _HASH_RE = re.compile(r"^0x[0-9a-f]{64}$")
 SEL_OWNER_OF = selector("ownerOf(uint256)")
 NFPM_FACTORY = {manager: factory for factory, manager in NFPM_BY_FACTORY.items()}
 LP_TARGETS = frozenset({POSM, NFPM_UNISWAP, NFPM_PANCAKE, NFPM_GIGA})
+
+SEL_DECIMALS = selector("decimals()")
+SEL_SYMBOL = selector("symbol()")
+
+
+class JsonRpc:
+    """Plain JSON-RPC over HTTP; errors carry the node's error object text."""
+
+    def __init__(self, url: str, *, timeout: float = 10.0) -> None:
+        self.url = url
+        self.timeout = timeout
+
+    def call(self, method: str, params: list[Any] | None = None) -> Any:
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": list(params or [])}).encode()
+        with urlopen(Request(self.url, body, {"Content-Type": "application/json"}), timeout=self.timeout) as response:
+            reply = json.loads(response.read())
+        if not isinstance(reply, dict) or "result" not in reply:
+            raise RuntimeError(json.dumps((reply or {}).get("error") if isinstance(reply, dict) else reply))
+        return reply["result"]
 
 
 @dataclass(frozen=True)
@@ -221,6 +242,16 @@ def _word(value: Any, index: int = 0) -> int:
     return int(value[2 + 64 * index:2 + 64 * (index + 1)], 16)
 
 
+def _abi_string(value: Any) -> str:
+    """ABI string or bytes32 symbol; unreadable symbols become an empty string."""
+    raw = bytes.fromhex(value[2:]) if isinstance(value, str) and value.startswith("0x") else b""
+    if len(raw) >= 64:
+        length = int.from_bytes(raw[32:64], "big")
+        if 64 + length <= len(raw):
+            return raw[64:64 + length].decode("utf-8", "replace")[:24]
+    return raw[:32].rstrip(b"\0").decode("utf-8", "replace")[:24]
+
+
 def _signed24(value: int) -> int:
     value &= 0xFFFFFF
     return value - (1 << 24) if value >= 1 << 23 else value
@@ -249,6 +280,7 @@ class TxCore:
         self.lps = LpPlanner()
         self.sim = Simulator(rpc)
         self._quotes: dict[str, Quote] = {}
+        self._token_meta: dict[str, tuple[int, str]] = {}
         self._lock = threading.Lock()
         self.mismatches = tx_allowlist.verify(rpc)
 
@@ -285,6 +317,27 @@ class TxCore:
 
     def _allowance(self, token: str, owner: str, spender: str, tag: str) -> int:
         return _word(self._call(token, erc20_allowance(owner, spender), tag))
+
+    def balances(self, wallet: str, currencies: list[str]) -> dict[str, dict[str, Any]]:
+        """Wallet balance, decimals and symbol per currency at latest; NATIVE is ETH."""
+        if _ADDRESS_RE.fullmatch(wallet.lower()) is None:
+            raise TxError("invalid_intent", "wallet must be an address")
+        out: dict[str, dict[str, Any]] = {}
+        for currency in dict.fromkeys(c.lower() for c in currencies[:8]):
+            if _ADDRESS_RE.fullmatch(currency) is None:
+                raise TxError("invalid_intent", "currency must be an address")
+            if currency == NATIVE:
+                out[currency] = {"balance": str(self._balance(NATIVE, wallet, "latest")), "decimals": 18, "symbol": "ETH"}
+                continue
+            with self._lock:
+                meta = self._token_meta.get(currency)
+            if meta is None:
+                decimals = _word(self._call(currency, SEL_DECIMALS, "latest"))
+                meta = (decimals, _abi_string(self._call(currency, SEL_SYMBOL, "latest")))
+                with self._lock:
+                    self._token_meta[currency] = meta
+            out[currency] = {"balance": str(self._balance(currency, wallet, "latest")), "decimals": meta[0], "symbol": meta[1]}
+        return out
 
     def _permit_nonce(self, wallet: str, token: str, spender: str, tag: str) -> int:
         return _word(self._call(PERMIT2, permit2_allowance(wallet, token, spender), tag), 2)
@@ -513,6 +566,11 @@ class TxCore:
         )
         self._store(quote)
         return quote
+
+    def kind_of(self, quote_id: str) -> str | None:
+        with self._lock:
+            quote = self._quotes.get(quote_id)
+        return None if quote is None else "lp" if isinstance(quote, LpQuote) else "swap"
 
     def prepare(self, quote_id: str, wallet: str, sigs: Signatures) -> Prepared:
         if not isinstance(quote_id, str) or re.fullmatch(r"[0-9a-f]{64}", quote_id) is None:

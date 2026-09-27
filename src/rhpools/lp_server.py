@@ -19,6 +19,9 @@ from urllib.parse import parse_qs, urlsplit
 
 from .lp_gate import COOKIE_NAME, Gate, GatePolicy, GateRefusal, Principal
 from .lp_gate_ws import CLOSE_NOT_ENTITLED, WebSocketPush
+from .tx_core import JsonRpc, TxCore
+from .tx_plan import LpIntent, LpOp, Signatures, SwapIntent, TxError, TxPolicy, TxRefusal
+from .tx_routes import RouteBook, Side
 
 STATIC = Path(__file__).resolve().parent / "static"
 MAX_BODY = 16_384
@@ -77,6 +80,9 @@ _LANE_SHARE = {"fast": 1.0, "slow": 0.5, "keyed": 0.5}
 _GATE_GET = {"/api/gate/nonce", "/api/gate/me", "/api/gate/keys", "/api/gate/policy"}
 _GATE_POST = {"/api/gate/session", "/api/gate/keys", "/api/gate/logout", "/api/gate/policy"}
 KEYED_STREAM = "/api/v1/stream"
+_TX_GET = {"/api/tx/status", "/api/tx/receipt", "/api/tx/balances"}
+_TX_POST = {"/api/tx/quote", "/api/tx/prepare"}
+TX_FEE_BPS = 75
 _MINT_TTL_DEFAULT_S = 90 * 86400
 DEFAULT_API_SLOTS = 4 * (getattr(os, "process_cpu_count", os.cpu_count)() or 1)
 
@@ -271,6 +277,20 @@ class Runtime:
                 hosts=frozenset(urlsplit(origin).netloc for origin in self.origins),
             )
             self._resources.callback(self.gate.close)
+            startup.phase("tx")
+            self.tx, self.tx_unavailable = None, "fee recipient not configured"
+            if args.tx_fee_recipient:
+                try:
+                    rpc = JsonRpc(args.gate_rpc_url)
+                    self.tx = TxCore(
+                        rpc, RouteBook(self.lp.store.reader_snapshot, rpc),
+                        TxPolicy(TX_FEE_BPS, str(args.tx_fee_recipient).lower()),
+                    )
+                    self.tx_unavailable = None
+                except Exception as exc:
+                    self.tx_unavailable = "transaction core failed to start: " + " ".join(str(exc).split())[:160]
+                if self.tx is not None and not self.tx.enabled:
+                    self.tx_unavailable = "pinned contract code changed; trading disabled"
         except BaseException:
             self._resources.close()
             raise
@@ -287,6 +307,40 @@ class LPHTTPServer(ThreadingHTTPServer):
     # socketserver's default backlog of 5 drops SYNs under any burst; each
     # drop costs the client a 1 s retransmit before the request even arrives.
     request_queue_size = 1024
+
+
+def _tx_uint(payload: dict, name: str, default: str | None = None) -> int:
+    value = payload.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, (int, str)) or not str(value).isdigit():
+        raise ValueError(f"{name} must be a non-negative integer in raw units")
+    return int(value)
+
+
+def _tx_int(payload: dict, name: str) -> int:
+    value = payload.get(name, 0)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer")
+    return value
+
+
+def _tx_intent(payload: dict, wallet: str) -> SwapIntent | LpIntent:
+    """The wallet always comes from the credential, never from the request body."""
+    slippage = _tx_uint(payload, "slippage_bps")
+    if not 1 <= slippage <= 5000:
+        raise ValueError("slippage_bps must be between 1 and 5000")
+    if payload["kind"] == "swap":
+        return SwapIntent(
+            wallet.lower(), Side(str(payload.get("side"))), str(payload.get("token") or "").lower(),
+            str(payload.get("quote_currency") or "").lower(), _tx_uint(payload, "amount_in"), slippage,
+        )
+    token_id = payload.get("token_id")
+    return LpIntent(
+        wallet.lower(), LpOp(str(payload.get("op"))), str(payload.get("pool_id") or "").lower(), slippage,
+        tick_lower=_tx_int(payload, "tick_lower"), tick_upper=_tx_int(payload, "tick_upper"),
+        amount0=_tx_uint(payload, "amount0", "0"), amount1=_tx_uint(payload, "amount1", "0"),
+        liquidity=_tx_uint(payload, "liquidity", "0"),
+        token_id=None if token_id is None else _tx_uint(payload, "token_id"),
+    )
 
 
 def _quota_headers(quota) -> tuple[tuple[str, str], ...]:
@@ -781,7 +835,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             route = _ROUTES.get(path)
-            if route is None and path not in {"/api/workbench/capabilities", "/api/lp/stream", "/api/workbench/stream"} and path not in _GATE_GET and path != KEYED_STREAM:
+            if route is None and path not in {"/api/workbench/capabilities", "/api/lp/stream", "/api/workbench/stream"} and path not in _GATE_GET and path != KEYED_STREAM and path not in _TX_GET:
                 return self._json(404, {"error": "Not found"})
             if self.runtime is None:
                 return self._starting()
@@ -794,6 +848,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._sse(False, query)
             if path in _GATE_GET:
                 return self._gate_get(path, query)
+            if path in _TX_GET:
+                return self._tx_get(path, query)
             if path == KEYED_STREAM:
                 return self._keyed_stream(query)
             return self._sse(True, query)
@@ -809,7 +865,7 @@ class Handler(BaseHTTPRequestHandler):
             path, _query = self._query()
         except ValueError as exc:
             return self._json(400, {"error": str(exc)})
-        if path in _GATE_GET or path in _GATE_POST or path == KEYED_STREAM:
+        if path in _GATE_GET or path in _GATE_POST or path == KEYED_STREAM or path in _TX_GET or path in _TX_POST:
             self.send_response(204)
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
@@ -851,6 +907,73 @@ class Handler(BaseHTTPRequestHandler):
 
     def _cookie(self, secret: str, max_age: int) -> tuple[str, str]:
         return ("Set-Cookie", f"{COOKIE_NAME}={secret}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age={max_age}")
+
+    def _tx_principal(self, feature: str) -> Principal:
+        principal, _ = self.runtime.gate.require(self.headers, feature)
+        if principal.via == "cookie" and self.command == "POST" and not self._same_origin():
+            raise GateRefusal(403, "Configured same-origin request required")
+        return principal
+
+    def _tx_core(self) -> TxCore:
+        if self.runtime.tx is None:
+            raise TxRefusal("trading_disabled", self.runtime.tx_unavailable or "")
+        return self.runtime.tx
+
+    def _tx_failure(self, exc: TxError) -> None:
+        if isinstance(exc, TxRefusal):
+            return self._json(422, {"refusal": exc.code, "detail": exc.detail}, private=True)
+        if exc.code == "rpc":
+            return self._json(503, {"error": "chain node unavailable", "code": exc.code}, retry=2, private=True)
+        self._json(400, {"error": exc.detail or exc.code, "code": exc.code}, private=True)
+
+    def _tx_get(self, path: str, query: dict[str, str]) -> None:
+        tx = self.runtime.tx
+        if path == "/api/tx/status":
+            return self._json(200, {
+                "enabled": tx is not None and tx.enabled, "reason": self.runtime.tx_unavailable,
+                "fee_bps": TX_FEE_BPS, "quote_ttl_s": tx.ttl_s if tx is not None else None,
+            }, private=True)
+        try:
+            principal = self._tx_principal("lp" if query.get("feature") == "lp" else "trade")
+            core = self._tx_core()
+            if path == "/api/tx/balances":
+                currencies = [c for c in str(query.get("currencies") or "").split(",") if c]
+                return self._json(200, {"wallet": principal.wallet, "balances": core.balances(principal.wallet, currencies)}, private=True)
+            return self._json(200, core.receipt(str(query.get("hash") or ""), principal.wallet).to_json(), private=True)
+        except GateRefusal as refusal:
+            self._refuse(refusal)
+        except TxError as exc:
+            self._tx_failure(exc)
+
+    def _tx_post(self, path: str) -> None:
+        if not self.api_slots["keyed"].acquire(False):
+            return self._json(503, {"error": "API request capacity reached"}, retry=1)
+        try:
+            payload = self._json_body()
+            if path == "/api/tx/quote":
+                kind = payload.get("kind")
+                if kind not in ("swap", "lp"):
+                    raise ValueError("kind must be swap or lp")
+                principal = self._tx_principal("trade" if kind == "swap" else "lp")
+                return self._json(200, self._tx_core().quote(_tx_intent(payload, principal.wallet)).to_json(), private=True)
+            core = self._tx_core()
+            quote_id = str(payload.get("quote_id") or "")
+            principal = self._tx_principal("lp" if core.kind_of(quote_id) == "lp" else "trade")
+            signature = str(payload.get("permit_signature") or "")
+            sigs = Signatures(permit=bytes.fromhex(signature[2:]) if signature.startswith("0x") else None)
+            return self._json(200, core.prepare(quote_id, principal.wallet, sigs).to_json(), private=True)
+        except GateRefusal as refusal:
+            self._refuse(refusal)
+        except TxError as exc:
+            self._tx_failure(exc)
+        except (ValueError, KeyError, TypeError) as exc:
+            self._json(400, {"error": str(exc)}, private=True)
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            return
+        except Exception:
+            self._json(503, {"error": "Upstream data is temporarily unavailable"}, retry=2, private=True)
+        finally:
+            self.api_slots["keyed"].release()
 
     def _gate_post(self, path: str) -> None:
         gate = self.runtime.gate
@@ -911,6 +1034,10 @@ class Handler(BaseHTTPRequestHandler):
             if self.runtime is None:
                 return self._starting()
             return self._gate_post(path)
+        if path in _TX_POST:
+            if self.runtime is None:
+                return self._starting()
+            return self._tx_post(path)
         if path not in {"/api/lp/allocation", "/api/workbench/simulate", "/api/workbench/prepare"}:
             return self._json(404, {"error": "Not found"})
         if self.runtime is None:
@@ -977,6 +1104,7 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--gate-owner", default=os.environ.get("RHP_GATE_OWNER") or None)
     ap.add_argument("--gate-db", default=os.environ.get("RHP_GATE_DB"))
     ap.add_argument("--gate-rpc-url", default=os.environ.get("RHP_GATE_RPC_URL", "http://127.0.0.1:8547"))
+    ap.add_argument("--tx-fee-recipient", default=os.environ.get("RHP_TX_FEE_RECIPIENT") or None)
     return ap
 
 
