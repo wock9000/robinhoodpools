@@ -9,6 +9,7 @@
   <script src="/static/lp_panes_boot.js"></script>
   <title>Robinhood Pools / Chain 4663</title>
   <link rel="stylesheet" href="/static/lp_terminal.css">
+  <link rel="stylesheet" href="/static/lp_gate.css">
 </head>
 <body>
   <header class="terminal-header">
@@ -23,6 +24,7 @@
       </span>
       <span id="stream-state" class="strip-state" role="status">CONNECTING</span>
       <span id="strip-freshness" title="Age of the last index status response. Select INDEX STATUS for full diagnostics.">STATUS —</span>
+      <button id="gate-chip" class="gate-chip" type="button" aria-haspopup="dialog" aria-controls="gate-dialog" hidden><span class="strip-label">WALLET</span><span class="gate-chip-text">none</span></button>
       <time id="terminal-clock" datetime="">--:--:-- UTC</time>
       <nav id="key-strip" class="key-strip" aria-label="Window, tape, and pane controls">
         <label class="mobile-only sr-only" for="mobile-window">Accounting window</label>
@@ -259,6 +261,19 @@
 
   <footer class="terminal-footer"><span id="footer-state">INDEX STATUS</span><span class="sponsor-credit">Powered by <a class="sponsor-link" href="https://goldsky.com/" target="_blank" rel="noopener noreferrer">Goldsky</a> and <a class="sponsor-link" href="https://www.quicknode.com/" target="_blank" rel="noopener noreferrer">Quicknode</a></span><span class="footer-meta"><span class="read-only-label">READ ONLY · </span><a class="source-link" href="https://github.com/wock9000/robinhoodpools" target="_blank" rel="noopener noreferrer" title="RobinhoodPools on GitHub · Copyright 2026 RobinhoodPools contributors · AGPL-3.0-only · no warranty">GITHUB</a></span></footer>
   <div id="copy-status" class="sr-only" role="status" aria-live="polite"></div>
+  <dialog id="gate-dialog" class="gate-dialog" aria-labelledby="gate-dialog-title">
+    <header class="pool-inspector-head">
+      <h2 id="gate-dialog-title">WALLET</h2>
+      <span id="gate-dialog-address"></span>
+      <button id="gate-dialog-close" type="button" aria-label="Close wallet dialog">CLOSE</button>
+    </header>
+    <div class="gate-body">
+      <section id="gate-status" class="gate-section"></section>
+      <section id="gate-keys" class="gate-section" hidden></section>
+      <section id="gate-policy" class="gate-section" hidden></section>
+    </div>
+  </dialog>
   <script src="/static/lp_terminal.js" defer></script>
+  <script src="/static/lp_gate.js" defer></script>
 </body>
 </html>
