@@ -18,7 +18,7 @@ from eth_abi import decode
 from eth_utils import keccak
 from . import tx_allowlist
 from .tx_chain import (
-    ADD_GOVERNING_FLAGS, CHAIN_ID, DEX_BY_FACTORY, GIGA_SWAP_ROUTER, GIGA_V3_FACTORY, MSG_SENDER, NATIVE,
+    CHAIN_ID, DEX_BY_FACTORY, GIGA_SWAP_ROUTER, GIGA_V3_FACTORY, MSG_SENDER, NATIVE,
     NFPM_BY_FACTORY, NFPM_GIGA, NFPM_PANCAKE, NFPM_UNISWAP, PANCAKE_SMART_ROUTER,
     PANCAKE_V3_FACTORY, PERMIT2, PONS_HOOK, POSM, SEL_PANCAKE_EXACT_INPUT,
     SEL_PANCAKE_EXACT_INPUT_SINGLE, SEL_ROUTER_MULTICALL_DEADLINE, SEL_SLIPSTREAM_EXACT_INPUT_SINGLE,
@@ -30,7 +30,7 @@ from .tx_chain import (
     SEL_POSM_PERMIT_BATCH, Sweep, UnwrapWeth, V2Swap, V3Swap, V4Swap, V4SwapExactInSingle,
     decode_multicall, decode_nfpm_call, decode_posm_modify_liquidities, decode_revert,
     decode_ur_execute, decode_v3_path, erc20_allowance, erc20_approve, erc20_balance_of,
-    hook_flags, nfpm_positions, permit2_allowance, posm_pool_and_position,
+    nfpm_positions, permit2_allowance, posm_pool_and_position,
     posm_position_liquidity, selector, state_view_slot0,
 )
 from .tx_plan import (
@@ -43,8 +43,11 @@ from .tx_routes import QUOTE_CURRENCIES, Hop, same_asset, IncompletePool, Pool, 
 DEADLINE_GRACE_S = 60
 IMPACT_DIVISOR = 100
 BALANCE_SLOT_SEARCH = 64
-SPLIT_STEPS = 20
+SPLIT_STEPS = 10
 SPLIT_WORKERS = 12
+SPLIT_ROUTES = 3
+MAX_QUOTES_PER_WALLET = 8
+OFF_MARKET_BPS = 300
 GAS_HEADROOM_PCT = 130
 ESTIMATE_HEADROOM_PCT = 125
 _ADDRESS_RE = re.compile(r"^0x[0-9a-f]{40}$")
@@ -526,8 +529,9 @@ class TxCore:
         with self._lock:
             for key in [k for k, q in self._quotes.items() if q.expires_at <= now]:
                 self._quotes.pop(key, None)
-            while len(self._quotes) >= self.max_quotes:
-                self._quotes.pop(next(iter(self._quotes)))
+            owned = [k for k, q in self._quotes.items() if q.wallet == quote.wallet]
+            if len(owned) >= min(self.max_quotes, MAX_QUOTES_PER_WALLET):
+                self._quotes.pop(owned[0])
             self._quotes[quote.quote_id] = quote
 
     def _quote_id(self, intent: SwapIntent | LpIntent, block: Block) -> str:
@@ -626,17 +630,19 @@ class TxCore:
         intent = self._validate_swap(intent)
         block = self._header("latest")
         tag = hex(block.number)
-        have = self._balance(intent.currency_in, intent.wallet, tag)
-        funded = None
-        if have < intent.amount_in:
-            funded = self._funded(intent.currency_in, intent.wallet, intent.amount_in, tag)
-            if funded is None:
-                raise TxRefusal("insufficient_balance", "wallet holds less than amount_in")
         candidates = self.routes.candidates(intent.token, intent.quote_currency, intent.side)
         if not candidates:
             factories = sorted({pool.factory for pool in self.routes.quote_pools(intent.token) if not pool.swappable})
             detail = "unsupported pool factories: " + ", ".join(factories) if factories else "no compatible route with a deployed router"
             raise TxRefusal("no_route", detail)
+        have = self._balance(intent.currency_in, intent.wallet, tag)
+        funded = None
+        if have < intent.amount_in:
+            if intent.currency_in != NATIVE and not any(intent.currency_in in (hop.pool.token0, hop.pool.token1) for route in candidates for hop in route.hops):
+                raise TxRefusal("no_route", "input currency has no routable pool")
+            funded = self._funded(intent.currency_in, intent.wallet, intent.amount_in, tag)
+            if funded is None:
+                raise TxRefusal("insufficient_balance", "wallet holds less than amount_in")
         expires_at, deadline = self._times()
         nonce = 0 if intent.currency_in == NATIVE else self._permit_nonce(intent.wallet, intent.currency_in, UR, tag)
         best: tuple[Plan, SimResult, Amounts, Route] | None = None
@@ -659,6 +665,9 @@ class TxCore:
                     ur_full.append(candidate_amounts)
             split_choice = None
             if not probe_only and best is not None and len(ur_routes) > 1 and intent.amount_in >= SPLIT_STEPS:
+                selected = sorted(range(len(ur_routes)), key=lambda i: ur_full[i].net_out, reverse=True)[:SPLIT_ROUTES]
+                ur_routes = [ur_routes[i] for i in selected]
+                ur_full = [ur_full[i] for i in selected]
                 samples = [(i, k) for i in range(len(ur_routes)) for k in range(1, SPLIT_STEPS)]
                 def sample(pair: tuple[int, int]) -> int | None:
                     i, k = pair
@@ -720,6 +729,13 @@ class TxCore:
             else:
                 small = None
         impact = impact_bps(amounts, small) if small is not None else None
+        if candidates[0] != route or len(split.legs) > 1:
+            try:
+                _, _, reference, _ = self._simulate_swap(small_intent, candidates[0], deadline, nonce, tag, funded)
+            except TxError:
+                reference = None
+            if reference is not None and small is not None and small.net_out * 10_000 < reference.net_out * (10_000 - OFF_MARKET_BPS):
+                raise TxRefusal("off_market", "execution price is more than 300 bps worse than the deepest pool")
         if impact is None:
             warnings.append("impact_unavailable")
         elif impact > self.policy.max_impact_bps:
@@ -860,6 +876,8 @@ class TxCore:
         adding = intent.op in (LpOp.MINT, LpOp.INCREASE)
         if adding and pool.hook == PONS_HOOK:
             raise TxRefusal("pons_add", "adds to Pons pools are refused: the hook keeps every swap fee")
+        if adding and pool.venue is Venue.V4 and pool.hook != NATIVE:
+            raise TxRefusal("untrusted_hook", "adding liquidity to this V4 hook is not supported")
         block = self._header("latest")
         tag = hex(block.number)
         position = None
@@ -878,8 +896,6 @@ class TxCore:
         sqrt_price = self._sqrt_price(pool, tag)
         plan = self.lps.plan(intent, pool, deadline, sqrt_price_x96=sqrt_price, position=position, permit_nonces=nonces)
         warnings: list[str] = []
-        if adding and pool.venue is Venue.V4 and hook_flags(pool.hook) & ADD_GOVERNING_FLAGS:
-            warnings.append("hook_governs_adds")
         sim = self.sim.run(intent.wallet, plan.staging, Call(plan.to, plan.calldata(), plan.value), tag)
         if not sim.ok:
             assert sim.revert is not None

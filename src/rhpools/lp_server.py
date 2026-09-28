@@ -954,10 +954,11 @@ class Handler(BaseHTTPRequestHandler):
             tagged.setdefault(tag.tx_hash, {})[tag.pool_id] = {"tags": sorted(tag.tags), "basis": sorted(tag.basis)}
         return self._json(200, {"tags": tagged}, private=True)
 
-    def _tx_principal(self, feature: str) -> Principal:
+    def _tx_principal(self, feature: str, cost: int = 1) -> Principal:
         principal, _ = self.runtime.gate.require(self.headers, feature)
         if principal.via == "cookie" and self.command == "POST" and not self._same_origin():
             raise GateRefusal(403, "Configured same-origin request required")
+        self.runtime.gate.admit(principal, cost=cost)
         return principal
 
     def _tx_core(self) -> TxCore:
@@ -981,8 +982,10 @@ class Handler(BaseHTTPRequestHandler):
             }, private=True)
         if path == "/api/tx/history" and query.get("feature") != "trade":
             return self._json(400, {"error": "feature must be trade"}, private=True)
+        if not self.api_slots["keyed"].acquire(False):
+            return self._json(503, {"error": "API request capacity reached"}, retry=1)
         try:
-            principal = self._tx_principal("lp" if query.get("feature") == "lp" else "trade")
+            principal = self._tx_principal("lp" if query.get("feature") == "lp" else "trade", cost=5 if path == "/api/tx/pool" else 1)
             if path == "/api/tx/history" and (principal.kind != "session" or principal.via != "cookie"):
                 raise GateRefusal(403, "browser session required", state="forbidden")
             core = self._tx_core()
@@ -999,6 +1002,8 @@ class Handler(BaseHTTPRequestHandler):
             self._refuse(refusal)
         except TxError as exc:
             self._tx_failure(exc)
+        finally:
+            self.api_slots["keyed"].release()
 
     def _tx_post(self, path: str) -> None:
         if not self.api_slots["keyed"].acquire(False):
@@ -1009,11 +1014,11 @@ class Handler(BaseHTTPRequestHandler):
                 kind = payload.get("kind")
                 if kind not in ("swap", "lp"):
                     raise ValueError("kind must be swap or lp")
-                principal = self._tx_principal("trade" if kind == "swap" else "lp")
+                principal = self._tx_principal("trade" if kind == "swap" else "lp", cost=10)
                 return self._json(200, self._tx_core().quote(_tx_intent(payload, principal.wallet)).to_json(), private=True)
             core = self._tx_core()
             quote_id = str(payload.get("quote_id") or "")
-            principal = self._tx_principal("lp" if core.kind_of(quote_id) == "lp" else "trade")
+            principal = self._tx_principal("lp" if core.kind_of(quote_id) == "lp" else "trade", cost=5)
             signature = str(payload.get("permit_signature") or "")
             sigs = Signatures(permit=bytes.fromhex(signature[2:]) if signature.startswith("0x") else None)
             return self._json(200, core.prepare(quote_id, principal.wallet, sigs, batched=payload.get("batched") is True).to_json(), private=True)

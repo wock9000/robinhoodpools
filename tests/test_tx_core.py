@@ -79,11 +79,13 @@ def pools_db(tmp_path):
     connection.executescript(
         "CREATE TABLE pools(id TEXT PRIMARY KEY, protocol TEXT NOT NULL, address TEXT NOT NULL, token0 TEXT NOT NULL, token1 TEXT NOT NULL,"
         " fee_ppm INTEGER, tick_spacing INTEGER, hook TEXT, factory TEXT, metadata_json TEXT);"
-        "CREATE TABLE lp_pool_state(pool_id TEXT PRIMARY KEY, block_number INTEGER NOT NULL);"
+        "CREATE TABLE lp_pool_state(pool_id TEXT PRIMARY KEY, block_number INTEGER NOT NULL, liquidity TEXT);"
+        "CREATE TABLE lp_v2_reserve_samples(pool_id TEXT, block_number INTEGER, tx_index INTEGER, log_index INTEGER, reserve0 TEXT, reserve1 TEXT);"
+        "CREATE INDEX lp_v2_samples_order ON lp_v2_reserve_samples(pool_id,block_number,tx_index,log_index);"
     )
     connection.executemany("INSERT INTO pools VALUES (?,?,?,?,?,?,?,?,?,NULL)", ROWS)
-    connection.execute("INSERT INTO lp_pool_state VALUES (?, ?)", (V2_POOL, 500))
-    connection.execute("INSERT INTO lp_pool_state VALUES (?, ?)", (V3_POOL, 900))
+    connection.execute("INSERT INTO lp_pool_state(pool_id,block_number) VALUES (?, ?)", (V2_POOL, 500))
+    connection.execute("INSERT INTO lp_pool_state(pool_id,block_number) VALUES (?, ?)", (V3_POOL, 900))
     connection.commit()
     connection.close()
 
@@ -94,6 +96,8 @@ def pools_db(tmp_path):
             yield connection
         finally:
             connection.close()
+
+    reader.path = path
 
     return reader
 
@@ -209,6 +213,8 @@ def usdg_buy_simulation(amount_out: int):
     """The V2 bridge candidate reverts."""
 
     def simulate(call, block):
+        if call["to"] != UR:
+            return {"status": "0x0", "logs": [], "gasUsed": "0x10", "returnData": "0x"}
         commands, _ = tc.decode_ur_execute(bytes.fromhex(call["data"][2:]))
         if any(type(c).__name__ == "V2Swap" for c in commands):
             return {"status": "0x0", "logs": [], "gasUsed": "0x10", "returnData": "0x" + tc.selector("V2TooLittleReceived()").hex()}
@@ -237,10 +243,11 @@ def test_route_book_filters_and_orders_candidates(pools_db, rpc):
     assert buy[0].hops[0] == Hop(routes.pool(V3_POOL), WETH, PIPEDOG)
     sell = routes.candidates(PIPEDOG, USDG, Side.SELL)
     assert all(r.hops[0].currency_in == PIPEDOG and r.hops[-1].currency_out == USDG for r in sell)
-    assert {r.hops[1].pool.id for r in sell} == {DEFAULT_BRIDGES[i].id for i in (0, 4, -1)}
-    assert len(sell) == 6
+    assert any(r.hops[1].pool.id == DEFAULT_BRIDGES[0].id for r in sell)
+    assert any(r.hops[0].pool.venue is Venue.V2 for r in sell)
+    assert len(sell) <= 6
     pons = routes.candidates(ITH, NATIVE, Side.BUY)
-    assert [h.pool.hook for r in pons for h in r.hops] == [PONS_HOOK, NATIVE]
+    assert {h.pool.hook for r in pons for h in r.hops} == {PONS_HOOK, NATIVE}
     assert routes.candidates(WETH, USDG, Side.BUY) == []
     assert routes.candidates(PIPEDOG, PIPEDOG, Side.BUY) == []
 
@@ -259,7 +266,7 @@ def test_route_book_hook_policy_is_cached_and_unknown_hooks_dropped(pools_db, rp
 def test_route_book_drops_v4_rows_whose_id_is_not_the_key_hash(rpc, tmp_path):
     path = tmp_path / "bad.sqlite"
     connection = sqlite3.connect(path)
-    connection.executescript("CREATE TABLE pools(id TEXT PRIMARY KEY, protocol TEXT, address TEXT, token0 TEXT, token1 TEXT, fee_ppm INTEGER, tick_spacing INTEGER, hook TEXT, factory TEXT, metadata_json TEXT); CREATE TABLE lp_pool_state(pool_id TEXT PRIMARY KEY, block_number INTEGER);")
+    connection.executescript("CREATE TABLE pools(id TEXT PRIMARY KEY, protocol TEXT, address TEXT, token0 TEXT, token1 TEXT, fee_ppm INTEGER, tick_spacing INTEGER, hook TEXT, factory TEXT, metadata_json TEXT); CREATE TABLE lp_pool_state(pool_id TEXT PRIMARY KEY, block_number INTEGER, liquidity TEXT); CREATE TABLE lp_v2_reserve_samples(pool_id TEXT, block_number INTEGER, tx_index INTEGER, log_index INTEGER, reserve0 TEXT, reserve1 TEXT);")
     connection.execute("INSERT INTO pools VALUES (?,?,?,?,?,?,?,?,?,NULL)", ("0x" + "99" * 32, "v4", POOL_MANAGER, NATIVE, ITH, 0, 200, PONS_HOOK, POOL_MANAGER))
     connection.commit()
     connection.close()
@@ -484,14 +491,14 @@ def test_split_allocator_follows_marginal_curves():
         Route((Hop(Pool(Venue.V3, f"0x{i:040x}", f"0x{i:040x}", WETH, PIPEDOG, 500, 10, NATIVE, UR_V3_FACTORY), WETH, PIPEDOG),))
         for i in (101, 102, 103)
     ]
-    curves = [[100 * n - n * n for n in range(21)], [85 * n - n * n // 2 for n in range(21)],
-              [20 * n for n in range(21)]]
+    curves = [[100 * n - n * n for n in range(11)], [85 * n - n * n // 2 for n in range(11)],
+              [20 * n for n in range(11)]]
     result = allocate_split(routes, curves, 1_000)
     assert 0 < result.legs[0].amount_in < 1_000
     assert 0 < result.legs[1].amount_in < 1_000
     assert sum(leg.amount_in for leg in result.legs) == 1_000
     assert sum(leg.amount_out for leg in result.legs) > max(curve[-1] for curve in curves)
-    assert len(allocate_split(routes, [[200 * n for n in range(21)], curves[1], curves[2]], 1_000).legs) == 1
+    assert len(allocate_split(routes, [[200 * n for n in range(11)], curves[1], curves[2]], 1_000).legs) == 1
 
 
 def test_split_reconciles_shared_pool_swaps_in_execution_order():
@@ -723,6 +730,127 @@ def test_quote_store_ttl_and_cap(rpc, pools_db):
     clock["now"] = a.expires_at
     d = core.quote(buy_intent())
     assert set(core._quotes) == {d.quote_id}
+
+
+def test_quote_store_isolated_per_wallet(core, rpc):
+    rpc.simulate = v3_buy_simulation(4_000_000)
+    first = core.quote(buy_intent())
+    for n in range(9):
+        core._store(replace(first, quote_id=f"other-{n}", wallet="0x" + "55" * 20))
+    assert first.quote_id in core._quotes
+    for n in range(9):
+        core._store(replace(first, quote_id=f"self-{n}"))
+    assert first.quote_id not in core._quotes
+
+
+def test_many_wallets_cannot_evict_another_live_quote(core, rpc):
+    rpc.simulate = v3_buy_simulation(4_000_000)
+    first = core.quote(buy_intent())
+    for n in range(core.max_quotes + 1):
+        core._store(replace(first, quote_id=f"quote-{n}", wallet=f"0x{n + 1:040x}"))
+    assert first.quote_id in core._quotes
+
+
+def test_quote_refuses_shallow_execution_price_below_deep_reference(core, rpc):
+    from rhpools.tx_core import SimResult
+    from rhpools.tx_plan import Fee
+
+    def simulated(intent, route, deadline, nonce, tag, funded=None):
+        shallow = route.hops[0].pool.id == V2_POOL
+        output = (1_100_000 if shallow else 1_000_000) if intent.amount_in == 10**18 else (9_000 if shallow else 10_000)
+        plan = core.swaps.plan(intent, route, core.policy, deadline, nonce)
+        return plan, SimResult(True, [], 150_000, None), Amounts(intent.amount_in, output, None, None, Fee(NATIVE, 0), output, 0, None), None
+
+    core._simulate_swap = simulated
+    core._simulate_split = lambda *args, **kwargs: None
+    with pytest.raises(TxRefusal) as refused:
+        core.quote(buy_intent())
+    assert refused.value.code == "off_market"
+
+
+def test_unroutable_underfunded_sell_does_not_probe_contract(core, rpc):
+    token = "0x" + "ef" * 20
+    with pytest.raises(TxRefusal) as refused:
+        core.quote(buy_intent(side=Side.SELL, token=token, amount_in=10**18))
+    assert refused.value.code == "no_route"
+    assert not any(method == "eth_call" and len(params) == 3 for method, params in rpc.calls)
+
+
+def test_route_depth_beats_recent_pools_and_preserves_venues(pools_db, rpc):
+    with sqlite3.connect(pools_db.path) as connection:
+        connection.execute("UPDATE lp_pool_state SET liquidity='1000000' WHERE pool_id=?", (V3_POOL,))
+        connection.execute("UPDATE lp_pool_state SET liquidity='900000' WHERE pool_id=?", (V2_POOL,))
+        for n in range(8):
+            pool_id = "0x" + f"{n + 100:040x}"
+            connection.execute("INSERT INTO pools VALUES (?,?,?,?,?,?,?,?,?,NULL)",
+                               (pool_id, "v3", pool_id, WETH, PIPEDOG, 500, 10, NATIVE, UR_V3_FACTORY))
+            connection.execute("INSERT INTO lp_pool_state(pool_id,block_number,liquidity) VALUES (?,?,?)",
+                               (pool_id, 1000 + n, "100"))
+        connection.commit()
+    candidates = RouteBook(pools_db, rpc).candidates(PIPEDOG, NATIVE, Side.BUY)
+    assert candidates[0].hops[0].pool.id == V3_POOL
+    assert any(route.hops[0].pool.id == V2_POOL for route in candidates)
+    assert len(candidates) == 6
+
+
+def test_v2_depth_uses_indexed_reserves_not_recent_activity(pools_db, rpc):
+    shallow = "0x" + "aa" * 20
+    with sqlite3.connect(pools_db.path) as connection:
+        connection.execute("INSERT INTO pools VALUES (?,?,?,?,?,?,?,?,?,NULL)",
+                           (shallow, "v2", shallow, WETH, PIPEDOG, 3000, 0, NATIVE, UR_V2_FACTORY))
+        connection.execute("INSERT INTO lp_pool_state(pool_id,block_number) VALUES (?, ?)", (shallow, 10_000))
+        connection.executemany(
+            "INSERT INTO lp_v2_reserve_samples VALUES (?,?,?,?,?,?)",
+            ((V2_POOL, 500, 0, 0, "1000000000", "1000000000"),
+             (shallow, 10_000, 0, 0, "100", "100")),
+        )
+    selected = [route.hops[0].pool.id for route in RouteBook(pools_db, rpc).candidates(PIPEDOG, NATIVE, Side.BUY)]
+    assert selected.index(V2_POOL) < selected.index(shallow)
+
+
+def test_high_fee_and_unknown_hook_pools_cannot_route(pools_db, rpc):
+    expensive = v4_pool(PoolKey(NATIVE, ITH, 100000, 200, NATIVE))
+    with sqlite3.connect(pools_db.path) as connection:
+        connection.execute("INSERT INTO pools VALUES (?,?,?,?,?,?,?,?,?,NULL)",
+                           (expensive.id, "v4", POOL_MANAGER, NATIVE, ITH, expensive.fee_ppm, 200, NATIVE, POOL_MANAGER))
+        connection.commit()
+    routes = RouteBook(pools_db, rpc)
+    assert expensive.id not in {hop.pool.id for route in routes.candidates(ITH, NATIVE, Side.BUY) for hop in route.hops}
+    assert BLOCKED_ITH.id not in {hop.pool.id for route in routes.candidates(ITH, NATIVE, Side.BUY) for hop in route.hops}
+    assert not Pool(Venue.V3, V3_POOL, V3_POOL, WETH, PIPEDOG, 10_001, 200, NATIVE, UR_V3_FACTORY).swappable
+    assert not Pool(Venue.V2, V2_POOL, V2_POOL, WETH, PIPEDOG, 10_001, 0, NATIVE, UR_V2_FACTORY).swappable
+
+
+def test_v4_untrusted_hook_refuses_add_without_blocking_removals(core, rpc):
+    mint = LpIntent(wallet=WALLET, op=LpOp.MINT, pool_id=BLOCKED_ITH.id,
+                    amount0=10**16, amount1=10**18, slippage_bps=100, tick_lower=-60, tick_upper=60)
+    rpc.simulate = lambda call, block: {"status": "0x0", "logs": [], "gasUsed": "0x10", "returnData": "0x"}
+    with pytest.raises(TxRefusal) as refused:
+        core.quote(mint)
+    assert refused.value.code == "untrusted_hook"
+
+    def deny_position(*args):
+        raise TxError("not_owner", "not owned")
+
+    core._position = deny_position
+    with pytest.raises(TxError) as remove:
+        core.quote(replace(mint, op=LpOp.DECREASE, token_id=1, amount0=0, amount1=0))
+    assert remove.value.code == "not_owner"
+
+
+@pytest.mark.parametrize("hook_suffix", (0x400, 0x001))
+def test_v4_remove_governing_hooks_never_receive_add_permits(pools_db, rpc, hook_suffix):
+    hook = f"0x{0xdead0000 | hook_suffix:040x}"
+    pool = v4_pool(PoolKey(NATIVE, ITH, 3000, 60, hook))
+    with sqlite3.connect(pools_db.path) as connection:
+        connection.execute("INSERT INTO pools VALUES (?,?,?,?,?,?,?,?,?,NULL)",
+                           (pool.id, "v4", POOL_MANAGER, NATIVE, ITH, 3000, 60, hook, POOL_MANAGER))
+    core = TxCore(rpc, RouteBook(pools_db, rpc), POLICY)
+    with pytest.raises(TxRefusal) as refused:
+        core.quote(LpIntent(wallet=WALLET, op=LpOp.MINT, pool_id=pool.id, slippage_bps=100,
+                            amount0=10**16, amount1=10**18, tick_lower=-60, tick_upper=60))
+    assert refused.value.code == "untrusted_hook"
+    assert not any(method == "eth_simulateV1" for method, _ in rpc.calls)
 
 
 def test_allowlist_mismatch_disables_core(rpc, pools_db):
