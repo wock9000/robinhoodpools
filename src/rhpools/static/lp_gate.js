@@ -152,7 +152,7 @@
     const out = [el("h3", { text: "WALLET" })];
     if (state.error) out.push(errorLine("bad"));
     if (!window.ethereum) {
-      out.push(el("p", { class: "note", text: "no browser wallet detected. sign-in needs an EIP-1193 wallet on chain 4663." }));
+      out.push(el("p", { class: "note", text: "no browser wallet found" }));
       return out;
     }
     if (!state.wallet) {
@@ -210,7 +210,7 @@
     const me = state.me;
     if (!me || !me.signed_in || !state.wallet || me.wallet.toLowerCase() !== state.wallet.toLowerCase()) return [];
     const out = [el("h3", { text: "API KEYS" })];
-    if (!me.features.includes("api")) out.push(el("p", { class: "note", text: "api feature required to mint keys." }));
+    if (!me.features.includes("api")) out.push(el("p", { class: "note", text: "minting keys needs the api threshold" }));
     if (state.secret) {
       out.push(el("p", { class: "warn", text: "new key " + state.secret.key_id + " (" + state.secret.label + "). shown once:" }));
       out.push(el("code", { class: "gate-secret", text: state.secret.secret }));
@@ -247,8 +247,9 @@
     const fields = {};
     const form = el("div", { class: "gate-form" });
     const add = (name, value, attrs) => {
-      fields[name] = el("input", Object.assign({ type: "text", value: value, class: "wide" }, attrs || {}));
-      form.append(el("label", { text: name }), fields[name]);
+      const id = "gate-policy-" + name;
+      fields[name] = el("input", Object.assign({ type: "text", id: id, value: value, class: "wide" }, attrs || {}));
+      form.append(el("label", { for: id, text: name === "grace_s" ? "grace (s)" : name }), fields[name]);
     };
     const previews = {};
     add("token", policy.token || "", { placeholder: "0x… (empty = unset)" });
@@ -274,8 +275,7 @@
     const apply = el("button", { type: "button", text: "sign & apply", onclick: () => applyPolicy(readPolicy(fields, policy.version + 1)) });
     form.addEventListener("input", preview);
     const out = [
-      el("h3", { text: "POLICY (owner)" }),
-      el("p", { class: "note", text: "current v" + policy.version + ". thresholds are whole tokens; the signed message carries raw units. signing uses EIP-712 (eth_signTypedData_v4); the server verifies the owner address and audits the change." }),
+      el("h3", { text: "POLICY v" + policy.version + " (owner)" }),
       form,
       summary,
       el("div", { class: "gate-row" }, [apply]),

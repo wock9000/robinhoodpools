@@ -15,6 +15,7 @@
   const REFUSALS = {
     no_route: "no route on supported pools for this pair",
     insufficient_balance: "balance too low for this amount",
+    fee_wallet: "this is the rhpools fee wallet; trade from another wallet",
     impact_over_limit: "price impact above the 15% limit; lower the amount",
     unmodeled_fee: "this token takes a transfer fee the ticket cannot price; refused",
     allowlist_mismatch: "trading paused: a pinned contract's code changed",
@@ -150,6 +151,7 @@
   }
 
   function clearQuote() {
+    state.seq++;
     state.quote = null;
     clearInterval(requoteTimer);
     requoteTimer = null;
@@ -443,7 +445,9 @@
     clearQuote();
     refs.token.value = label ? label + "  " + short(state.token) : state.token;
     renderForm();
+    render();
     loadBalances();
+    scheduleQuote(0);
   }
 
   function onTokenInput() {
@@ -502,7 +506,10 @@
       render();
     }));
     refs.currencyLabel.textContent = payLabel;
-    refs.currency.replaceWith(refs.currency = segment(CURRENCIES, state.currency, (value) => {
+    const sameAsset = (a, b) => a === b || (a === NATIVE || a === WETH) && (b === NATIVE || b === WETH);
+    const payWith = CURRENCIES.filter(([address]) => !state.token || !sameAsset(address, state.token));
+    if (!payWith.some(([address]) => address === state.currency)) state.currency = payWith[0][0];
+    refs.currency.replaceWith(refs.currency = segment(payWith, state.currency, (value) => {
       state.currency = value;
       if (state.side === "buy") { state.amount = ""; refs.amount.value = ""; }
       clearQuote();
@@ -752,7 +759,7 @@
   function cta() {
     const g = gate();
     const me = g.me || {};
-    if (!window.ethereum) return { label: "no browser wallet detected", disabled: true };
+    if (!window.ethereum) return { label: "no browser wallet found", disabled: true };
     if (!g.wallet) return { label: "connect wallet", action: () => window.rhpGate.connect() };
     if (Number(g.chain) !== CHAIN_ID) return { label: "switch to chain 4663", action: () => window.rhpGate.switchChain() };
     if (!me.signed_in) return { label: "sign in", action: () => window.rhpGate.signIn() };
@@ -787,6 +794,11 @@
     if (state.phase === "refused") return { label: "not tradable", disabled: true };
     if (!state.quote) return { label: "quoting…", disabled: true };
     if (state.quote.expires_at - Date.now() / 1000 <= 3) return { label: "refreshing quote…", disabled: true };
+    if (state.quote.shortfall) {
+      const s = state.quote.shortfall;
+      const missing = BigInt(s.need) - BigInt(s.have);
+      return { label: "add " + fromRaw(missing.toString(), decimalsOf(s.currency)) + " " + symbolOf(s.currency) + " to " + state.side, disabled: true };
+    }
     if (state.mode === "lp") {
       const labels = { mint: "mint position", increase: "add liquidity", decrease: "remove " + state.lp.pct + "%", collect: "collect fees" };
       return { label: labels[state.lp.op], action: execute };
