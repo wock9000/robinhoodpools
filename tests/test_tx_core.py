@@ -809,7 +809,7 @@ def test_v2_depth_uses_indexed_reserves_not_recent_activity(pools_db, rpc):
 
 
 def test_high_fee_and_unknown_hook_pools_cannot_route(pools_db, rpc):
-    expensive = v4_pool(PoolKey(NATIVE, ITH, 100000, 200, NATIVE))
+    expensive = v4_pool(PoolKey(NATIVE, ITH, 200000, 200, NATIVE))
     with sqlite3.connect(pools_db.path) as connection:
         connection.execute("INSERT INTO pools VALUES (?,?,?,?,?,?,?,?,?,NULL)",
                            (expensive.id, "v4", POOL_MANAGER, NATIVE, ITH, expensive.fee_ppm, 200, NATIVE, POOL_MANAGER))
@@ -817,8 +817,9 @@ def test_high_fee_and_unknown_hook_pools_cannot_route(pools_db, rpc):
     routes = RouteBook(pools_db, rpc)
     assert expensive.id not in {hop.pool.id for route in routes.candidates(ITH, NATIVE, Side.BUY) for hop in route.hops}
     assert BLOCKED_ITH.id not in {hop.pool.id for route in routes.candidates(ITH, NATIVE, Side.BUY) for hop in route.hops}
-    assert not Pool(Venue.V3, V3_POOL, V3_POOL, WETH, PIPEDOG, 10_001, 200, NATIVE, UR_V3_FACTORY).swappable
-    assert not Pool(Venue.V2, V2_POOL, V2_POOL, WETH, PIPEDOG, 10_001, 0, NATIVE, UR_V2_FACTORY).swappable
+    assert not Pool(Venue.V3, V3_POOL, V3_POOL, WETH, PIPEDOG, 100_001, 200, NATIVE, UR_V3_FACTORY).swappable
+    assert not Pool(Venue.V2, V2_POOL, V2_POOL, WETH, PIPEDOG, 100_001, 0, NATIVE, UR_V2_FACTORY).swappable
+    assert Pool(Venue.V3, V3_POOL, V3_POOL, WETH, PIPEDOG, 30_000, 200, NATIVE, UR_V3_FACTORY).swappable
 
 
 def test_v4_untrusted_hook_refuses_add_without_blocking_removals(core, rpc):

@@ -19,7 +19,8 @@ from .tx_chain import GIGA_V3_FACTORY, NATIVE, PANCAKE_V3_FACTORY, PONS_HOOK, PO
 
 MAX_CANDIDATES = 6
 QUOTE_CURRENCIES = frozenset({NATIVE, WETH, USDG})
-MAX_POOL_FEE_PPM = 10_000
+MAX_POOL_FEE_PPM = 100_000
+DYNAMIC_FEE_FLAG = 0x800000
 
 
 
@@ -61,7 +62,8 @@ class Pool:
 
     @property
     def swappable(self) -> bool:
-        if not (self.venue is Venue.V4 and self.hook == PONS_HOOK) and (self.fee_ppm > MAX_POOL_FEE_PPM or self.fee_ppm < 0):
+        static_fee = 0 if self.venue is Venue.V4 and self.fee_ppm & DYNAMIC_FEE_FLAG else self.fee_ppm
+        if not (self.venue is Venue.V4 and self.hook == PONS_HOOK) and (static_fee > MAX_POOL_FEE_PPM or static_fee < 0):
             return False
         if self.venue is Venue.V2:
             return self.factory == UR_V2_FACTORY

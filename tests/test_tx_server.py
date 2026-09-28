@@ -164,7 +164,6 @@ def test_tx_get_takes_api_slot(tmp_path):
     core = FakeCore()
     with serving(tmp_path, core) as (address, gate):
         headers = signed_in(address, gate, balance=5_000_000)
-        from rhpools.lp_server import Handler
         slots = Handler.api_slots["keyed"]
         acquired = []
         while slots.acquire(False):

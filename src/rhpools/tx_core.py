@@ -38,7 +38,7 @@ from .tx_plan import (
     PositionState, Signatures, Split, SplitLeg, SwapIntent, SwapPlanner, SwapShape, TxError, TxPolicy,
     TxRefusal, impact_bps, min_out_for, split_amounts, swap_amounts,
 )
-from .tx_routes import QUOTE_CURRENCIES, Hop, same_asset, IncompletePool, Pool, Route, RouteBook, Side, Venue, v4_pool
+from .tx_routes import DYNAMIC_FEE_FLAG, QUOTE_CURRENCIES, Hop, same_asset, IncompletePool, Pool, Route, RouteBook, Side, Venue, v4_pool
 
 DEADLINE_GRACE_S = 60
 IMPACT_DIVISOR = 100
@@ -48,6 +48,7 @@ SPLIT_WORKERS = 12
 SPLIT_ROUTES = 3
 MAX_QUOTES_PER_WALLET = 8
 OFF_MARKET_BPS = 300
+HIGH_POOL_FEE_PPM = 10_000
 GAS_HEADROOM_PCT = 130
 ESTIMATE_HEADROOM_PCT = 125
 _ADDRESS_RE = re.compile(r"^0x[0-9a-f]{40}$")
@@ -743,6 +744,9 @@ class TxCore:
         amounts = replace(amounts, min_out=min_out_for(amounts.net_out, intent.slippage_bps), impact_bps=impact)
         if amounts.hook_fee is not None:
             warnings.append("pons_fees")
+        if any(hop.pool.hook != PONS_HOOK and not hop.pool.fee_ppm & DYNAMIC_FEE_FLAG and hop.pool.fee_ppm > HIGH_POOL_FEE_PPM
+               for leg in split.legs for hop in leg.route.hops):
+            warnings.append("high_pool_fee")
         if intent.side is Side.BUY:
             warnings.extend(self._require_sellable(intent, amounts.net_out))
         steps = self._steps(intent.wallet, plan, tag)

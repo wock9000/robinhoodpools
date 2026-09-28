@@ -655,7 +655,6 @@ def test_hookless_ten_percent_fee_pool_is_excluded_from_quote(core, fork, pools_
     mint = lp(fork.user, LpOp.MINT, key.id(), tick_lower=(tick // 200 - 10) * 200,
               tick_upper=(tick // 200 + 10) * 200, amount0=10**15, amount1=10**18)
     lp_round_trip(core, fork, mint)
-    assert key.id() not in {hop.pool.id for route in core.routes.candidates(ITH, NATIVE, Side.BUY) for hop in route.hops}
     quoted = core.quote(swap(fork.user, Side.BUY, ITH, NATIVE, 10**15))
     assert all(hop.pool.id != key.id() for leg in quoted.split.legs for hop in leg.route.hops)
 

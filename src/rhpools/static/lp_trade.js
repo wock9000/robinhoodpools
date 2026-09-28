@@ -815,6 +815,7 @@
       pons ? feeRow("creator tax", pons.creator_tax_bps / 100 + "%", amounts.creator_tax) : null,
       feeRow("rhpools fee", "0.75%", amounts.rhpools_fee),
       el("tr", {}, [el("th", { text: "price impact" }), el("td", {}), el("td", { class: "numeric " + impactClass, text: impact == null ? "—" : (impact / 100).toFixed(2) + "%" })]),
+      quote.warnings.includes("high_pool_fee") ? el("tr", {}, [el("th", { text: "pool fee" }), el("td", {}), el("td", { class: "numeric impact-warn", text: "above 1% on this route" })]) : null,
       quote.warnings.includes("sell_unverified") ? el("tr", {}, [el("th", { text: "sell back" }), el("td", {}), el("td", { class: "numeric impact-warn", text: "unverified" })]) : null,
       el("tr", {}, [el("th", { text: "quote" }), el("td", { class: "dim", text: "block " + quote.block.number }), el("td", { class: "numeric dim" }, [refs.expiry = el("span")])]),
     ])]));
