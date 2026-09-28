@@ -5537,7 +5537,7 @@ class AccountBook:
             if replica is None:
                 stale_keys = self._stale_position_keys(conn)
             else:
-                with self.store.reader_snapshot() as ledger:
+                with self.store.reader_snapshot(_OWNER_ACTIVITY_SNAPSHOT_SECONDS) as ledger:
                     stale_keys = self._stale_position_keys(ledger)
             stale_json = json.dumps(stale_keys, separators=(",", ":"))
             for kind, fields, components in (
