@@ -6,6 +6,7 @@ both hops in the same router when using a protocol-specific SwapRouter.
 from __future__ import annotations
 
 import json
+from math import isqrt
 import sqlite3
 import threading
 from collections.abc import Callable
@@ -18,6 +19,9 @@ from .tx_chain import GIGA_V3_FACTORY, NATIVE, PANCAKE_V3_FACTORY, PONS_HOOK, PO
 
 MAX_CANDIDATES = 6
 QUOTE_CURRENCIES = frozenset({NATIVE, WETH, USDG})
+MAX_POOL_FEE_PPM = 100_000
+DYNAMIC_FEE_FLAG = 0x800000
+
 
 
 class Venue(str, Enum):
@@ -58,6 +62,9 @@ class Pool:
 
     @property
     def swappable(self) -> bool:
+        static_fee = 0 if self.venue is Venue.V4 and self.fee_ppm & DYNAMIC_FEE_FLAG else self.fee_ppm
+        if not (self.venue is Venue.V4 and self.hook == PONS_HOOK) and (static_fee > MAX_POOL_FEE_PPM or static_fee < 0):
+            return False
         if self.venue is Venue.V2:
             return self.factory == UR_V2_FACTORY
         if self.venue is Venue.V3:
@@ -187,8 +194,12 @@ DEFAULT_BRIDGES: tuple[Pool, ...] = (
 
 _POOL_COLUMNS = "p.id, p.protocol, p.address, p.token0, p.token1, p.fee_ppm, p.tick_spacing, p.hook, p.factory, p.metadata_json"
 _CANDIDATE_SQL = (
-    f"SELECT {_POOL_COLUMNS}, s.block_number FROM pools p "
-    "LEFT JOIN lp_pool_state s ON s.pool_id = p.id "
+    f"SELECT {_POOL_COLUMNS}, s.liquidity, "
+    "(SELECT r.reserve0 FROM lp_v2_reserve_samples r WHERE r.pool_id=p.id "
+    "ORDER BY r.block_number DESC,r.tx_index DESC,r.log_index DESC LIMIT 1), "
+    "(SELECT r.reserve1 FROM lp_v2_reserve_samples r WHERE r.pool_id=p.id "
+    "ORDER BY r.block_number DESC,r.tx_index DESC,r.log_index DESC LIMIT 1) "
+    "FROM pools p LEFT JOIN lp_pool_state s ON s.pool_id = p.id "
     "WHERE (p.token0 = ? AND p.token1 IN ({quotes})) OR (p.token1 = ? AND p.token0 IN ({quotes}))"
 )
 _BY_ID_SQL = f"SELECT {_POOL_COLUMNS} FROM pools p WHERE p.id = ?"
@@ -269,15 +280,17 @@ class RouteBook:
         sql = _CANDIDATE_SQL.format(quotes=",".join("?" * len(quotes)))
         with self._reader() as connection:
             rows = connection.execute(sql, (token, *quotes, token, *quotes)).fetchall()
-        rows.sort(key=lambda row: -(row[10] or 0))
+        rows.sort(key=lambda row: (
+            -(isqrt(int(row[11]) * int(row[12])) if row[1] == "v2" and row[11] and row[12] else int(row[10] or 0)),
+            row[1] != "v3", row[8] != UR_V3_FACTORY, row[0],
+        ))
         return [pool for pool in map(_pool_from_row, rows) if pool is not None]
 
     def candidates(self, token: str, quote_currency: str, side: Side) -> list[Route]:
         token = token.lower()
         if quote_currency not in QUOTE_CURRENCIES or same_asset(token, quote_currency):
             return []
-        direct: list[Route] = []
-        bridged: list[Route] = []
+        ranked: list[Route] = []
         for pool in self.quote_pools(token):
             if not pool.swappable:
                 continue
@@ -289,7 +302,7 @@ class RouteBook:
                     continue
             token_hop = Hop(pool, other, token) if side is Side.BUY else Hop(pool, token, other)
             if same_asset(other, quote_currency):
-                direct.append(Route((token_hop,)))
+                ranked.append(Route((token_hop,)))
                 continue
             if other not in QUOTE_CURRENCIES:
                 continue
@@ -307,8 +320,18 @@ class RouteBook:
                     continue
                 bridge_hop = Hop(bridge, far, near) if side is Side.BUY else Hop(bridge, near, far)
                 hops = (bridge_hop, token_hop) if side is Side.BUY else (token_hop, bridge_hop)
-                bridged.append(Route(hops))
-        return (direct + bridged)[:MAX_CANDIDATES]
+                ranked.append(Route(hops))
+        chosen: list[Route] = []
+        venues: set[Venue] = set()
+        for route in ranked:
+            venue = next(hop.pool.venue for hop in route.hops if token in (hop.pool.token0, hop.pool.token1))
+            if venue not in venues:
+                chosen.append(route)
+                venues.add(venue)
+        for route in ranked:
+            if route not in chosen:
+                chosen.append(route)
+        return chosen[:MAX_CANDIDATES]
 
 
 __all__ = [

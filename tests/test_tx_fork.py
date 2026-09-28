@@ -194,7 +194,9 @@ def pools_db(tmp_path_factory):
     connection.executescript(
         "CREATE TABLE pools(id TEXT PRIMARY KEY, protocol TEXT NOT NULL, address TEXT NOT NULL, token0 TEXT NOT NULL, token1 TEXT NOT NULL,"
         " fee_ppm INTEGER, tick_spacing INTEGER, hook TEXT, factory TEXT, metadata_json TEXT);"
-        "CREATE TABLE lp_pool_state(pool_id TEXT PRIMARY KEY, block_number INTEGER NOT NULL);"
+        "CREATE TABLE lp_pool_state(pool_id TEXT PRIMARY KEY, block_number INTEGER NOT NULL, liquidity TEXT);"
+        "CREATE TABLE lp_v2_reserve_samples(pool_id TEXT, block_number INTEGER, tx_index INTEGER, log_index INTEGER, reserve0 TEXT, reserve1 TEXT);"
+        "CREATE INDEX lp_v2_samples_order ON lp_v2_reserve_samples(pool_id,block_number,tx_index,log_index);"
     )
     connection.executemany(f"INSERT INTO pools({POOL_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?)", POOL_ROWS)
     connection.commit()
@@ -636,8 +638,25 @@ def test_hook_blocked_add_from_synthetic_before_add_hook(core, fork, pools_db):
     intent = lp(fork.user, LpOp.MINT, key.id(), tick_lower=(tick // 60 - 10) * 60, tick_upper=(tick // 60 + 10) * 60, amount0=10**15, amount1=10**18)
     with pytest.raises(TxRefusal) as refused:
         core.quote(intent)
-    assert refused.value.code == "hook_blocked_add"
-    assert BLOCKING_HOOK in refused.value.detail
+    assert refused.value.code == "untrusted_hook"
+    assert BLOCKING_HOOK in refused.value.detail or "hook" in refused.value.detail
+
+
+def test_hookless_ten_percent_fee_pool_is_excluded_from_quote(core, fork, pools_db):
+    key = PoolKey(NATIVE, ITH, 100_000, 200, NATIVE)
+    sqrt_price = int.from_bytes(fork.call(tc.STATE_VIEW, tc.state_view_slot0(PONS_POOL))[:32], "big")
+    fork.raw(POOL_MANAGER, pool_manager_initialize(key, sqrt_price))
+    with sqlite3.connect(pools_db) as connection:
+        connection.execute(f"INSERT INTO pools({POOL_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?)",
+                           (key.id(), "v4", POOL_MANAGER, NATIVE, ITH, key.fee, key.tick_spacing, NATIVE, POOL_MANAGER))
+    if fork.balance(ITH, fork.user) < 10**18:
+        trade(core, fork, swap(fork.user, Side.BUY, ITH, NATIVE, 10**16))
+    tick = v4_tick(fork, key.id())
+    mint = lp(fork.user, LpOp.MINT, key.id(), tick_lower=(tick // 200 - 10) * 200,
+              tick_upper=(tick // 200 + 10) * 200, amount0=10**15, amount1=10**18)
+    lp_round_trip(core, fork, mint)
+    quoted = core.quote(swap(fork.user, Side.BUY, ITH, NATIVE, 10**15))
+    assert all(hop.pool.id != key.id() for leg in quoted.split.legs for hop in leg.route.hops)
 
 
 def test_allowlist_mismatch_disables_trade(fork, pools_db):

@@ -40,6 +40,15 @@ class FakeCore:
         return {"rows": [{"hash": "0x" + "ab" * 32, "block": 42, "timestamp": 84,
                           "sent": [], "received": [], "via": "UR"}]}
 
+    def balances(self, wallet, currencies):
+        return {}
+
+    def pool_view(self, pool_id, wallet, known):
+        return {"wallet": wallet, "pool_id": pool_id}
+
+    def receipt(self, tx_hash, wallet):
+        return SimpleNamespace(to_json=lambda: {"wallet": wallet, "hash": tx_hash})
+
 
 @contextmanager
 def serving(tmp_path, core):
@@ -138,3 +147,50 @@ def test_history_requires_trade_browser_session_and_uses_only_session_wallet(tmp
         assert status == 200 and body["rows"][0]["via"] == "UR"
         assert core.history_wallet.lower() == HOLDER.lower()
         assert response_headers["Cache-Control"] == "private, no-store"
+
+
+def test_tx_quota_charges_weighted_requests(tmp_path):
+    core = FakeCore()
+    with serving(tmp_path, core) as (address, gate):
+        headers = signed_in(address, gate, balance=5_000_000)
+        gate.limits = Limits(key_rps=1, key_burst=12)
+        assert call(address, "POST", "/api/tx/quote", SWAP, headers)[0] == 200
+        assert call(address, "GET", "/api/tx/history?feature=trade", headers=headers)[0] == 200
+        assert call(address, "POST", "/api/tx/quote", SWAP, headers)[0] == 429
+        assert len(core.intents) == 1
+
+
+def test_tx_get_takes_api_slot(tmp_path):
+    core = FakeCore()
+    with serving(tmp_path, core) as (address, gate):
+        headers = signed_in(address, gate, balance=5_000_000)
+        slots = Handler.api_slots["keyed"]
+        acquired = []
+        while slots.acquire(False):
+            acquired.append(True)
+        try:
+            assert call(address, "GET", "/api/tx/history?feature=trade", headers=headers)[0] == 503
+        finally:
+            for _ in acquired:
+                slots.release()
+
+
+def test_tx_prepare_and_pool_charge_five_tokens(tmp_path):
+    core = FakeCore()
+    with serving(tmp_path, core) as (address, gate):
+        headers = signed_in(address, gate, balance=5_000_000)
+        gate.limits = Limits(key_rps=1, key_burst=16)
+        status, _, quote = call(address, "POST", "/api/tx/quote", SWAP, headers)
+        assert status == 200
+        assert call(address, "POST", "/api/tx/prepare", {"quote_id": quote["quote_id"]}, headers)[0] == 200
+        assert call(address, "GET", "/api/tx/history?feature=trade", headers=headers)[0] == 200
+        assert call(address, "GET", "/api/tx/pool?pool_id=" + TOKEN, headers=headers)[0] == 429
+
+
+def test_tx_pool_five_tokens_leaves_one_for_receipt(tmp_path):
+    with serving(tmp_path, FakeCore()) as (address, gate):
+        headers = signed_in(address, gate, balance=5_000_000)
+        gate.limits = Limits(key_rps=1, key_burst=6)
+        assert call(address, "GET", "/api/tx/pool?pool_id=" + TOKEN, headers=headers)[0] == 200
+        assert call(address, "GET", "/api/tx/receipt?hash=" + "ab" * 32, headers=headers)[0] == 200
+        assert call(address, "GET", "/api/tx/balances?currencies=" + USDG, headers=headers)[0] == 429
