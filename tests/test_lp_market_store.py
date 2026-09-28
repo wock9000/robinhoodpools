@@ -605,6 +605,36 @@ def test_open_reports_inherited_wal_size(tmp_path, monkeypatch, caplog):
         store.close()
 
 
+def test_schema18_replaces_token_indexes_and_keeps_pool_pages_ordered(tmp_path):
+    path = tmp_path / "market.sqlite"
+    with MarketStore(path) as store:
+        with store.transaction() as connection:
+            connection.execute("DROP INDEX pools_token0_id_idx")
+            connection.execute("DROP INDEX pools_token1_id_idx")
+            connection.execute("CREATE INDEX pools_token0_idx ON pools(token0)")
+            connection.execute("CREATE INDEX pools_token1_idx ON pools(token1)")
+            connection.execute("PRAGMA user_version=17")
+    for _ in range(2):
+        with MarketStore(path) as store:
+            connection = store.read()
+            indexes = {
+                row[0] for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'pools_token%'"
+                )
+            }
+            assert indexes == {"pools_token0_id_idx", "pools_token1_id_idx"}
+            plan = [
+                row[3] for row in connection.execute(
+                    "EXPLAIN QUERY PLAN "
+                    "SELECT id FROM pools WHERE token0=? "
+                    "UNION SELECT id FROM pools WHERE token1=? "
+                    "ORDER BY id LIMIT 100",
+                    ("0x" + "22" * 20,) * 2,
+                )
+            ]
+            assert all("TEMP B-TREE" not in step for step in plan)
+
+
 def test_schema16_baselines_completed_synchronous_search_index_only(tmp_path):
     path = tmp_path / "market.sqlite"
     store = MarketStore(path)

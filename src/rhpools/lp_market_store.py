@@ -410,8 +410,6 @@ class MarketStore:
             source TEXT, metadata_json TEXT
         );
         CREATE INDEX IF NOT EXISTS pools_created_idx ON pools(created_block, id);
-        CREATE INDEX IF NOT EXISTS pools_token0_idx ON pools(token0);
-        CREATE INDEX IF NOT EXISTS pools_token1_idx ON pools(token1);
         CREATE TABLE IF NOT EXISTS pool_provenance(
             pool_id TEXT PRIMARY KEY, observed_block INTEGER NOT NULL,
             observed_hash TEXT NOT NULL, basis TEXT NOT NULL
@@ -788,6 +786,16 @@ class MarketStore:
                         "end_tx_index DESC,end_log_index DESC) WHERE end_block IS NOT NULL"
                     )
                 self.connection.execute("PRAGMA user_version=17")
+            if int(self.connection.execute("PRAGMA user_version").fetchone()[0]) < 18:
+                self.connection.execute(
+                    "CREATE INDEX IF NOT EXISTS pools_token0_id_idx ON pools(token0,id)"
+                )
+                self.connection.execute(
+                    "CREATE INDEX IF NOT EXISTS pools_token1_id_idx ON pools(token1,id)"
+                )
+                self.connection.execute("DROP INDEX IF EXISTS pools_token0_idx")
+                self.connection.execute("DROP INDEX IF EXISTS pools_token1_idx")
+                self.connection.execute("PRAGMA user_version=18")
             self.connection.execute(
                 "CREATE INDEX IF NOT EXISTS pending_reprojection_order_idx "
                 "ON pending_reprojection(block_number,tx_index,log_index,event_id)"
