@@ -340,6 +340,37 @@
     throw { message: "approval not confirmed after 3 minutes" };
   }
 
+  function unsupportedBatch(error) {
+    const code = Number(error && error.code);
+    const text = String((error && error.message) || "");
+    return code === -32601 || code === 4200 || /unsupported|not (implemented|available|found)|unknown method/i.test(text);
+  }
+
+  async function atomicCapability() {
+    try {
+      const capabilities = await window.ethereum.request({ method: "wallet_getCapabilities", params: [gate().wallet, ["0x1237"]] });
+      const chain = capabilities && (capabilities["0x1237"] || capabilities["0X1237"]);
+      return chain && ["supported", "ready"].includes(chain.atomicBatch && chain.atomicBatch.status);
+    } catch (error) {
+      if (unsupportedBatch(error)) return false;
+      throw error;
+    }
+  }
+
+  async function waitBatchHash(id) {
+    const until = Date.now() + 180000;
+    while (Date.now() < until) {
+      const result = await window.ethereum.request({ method: "wallet_getCallsStatus", params: [id] });
+      const receipts = result && result.receipts;
+      const last = Array.isArray(receipts) && receipts[receipts.length - 1];
+      const hash = last && (last.transactionHash || last.txHash);
+      if (hash) return hash;
+      if (result && (result.status === "0x500" || result.status === "failed")) throw { message: "batch failed in wallet" };
+      await new Promise((resolve) => setTimeout(resolve, 800));
+    }
+    throw { message: "batch status not confirmed after 3 minutes" };
+  }
+
   async function execute() {
     let quote = state.quote;
     if (!quote) return;
@@ -350,6 +381,36 @@
     const wallet = gate().wallet;
     state.note = null;
     try {
+      const atomic = quote.kind === "swap" && quote.steps.some((step) => step.kind === "approve")
+        && !quote.steps.some((step) => step.kind === "permit") && await atomicCapability();
+      if (atomic) {
+        state.phase = "preparing";
+        render();
+        const prepared = await api("/api/tx/prepare", { quote_id: quote.quote_id, batched: true });
+        if (prepared.calls && prepared.calls.length === 2) {
+          state.phase = "confirming";
+          render();
+          let id;
+          try {
+            id = await window.ethereum.request({
+              method: "wallet_sendCalls",
+              params: [{ version: "2.0.0", chainId: "0x1237", from: wallet, atomicRequired: true,
+                calls: prepared.calls.map(({ to, data, value, gas }) => ({ to, data, value, gas })) }],
+            });
+          } catch (error) {
+            if (!unsupportedBatch(error)) throw error;
+          }
+          if (id) {
+            state.phase = "pending";
+            clearInterval(requoteTimer);
+            requoteTimer = null;
+            render();
+            state.hash = await waitBatchHash(id);
+            await trackFill(state.hash);
+            return;
+          }
+        }
+      }
       for (const step of quote.steps.filter((item) => item.kind === "approve")) {
         state.phase = "approving";
         render();

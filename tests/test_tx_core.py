@@ -109,6 +109,7 @@ class FakeRPC:
         self.launches = [1] * 13
         self.launches[7], self.launches[10] = 200, 100
         self.simulate = None
+        self.fail_stage = False
         self.estimate = 150_000
         self.calls: list[tuple[str, list]] = []
         self.txs: dict[str, dict] = {}
@@ -134,6 +135,8 @@ class FakeRPC:
             self.last_state = params[0]["blockStateCalls"][0]
             calls = self.last_state["calls"]
             outs = [{"status": "0x1", "logs": [], "gasUsed": "0x5208"} for _ in calls[:-1]]
+            if self.fail_stage and outs:
+                outs[0]["status"] = "0x0"
             outs.append(self.simulate(calls[-1], params[1]))
             return [{"calls": outs}]
         if method == "eth_estimateGas":
@@ -376,6 +379,8 @@ def test_min_out_lives_in_sweep_or_unwrap_for_output_fee_plans():
     assert kinds == ["Permit2TransferFrom", "V3Swap", "PayPortion", "UnwrapWeth"]
     assert plan.permit.details.nonce == 7 and plan.permit.details.amount == 5_000 and plan.permit.sig_deadline == 5_000
     assert [c.to for c in plan.staging] == [PIPEDOG, PERMIT2]
+    assert plan.permit.details.expiration <= plan.deadline
+    assert plan.permit.sig_deadline <= plan.deadline
     assert plan.body.commands[1].recipient == ADDRESS_THIS and plan.shape.fee_currency == WETH
     with pytest.raises(TxError) as err:
         SwapPlanner().finalize(plan, 1, Signatures())
@@ -600,6 +605,10 @@ def test_prepare_requires_erc20_allowance_and_permit(core, rpc):
     typed = quote.step("permit").typed_data
     assert typed["message"]["details"] == {"token": USDG, "amount": str(10**9), "expiration": str(quote.deadline), "nonce": "3"}
     assert typed["message"]["sigDeadline"] == str(quote.deadline) and typed["message"]["spender"] == UR
+    assert int(approve["data"][-64:], 16) == tc.MAX_UINT256
+    assert int(typed["message"]["details"]["amount"]) == 10**9
+    assert int(typed["message"]["details"]["expiration"]) <= quote.deadline
+    assert int(typed["message"]["sigDeadline"]) <= quote.deadline
     with pytest.raises(TxError) as err:
         core.prepare(quote.quote_id, WALLET, Signatures(permit=b"\x01" * 65))
     assert err.value.code == "approve_pending"
@@ -609,6 +618,45 @@ def test_prepare_requires_erc20_allowance_and_permit(core, rpc):
     assert err.value.code == "permit_required"
     quote2 = core.quote(buy_intent(quote_currency=USDG, amount_in=10**9))
     assert [s.kind for s in quote2.steps] == ["permit", "send"]
+
+
+def test_batched_external_approval_simulates_both_calls(core, rpc):
+    rpc.simulate = v3_buy_simulation(4_000_000)
+    original = core.quote(buy_intent())
+    rpc.balances[(PIPEDOG, WALLET)] = 5_000
+    intent = buy_intent(side=Side.SELL, quote_currency=WETH, amount_in=5_000)
+    pool = core.routes.pool("0x" + "31" * 20)
+    plan = core.swaps.plan(intent, Route((Hop(pool, PIPEDOG, WETH),)), POLICY, original.deadline, 0)
+    quote = replace(original, intent=intent, plan=plan)
+    core._quotes[quote.quote_id] = quote
+    with pytest.raises(TxError) as err:
+        core.prepare(quote.quote_id, WALLET, Signatures())
+    assert err.value.code == "approve_pending"
+    prepared = core.prepare(quote.quote_id, WALLET, Signatures(), batched=True)
+    assert [tx["to"] for tx in prepared.calls] == [PIPEDOG, tc.PANCAKE_SMART_ROUTER]
+    assert prepared.calls[0]["data"] == "0x" + tc.erc20_approve(tc.PANCAKE_SMART_ROUTER, intent.amount_in).hex()
+    assert prepared.calls[1] == prepared.transaction
+    assert rpc.last_state["calls"][0]["data"] == prepared.calls[0]["data"]
+    assert rpc.last_state["calls"][1]["data"] == prepared.calls[1]["data"]
+    assert prepared.to_json()["calls"] == list(prepared.calls)
+    assert prepared.calls[0]["gas"] == hex(150_000 * 125 // 100)
+    override = {PIPEDOG: {"stateDiff": {"0x" + "11" * 32: hex(intent.amount_in)}}}
+    core._allowance_override = lambda *_: override
+    rpc.estimate = 400_000
+    prepared = core.prepare(quote.quote_id, WALLET, Signatures(), batched=True)
+    estimates = [params for method, params in rpc.calls if method == "eth_estimateGas"]
+    assert estimates[-2][2] == override
+    assert estimates[-1][0]["to"] == PIPEDOG
+    assert prepared.transaction["gas"] == hex(400_000 * 125 // 100)
+    rpc.allowances[(PIPEDOG, WALLET, tc.PANCAKE_SMART_ROUTER)] = intent.amount_in * 2
+    assert [step.kind for step in core._steps(WALLET, plan, "latest")] == ["approve", "send"]
+    with pytest.raises(TxError) as err:
+        core.prepare(quote.quote_id, WALLET, Signatures())
+    assert err.value.code == "approve_pending"
+    rpc.fail_stage = True
+    with pytest.raises(TxError) as err:
+        core.prepare(quote.quote_id, WALLET, Signatures(), batched=True)
+    assert err.value.code == "staging_failed"
 
 
 def test_quote_store_ttl_and_cap(rpc, pools_db):
@@ -682,6 +730,10 @@ def test_lp_planner_bounds_and_permit_batch(core, rpc):
     assert isinstance(mint, PosmMint)
     assert mint.liquidity == liquidity_for_amounts(1 << 96, sqrt_ratio_at_tick(-100), sqrt_ratio_at_tick(100), 10**18, 10**18) > 0
     assert plan.value == 10**18 and plan.permit.details[0].nonce == 4 and plan.permit.spender == POSM
+    typed = plan.permit_typed_data()["message"]
+    assert typed["details"] == [{"token": ITH, "amount": str(intent.amount1), "expiration": str(plan.deadline), "nonce": "4"}]
+    assert int(typed["details"][0]["expiration"]) <= plan.deadline
+    assert int(typed["sigDeadline"]) <= plan.deadline
     assert [type(p).__name__ for p in plan.body.params] == ["PosmMint", "PosmSettlePair", "PosmSweep"]
     with pytest.raises(TxError) as err:
         LpPlanner().finalize(plan, (1, 1), Signatures())
