@@ -17,6 +17,7 @@ from rhpools.tx_chain import (
 )
 from rhpools.lp_market_protocols import V4_INITIALIZE_TOPIC, _normalize_pool_creation
 from rhpools.tx_core import SwapQuote, TxCore, allocate_split
+from rhpools.tx_trade_store import TradeStore
 from rhpools.lp_math import sqrt_ratio_at_tick
 from rhpools.tx_plan import (
     Amounts, Fee, FeeLeg, Ledger, LpIntent, LpOp, LpPlanner, LpShape, Signatures, Split, SplitLeg, SwapIntent,
@@ -129,7 +130,8 @@ class FakeRPC:
         if method == "eth_getBlockByNumber":
             requested = params[0]
             number = self.block if requested == "latest" else int(requested, 16)
-            return {"number": hex(number), "hash": self.block_hash if number == self.block else "0x" + "cd" * 32}
+            return {"number": hex(number), "hash": self.block_hash if number == self.block else "0x" + "cd" * 32,
+                    "timestamp": hex(number * 2)}
         if method == "eth_getCode":
             return self.code.get(params[0].lower(), "0x")
         if method == "eth_getBalance":
@@ -885,6 +887,64 @@ def test_receipt_decodes_swap_from_calldata_and_logs(core, rpc):
     assert err.value.code == "wallet_mismatch"
     rpc.receipts[tx_hash]["status"] = "0x0"
     assert core.receipt(tx_hash, WALLET).status == "failed"
+
+def test_receipt_persists_only_proven_rhpools_swaps_once(core, rpc, tmp_path):
+    store = TradeStore(tmp_path / "trades.sqlite")
+    core.trade_store = store
+    rpc.simulate = v3_buy_simulation(4_000_000)
+    quote = core.quote(buy_intent())
+    tx = core.prepare(quote.quote_id, WALLET, Signatures()).transaction
+    tx_hash = "0x" + "aa" * 32
+    fee = 10**18 * 75 // 10_000
+    rpc.txs[tx_hash] = {"from": WALLET, "to": UR, "input": tx["data"], "value": tx["value"]}
+    rpc.receipts[tx_hash] = {"status": "0x1", "blockNumber": hex(101), "gasUsed": hex(140_000),
+                             "effectiveGasPrice": hex(10**8),
+                             "logs": [v3_swap_log(V3_POOL, 10**18 - fee, -3_999_000),
+                                      transfer(PIPEDOG, V3_POOL, WALLET, 3_999_000)]}
+    assert core.receipt(tx_hash, WALLET).status == "confirmed"
+    assert core.receipt(tx_hash, WALLET).status == "confirmed"
+    persisted = store.history(WALLET)
+    assert len(persisted) == 1
+    assert persisted[0]["fee"] == {"currency": "native", "amount": str(fee)}
+    assert persisted[0]["sent"] == [{"token": "native", "amount": str(10**18)}]
+    assert persisted[0]["received"] == [{"token": PIPEDOG, "amount": "3999000"}]
+    with sqlite3.connect(store.path) as db:
+        assert db.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        assert db.execute("SELECT COUNT(*) FROM trades").fetchone()[0] == 1
+    foreign_hash = "0x" + "bb" * 32
+    foreign_fee = "0x" + "bb" * 20
+    original_recipient = FEE_TO[2:].rjust(64, "0")
+    foreign_recipient = foreign_fee[2:].rjust(64, "0")
+    assert original_recipient in tx["data"]
+    rpc.txs[foreign_hash] = {"from": WALLET, "to": UR,
+                             "input": tx["data"].replace(original_recipient, foreign_recipient),
+                             "value": tx["value"]}
+    rpc.receipts[foreign_hash] = rpc.receipts[tx_hash]
+    assert core.receipt(foreign_hash, WALLET).status == "confirmed"
+    assert [row["hash"] for row in store.history(WALLET)] == [tx_hash]
+
+
+def test_receipt_records_lp_manager_fill(core, rpc, tmp_path):
+    store = TradeStore(tmp_path / "trades.sqlite")
+    core.trade_store = store
+    pool = core.routes.pool(V3_POOL)
+    intent = LpIntent(wallet=WALLET, op=LpOp.MINT, pool_id=V3_POOL, slippage_bps=50,
+                      tick_lower=-200, tick_upper=200, amount0=7, amount1=9)
+    plan = LpPlanner().plan(intent, pool, 5_000, sqrt_price_x96=1 << 96,
+                            position=None, permit_nonces={})
+    tx_hash = "0x" + "cc" * 32
+    rpc.txs[tx_hash] = {"from": WALLET, "to": plan.to, "input": "0x" + plan.calldata().hex(), "value": "0x0"}
+    rpc.receipts[tx_hash] = {"status": "0x1", "blockNumber": hex(101), "gasUsed": "0x0",
+                             "effectiveGasPrice": "0x0", "logs": [
+                                 {"address": plan.to, "topics": [tc.TOPIC_TRANSFER, _topic_addr(NATIVE),
+                                                                _topic_addr(WALLET), hex(31)], "data": "0x"},
+                                 {"address": plan.to, "topics": [tc.TOPIC_NFPM_INCREASE, hex(31)],
+                                  "data": "0x" + _word(5) + _word(7) + _word(9)}]}
+    assert core.receipt(tx_hash, WALLET).status == "confirmed"
+    row, = store.history(WALLET)
+    assert row["kind"] == "lp" and row["via"] == "NFPM" and row["fee"] is None
+    assert row["sent"] == [{"token": WETH, "amount": "7"}, {"token": PIPEDOG, "amount": "9"}]
+    assert row["received"] == []
 
 
 def test_swap_shape_round_trips_through_calldata(core):

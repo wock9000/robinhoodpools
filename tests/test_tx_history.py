@@ -7,7 +7,8 @@ import pytest
 from eth_abi import encode
 
 from rhpools.tx_chain import PANCAKE_SMART_ROUTER, TOPIC_TRANSFER, TOPIC_V3_SWAP, UR, WETH
-from rhpools.tx_core import HISTORY_BLOCKS_PER_DAY, TOPIC_WITHDRAWAL, TxCore
+from rhpools.tx_core import HISTORY_BLOCKS_PER_DAY, HISTORY_DAYS, TOPIC_WITHDRAWAL, TxCore
+from rhpools.tx_trade_store import TradeStore
 from rhpools.tx_plan import TxError
 
 WALLET = "0x" + "44" * 20
@@ -24,7 +25,7 @@ def transfer(tx_hash, block, index, token, sender, recipient, value):
 
 
 class HistoryRPC:
-    def __init__(self, entries, latest=HISTORY_BLOCKS_PER_DAY * 7 + 10):
+    def __init__(self, entries, latest=HISTORY_BLOCKS_PER_DAY * HISTORY_DAYS + 10):
         self.entries = entries
         self.latest = latest
         self.calls = []
@@ -62,6 +63,7 @@ def make_core(rpc, clock):
     core = object.__new__(TxCore)
     core.rpc = rpc
     core._clock = lambda: clock[0]
+    core.trade_store = None
     core._lock = threading.Lock()
     core._token_meta = {}
     core._history_txs = OrderedDict()
@@ -81,7 +83,7 @@ def methods(rpc, method):
 
 
 def test_history_groups_flows_and_labels_newest_first_and_caches_wallet():
-    block = HISTORY_BLOCKS_PER_DAY * 7 + 10
+    block = HISTORY_BLOCKS_PER_DAY * HISTORY_DAYS + 10
     old_hash, old = entry(1, block - 2, [transfer("", block - 2, 0, TOKEN, WALLET, OTHER, 13)], value=8)
     new_hash, new = entry(2, block, [transfer("", block, 0, TOKEN, WALLET, OTHER, 3),
                                       transfer("", block, 0, TOKEN, WALLET, OTHER, 4),
@@ -93,20 +95,20 @@ def test_history_groups_flows_and_labels_newest_first_and_caches_wallet():
     assert [row["hash"] for row in rows] == [new_hash, old_hash]
     assert rows[0] == {"hash": new_hash, "block": block, "timestamp": block * 2,
                        "sent": [{"token": TOKEN, "amount": "7", "symbol": "ABC", "decimals": 6}],
-                       "received": [{"token": TOKEN2, "amount": "22", "symbol": "XYZ", "decimals": 8}], "via": "Pancake"}
+                       "received": [{"token": TOKEN2, "amount": "22", "symbol": "XYZ", "decimals": 8}], "via": "Pancake", "source": "chain"}
     assert rows[1]["sent"] == [{"token": TOKEN, "amount": "13", "symbol": "ABC", "decimals": 6},
                                 {"token": "native", "amount": "8", "symbol": "ETH", "decimals": 18}]
     assert rows[1]["via"] == "UR"
-    assert len(methods(rpc, "eth_getLogs")) == 14
+    assert len(methods(rpc, "eth_getLogs")) == 20
     assert core.history(WALLET)["rows"] == rows
-    assert len(methods(rpc, "eth_getLogs")) == 14
+    assert len(methods(rpc, "eth_getLogs")) == 20
     clock[0] += 16
     assert core.history(WALLET)["rows"] == rows
     assert len(methods(rpc, "eth_getTransactionReceipt")) == 2
 
 
 def test_history_traces_inbound_native_for_withdrawal_and_empty_receives():
-    block = HISTORY_BLOCKS_PER_DAY * 7 + 10
+    block = HISTORY_BLOCKS_PER_DAY * HISTORY_DAYS + 10
     withdrawn_hash, withdrawn = entry(3, block, [transfer("", block, 0, TOKEN, WALLET, OTHER, 1),
         transfer("", block, 0, TOKEN2, OTHER, WALLET, 2),
         {"address": WETH, "topics": [TOPIC_WITHDRAWAL, "0x" + UR[2:].rjust(64, "0")], "data": "0x5"}])
@@ -125,7 +127,7 @@ def test_history_traces_inbound_native_for_withdrawal_and_empty_receives():
 
 
 def test_history_caps_rows_and_traces_without_extra_log_requests():
-    block = HISTORY_BLOCKS_PER_DAY * 7 + 10
+    block = HISTORY_BLOCKS_PER_DAY * HISTORY_DAYS + 10
     entries = dict(entry(i, block - 1, [transfer("", block - 1, 0, TOKEN, WALLET, OTHER, i)]) for i in range(1, 61))
     rpc = HistoryRPC(entries, block)
     rows = make_core(rpc, [100]).history(WALLET)["rows"]
@@ -133,13 +135,13 @@ def test_history_caps_rows_and_traces_without_extra_log_requests():
     assert rows[0]["hash"] == "0x" + f"{60:064x}"
     assert rows[-1]["hash"] == "0x" + f"{41:064x}"
     assert len(methods(rpc, "debug_traceTransaction")) == 20
-    assert len(methods(rpc, "eth_getLogs")) == 14
+    assert len(methods(rpc, "eth_getLogs")) == 20
     logs = methods(rpc, "eth_getLogs")
     assert all(int(params[0]["toBlock"], 16) - int(params[0]["fromBlock"], 16) < HISTORY_BLOCKS_PER_DAY for params in logs)
 
 
 def test_history_skips_wallet_transfers_and_lp_without_losing_older_trade():
-    block = HISTORY_BLOCKS_PER_DAY * 7 + 10
+    block = HISTORY_BLOCKS_PER_DAY * HISTORY_DAYS + 10
     unrelated = dict(entry(i, block, [transfer("", block, 0, TOKEN, WALLET, OTHER, i)],
                            router=OTHER) for i in range(2, 53))
     trade_hash, trade = entry(1, block - HISTORY_BLOCKS_PER_DAY - 1,
@@ -149,7 +151,43 @@ def test_history_skips_wallet_transfers_and_lp_without_losing_older_trade():
                               router=OTHER)
     rpc = HistoryRPC({**unrelated, trade_hash: trade}, block)
     assert [row["hash"] for row in make_core(rpc, [100]).history(WALLET)["rows"]] == [trade_hash]
-    assert len(methods(rpc, "eth_getLogs")) == 14
+    assert len(methods(rpc, "eth_getLogs")) == 20
+
+
+def test_history_merges_recent_chain_with_durable_trades_and_pages_old_rows(tmp_path):
+    latest = HISTORY_BLOCKS_PER_DAY * 20
+    recent_hash, recent = entry(800, latest - 1,
+                                [transfer("", latest - 1, 0, TOKEN, WALLET, OTHER, 4)])
+    external_hash, external = entry(801, latest,
+                                    [transfer("", latest, 0, TOKEN, OTHER, WALLET, 9)])
+    rpc = HistoryRPC({recent_hash: recent, external_hash: external}, latest)
+    store = TradeStore(tmp_path / "trades.sqlite")
+    raw = {"kind": "swap", "sent": [{"token": TOKEN, "amount": "4"}], "received": [],
+           "via": "UR", "fee": {"currency": TOKEN, "amount": "1"}}
+    store.save(WALLET, {**raw, "hash": recent_hash, "block": latest - 1, "timestamp": 42})
+    oldest = latest - HISTORY_DAYS * HISTORY_BLOCKS_PER_DAY - 100
+    for index in range(55):
+        store.save(WALLET, {**raw, "hash": "0x" + f"{index + 1:064x}",
+                            "block": oldest - index, "timestamp": index})
+    core = make_core(rpc, [100])
+    core.trade_store = store
+    first = core.history(WALLET)
+    assert len(first["rows"]) == 50
+    assert [row["hash"] for row in first["rows"][:2]] == [external_hash, recent_hash]
+    assert first["rows"][0]["source"] == "chain"
+    assert first["rows"][1]["source"] == "rhpools"
+    assert first["rows"][1]["sent"] == [{"token": TOKEN, "amount": "4", "symbol": "ABC", "decimals": 6}]
+    assert first["rows"][1]["fee"] == raw["fee"]
+    assert first["next_before"] == oldest - 47
+    assert len(methods(rpc, "eth_getTransactionReceipt")) == 1
+    assert min(int(params[0]["fromBlock"], 16) for params in methods(rpc, "eth_getLogs")) == latest - HISTORY_DAYS * HISTORY_BLOCKS_PER_DAY + 1
+    rpc.calls.clear()
+    second = core.history(WALLET, first["next_before"])
+    assert len(second["rows"]) == 7
+    assert second["next_before"] is None
+    assert second["rows"][-1]["block"] == oldest - 54
+    assert not methods(rpc, "eth_getLogs")
+    assert not methods(rpc, "eth_getTransactionByHash")
 
 
 def test_history_refuses_bad_wallet_before_rpc():
