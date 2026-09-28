@@ -735,11 +735,14 @@
     const amounts = quote.amounts;
     const inDec = decimalsOf(currencyIn());
     const outDec = decimalsOf(currencyOut());
-    const pons = quote.hops.find((hop) => hop.hook_fee_bps || hop.creator_tax_bps);
+    const pons = (quote.legs || [quote]).flatMap((leg) => leg.hops).find((hop) => hop.hook_fee_bps || hop.creator_tax_bps);
     const impact = amounts.impact_bps;
     const impactClass = impact == null ? "dim" : impact >= 1000 ? "impact-bad" : impact >= 300 ? "impact-warn" : "";
     refs.quote.replaceChildren(el("table", { class: "gate-table" }, [el("tbody", {}, [
-      el("tr", {}, [el("th", { text: "route" }), el("td", { class: "trade-route", colspan: "2", text: routeText(quote) })]),
+      ...(quote.legs && quote.legs.length > 1 ? quote.legs.map((leg, i) =>
+        el("tr", {}, [el("th", { text: i ? "" : "route" }), el("td", { class: "trade-route", colspan: "2",
+          text: Number(BigInt(leg.amount_in) * 1000n / BigInt(amounts.amount_in)) / 10 + "% " + routeText(leg) })])
+      ) : [el("tr", {}, [el("th", { text: "route" }), el("td", { class: "trade-route", colspan: "2", text: routeText(quote) })])]),
       el("tr", {}, [el("th", { text: "you pay" }), el("td", {}), el("td", { class: "numeric", text: fromRaw(amounts.amount_in, inDec) + " " + symbolOf(currencyIn()) })]),
       el("tr", {}, [el("th", { text: "you get" }), el("td", {}), el("td", { class: "numeric", text: fromRaw(amounts.net_out, outDec) + " " + symbolOf(currencyOut()) })]),
       el("tr", {}, [el("th", { text: "min received" }), el("td", { class: "dim", text: state.slippage / 100 + "% slippage" }), el("td", { class: "numeric", text: fromRaw(amounts.min_out, outDec) + " " + symbolOf(currencyOut()) })]),

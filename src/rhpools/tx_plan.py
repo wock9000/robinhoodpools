@@ -1,8 +1,7 @@
-"""A swap Plan is a tuple of typed UniversalRouter commands; ``min_out`` lives in
-exactly one command and the Permit2 permit is prepended at finalize. LP plans
-target a V3 NFPM or the V4 PositionManager. Accounting reads venue Swap logs,
-ERC-20 Transfer logs and (under eth_simulateV1 traceTransfers) native
-pseudo-transfers, then reconciles them against the plan to the wei.
+"""Swap plans encode typed UniversalRouter commands or external V3 router calls.
+Split plans enforce total min-out at the final sweep and bound each leg.
+Permit2 signatures are prepended at finalize. LP plans target V3 NFPM or V4 POSM.
+Swap and transfer logs reconcile the executed amounts to the wei.
 """
 from __future__ import annotations
 
@@ -168,6 +167,23 @@ class SwapShape:
     fee_recipient: str
     fee_bps: int
 
+@dataclass(frozen=True)
+class SplitLeg:
+    route: Route
+    amount_in: int
+    amount_out: int
+
+
+@dataclass(frozen=True)
+class Split:
+    legs: tuple[SplitLeg, ...]
+
+    def __post_init__(self) -> None:
+        if not 1 <= len(self.legs) <= 3 or any(leg.amount_in <= 0 for leg in self.legs):
+            raise ValueError("split needs one to three positive legs")
+
+
+
 
 @dataclass(frozen=True)
 class LpShape:
@@ -186,6 +202,7 @@ class SwapBody:
     commands: tuple[UrCommand, ...]
     min_out_index: int
     shape: SwapShape
+    split: Split | None = None
 
 
 
@@ -397,12 +414,14 @@ class Ledger:
                 raise TxError("unobservable", f"no native flow for {who}") from None
         return self.received(currency, who) - self.sent(currency, who)
 
-    def hop_io(self, hop: Hop) -> tuple[int, int]:
+    def hop_io(self, hop: Hop, *, occurrence: int | None = None) -> tuple[int, int]:
         key = hop.pool.id if hop.pool.venue is Venue.V4 else hop.pool.address
         matches = [s for s in self.swaps if s.pool_key == key]
-        if len(matches) != 1:
+        if occurrence is None and len(matches) != 1:
             raise TxError("unmodeled_fee", f"expected one Swap log for {key[:10]}, saw {len(matches)}")
-        swap = matches[0]
+        if (occurrence or 0) >= len(matches):
+            raise TxError("unmodeled_fee", f"expected Swap log {(occurrence or 0) + 1} for {key[:10]}, saw {len(matches)}")
+        swap = matches[occurrence or 0]
         zero_in = hop.currency_in == hop.pool.token0
         a_in, a_out = (swap.amount0, swap.amount1) if zero_in else (swap.amount1, swap.amount0)
         if swap.venue is Venue.V3:
@@ -453,6 +472,60 @@ def swap_amounts(shape: SwapShape, ledger: Ledger, hook_policy: Callable[[Pool],
         if spent != shape.amount_in:
             raise TxError("unmodeled_fee", f"wallet spent {spent}, expected {shape.amount_in}")
     return Amounts(shape.amount_in, pool_out, hook_fee, creator_tax, rhpools_fee, net_out, 0, None)
+
+
+def split_amounts(shape: SwapShape, split: Split, ledger: Ledger,
+                  hook_policy: Callable[[Pool], HookPolicy], *, net_shares: bool = False) -> tuple[Amounts, Split]:
+    fee_in = _floor_bps(shape.amount_in, shape.fee_bps) if shape.fee_leg is FeeLeg.INPUT else 0
+    net_input = shape.amount_in - fee_in
+    allocated = 0
+    seen: dict[str, int] = {}
+    outs: list[SplitLeg] = []
+    pool_out = 0
+    hook_total = creator_total = 0
+    hook_currency = None
+    if net_shares and sum(leg.amount_in for leg in split.legs) != net_input:
+        raise TxError("unmodeled_fee", "split inputs do not cover the order")
+    for index, leg in enumerate(split.legs):
+        share = (leg.amount_in if net_shares else net_input - allocated if index == len(split.legs) - 1
+                 else leg.amount_in * net_input // shape.amount_in)
+        allocated += share
+        carry = share
+        for hop in leg.route.hops:
+            key = hop.pool.id if hop.pool.venue is Venue.V4 else hop.pool.address
+            hop_in, hop_out = ledger.hop_io(hop, occurrence=seen.get(key, 0))
+            seen[key] = seen.get(key, 0) + 1
+            if hop_in != carry:
+                raise TxError("unmodeled_fee", f"hop input {hop_in} != carried {carry}")
+            carry = hop_out
+            policy = hook_policy(hop.pool)
+            if policy.is_pons:
+                hook_total += _floor_bps(hop_out, policy.hook_fee_bps)
+                creator_total += _floor_bps(hop_out, policy.creator_tax_bps)
+                hook_currency = hop.currency_out
+                carry -= _floor_bps(hop_out, policy.hook_fee_bps) + _floor_bps(hop_out, policy.creator_tax_bps)
+        pool_out += hop_out
+        outs.append(replace(leg, amount_out=carry))
+    gross_out = sum(leg.amount_out for leg in outs)
+    fee = fee_in if shape.fee_leg is FeeLeg.INPUT else _floor_bps(gross_out, shape.fee_bps)
+    net_out = gross_out - (fee if shape.fee_leg is FeeLeg.OUTPUT else 0)
+    if shape.fee_leg is FeeLeg.OUTPUT and gross_out:
+        distributed = 0
+        for index, leg in enumerate(outs):
+            net_leg = net_out - distributed if index == len(outs) - 1 else leg.amount_out * net_out // gross_out
+            distributed += net_leg
+            outs[index] = replace(leg, amount_out=net_leg)
+    if ledger.observable(shape.fee_currency) and ledger.received(shape.fee_currency, shape.fee_recipient) != fee:
+        raise TxError("unmodeled_fee", "split fee transfer differs from stated fee")
+    if ledger.observable(shape.currency_out) and ledger.flow(shape.currency_out, shape.wallet) != net_out:
+        raise TxError("unmodeled_fee", "split wallet output differs from stated output")
+    if shape.currency_in != NATIVE and ledger.sent(shape.currency_in, shape.wallet) != shape.amount_in:
+        raise TxError("unmodeled_fee", "split wallet input differs from stated input")
+    amounts = Amounts(shape.amount_in, pool_out,
+                      Fee(hook_currency, hook_total) if hook_currency else None,
+                      Fee(hook_currency, creator_total) if hook_currency else None,
+                      Fee(shape.fee_currency, fee), net_out, 0, None)
+    return amounts, Split(tuple(outs))
 
 
 def min_out_for(net_out: int, slippage_bps: int) -> int:
@@ -566,6 +639,59 @@ class SwapPlanner:
         )
         return Plan(UR, value, deadline, SwapBody(tuple(commands), min_out_index, shape), approvals, permit, staging)
 
+    def plan_split(self, intent: SwapIntent, split: Split, policy: TxPolicy, deadline: int, permit_nonce: int) -> Plan:
+        if len(split.legs) == 1:
+            return self.plan(intent, split.legs[0].route, policy, deadline, permit_nonce)
+        if sum(leg.amount_in for leg in split.legs) != intent.amount_in:
+            raise TxError("internal", "split does not cover the order")
+        base = self.plan(intent, split.legs[0].route, policy, deadline, permit_nonce)
+        if base.to != UR or not isinstance(base.body, SwapBody):
+            raise TxError("internal", "split route cannot execute in UniversalRouter")
+        commands: list[UrCommand] = []
+        if intent.currency_in != NATIVE:
+            commands.append(Permit2TransferFrom(intent.currency_in, ADDRESS_THIS, intent.amount_in))
+        if intent.fee_leg is FeeLeg.INPUT:
+            commands.append(PayPortion(intent.currency_in, policy.fee_recipient, policy.fee_bps))
+        net_input = intent.amount_in - (_floor_bps(intent.amount_in, policy.fee_bps) if intent.fee_leg is FeeLeg.INPUT else 0)
+        allocated = 0
+        for leg_index, leg in enumerate(split.legs):
+            route = leg.route
+            if not same_asset(route.currency_in, intent.currency_in) or not same_asset(route.currency_out, intent.currency_out):
+                raise TxError("internal", "split route does not serve the intent")
+            share = net_input - allocated if leg_index == len(split.legs) - 1 else leg.amount_in * net_input // intent.amount_in
+            allocated += share
+            held = intent.currency_in
+            for hop_index, hop in enumerate(route.hops):
+                if hop.currency_in != held:
+                    commands.append(WrapEth(ADDRESS_THIS, share if hop_index == 0 else CONTRACT_BALANCE)
+                                    if held == NATIVE else UnwrapWeth(ADDRESS_THIS, 0))
+                    held = hop.currency_in
+                command = _hop_command(hop, ADDRESS_THIS, 0)
+                if hop_index == 0:
+                    if isinstance(command, (V2Swap, V3Swap)):
+                        command = replace(command, amount_in=share)
+                    elif isinstance(command, V4Swap):
+                        command = replace(command, params=tuple(
+                            replace(param, amount=share) if isinstance(param, V4Settle) else
+                            replace(param, amount_in=share) if isinstance(param, V4SwapExactInSingle) else param
+                            for param in command.params
+                        ))
+                commands.append(command)
+                held = hop.currency_out
+            if held == NATIVE and intent.currency_out == NATIVE:
+                commands.append(WrapEth(ADDRESS_THIS, CONTRACT_BALANCE))
+                held = WETH
+            elif held != intent.currency_out:
+                commands.append(WrapEth(ADDRESS_THIS, CONTRACT_BALANCE) if held == NATIVE else UnwrapWeth(ADDRESS_THIS, 0))
+                held = intent.currency_out
+        output = WETH if intent.currency_out == NATIVE else intent.currency_out
+        if intent.fee_leg is FeeLeg.OUTPUT:
+            commands.append(PayPortion(output, policy.fee_recipient, policy.fee_bps))
+        commands.append(UnwrapWeth(MSG_SENDER, 0) if intent.currency_out == NATIVE
+                        else Sweep(output, MSG_SENDER, 0))
+        shape = replace(base.shape, fee_currency=output) if intent.fee_leg is FeeLeg.OUTPUT else base.shape
+        return replace(base, body=SwapBody(tuple(commands), len(commands) - 1, shape, split))
+
     def finalize(self, plan: Plan, min_out: int, sigs: Signatures) -> Plan:
         body = plan.body
         if isinstance(body, RouterBody):
@@ -579,6 +705,16 @@ class SwapPlanner:
             raise TxError("permit_required", "the quote needs a Permit2 signature")
         commands = list(body.commands)
         commands[body.min_out_index] = _with_min_out(commands[body.min_out_index], min_out)
+        if body.split is not None and len(body.split.legs) > 1:
+            swaps = [i for i, command in enumerate(commands) if isinstance(command, (V2Swap, V3Swap, V4Swap))]
+            total = sum(leg.amount_out for leg in body.split.legs)
+            if total:
+                count = assigned = 0
+                for index, leg in enumerate(body.split.legs):
+                    count += len(leg.route.hops)
+                    bound = min_out - assigned if index == len(body.split.legs) - 1 else min_out * leg.amount_out // total
+                    assigned += bound
+                    commands[swaps[count - 1]] = _with_min_out(commands[swaps[count - 1]], bound)
         return replace(plan, body=replace(body, commands=tuple(commands)), signature=sigs.permit)
 
 

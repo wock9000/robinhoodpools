@@ -1,6 +1,7 @@
 """The shared transaction core. Never signs, never sends; the wallet signs what it is handed."""
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -32,14 +33,16 @@ from .tx_chain import (
 )
 from .tx_plan import (
     Amounts, Call, FeeLeg, Ledger, LpAmounts, LpIntent, LpOp, LpPlanner, LpShape, Plan,
-    PositionState, Signatures, SwapIntent, SwapPlanner, SwapShape, TxError, TxPolicy,
-    TxRefusal, impact_bps, min_out_for, swap_amounts,
+    PositionState, Signatures, Split, SplitLeg, SwapIntent, SwapPlanner, SwapShape, TxError, TxPolicy,
+    TxRefusal, impact_bps, min_out_for, split_amounts, swap_amounts,
 )
 from .tx_routes import QUOTE_CURRENCIES, Hop, same_asset, IncompletePool, Pool, Route, RouteBook, Side, Venue, v4_pool
 
 DEADLINE_GRACE_S = 60
 IMPACT_DIVISOR = 100
 BALANCE_SLOT_SEARCH = 64
+SPLIT_STEPS = 20
+SPLIT_WORKERS = 12
 GAS_HEADROOM_PCT = 130
 ESTIMATE_HEADROOM_PCT = 125
 _ADDRESS_RE = re.compile(r"^0x[0-9a-f]{40}$")
@@ -197,24 +200,33 @@ class SwapQuote(QuoteBase):
     intent: SwapIntent
     route: Route
     amounts: Amounts
+    split: Split
     hop_policies: tuple[tuple[int, int], ...] = ()
+    leg_policies: tuple[tuple[tuple[int, int], ...], ...] = ()
     have: int | None = None
 
     def to_json(self) -> dict[str, Any]:
-        policies = self.hop_policies or tuple((0, 0) for _ in self.route.hops)
-        return {
-            **self._base_json(),
-            "kind": "swap",
-            "intent": self.intent.to_json(),
-            "route": self.route.describe(),
-            "hops": [
+        def hops(route: Route, policies: tuple[tuple[int, int], ...]) -> list[dict[str, Any]]:
+            return [
                 {
                     "venue": hop.pool.venue.value, "dex": DEX_BY_FACTORY.get(hop.pool.factory or "", "uniswap"),
                     "pool_id": hop.pool.id, "fee_ppm": hop.pool.fee_ppm,
                     "currency_in": hop.currency_in, "currency_out": hop.currency_out,
                     "hook_fee_bps": hook_bps, "creator_tax_bps": creator_bps,
                 }
-                for hop, (hook_bps, creator_bps) in zip(self.route.hops, policies)
+                for hop, (hook_bps, creator_bps) in zip(route.hops, policies)
+            ]
+
+        return {
+            **self._base_json(),
+            "kind": "swap",
+            "intent": self.intent.to_json(),
+            "route": self.route.describe(),
+            "hops": hops(self.route, self.hop_policies),
+            "legs": [
+                {"route": leg.route.describe(), "hops": hops(leg.route, policies),
+                 "amount_in": str(leg.amount_in), "amount_out": str(leg.amount_out)}
+                for leg, policies in zip(self.split.legs, self.leg_policies)
             ],
             "amounts": self.amounts.to_json(),
             "shortfall": None if self.have is None else {
@@ -304,6 +316,25 @@ def _abi_string(value: Any) -> str:
 def _signed24(value: int) -> int:
     value &= 0xFFFFFF
     return value - (1 << 24) if value >= 1 << 23 else value
+
+
+def allocate_split(routes: list[Route], curves: list[list[int | None]], amount: int) -> Split:
+    counts = [0] * len(routes)
+    for _ in range(SPLIT_STEPS):
+        options = [
+            (curve[count + 1] - curve[count], index)
+            for index, curve in enumerate(curves)
+            for count in (counts[index],)
+            if count < SPLIT_STEPS and curve[count] is not None and curve[count + 1] is not None
+            and (count or sum(value > 0 for value in counts) < 3)
+        ]
+        if not options:
+            raise TxError("no_route", "no executable split allocation")
+        counts[max(options)[1]] += 1
+    legs = tuple(SplitLeg(route, amount * count // SPLIT_STEPS, curve[count] or 0)
+                 for route, curve, count in zip(routes, curves, counts) if count)
+    remainder = amount - sum(leg.amount_in for leg in legs)
+    return Split((*legs[:-1], replace(legs[-1], amount_in=legs[-1].amount_in + remainder)))
 
 
 class TxCore:
@@ -495,6 +526,35 @@ class TxCore:
             return plan, sim, None, exc
         return plan, sim, amounts, None
 
+    def _simulate_split(self, intent: SwapIntent, split: Split, deadline: int, nonce: int, tag: str,
+                        funded: dict[str, Any] | None, *, enforce_min: bool = False) -> tuple[Plan, SimResult, Amounts, Split] | None:
+        plan = self.swaps.plan_split(intent, split, self.policy, deadline, nonce)
+        sim = self.sim.run(intent.wallet, plan.staging, Call(plan.to, plan.calldata(), plan.value), tag, funded)
+        if not sim.ok:
+            return None
+        try:
+            amounts, measured = split_amounts(plan.shape, split, Ledger(sim.logs, traced=True), self.routes.hook_policy)
+        except TxError:
+            return None
+        if enforce_min:
+            bound = min_out_for(amounts.net_out, intent.slippage_bps)
+            exact_plan = self.swaps.finalize(
+                replace(plan, permit=None, body=replace(plan.body, split=measured)), bound, Signatures()
+            )
+            exact = self.sim.run(intent.wallet, plan.staging, Call(plan.to, exact_plan.calldata(), plan.value), tag, funded)
+            if not exact.ok:
+                return None
+            try:
+                verified, verified_split = split_amounts(
+                    plan.shape, split, Ledger(exact.logs, traced=True), self.routes.hook_policy
+                )
+            except TxError:
+                return None
+            if verified.net_out != amounts.net_out:
+                return None
+            sim, amounts, measured = exact, verified, verified_split
+        return plan, sim, amounts, measured
+
     def _quote_swap(self, intent: SwapIntent) -> SwapQuote:
         intent = self._validate_swap(intent)
         block = self._header("latest")
@@ -514,22 +574,81 @@ class TxCore:
         nonce = 0 if intent.currency_in == NATIVE else self._permit_nonce(intent.wallet, intent.currency_in, UR, tag)
         best: tuple[Plan, SimResult, Amounts, Route] | None = None
         failures: list[tuple[Route, TxError]] = []
-        for route in candidates:
-            plan, sim, amounts, failure = self._simulate_swap(intent, route, deadline, nonce, tag, funded)
-            if amounts is None:
-                assert failure is not None
-                failures.append((route, failure))
-                continue
-            if best is None or amounts.net_out > best[2].net_out:
-                best = (plan, sim, amounts, route)
+        with ThreadPoolExecutor(max_workers=SPLIT_WORKERS) as executor:
+            full = list(executor.map(
+                lambda route: self._simulate_swap(intent, route, deadline, nonce, tag, funded), candidates
+            ))
+            ur_routes: list[Route] = []
+            ur_full: list[Amounts] = []
+            for route, (candidate_plan, candidate_sim, candidate_amounts, failure) in zip(candidates, full):
+                if candidate_amounts is None:
+                    assert failure is not None
+                    failures.append((route, failure))
+                    continue
+                if best is None or candidate_amounts.net_out > best[2].net_out:
+                    best = (candidate_plan, candidate_sim, candidate_amounts, route)
+                if candidate_plan.to == UR:
+                    ur_routes.append(route)
+                    ur_full.append(candidate_amounts)
+            split_choice = None
+            if best is not None and len(ur_routes) > 1 and intent.amount_in >= SPLIT_STEPS:
+                samples = [(i, k) for i in range(len(ur_routes)) for k in range(1, SPLIT_STEPS)]
+                def sample(pair: tuple[int, int]) -> int | None:
+                    i, k = pair
+                    share = intent.amount_in * k // SPLIT_STEPS
+                    try:
+                        _, _, got, _ = self._simulate_swap(
+                            replace(intent, amount_in=share), ur_routes[i], deadline, nonce, tag, funded
+                        )
+                        return got.net_out if got else None
+                    except TxError:
+                        return None
+                sampled = list(executor.map(sample, samples))
+                curves: list[list[int | None]] = [[0] + [None] * (SPLIT_STEPS - 1) + [got.net_out] for got in ur_full]
+                for (i, k), out in zip(samples, sampled):
+                    curves[i][k] = out
+                try:
+                    proposed = allocate_split(ur_routes, curves, intent.amount_in)
+                    if len(proposed.legs) > 1:
+                        split_choice = self._simulate_split(intent, proposed, deadline, nonce, tag, funded, enforce_min=True)
+                except TxError:
+                    pass
         if best is None:
             codes = {f.code for _, f in failures}
             code = next(iter(codes)) if codes <= {"insufficient_balance", "unmodeled_fee"} and len(codes) == 1 else "no_route"
             raise TxRefusal(code, "; ".join(f"{r.describe()}: {f}" for r, f in failures)[:400])
         plan, sim, amounts, route = best
+        split = Split((SplitLeg(route, intent.amount_in, amounts.net_out),))
+        if split_choice is not None:
+            split_plan, split_sim, split_amounts_result, measured = split_choice
+            improvement = split_amounts_result.net_out - amounts.net_out
+            gas_cost_out = None
+            if improvement > 0 and (intent.currency_out in (NATIVE, WETH) or intent.currency_in in (NATIVE, WETH)):
+                try:
+                    gas_price = _hex_int(self.rpc.call("eth_gasPrice", []), "gas price")
+                    gas_wei = max(0, split_sim.gas_used - sim.gas_used) * gas_price
+                    gas_cost_out = (gas_wei if intent.currency_out in (NATIVE, WETH)
+                                    else gas_wei * amounts.net_out // intent.amount_in)
+                except (TxError, RuntimeError, ValueError):
+                    pass
+            threshold = gas_cost_out if gas_cost_out is not None else amounts.net_out // 1000
+            if improvement > threshold:
+                plan, sim, amounts, split = split_plan, split_sim, split_amounts_result, measured
+                route = split.legs[0].route
+                plan = replace(plan, body=replace(plan.body, split=split))
         warnings: list[str] = []
         small_intent = replace(intent, amount_in=max(1, intent.amount_in // IMPACT_DIVISOR))
-        _, _, small, _ = self._simulate_swap(small_intent, route, deadline, nonce, tag, funded)
+        if len(split.legs) == 1:
+            _, _, small, _ = self._simulate_swap(small_intent, route, deadline, nonce, tag, funded)
+        else:
+            small_shares = [small_intent.amount_in * leg.amount_in // intent.amount_in for leg in split.legs]
+            small_shares[-1] += small_intent.amount_in - sum(small_shares)
+            if all(small_shares):
+                small_split = Split(tuple(SplitLeg(leg.route, share, 0) for leg, share in zip(split.legs, small_shares)))
+                result = self._simulate_split(small_intent, small_split, deadline, nonce, tag, funded)
+                small = result[2] if result else None
+            else:
+                small = None
         impact = impact_bps(amounts, small) if small is not None else None
         if impact is None:
             warnings.append("impact_unavailable")
@@ -552,6 +671,12 @@ class TxCore:
             intent=intent,
             route=route,
             amounts=amounts,
+            split=split,
+            leg_policies=tuple(
+                tuple((policy.hook_fee_bps, policy.creator_tax_bps)
+                      for policy in (self.routes.hook_policy(hop.pool) for hop in leg.route.hops))
+                for leg in split.legs
+            ),
             hop_policies=tuple(
                 (policy.hook_fee_bps, policy.creator_tax_bps)
                 for policy in (self.routes.hook_policy(hop.pool) for hop in route.hops)
@@ -755,12 +880,13 @@ class TxCore:
         gas = max(sim.gas_used * GAS_HEADROOM_PCT // 100, estimate * ESTIMATE_HEADROOM_PCT // 100)
         return Prepared(self._tx(wallet, plan.to, data, plan.value, gas), sim.gas_used, quote.expires_at)
 
-    def _swap_shape(self, wallet: str, data: bytes, value: int) -> SwapShape:
+    def _swap_shape(self, wallet: str, data: bytes, value: int) -> SwapShape | tuple[SwapShape, Split]:
         commands, _ = decode_ur_execute(data)
         amount_in, currency_in = value, NATIVE
         fee: PayPortion | None = None
         fee_leg = FeeLeg.INPUT
         hops: list[Hop] = []
+        starts: list[tuple[int, int]] = []
         currency_out: str | None = None
         for command in commands:
             if isinstance(command, Permit2TransferFrom):
@@ -769,6 +895,8 @@ class TxCore:
                 fee = command
                 fee_leg = FeeLeg.OUTPUT if hops else FeeLeg.INPUT
             elif isinstance(command, V3Swap):
+                if command.amount_in != 1 << 255:
+                    starts.append((len(hops), command.amount_in))
                 tokens, fees = decode_v3_path(command.path)
                 for a, b, fee_ppm in zip(tokens, tokens[1:], fees):
                     pool = self.routes.pool_for(Venue.V3, a, b, fee_ppm)
@@ -776,6 +904,8 @@ class TxCore:
                         raise TxError("unknown_pool", f"no indexed V3 pool for {a}/{b}")
                     hops.append(Hop(pool, a, b))
             elif isinstance(command, V2Swap):
+                if command.amount_in != 1 << 255:
+                    starts.append((len(hops), command.amount_in))
                 for a, b in zip(command.path, command.path[1:]):
                     pool = self.routes.pool_for(Venue.V2, a, b)
                     if pool is None:
@@ -783,6 +913,8 @@ class TxCore:
                     hops.append(Hop(pool, a, b))
             elif isinstance(command, V4Swap):
                 single = next(p for p in command.params if isinstance(p, V4SwapExactInSingle))
+                if single.amount_in:
+                    starts.append((len(hops), single.amount_in))
                 key = single.key
                 pool = v4_pool(key)
                 cin, cout = (key.currency0, key.currency1) if single.zero_for_one else (key.currency1, key.currency0)
@@ -793,8 +925,15 @@ class TxCore:
                 currency_out = NATIVE
         if fee is None or not hops:
             raise TxError("unknown_target", "calldata is not an rhpools swap")
-        route = Route(tuple(hops))
-        return SwapShape(
+        split = None
+        if len(starts) > 1:
+            legs = tuple(SplitLeg(Route(tuple(hops[start:end])), share, 0)
+                         for (start, share), (end, _) in zip(starts, [*starts[1:], (len(hops), 0)]))
+            split = Split(legs)
+            route = split.legs[0].route
+        else:
+            route = Route(tuple(hops))
+        shape = SwapShape(
             wallet=wallet,
             route=route,
             currency_in=currency_in,
@@ -805,6 +944,7 @@ class TxCore:
             fee_recipient=fee.recipient,
             fee_bps=fee.bips,
         )
+        return (shape, split) if split else shape
 
     def _router_swap_shape(self, wallet: str, to: str, data: bytes, value: int) -> SwapShape:
         pancake = to == PANCAKE_SMART_ROUTER
@@ -929,7 +1069,12 @@ class TxCore:
         logs = list(receipt.get("logs", []))
         tag = hex(block)
         if to == UR:
-            amounts: Amounts | LpAmounts = swap_amounts(self._swap_shape(wallet, data, value), Ledger(logs, traced=False), self.routes.hook_policy)
+            parsed = self._swap_shape(wallet, data, value)
+            ledger = Ledger(logs, traced=False)
+            amounts: Amounts | LpAmounts = (
+                split_amounts(parsed[0], parsed[1], ledger, self.routes.hook_policy, net_shares=True)[0]
+                if isinstance(parsed, tuple) else swap_amounts(parsed, ledger, self.routes.hook_policy)
+            )
         elif to in (GIGA_SWAP_ROUTER, PANCAKE_SMART_ROUTER, SLIPSTREAM_SWAP_ROUTER):
             shape = self._router_swap_shape(wallet, to, data, value)
             native_flows = {}

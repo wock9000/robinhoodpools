@@ -41,6 +41,7 @@ FEE_TO = "0x00000000000000000000000000000000000fee75"
 ITH = "0xb3377f953994c6fa04383a64d88aa8122e81fd62"
 PIPEDOG = "0x5cb6f181081301b44905f3ae15419112ecabd8a6"
 ASTRO = "0x5b81efe5e0ba2b31c0ed843b908a2c45fe6e14c5"
+SPLIT_ASSET = "0xc6911796042b15d7fa4f6cde69e245ddcd3d9c31"
 PONS_POOL = "0xeda3dbcd4b745a70d04a92293bb7dcb3d9de234bd59e2773574a259cfe6f3fb0"
 V4_ETH_USDG = PoolKey(NATIVE, USDG, 500, 10, NATIVE).id()
 UNI_WETH_USDG = "0x52e65b17fb6e5ba00ed806f37afcd2daa50271ca"
@@ -61,6 +62,9 @@ POOL_ROWS = [
     (PONS_POOL, "v4", POOL_MANAGER, NATIVE, ITH, 0, 200, PONS_HOOK, POOL_MANAGER),
     ("0xb7f10f74b39291b9290b779978e19a7637c742d6", "v3", "0xb7f10f74b39291b9290b779978e19a7637c742d6", WETH, PIPEDOG, 10000, 200, None, UR_V3_FACTORY),
     ("0x3416b8d8aa6ae642ffdc2f65165ff479d4bd3007", "v2", "0x3416b8d8aa6ae642ffdc2f65165ff479d4bd3007", WETH, ASTRO, None, None, None, UR_V2_FACTORY),
+    ("0x9cc8c4f6118419a27f113723f1dea646685be55f", "v3", "0x9cc8c4f6118419a27f113723f1dea646685be55f", WETH, SPLIT_ASSET, 500, 10, None, UR_V3_FACTORY),
+    ("0x7a11bc7f32aea2f81e83da399c70315d9662869c", "v3", "0x7a11bc7f32aea2f81e83da399c70315d9662869c", WETH, SPLIT_ASSET, 3000, 60, None, UR_V3_FACTORY),
+    ("0xd95e8e2cd04c207625c6f23c974d365a5f3a91d3", "v2", "0xd95e8e2cd04c207625c6f23c974d365a5f3a91d3", WETH, SPLIT_ASSET, None, None, None, UR_V2_FACTORY),
     (UNI_WETH_USDG, "v3", UNI_WETH_USDG, WETH, USDG, 100, 1, None, UR_V3_FACTORY),
     (PANCAKE_WETH_USDG, "v3", PANCAKE_WETH_USDG, WETH, USDG, 500, 10, None, PANCAKE_FACTORY),
     (GIGA_WETH_USDG, "v3", GIGA_WETH_USDG, WETH, USDG, 100, 1, None, GIGA_FACTORY),
@@ -346,6 +350,23 @@ def test_pons_buy_and_sell_from_eth(core, fork):
     assert [h.pool.venue.value for h in quote.route.hops] == ["v4"]
     assert quote.amounts.rhpools_fee.currency == NATIVE
     assert quote.amounts.hook_fee.currency == NATIVE
+
+
+def test_split_routing_real_pools(core, fork):
+    small = core.quote(swap(fork.user, Side.BUY, SPLIT_ASSET, NATIVE, 10**17))
+    assert len(small.split.legs) == 1
+    start = time.perf_counter()
+    measured = core.quote(swap(fork.user, Side.BUY, SPLIT_ASSET, NATIVE, 5 * 10**18))
+    latency = time.perf_counter() - start
+    assert len(measured.split.legs) > 1
+    quote, fill = trade(core, fork, swap(fork.user, Side.BUY, SPLIT_ASSET, NATIVE, 5 * 10**18))
+    assert 2 <= len(quote.split.legs) <= 3
+    assert len({leg.route.hops[-1].pool.id for leg in quote.split.legs}) > 1
+    assert sum(leg.amount_in for leg in quote.split.legs) == quote.intent.amount_in
+    assert quote.amounts.rhpools_fee.amount == 5 * 10**18 * 75 // 10_000
+    assert fill.amounts.net_out == quote.amounts.net_out
+    assert quote.to_json()["legs"][0]["amount_in"] == str(quote.split.legs[0].amount_in)
+    print(f"split fork quote: {latency:.3f}s, {len(quote.split.legs)} legs, fee {quote.amounts.rhpools_fee.amount} wei, received {fill.amounts.net_out} wei")
 
 
 def test_v3_token_buy_and_sell(core, fork):
