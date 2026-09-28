@@ -1067,7 +1067,18 @@
     setTextCell(cells[7], valuation, "dim");
     setTextCell(cells[8], item.status || "open", "dim");
     const poolId = item.pool_id || "";
-    setNodeCell(cells[9], `${poolId}|${state.ownerAddress}`, "cyan", () => internalPoolLink(poolId, state.ownerAddress));
+    setNodeCell(cells[9], `${poolId}|${state.ownerAddress}|${item.token_id}|${window.rhpGate?.snapshot().wallet || ""}`, "cyan", () => {
+      const link = internalPoolLink(poolId, state.ownerAddress);
+      const wallet = window.rhpGate?.snapshot().wallet;
+      if (wallet && wallet.toLowerCase() === state.ownerAddress && item.token_id && poolId) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = "manage";
+        button.addEventListener("click", () => window.rhpTrade?.open({ mode: "lp", pool: poolId, tokenId: item.token_id }));
+        link.append(" ", button);
+      }
+      return link;
+    });
   }
 
   function patchOwnerClosedRow(row, item) {
@@ -3186,6 +3197,29 @@
   });
   elements.paneReset.addEventListener("click", resetPaneLayouts);
   PANE_LAYOUT_MEDIA.addEventListener("change", applyPaneLayout);
+  const sectionLinks = Array.from(document.querySelectorAll('.section-nav > a[href^="#"]'))
+    .filter((link) => ["#search", "#tape-section", "#owners-section", "#pools-section"].includes(link.getAttribute("href")));
+  function activateSection() {
+    const hash = sectionLinks.some((link) => link.getAttribute("href") === location.hash) ? location.hash : "#tape-section";
+    sectionLinks.forEach((link) => {
+      if (link.getAttribute("href") === hash) link.setAttribute("aria-current", "location");
+      else link.removeAttribute("aria-current");
+    });
+    if (hash === "#search") {
+      elements.lpSearchInput.focus();
+    } else if (!PANE_LAYOUT_MEDIA.matches) {
+      const index = ["#tape-section", "#owners-section", "#pools-section"].indexOf(hash);
+      const sizes = [0.12, 0.12, 0.12];
+      sizes[index] = 0.76;
+      setPaneProperties("desktop", sizes);
+      requestAnimationFrame(updatePaneSeparatorValues);
+    }
+  }
+  sectionLinks.forEach((link) => link.addEventListener("click", () => {
+    if (location.hash === link.getAttribute("href")) activateSection();
+  }));
+  window.addEventListener("hashchange", activateSection);
+  activateSection();
   byId("pools-table").addEventListener("click", (event) => {
     const button = event.target.closest("[data-pool-sort]");
     if (button) setPoolSort(button.dataset.poolSort);
@@ -3329,6 +3363,7 @@
   reloadTape("initial");
   const initialOwner = String(initialUrl.searchParams.get("owner") || "").toLowerCase();
   if (ADDRESS_RE.test(initialOwner)) openOwner(initialOwner, null, "replace");
+  window.rhpTerminal = { openOwner: (address) => openOwner(address, document.activeElement) };
   requestAnimationFrame(() => {
     setTimeout(() => {
       startSummaryObservers();
