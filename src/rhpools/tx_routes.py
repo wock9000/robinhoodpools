@@ -130,6 +130,7 @@ class IncompletePool(ValueError):
 
 
 TICK_SPACING_CANDIDATES = (1, 10, 50, 60, 100, 200)
+V2_FEE_PPM = 3000
 
 
 def _pool_from_row(row: tuple[Any, ...], *, strict: bool = False) -> Pool | None:
@@ -159,7 +160,7 @@ def _pool_from_row(row: tuple[Any, ...], *, strict: bool = False) -> Pool | None
         address=(address or "").lower(),
         token0=token0.lower(),
         token1=token1.lower(),
-        fee_ppm=int(fee_ppm or 0),
+        fee_ppm=V2_FEE_PPM if protocol == "v2" else int(fee_ppm or 0),
         tick_spacing=int(tick_spacing or 0),
         hook=(hook or NATIVE).lower(),
         factory=(factory or "").lower(),
@@ -180,7 +181,7 @@ DEFAULT_BRIDGES: tuple[Pool, ...] = (
     Pool(Venue.V3, "0xb2a6ad51b3ea3cdc8d3508cca147a43471382e53", "0xb2a6ad51b3ea3cdc8d3508cca147a43471382e53", WETH, USDG, 100, 1, NATIVE, GIGA_V3_FACTORY),
     Pool(Venue.V3, "0x88a8e96e7785d378825e8b5d7fc0e6f62487061e", "0x88a8e96e7785d378825e8b5d7fc0e6f62487061e", WETH, USDG, 500, 10, NATIVE, PANCAKE_V3_FACTORY),
     Pool(Venue.V3, "0x16679e2ac1a798865ecf1c1639e67693ddb1c220", "0x16679e2ac1a798865ecf1c1639e67693ddb1c220", WETH, USDG, 89, 10, NATIVE, SLIPSTREAM_FACTORY),
-    Pool(Venue.V2, "0x8803c117ccae7b5146297876c2a25df135141c4d", "0x8803c117ccae7b5146297876c2a25df135141c4d", WETH, USDG, 0, 0, NATIVE, UR_V2_FACTORY),
+    Pool(Venue.V2, "0x8803c117ccae7b5146297876c2a25df135141c4d", "0x8803c117ccae7b5146297876c2a25df135141c4d", WETH, USDG, V2_FEE_PPM, 0, NATIVE, UR_V2_FACTORY),
     v4_pool(PoolKey(NATIVE, USDG, 500, 10, NATIVE)),
 )
 

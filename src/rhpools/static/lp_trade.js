@@ -154,6 +154,7 @@
   function clearQuote() {
     state.seq++;
     state.quote = null;
+    if (settled()) Object.assign(state, { phase: "idle", hash: null, fill: null, note: null });
     clearInterval(requoteTimer);
     requoteTimer = null;
   }

@@ -593,7 +593,6 @@ select:focus { border-color: var(--text); color: var(--text); }
   .terminal-footer #footer-state { grid-column: 1 / -1; grid-row: 1; justify-self: stretch; text-align: center; }
   .terminal-footer .sponsor-credit { grid-row: 2; }
   .terminal-footer .footer-meta { grid-row: 2; }
-  .terminal-footer .read-only-label { display: none; }
 }
 
 .pool-inspector {
