@@ -363,6 +363,14 @@ def test_v3_token_buy_and_sell(core, fork):
     assert quote.amounts.rhpools_fee.currency == WETH
 
 
+def test_usdg_bought_and_sold_against_eth(core, fork):
+    quote, _ = trade(core, fork, swap(fork.user, Side.BUY, USDG, NATIVE, 10**16))
+    assert len(quote.route.hops) == 1
+    held = fork.balance(USDG, fork.user)
+    quote, _ = trade(core, fork, swap(fork.user, Side.SELL, USDG, NATIVE, held // 2))
+    assert len(quote.route.hops) == 1 and quote.amounts.rhpools_fee.currency == WETH
+
+
 def test_v2_token_buy_and_sell(core, fork):
     quote, _ = trade(core, fork, swap(fork.user, Side.BUY, ASTRO, NATIVE, 10**16))
     assert [h.pool.venue.value for h in quote.route.hops] == ["v2"]

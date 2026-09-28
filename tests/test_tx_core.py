@@ -130,7 +130,8 @@ class FakeRPC:
             return hex(self.balances.get((NATIVE, params[0].lower()), 0))
         if method == "eth_simulateV1":
             assert self.simulate is not None, "no simulation scripted"
-            calls = params[0]["blockStateCalls"][0]["calls"]
+            self.last_state = params[0]["blockStateCalls"][0]
+            calls = self.last_state["calls"]
             outs = [{"status": "0x1", "logs": [], "gasUsed": "0x5208"} for _ in calls[:-1]]
             outs.append(self.simulate(calls[-1], params[1]))
             return [{"calls": outs}]
@@ -489,10 +490,30 @@ def test_quote_picks_best_route_and_reports_failures(core, rpc):
     assert refused.value.code == "no_route" and "slippage" in refused.value.detail
 
 
+def test_underfunded_buy_is_priced_but_not_preparable(core, rpc):
+    rpc.balances[(NATIVE, WALLET)] = 10**17
+    rpc.simulate = v3_buy_simulation(4_000_000)
+    quote = core.quote(buy_intent())
+    assert rpc.last_state["stateOverrides"] == {WALLET: {"balance": hex(10**18)}}
+    assert quote.amounts.net_out == 4_000_000
+    assert quote.to_json()["shortfall"] == {"currency": NATIVE, "have": str(10**17), "need": str(10**18)}
+    with pytest.raises(TxRefusal) as refused:
+        core.prepare(quote.quote_id, WALLET, Signatures())
+    assert refused.value.code == "insufficient_balance"
+    rpc.balances[(NATIVE, WALLET)] = 10**20
+    assert core.prepare(quote.quote_id, WALLET, Signatures()).transaction["value"] == hex(10**18)
+
+
 def test_quote_refusals(core, rpc):
     with pytest.raises(TxRefusal) as refused:
-        core.quote(buy_intent(amount_in=10**21))
+        core.quote(buy_intent(quote_currency=USDG, amount_in=10**13))
     assert refused.value.code == "insufficient_balance"
+    with pytest.raises(TxError) as err:
+        core.quote(buy_intent(token=WETH, quote_currency=NATIVE))
+    assert err.value.code == "invalid_intent"
+    with pytest.raises(TxRefusal) as refused:
+        core.quote(buy_intent(wallet=FEE_TO))
+    assert refused.value.code == "fee_wallet"
     with pytest.raises(TxRefusal) as refused:
         core.quote(buy_intent(token="0x" + "ee" * 20))
     assert refused.value.code == "no_route"

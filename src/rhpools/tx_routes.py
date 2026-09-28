@@ -263,7 +263,7 @@ class RouteBook:
 
     def candidates(self, token: str, quote_currency: str, side: Side) -> list[Route]:
         token = token.lower()
-        if quote_currency not in QUOTE_CURRENCIES or token in QUOTE_CURRENCIES:
+        if quote_currency not in QUOTE_CURRENCIES or same_asset(token, quote_currency):
             return []
         direct: list[Route] = []
         bridged: list[Route] = []

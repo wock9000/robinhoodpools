@@ -13,6 +13,7 @@ from typing import Any
 from urllib.request import Request, urlopen
 
 from eth_abi import decode
+from eth_utils import keccak
 from . import tx_allowlist
 from .tx_chain import (
     ADD_GOVERNING_FLAGS, CHAIN_ID, DEX_BY_FACTORY, GIGA_SWAP_ROUTER, GIGA_V3_FACTORY, MSG_SENDER, NATIVE,
@@ -34,10 +35,11 @@ from .tx_plan import (
     PositionState, Signatures, SwapIntent, SwapPlanner, SwapShape, TxError, TxPolicy,
     TxRefusal, impact_bps, min_out_for, swap_amounts,
 )
-from .tx_routes import QUOTE_CURRENCIES, Hop, IncompletePool, Pool, Route, RouteBook, Side, Venue, v4_pool
+from .tx_routes import QUOTE_CURRENCIES, Hop, same_asset, IncompletePool, Pool, Route, RouteBook, Side, Venue, v4_pool
 
 DEADLINE_GRACE_S = 60
 IMPACT_DIVISOR = 100
+BALANCE_SLOT_SEARCH = 64
 GAS_HEADROOM_PCT = 130
 _ADDRESS_RE = re.compile(r"^0x[0-9a-f]{40}$")
 _HASH_RE = re.compile(r"^0x[0-9a-f]{64}$")
@@ -96,12 +98,14 @@ class Simulator:
     def __init__(self, rpc: Any) -> None:
         self._rpc = rpc
 
-    def run(self, wallet: str, staging: tuple[Call, ...], call: Call, block: str) -> SimResult:
+    def run(self, wallet: str, staging: tuple[Call, ...], call: Call, block: str,
+            overrides: dict[str, Any] | None = None) -> SimResult:
         calls = [
             {"from": wallet, "to": c.to, "data": "0x" + c.data.hex(), "value": hex(c.value)}
             for c in (*staging, call)
         ]
-        params = [{"blockStateCalls": [{"calls": calls}], "traceTransfers": True, "validation": False}, block]
+        state = {"calls": calls, **({"stateOverrides": overrides} if overrides else {})}
+        params = [{"blockStateCalls": [state], "traceTransfers": True, "validation": False}, block]
         try:
             result = self._rpc.call("eth_simulateV1", params)
         except Exception as exc:
@@ -118,6 +122,10 @@ class Simulator:
         if last.get("status") == "0x1":
             return SimResult(True, list(last.get("logs", [])), gas, None)
         return SimResult(False, [], gas, decode_revert(_revert_bytes(last)))
+
+
+def _mapping_key(holder: str, slot: int) -> str:
+    return "0x" + keccak(bytes.fromhex(holder[2:].rjust(64, "0")) + slot.to_bytes(32, "big")).hex()
 
 
 def _revert_bytes(out: dict[str, Any]) -> bytes:
@@ -189,6 +197,7 @@ class SwapQuote(QuoteBase):
     route: Route
     amounts: Amounts
     hop_policies: tuple[tuple[int, int], ...] = ()
+    have: int | None = None
 
     def to_json(self) -> dict[str, Any]:
         policies = self.hop_policies or tuple((0, 0) for _ in self.route.hops)
@@ -207,6 +216,9 @@ class SwapQuote(QuoteBase):
                 for hop, (hook_bps, creator_bps) in zip(self.route.hops, policies)
             ],
             "amounts": self.amounts.to_json(),
+            "shortfall": None if self.have is None else {
+                "currency": self.intent.currency_in, "have": str(self.have), "need": str(self.intent.amount_in),
+            },
         }
 
 
@@ -317,6 +329,7 @@ class TxCore:
         self.sim = Simulator(rpc)
         self._quotes: dict[str, Quote] = {}
         self._token_meta: dict[str, tuple[int, str]] = {}
+        self._balance_slots: dict[str, int | None] = {}
         self._lock = threading.Lock()
         self.mismatches = tx_allowlist.verify(rpc)
 
@@ -350,6 +363,33 @@ class TxCore:
         if currency == NATIVE:
             return _hex_int(self.rpc.call("eth_getBalance", [wallet, tag]), "balance")
         return _word(self._call(currency, erc20_balance_of(wallet), tag))
+
+    def _balance_slot(self, token: str, tag: str) -> int | None:
+        with self._lock:
+            if token in self._balance_slots:
+                return self._balance_slots[token]
+        probe, marker = "0x" + "de" * 20, (1 << 128) + 7
+        found = None
+        for slot in range(BALANCE_SLOT_SEARCH):
+            key = _mapping_key(probe, slot)
+            out = self.rpc.call("eth_call", [
+                {"to": token, "data": "0x" + erc20_balance_of(probe).hex()}, tag,
+                {token: {"stateDiff": {key: "0x" + marker.to_bytes(32, "big").hex()}}},
+            ])
+            if _word(out) == marker:
+                found = slot
+                break
+        with self._lock:
+            self._balance_slots[token] = found
+        return found
+
+    def _funded(self, currency: str, wallet: str, amount: int, tag: str) -> dict[str, Any] | None:
+        if currency == NATIVE:
+            return {wallet: {"balance": hex(amount)}}
+        slot = self._balance_slot(currency, tag)
+        if slot is None:
+            return None
+        return {currency: {"stateDiff": {_mapping_key(wallet, slot): "0x" + amount.to_bytes(32, "big").hex()}}}
 
     def _allowance(self, token: str, owner: str, spender: str, tag: str) -> int:
         return _word(self._call(token, erc20_allowance(owner, spender), tag))
@@ -427,10 +467,12 @@ class TxCore:
             token=_address(intent.token, "token"),
             quote_currency=_address(intent.quote_currency, "quote_currency"),
         )
+        if intent.wallet == self.policy.fee_recipient:
+            raise TxRefusal("fee_wallet", "the fee recipient cannot pay itself a fee")
         if intent.quote_currency not in QUOTE_CURRENCIES:
             raise TxError("invalid_intent", "quote_currency must be ETH, WETH or USDG")
-        if intent.token in QUOTE_CURRENCIES:
-            raise TxError("invalid_intent", "token must not be a quote currency")
+        if same_asset(intent.token, intent.quote_currency):
+            raise TxError("invalid_intent", "token and pay-with currency are the same asset")
         if not isinstance(intent.amount_in, int) or isinstance(intent.amount_in, bool) or not 0 < intent.amount_in < 1 << 160:
             raise TxError("invalid_intent", "amount_in must be a positive integer below 2**160")
         if not isinstance(intent.slippage_bps, int) or not 0 <= intent.slippage_bps <= 5_000:
@@ -439,9 +481,10 @@ class TxCore:
             raise TxError("invalid_intent", "side must be buy or sell")
         return intent
 
-    def _simulate_swap(self, intent: SwapIntent, route: Route, deadline: int, nonce: int, tag: str) -> tuple[Plan, SimResult, Amounts | None, TxError | None]:
+    def _simulate_swap(self, intent: SwapIntent, route: Route, deadline: int, nonce: int, tag: str,
+                       funded: dict[str, Any] | None = None) -> tuple[Plan, SimResult, Amounts | None, TxError | None]:
         plan = self.swaps.plan(intent, route, self.policy, deadline, nonce)
-        sim = self.sim.run(intent.wallet, plan.staging, Call(plan.to, plan.calldata(), plan.value), tag)
+        sim = self.sim.run(intent.wallet, plan.staging, Call(plan.to, plan.calldata(), plan.value), tag, funded)
         if not sim.ok:
             assert sim.revert is not None
             return plan, sim, None, TxError(sim.revert.kind, f"{sim.revert.selector} {sim.revert.detail}".strip())
@@ -455,8 +498,12 @@ class TxCore:
         intent = self._validate_swap(intent)
         block = self._header("latest")
         tag = hex(block.number)
-        if self._balance(intent.currency_in, intent.wallet, tag) < intent.amount_in:
-            raise TxRefusal("insufficient_balance", "wallet holds less than amount_in")
+        have = self._balance(intent.currency_in, intent.wallet, tag)
+        funded = None
+        if have < intent.amount_in:
+            funded = self._funded(intent.currency_in, intent.wallet, intent.amount_in, tag)
+            if funded is None:
+                raise TxRefusal("insufficient_balance", "wallet holds less than amount_in")
         candidates = self.routes.candidates(intent.token, intent.quote_currency, intent.side)
         if not candidates:
             factories = sorted({pool.factory for pool in self.routes.token_pools(intent.token) if not pool.swappable})
@@ -467,7 +514,7 @@ class TxCore:
         best: tuple[Plan, SimResult, Amounts, Route] | None = None
         failures: list[tuple[Route, TxError]] = []
         for route in candidates:
-            plan, sim, amounts, failure = self._simulate_swap(intent, route, deadline, nonce, tag)
+            plan, sim, amounts, failure = self._simulate_swap(intent, route, deadline, nonce, tag, funded)
             if amounts is None:
                 assert failure is not None
                 failures.append((route, failure))
@@ -481,7 +528,7 @@ class TxCore:
         plan, sim, amounts, route = best
         warnings: list[str] = []
         small_intent = replace(intent, amount_in=max(1, intent.amount_in // IMPACT_DIVISOR))
-        _, _, small, _ = self._simulate_swap(small_intent, route, deadline, nonce, tag)
+        _, _, small, _ = self._simulate_swap(small_intent, route, deadline, nonce, tag, funded)
         impact = impact_bps(amounts, small) if small is not None else None
         if impact is None:
             warnings.append("impact_unavailable")
@@ -508,6 +555,7 @@ class TxCore:
                 (policy.hook_fee_bps, policy.creator_tax_bps)
                 for policy in (self.routes.hook_policy(hop.pool) for hop in route.hops)
             ),
+            have=None if funded is None else have,
         )
         self._store(quote)
         return quote
@@ -681,6 +729,8 @@ class TxCore:
         self._require_enabled()
         if self._header(hex(quote.block.number)).hash != quote.block.hash:
             raise TxError("reorg", "quoted block was reorganized; re-quote")
+        if isinstance(quote, SwapQuote) and self._balance(quote.intent.currency_in, wallet, "latest") < quote.intent.amount_in:
+            raise TxRefusal("insufficient_balance", "wallet holds less than amount_in; fund it and re-quote")
         for need in quote.plan.approvals:
             if self._allowance(need.token, wallet, need.spender, "latest") < need.required:
                 raise TxError("approve_pending", f"approve {need.token} for {need.spender} first")
