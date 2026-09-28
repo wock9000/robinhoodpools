@@ -1,6 +1,6 @@
-"""Loopback dev server: terminal + real gate on an anvil fork with the stand-in token. Not committed.
+"""Loopback dev server: terminal + real gate on an anvil fork with the stand-in token.
 
-    .venv/bin/python .audit/dev_gate_server.py [--port 8196]
+    .venv/bin/python .audit/dev_gate_server.py [--port 8297]
 """
 from __future__ import annotations
 
@@ -59,7 +59,7 @@ def market(tmp: Path):
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", type=int, default=8196)
+    ap.add_argument("--port", type=int, default=8297)
     args = ap.parse_args()
     owner, holder, poor = (fresh_key(keccak(text=f"rhpools dev {name}")) for name in ("owner", "holder", "nobody"))
     tmp = Path(tempfile.mkdtemp(prefix="rhp-gate-dev-"))

@@ -153,8 +153,13 @@ def main() -> int:
     ap.add_argument("--threshold-usdg", type=float, default=1.0)
     args = ap.parse_args()
     STATE.mkdir(parents=True, exist_ok=True)
-    owner = keys.PrivateKey(bytes.fromhex((SECRETS / "owner.key").read_text().strip()[2:]))
+    owner_file = STATE / "preview-owner.key"
+    if not owner_file.exists():
+        owner_file.write_text(keys.PrivateKey(os.urandom(32)).to_hex() + "\n")
+        owner_file.chmod(0o600)
+    owner = keys.PrivateKey(bytes.fromhex(owner_file.read_text().strip()[2:]))
     owner_address = owner.public_key.to_checksum_address()
+    fee_recipient = (SECRETS / "owner.address").read_text().strip().lower()
     hosts = frozenset({f"localhost:{args.port}"})
     gate = Gate(STATE / "gate.sqlite", owner=owner_address, rpc_url=RPC, hosts=hosts)
     if gate.policy().version == 0:
@@ -163,7 +168,7 @@ def main() -> int:
     runtime = stub_runtime()
     runtime.lp = SimpleNamespace(store=SimpleNamespace(reader_snapshot=market_reader, close_reader=lambda: None))
     runtime.gate = gate
-    runtime.tx = TxCore(rpc, RouteBook(market_reader, rpc), TxPolicy(75, owner_address.lower()))
+    runtime.tx = TxCore(rpc, RouteBook(market_reader, rpc), TxPolicy(75, fee_recipient))
     runtime.tx_unavailable = None if runtime.tx.enabled else "pinned contract code changed; trading disabled"
     dsn = next((line.split("=", 1)[1].strip() for line in (SECRETS / "listener.env").read_text().splitlines()
                 if line.startswith("RHP_LISTENER_DSN=")), None)
@@ -177,7 +182,8 @@ def main() -> int:
     policy = gate.policy()
     print(f"preview   http://localhost:{args.port}/  (branch UI; market data from production 127.0.0.1:8196, read-only)")
     print(f"chain     real Robinhood Chain {CHAIN_ID} via {RPC}; transactions spend real funds")
-    print(f"owner     {owner_address}  (policy signer and fee recipient)")
+    print(f"owner     {owner_address}  (preview-only policy signer)")
+    print(f"fee to    {fee_recipient}")
     print(f"gate      token USDG, holder threshold {int(policy.threshold['trade']) / 10**6} USDG, grace {policy.grace_s} s")
     print(f"tx core   enabled={runtime.tx.enabled} {runtime.tx_unavailable or ''}", flush=True)
     stopping = threading.Event()

@@ -23,6 +23,7 @@ RestartSec=5s
 TimeoutStopSec=120s
 LimitNOFILE=8192
 NoNewPrivileges=true
+InaccessiblePaths=-%h/.secrets
 UMask=0077
 StandardOutput=journal
 StandardError=journal
