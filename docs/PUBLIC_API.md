@@ -128,7 +128,8 @@ discard successful reads for other pools.
 
 ### `GET /api/v1/assets`
 
-This route reuses the pools endpoint's canonical snapshot and groups matches by:
+This route groups the entire verified known token catalog at one canonical
+snapshot block by:
 
 1. protocol;
 2. fee mode and exact configured fee field;
@@ -145,10 +146,12 @@ Every term therefore has the same currency and raw unit. `value_raw` is exact;
 The subtotal's `coverage` is `partial` if any pool in the group lacks a reserve
 measurement.
 
-`/api/v1/assets` requires a complete matching-pool snapshot. It rejects a
-token with more than 200 matching identity candidates with `400` rather than
-returning partial groups or a misleading reserve subtotal. `limit` and
-`offset` are not accepted on this route.
+`/api/v1/assets` does not paginate: it retains all verified pool identities
+and groups, even for tokens with more than 200 pools. Its block-pinned state
+reads cover at most 512 pools per response. `coverage.state.pools_over_limit`,
+group `state_coverage`, and each V2 subtotal's `coverage` and `pools_missing`
+show which measurements were unavailable; a partial sum is never labelled
+complete. `limit` and `offset` are not accepted on this route.
 
 The route never:
 
@@ -244,8 +247,10 @@ Use `occurred_at` and, when available, `observed_at` as evidence times.
 
 For pool and asset responses, the service obtains the Robinhood Chain head,
 executes contract calls using that exact block number, and confirms the block
-hash again before publication. Responses can be cached for up to 2 seconds;
-use `snapshot.block_number`, `snapshot.block_hash`, and `snapshot.timestamp`,
+hash again before publication. The in-process response cache lasts 2 seconds.
+HTTP responses use `Cache-Control: public, max-age=2, stale-while-revalidate=10`;
+intermediaries may serve an older response during the 10-second stale window.
+Use `snapshot.block_number`, `snapshot.block_hash`, and `snapshot.timestamp`,
 not HTTP arrival time, as freshness evidence.
 
 Coverage dimensions are independent:

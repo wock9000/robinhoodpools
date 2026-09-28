@@ -39,7 +39,7 @@
         "tags": ["Market"],
         "operationId": "getPoolsByToken",
         "summary": "List one bounded page of pools matching a token",
-        "description": "Returns up to 200 verified rows in deterministic pool-id order. `pool_count` counts distinct matching stored and indexed catalog identity candidates before per-page verification, so malformed or conflicting candidates may be omitted. `next_offset` continues the scan; independent requests may see catalog or chain changes. The response is published only after block-pinned calls and canonical hash confirmation. `coverage.catalog` reports omissions on this page, `coverage.history` qualifies event history, and `coverage.state` qualifies this page's state reads. Responses can be cached for up to 2 seconds.",
+        "description": "Returns up to 200 verified rows in deterministic pool-id order. `pool_count` counts distinct matching stored and indexed catalog identity candidates before per-page verification, so malformed or conflicting candidates may be omitted. `next_offset` continues the scan; independent requests may see catalog or chain changes. The response is published only after block-pinned calls and canonical hash confirmation. `coverage.catalog` reports omissions on this page, `coverage.history` qualifies event history, and `coverage.state` qualifies this page's state reads. In-process caching lasts 2 seconds; HTTP Cache-Control uses max-age=2, stale-while-revalidate=10.",
         "parameters": [
           {"$ref": "#/components/parameters/Token"},
           {"$ref": "#/components/parameters/PoolLimit"},
@@ -67,7 +67,7 @@
         "tags": ["Market"],
         "operationId": "getAssetGroupsByToken",
         "summary": "Group matching pools into unit-safe asset aggregates",
-        "description": "Requires a complete token snapshot and rejects tokens with more than 200 matching identity candidates with 400 instead of returning incomplete groups or reserve subtotals. Groups by protocol, exact fee configuration, tick spacing, and hooks. Only same-token V2 reserves have a cross-pool subtotal. Concentrated-liquidity raw L is pool-specific and is never added across pools. Supplying `limit` or `offset` is an error.",
+        "description": "Returns complete verified known-pool identities and configuration groups, including tokens with more than 200 matches. Block-pinned state reads cover at most 512 pools per response; `coverage.state.pools_over_limit`, group state coverage, and partial V2 subtotals disclose missing measurements. Groups use protocol, exact fee configuration, tick spacing, and hooks. Only same-token V2 reserves have a cross-pool subtotal. Concentrated-liquidity raw L is pool-specific and is never added across pools. Supplying `limit` or `offset` is an error. In-process caching lasts 2 seconds; HTTP Cache-Control uses max-age=2, stale-while-revalidate=10.",
         "parameters": [
           {"$ref": "#/components/parameters/Token"}
         ],
@@ -451,7 +451,7 @@
         "required": ["scope", "returned_matching_pools", "known_catalog_pools", "known_catalog_state", "complete_for_known_catalog", "full_chain_complete", "historical_continuity", "historical_gap_count", "factory_tail", "omitted_records", "omission_reasons", "limitation"],
         "properties": {
           "scope": {"type": "string"},
-          "returned_matching_pools": {"type": "integer", "minimum": 0, "description": "Verified rows returned on this page, not a token-wide total."},
+          "returned_matching_pools": {"type": "integer", "minimum": 0, "description": "Verified rows in the pools page or complete assets snapshot."},
           "known_catalog_pools": {"type": ["integer", "null"], "minimum": 0},
           "known_catalog_state": {"type": "string"},
           "complete_for_known_catalog": {"type": "boolean"},
@@ -459,7 +459,7 @@
           "historical_continuity": {"type": "string"},
           "historical_gap_count": {"type": ["integer", "null"], "minimum": 0},
           "factory_tail": {"$ref": "#/components/schemas/FactoryTail"},
-          "omitted_records": {"type": "integer", "minimum": 0, "description": "Identity candidates omitted on this page only."},
+          "omitted_records": {"type": "integer", "minimum": 0, "description": "Identity candidates omitted from the pools page or complete assets snapshot."},
           "omission_reasons": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
           "limitation": {"type": "string"}
         },
@@ -502,16 +502,16 @@
           "unavailable_pools"
         ],
         "properties": {
-          "requested_pools": {"type": "integer", "minimum": 0, "description": "Verified pools on this page."},
+          "requested_pools": {"type": "integer", "minimum": 0, "description": "Verified pools on this page or in the complete assets snapshot."},
           "state_read_limit": {
             "type": "integer",
             "minimum": 1,
-            "description": "Per-request bound on block-pinned contract reads. Pools pages contain at most 200 candidates; assets rejects larger token censuses."
+            "description": "Bound on block-pinned pool state reads: at most 200 pools per pools page and 512 pools per assets response."
           },
           "pools_over_limit": {
             "type": "integer",
             "minimum": 0,
-            "description": "Page pools exceeding the state-read limit, if any."
+            "description": "Assets pools beyond the 512-state-read budget; they remain in configuration groups with explicit unavailable measurements."
           },
           "available_pools": {"type": "integer", "minimum": 0},
           "unavailable_pools": {"type": "integer", "minimum": 0}

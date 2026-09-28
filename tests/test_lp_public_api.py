@@ -243,6 +243,7 @@ def test_lookup_matches_both_currency_sides_and_recovers_canonical_dynamic_v4_ke
     try:
         result = api.pools({"token": TOKEN.upper().replace("0X", "0x")})
         assert result["pool_count"] == 3
+        assert [row["pool_id"] for row in result["pools"]] == sorted((v2, v3, v4))
         assert {row["matched_currency"] for row in result["pools"]} == {
             "currency0", "currency1",
         }
@@ -405,9 +406,43 @@ def test_token_pages_include_all_matches_without_fetching_other_pages():
             api.pools({"token": TOKEN, "limit": "201"})
         with pytest.raises(ValueError, match="offset"):
             api.pools({"token": TOKEN, "offset": "-1"})
-        with pytest.raises(ValueError, match="complete"):
-            api.assets({"token": TOKEN})
-        assert rpc.multicalls == 3
+        assets = api.assets({"token": TOKEN})
+        assert assets["pool_count"] == 205
+        assert assets["groups"][0]["pool_count"] == 205
+        assert assets["groups"][0]["state_coverage"]["measured_pools"] == 205
+        assert assets["coverage"]["state"]["requested_pools"] == 205
+        assert rpc.multicalls == 4
+    finally:
+        api.close()
+        store.close()
+
+
+def test_assets_keep_all_pool_identities_and_qualify_reserve_sum_beyond_state_budget():
+    pool_ids = [f"0x{index + 1:040x}" for index in range(513)]
+    store = MarketStore(":memory:")
+    _insert(store, [_pool(pool_id, "v2", TOKEN, HIGH) for pool_id in pool_ids])
+    rpc = SnapshotRpc({
+        (pool_id, RESERVES_SELECTOR): abi_encode(
+            ["uint112", "uint112", "uint32"], [1, 10, 0],
+        )
+        for pool_id in pool_ids
+    })
+    api = PublicMarketAPI(Service(store, rpc), cache_ttl=0)
+    try:
+        result = api.assets({"token": TOKEN})
+        assert result["pool_count"] == 513
+        assert result["snapshot"]["canonical"] is True
+        assert result["coverage"]["state"]["pools_over_limit"] == 1
+        group = result["groups"][0]
+        assert group["pool_ids"] == pool_ids
+        assert group["state_coverage"] == {
+            "state": "partial", "measured_pools": 512, "missing_pools": 1,
+        }
+        subtotal = group["subtotals"][0]
+        assert subtotal["value_raw"] == "512"
+        assert subtotal["pools_measured"] == 512
+        assert subtotal["pools_missing"] == 1
+        assert subtotal["coverage"] == "partial"
     finally:
         api.close()
         store.close()
