@@ -38,14 +38,16 @@
       "get": {
         "tags": ["Market"],
         "operationId": "getPoolsByToken",
-        "summary": "List every verified known pool containing a token",
-        "description": "Returns all matches in the verified known catalog without output pagination. The response is published only after all state calls are pinned to one block number and that block's canonical hash is confirmed. `coverage.catalog` qualifies discovery completeness, `coverage.history` independently qualifies indexed event history, and `coverage.state` reports current state-read availability. Supplying `limit` or `offset` is an error rather than a result cap.",
+        "summary": "List one bounded page of pools matching a token",
+        "description": "Returns up to 200 verified rows in deterministic pool-id order. `pool_count` counts distinct matching stored and indexed catalog identity candidates before per-page verification, so malformed or conflicting candidates may be omitted. `next_offset` continues the scan; independent requests may see catalog or chain changes. The response is published only after block-pinned calls and canonical hash confirmation. `coverage.catalog` reports omissions on this page, `coverage.history` qualifies event history, and `coverage.state` qualifies this page's state reads. Responses can be cached for up to 2 seconds.",
         "parameters": [
-          {"$ref": "#/components/parameters/Token"}
+          {"$ref": "#/components/parameters/Token"},
+          {"$ref": "#/components/parameters/PoolLimit"},
+          {"$ref": "#/components/parameters/PoolOffset"}
         ],
         "responses": {
           "200": {
-            "description": "Every verified known match, including explicit nulls and reasons for pool state that could not be read.",
+            "description": "One verified page, including explicit nulls and reasons for pool state that could not be read.",
             "headers": {
               "Access-Control-Allow-Origin": {"$ref": "#/components/headers/PublicCors"}
             },
@@ -65,7 +67,7 @@
         "tags": ["Market"],
         "operationId": "getAssetGroupsByToken",
         "summary": "Group matching pools into unit-safe asset aggregates",
-        "description": "Uses the same canonical pool snapshot as `/api/v1/pools` and groups matches by protocol, exact fee configuration, tick spacing, and hooks. Only same-token V2 reserves have a cross-pool subtotal. Concentrated-liquidity raw L, unlike reserves, is pool-specific and is never added across pools. Supplying `limit` or `offset` is an error.",
+        "description": "Requires a complete token snapshot and rejects tokens with more than 200 matching identity candidates with 400 instead of returning incomplete groups or reserve subtotals. Groups by protocol, exact fee configuration, tick spacing, and hooks. Only same-token V2 reserves have a cross-pool subtotal. Concentrated-liquidity raw L is pool-specific and is never added across pools. Supplying `limit` or `offset` is an error.",
         "parameters": [
           {"$ref": "#/components/parameters/Token"}
         ],
@@ -161,6 +163,20 @@
         "required": true,
         "description": "A 0x-prefixed 20-byte currency address. Input hex is case-insensitive and output is normalized to lowercase. The native currency is represented by the zero address.",
         "schema": {"$ref": "#/components/schemas/AddressInput"}
+      },
+      "PoolLimit": {
+        "name": "limit",
+        "in": "query",
+        "required": false,
+        "description": "Maximum number of matching identity candidates inspected on this page.",
+        "schema": {"type": "integer", "minimum": 1, "maximum": 200, "default": 100}
+      },
+      "PoolOffset": {
+        "name": "offset",
+        "in": "query",
+        "required": false,
+        "description": "Zero-based offset into the deterministic identity-candidate ordering.",
+        "schema": {"type": "integer", "minimum": 0, "default": 0}
       },
       "Owner": {
         "name": "owner",
@@ -435,7 +451,7 @@
         "required": ["scope", "returned_matching_pools", "known_catalog_pools", "known_catalog_state", "complete_for_known_catalog", "full_chain_complete", "historical_continuity", "historical_gap_count", "factory_tail", "omitted_records", "omission_reasons", "limitation"],
         "properties": {
           "scope": {"type": "string"},
-          "returned_matching_pools": {"type": "integer", "minimum": 0},
+          "returned_matching_pools": {"type": "integer", "minimum": 0, "description": "Verified rows returned on this page, not a token-wide total."},
           "known_catalog_pools": {"type": ["integer", "null"], "minimum": 0},
           "known_catalog_state": {"type": "string"},
           "complete_for_known_catalog": {"type": "boolean"},
@@ -443,7 +459,7 @@
           "historical_continuity": {"type": "string"},
           "historical_gap_count": {"type": ["integer", "null"], "minimum": 0},
           "factory_tail": {"$ref": "#/components/schemas/FactoryTail"},
-          "omitted_records": {"type": "integer", "minimum": 0},
+          "omitted_records": {"type": "integer", "minimum": 0, "description": "Identity candidates omitted on this page only."},
           "omission_reasons": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
           "limitation": {"type": "string"}
         },
@@ -486,16 +502,16 @@
           "unavailable_pools"
         ],
         "properties": {
-          "requested_pools": {"type": "integer", "minimum": 0},
+          "requested_pools": {"type": "integer", "minimum": 0, "description": "Verified pools on this page."},
           "state_read_limit": {
             "type": "integer",
             "minimum": 1,
-            "description": "Per-request bound on block-pinned contract reads. Pools beyond it keep their catalog row and return unavailable state with reason state_read_budget, selected most-recently-active first."
+            "description": "Per-request bound on block-pinned contract reads. Pools pages contain at most 200 candidates; assets rejects larger token censuses."
           },
           "pools_over_limit": {
             "type": "integer",
             "minimum": 0,
-            "description": "Matching pools beyond the state-read limit; their liquidity and current dynamic fee are not read and are reported unavailable rather than dropped."
+            "description": "Page pools exceeding the state-read limit, if any."
           },
           "available_pools": {"type": "integer", "minimum": 0},
           "unavailable_pools": {"type": "integer", "minimum": 0}
@@ -514,13 +530,16 @@
       },
       "PoolsResponse": {
         "type": "object",
-        "required": ["chain_id", "token", "snapshot", "pool_count", "pools", "coverage"],
+        "required": ["chain_id", "token", "snapshot", "pool_count", "limit", "offset", "next_offset", "pools", "coverage"],
         "properties": {
           "chain_id": {"type": "integer", "const": 4663},
           "token": {"$ref": "#/components/schemas/Address"},
           "snapshot": {"$ref": "#/components/schemas/Snapshot"},
-          "pool_count": {"type": "integer", "minimum": 0},
-          "pools": {"type": "array", "items": {"$ref": "#/components/schemas/Pool"}},
+          "pool_count": {"type": "integer", "minimum": 0, "description": "Total distinct matching identity candidates before per-page identity validation."},
+          "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+          "offset": {"type": "integer", "minimum": 0},
+          "next_offset": {"type": ["integer", "null"], "minimum": 0},
+          "pools": {"type": "array", "maxItems": 200, "items": {"$ref": "#/components/schemas/Pool"}},
           "coverage": {"$ref": "#/components/schemas/PoolCoverage"}
         },
         "additionalProperties": false

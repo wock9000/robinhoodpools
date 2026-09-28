@@ -8,7 +8,7 @@ The API exposes four `GET` routes:
 
 | Route | Purpose |
 | --- | --- |
-| `/api/v1/pools` | Every verified known pool containing a token, with current block-pinned state |
+| `/api/v1/pools` | One bounded page of matching known-pool identity candidates, with current block-pinned state for verified rows |
 | `/api/v1/assets` | Unit-safe configuration groups and defensible V2 reserve subtotals |
 | `/api/v1/research/owner` | Bounded, coverage-qualified owner allocation, configuration, and lifecycle research |
 | `/api/v1/fomo/flow` | One bounded, attributed page from a selected anonymous public flow publisher |
@@ -53,32 +53,40 @@ curl --fail --get 'https://rhpools.lol/api/v1/assets' \
 ### `GET /api/v1/pools`
 
 A pool matches when the queried address is either `currency0.address` or
-`currency1.address`; `matched_currency` identifies the side. The route returns
-every verified known match. There is no output pagination: supplying `limit` or
-`offset` is a `400` error rather than a silent cap.
+`currency1.address`; `matched_currency` identifies the side. Responses use
+deterministic pool-id order. `limit` defaults to 100 and accepts integers from
+1 through 200; `offset` defaults to 0 and accepts nonnegative integers. Pass
+`next_offset` as the next request's `offset` until it is null. Invalid values
+return `400`. Repeating a page may see a changed catalog or chain head; the
+offset is not a stable cross-request snapshot cursor.
 
 The response contains:
 
 - `chain_id`, the normalized `token`, `pool_count`, and `pools`;
+- `limit`, `offset`, and nullable `next_offset`;
 - `snapshot`, the exact current block number, hash, timestamp, canonical
   confirmation basis, and state-read transports;
-- `coverage.catalog`, which qualifies the verified known census and any omitted
-  malformed or conflicting catalog records;
+- `coverage.catalog`, which qualifies the known census and malformed,
+  conflicting, or missing identity records found on this page;
 - `coverage.history`, which separately describes indexed canonical event
   history; and
 - `coverage.state`, which counts available and unavailable current liquidity
-  reads.
+  reads **on this page**, not across all matching pools.
 
-“Every verified known match” does not mean every pool deployed on-chain.
-`coverage.catalog.complete_for_known_catalog` applies only to supported known
-factories and the indexed V4 PoolManager catalog.
+`pool_count` counts distinct matching identities in the stored-pool and ready
+catalog-search indexes before per-page identity verification. A malformed or
+conflicting candidate can be absent from `pools`; `coverage.catalog.omitted_records`
+and `omission_reasons` describe exclusions on the returned page only. Thus
+`pool_count` is a candidate total, not a guarantee that every page contains
+`limit` verified rows. `coverage.catalog.complete_for_known_catalog` only
+qualifies the returned page within supported known factories and the indexed
+V4 PoolManager catalog. It does not assert full-chain discovery.
 
 Verified pool identities are cached separately from current liquidity snapshots
 and invalidated when pool or token metadata changes. Recovering an omitted V4
 tick spacing reuses candidates from previously verified PoolKeys, but each
-candidate must still reproduce the requested pool hash. Large-token responses
-remain complete rather than silently capped; state reads use bounded RPC
-batches and retain the exact-block confirmation described above.
+candidate must still reproduce the requested pool hash. Pages cap state reads
+to at most 200 pools and preserve the exact-block confirmation described above.
 
 ### Pool identity and dynamic fees
 
@@ -136,6 +144,11 @@ Every term therefore has the same currency and raw unit. `value_raw` is exact;
 `value_decimal` is non-null only when token decimals are consistent and known.
 The subtotal's `coverage` is `partial` if any pool in the group lacks a reserve
 measurement.
+
+`/api/v1/assets` requires a complete matching-pool snapshot. It rejects a
+token with more than 200 matching identity candidates with `400` rather than
+returning partial groups or a misleading reserve subtotal. `limit` and
+`offset` are not accepted on this route.
 
 The route never:
 
@@ -231,9 +244,9 @@ Use `occurred_at` and, when available, `observed_at` as evidence times.
 
 For pool and asset responses, the service obtains the Robinhood Chain head,
 executes contract calls using that exact block number, and confirms the block
-hash again before publication. An otherwise valid response may be briefly
-cached; use `snapshot.block_number`, `snapshot.block_hash`, and
-`snapshot.timestamp`, not HTTP arrival time, as freshness evidence.
+hash again before publication. Responses can be cached for up to 2 seconds;
+use `snapshot.block_number`, `snapshot.block_hash`, and `snapshot.timestamp`,
+not HTTP arrival time, as freshness evidence.
 
 Coverage dimensions are independent:
 
@@ -246,6 +259,12 @@ Coverage dimensions are independent:
   identity scope, omissions, and evidence.
 
 Preserve nulls and these qualifications in derived data.
+
+### Terminal LP search
+
+The terminal's `/api/lp/search` counts all matching indexed prefix terms in
+`total`. Its top results are ranked only within bounded candidates; `total`
+does not mean every matching result was ranked. Search uses the existing index.
 
 ### Terminal wallet accounting
 
