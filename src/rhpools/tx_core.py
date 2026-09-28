@@ -41,6 +41,7 @@ DEADLINE_GRACE_S = 60
 IMPACT_DIVISOR = 100
 BALANCE_SLOT_SEARCH = 64
 GAS_HEADROOM_PCT = 130
+ESTIMATE_HEADROOM_PCT = 125
 _ADDRESS_RE = re.compile(r"^0x[0-9a-f]{40}$")
 _HASH_RE = re.compile(r"^0x[0-9a-f]{64}$")
 SEL_OWNER_OF = selector("ownerOf(uint256)")
@@ -506,7 +507,7 @@ class TxCore:
                 raise TxRefusal("insufficient_balance", "wallet holds less than amount_in")
         candidates = self.routes.candidates(intent.token, intent.quote_currency, intent.side)
         if not candidates:
-            factories = sorted({pool.factory for pool in self.routes.token_pools(intent.token) if not pool.swappable})
+            factories = sorted({pool.factory for pool in self.routes.quote_pools(intent.token) if not pool.swappable})
             detail = "unsupported pool factories: " + ", ".join(factories) if factories else "no compatible route with a deployed router"
             raise TxRefusal("no_route", detail)
         expires_at, deadline = self._times()
@@ -744,7 +745,14 @@ class TxCore:
             assert sim.revert is not None
             code = sim.revert.kind if sim.revert.kind != "unknown" else "no_longer_executable"
             raise TxError(code, f"{sim.revert.selector} {sim.revert.detail}".strip())
-        gas = sim.gas_used * GAS_HEADROOM_PCT // 100
+        request = {"from": wallet, "to": plan.to, "data": "0x" + data.hex(), "value": hex(plan.value)}
+        try:
+            estimate = _hex_int(self.rpc.call("eth_estimateGas", [request, "latest"]), "gas estimate")
+        except TxError:
+            raise
+        except Exception as exc:
+            raise TxError("no_longer_executable", " ".join(str(exc).split())[:200]) from exc
+        gas = max(sim.gas_used * GAS_HEADROOM_PCT // 100, estimate * ESTIMATE_HEADROOM_PCT // 100)
         return Prepared(self._tx(wallet, plan.to, data, plan.value, gas), sim.gas_used, quote.expires_at)
 
     def _swap_shape(self, wallet: str, data: bytes, value: int) -> SwapShape:

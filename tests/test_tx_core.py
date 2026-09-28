@@ -109,6 +109,7 @@ class FakeRPC:
         self.launches = [1] * 13
         self.launches[7], self.launches[10] = 200, 100
         self.simulate = None
+        self.estimate = 150_000
         self.calls: list[tuple[str, list]] = []
         self.txs: dict[str, dict] = {}
         self.receipts: dict[str, dict] = {}
@@ -135,6 +136,8 @@ class FakeRPC:
             outs = [{"status": "0x1", "logs": [], "gasUsed": "0x5208"} for _ in calls[:-1]]
             outs.append(self.simulate(calls[-1], params[1]))
             return [{"calls": outs}]
+        if method == "eth_estimateGas":
+            return hex(self.estimate)
         if method == "eth_getTransactionByHash":
             return self.txs.get(params[0])
         if method == "eth_getTransactionReceipt":
@@ -335,7 +338,7 @@ def test_route_book_decodes_dynamic_fee_and_refuses_incomplete_spacing(pools_db,
     with pytest.raises(TxRefusal, match="tick_spacing") as quote_refusal:
         core.quote(intent)
     assert quote_refusal.value.code == "incomplete_pool"
-    assert all(pool.id != incomplete.id for pool in routes.token_pools(PIPEDOG))
+    assert all(pool.id != incomplete.id for pool in routes.quote_pools(PIPEDOG))
 
 def test_route_rejects_non_contiguous_hops():
     v3 = Pool(Venue.V3, V3_POOL, V3_POOL, WETH, PIPEDOG, 10000, 200, NATIVE, UR_V3_FACTORY)
@@ -466,6 +469,13 @@ def test_quote_prepare_round_trip_and_idempotence(core, rpc):
     commands, deadline = tc.decode_ur_execute(bytes.fromhex(tx["data"][2:]))
     assert deadline == 1_000_120 and commands[-1].min_out == 3_960_000
     assert quote.to_json()["amounts"]["net_out"] == "4000000"
+
+
+def test_gas_limit_covers_the_node_estimate(core, rpc):
+    rpc.simulate = v3_buy_simulation(4_000_000)
+    rpc.estimate = 400_000
+    quote = core.quote(buy_intent())
+    assert core.prepare(quote.quote_id, WALLET, Signatures()).transaction["gas"] == hex(400_000 * 125 // 100)
 
 
 def test_quote_picks_best_route_and_reports_failures(core, rpc):

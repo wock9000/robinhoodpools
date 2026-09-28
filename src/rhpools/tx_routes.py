@@ -180,7 +180,7 @@ _POOL_COLUMNS = "p.id, p.protocol, p.address, p.token0, p.token1, p.fee_ppm, p.t
 _CANDIDATE_SQL = (
     f"SELECT {_POOL_COLUMNS}, s.block_number FROM pools p "
     "LEFT JOIN lp_pool_state s ON s.pool_id = p.id "
-    "WHERE p.token0 = ? OR p.token1 = ?"
+    "WHERE (p.token0 = ? AND p.token1 IN ({quotes})) OR (p.token1 = ? AND p.token0 IN ({quotes}))"
 )
 _BY_ID_SQL = f"SELECT {_POOL_COLUMNS} FROM pools p WHERE p.id = ?"
 _BY_PAIR_SQL = f"SELECT {_POOL_COLUMNS} FROM pools p WHERE p.protocol = ? AND p.token0 = ? AND p.token1 = ?"
@@ -255,9 +255,11 @@ class RouteBook:
             self._hooks[pool.id] = policy
         return policy
 
-    def token_pools(self, token: str) -> list[Pool]:
+    def quote_pools(self, token: str) -> list[Pool]:
+        quotes = sorted(QUOTE_CURRENCIES)
+        sql = _CANDIDATE_SQL.format(quotes=",".join("?" * len(quotes)))
         with self._reader() as connection:
-            rows = connection.execute(_CANDIDATE_SQL, (token, token)).fetchall()
+            rows = connection.execute(sql, (token, *quotes, token, *quotes)).fetchall()
         rows.sort(key=lambda row: -(row[10] or 0))
         return [pool for pool in map(_pool_from_row, rows) if pool is not None]
 
@@ -267,7 +269,7 @@ class RouteBook:
             return []
         direct: list[Route] = []
         bridged: list[Route] = []
-        for pool in self.token_pools(token):
+        for pool in self.quote_pools(token):
             if not pool.swappable:
                 continue
             other = pool.other(token)
