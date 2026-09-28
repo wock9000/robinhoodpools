@@ -21,6 +21,7 @@ from .lp_gate import COOKIE_NAME, Gate, GatePolicy, GateRefusal, Principal
 from .lp_gate_ws import CLOSE_NOT_ENTITLED, WebSocketPush
 from .lp_flow_tags import FlowTagger, PostgresListener, TagStore
 from .tx_core import JsonRpc, TxCore
+from .tx_trade_store import TradeStore
 from .tx_plan import LpIntent, LpOp, Signatures, SwapIntent, TxError, TxPolicy, TxRefusal
 from .tx_routes import RouteBook, Side
 
@@ -288,6 +289,7 @@ class Runtime:
                     self.tx = TxCore(
                         rpc, RouteBook(self.lp.store.reader_snapshot, rpc),
                         TxPolicy(TX_FEE_BPS, str(args.tx_fee_recipient).lower()),
+                        trade_store=TradeStore(args.gate_db.parent / "trades.sqlite"),
                     )
                     self.tx_unavailable = None
                 except Exception as exc:
@@ -1002,7 +1004,10 @@ class Handler(BaseHTTPRequestHandler):
                 raise GateRefusal(403, "browser session required", state="forbidden")
             core = self._tx_core()
             if path == "/api/tx/history":
-                return self._json(200, core.history(principal.wallet), private=True)
+                before = query.get("before")
+                if before is not None and (not before.isdecimal() or int(before) <= 0):
+                    raise TxError("invalid_intent", "before must be a positive block number")
+                return self._json(200, core.history(principal.wallet, int(before) if before else None), private=True)
             if path == "/api/tx/balances":
                 currencies = [c for c in str(query.get("currencies") or "").split(",") if c]
                 return self._json(200, {"wallet": principal.wallet, "balances": core.balances(principal.wallet, currencies)}, private=True)

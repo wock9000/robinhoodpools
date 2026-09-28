@@ -35,8 +35,8 @@ class FakeCore:
 
     def prepare(self, quote_id, wallet, sigs, batched=False):
         return SimpleNamespace(to_json=lambda: {"quote_id": quote_id, "wallet": wallet, "permit": sigs.permit.hex() if sigs.permit else None})
-    def history(self, wallet):
-        self.history_wallet = wallet
+    def history(self, wallet, before=None):
+        self.history_wallet, self.history_before = wallet, before
         return {"rows": [{"hash": "0x" + "ab" * 32, "block": 42, "timestamp": 84,
                           "sent": [], "received": [], "via": "UR"}]}
 
@@ -147,6 +147,10 @@ def test_history_requires_trade_browser_session_and_uses_only_session_wallet(tmp
         assert status == 200 and body["rows"][0]["via"] == "UR"
         assert core.history_wallet.lower() == HOLDER.lower()
         assert response_headers["Cache-Control"] == "private, no-store"
+        status, _, body = call(address, "GET", path + "&before=120", headers=headers)
+        assert status == 200 and core.history_before == 120
+        status, _, body = call(address, "GET", path + "&before=0", headers=headers)
+        assert status == 400 and body["code"] == "invalid_intent"
 
 
 def test_tx_quota_charges_weighted_requests(tmp_path):

@@ -2607,7 +2607,7 @@
     return `${whole}${fractional ? "." + fractional : ""} ${symbol}`;
   }
 
-  async function loadWalletTrades(address) {
+  async function loadWalletTrades(address, before = null) {
     const section = elements.ownerTrades;
     const body = elements.ownerTradesBody;
     const gate = window.rhpGate?.snapshot();
@@ -2615,46 +2615,71 @@
       && gate.me.wallet?.toLowerCase() === address;
     section.hidden = !visible;
     if (!visible) return;
-    body.replaceChildren(el("tr", "", ""));
-    body.firstChild.append(el("td", "dim", "loading trades"));
-    body.firstChild.firstChild.colSpan = 5;
+    const request = (state.ownerTradesRequest || 0) + 1;
+    state.ownerTradesRequest = request;
+    if (before === null) {
+      body.replaceChildren(el("tr", "", ""));
+      body.firstChild.append(el("td", "dim", "loading trades"));
+      body.firstChild.firstChild.colSpan = 5;
+    } else {
+      body.lastChild?.remove();
+    }
     try {
-      const response = await fetch("/api/tx/history?feature=trade", { credentials: "same-origin" });
+      const url = `/api/tx/history?feature=trade${before === null ? "" : `&before=${before}`}`;
+      const response = await fetch(url, { credentials: "same-origin" });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const payload = await response.json();
-      if (state.ownerAddress !== address || section.hidden) return;
+      if (state.ownerTradesRequest !== request || state.ownerAddress !== address || section.hidden) return;
       const rows = payload.rows || [];
-      body.replaceChildren(...rows.map((trade) => {
+      const trades = rows.map((trade) => {
         const row = el("tr");
         const link = el("a", "cyan", shortIdentifier(trade.hash));
         link.href = `${ROBINSCAN}/tx/${trade.hash}`;
         link.target = "_blank";
         link.rel = "noopener noreferrer";
+        const feeLeg = trade.fee && [...trade.sent, ...trade.received].find((leg) => leg.token === trade.fee.currency);
+        const via = trade.fee && feeLeg
+          ? `${trade.via} · fee ${tradeAmount({ ...feeLeg, amount: trade.fee.amount })}`
+          : trade.via;
         for (const content of [
           formatAge(Math.max(0, Date.now() / 1000 - trade.timestamp)),
           trade.sent.map(tradeAmount).join(" + ") || "—",
           trade.received.map(tradeAmount).join(" + ") || "—",
-          trade.via
+          via
         ]) row.append(el("td", "", content));
         const tx = el("td");
         tx.append(link);
         row.append(tx);
         return row;
-      }));
-      if (!rows.length) {
+      });
+      if (before === null) body.replaceChildren(...trades);
+      else body.append(...trades);
+      if (!rows.length && before === null) {
         const row = el("tr");
-        const cell = el("td", "dim", "no trades in 7d");
+        const cell = el("td", "dim", "no trades");
         cell.colSpan = 5;
         row.append(cell);
         body.append(row);
       }
+      if (payload.next_before != null) {
+        const row = el("tr");
+        const cell = el("td", "dim");
+        cell.colSpan = 5;
+        const older = el("button", "", "older");
+        older.type = "button";
+        older.addEventListener("click", () => loadWalletTrades(address, payload.next_before), { once: true });
+        cell.append(older);
+        row.append(cell);
+        body.append(row);
+      }
     } catch (error) {
-      if (state.ownerAddress !== address || section.hidden) return;
+      if (state.ownerTradesRequest !== request || state.ownerAddress !== address || section.hidden) return;
       const row = el("tr");
       const cell = el("td", "dim", `trades unavailable · ${error.message}`);
       cell.colSpan = 5;
       row.append(cell);
-      body.replaceChildren(row);
+      if (before === null) body.replaceChildren(row);
+      else body.append(row);
     }
   }
 

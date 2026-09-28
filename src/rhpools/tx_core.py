@@ -38,6 +38,7 @@ from .tx_plan import (
     PositionState, Signatures, Split, SplitLeg, SwapIntent, SwapPlanner, SwapShape, TxError, TxPolicy,
     TxRefusal, impact_bps, min_out_for, split_amounts, swap_amounts,
 )
+from .tx_trade_store import TradeStore
 from .tx_routes import DYNAMIC_FEE_FLAG, QUOTE_CURRENCIES, Hop, same_asset, IncompletePool, Pool, Route, RouteBook, Side, Venue, v4_pool
 
 DEADLINE_GRACE_S = 60
@@ -62,7 +63,7 @@ SEL_DECIMALS = selector("decimals()")
 SEL_SYMBOL = selector("symbol()")
 TOPIC_WITHDRAWAL = "0x" + keccak(text="Withdrawal(address,uint256)").hex()
 HISTORY_BLOCKS_PER_DAY = 855_000
-HISTORY_DAYS = 7
+HISTORY_DAYS = 10
 HISTORY_LIMIT = 50
 HISTORY_TRACE_LIMIT = 20
 HISTORY_TX_CACHE_LIMIT = 512
@@ -374,6 +375,7 @@ class TxCore:
         ttl_s: int = 60,
         max_quotes: int = 512,
         clock: Callable[[], float] = time.time,
+        trade_store: TradeStore | None = None,
     ) -> None:
         if not hasattr(rpc, "call"):
             raise TypeError("rpc must provide call(method, params)")
@@ -383,13 +385,14 @@ class TxCore:
         self.ttl_s = ttl_s
         self.max_quotes = max_quotes
         self._clock = clock
+        self.trade_store = trade_store
         self.swaps = SwapPlanner()
         self.lps = LpPlanner()
         self.sim = Simulator(rpc)
         self._quotes: dict[str, Quote] = {}
         self._token_meta: dict[str, tuple[int, str]] = {}
         self._history_txs: OrderedDict[tuple[str, str], dict[str, Any]] = OrderedDict()
-        self._history_wallets: OrderedDict[str, tuple[float, dict[str, Any]]] = OrderedDict()
+        self._history_wallets: OrderedDict[tuple[str, int | None], tuple[float, dict[str, Any]]] = OrderedDict()
         self._balance_slots: dict[str, int | None] = {}
         self._allowance_slots: dict[str, int | None] = {}
         self._lock = threading.Lock()
@@ -1159,23 +1162,29 @@ class TxCore:
             return LpShape(wallet, LpOp.COLLECT, pool, to, call.token_id, lower, upper, 0)
         raise TxError("unknown_target", "calldata is not an rhpools lp action")
 
-    def history(self, wallet: str) -> dict[str, Any]:
+    def history(self, wallet: str, before: int | None = None) -> dict[str, Any]:
         wallet = _address(wallet, "wallet")
+        if before is not None and (isinstance(before, bool) or not isinstance(before, int) or before <= 0):
+            raise TxError("invalid_intent", "before must be a positive block number")
+        cache_key = (wallet, before)
         now = self._clock()
         with self._lock:
-            cached = self._history_wallets.get(wallet)
+            cached = self._history_wallets.get(cache_key)
             if cached is not None and cached[0] > now:
-                self._history_wallets.move_to_end(wallet)
+                self._history_wallets.move_to_end(cache_key)
                 return cached[1]
         latest = self._header("latest").number
         earliest = max(0, latest - HISTORY_DAYS * HISTORY_BLOCKS_PER_DAY + 1)
+        stored = self.trade_store.history(wallet, before) if self.trade_store is not None else []
         wallet_topic = "0x" + wallet[2:].rjust(64, "0")
         discovered: dict[str, tuple[int, int]] = {}
-        for day in range(HISTORY_DAYS):
-            upper = latest - day * HISTORY_BLOCKS_PER_DAY
+        for day in range(HISTORY_DAYS if before is None or before > earliest else 0):
+            upper = min(latest - day * HISTORY_BLOCKS_PER_DAY, before - 1) if before is not None else latest - day * HISTORY_BLOCKS_PER_DAY
             if upper < earliest:
                 break
-            lower = max(earliest, upper - HISTORY_BLOCKS_PER_DAY + 1)
+            lower = max(earliest, latest - (day + 1) * HISTORY_BLOCKS_PER_DAY + 1)
+            if upper < lower:
+                continue
             for position in (1, 2):
                 topics = [TOPIC_TRANSFER, None, None]
                 topics[position] = wallet_topic
@@ -1195,12 +1204,13 @@ class TxCore:
                              _hex_int(log["transactionIndex"], "transaction index"))
                     discovered[tx_hash] = order
         hashes = sorted(discovered, key=lambda tx_hash: (*discovered[tx_hash], tx_hash), reverse=True)
-        rows: list[dict[str, Any]] = []
+        rows: list[dict[str, Any]] = list(stored)
+        stored_hashes = {row["hash"] for row in stored}
         timestamps: dict[int, int] = {}
         traces = 0
         for tx_hash in hashes:
-            if len(rows) == HISTORY_LIMIT:
-                break
+            if tx_hash in stored_hashes or len(rows) - len(stored) >= HISTORY_LIMIT + 1:
+                continue
             key = (wallet, tx_hash)
             with self._lock:
                 row = self._history_txs.get(key)
@@ -1297,11 +1307,34 @@ class TxCore:
                     amounts[side].append({"token": token, "amount": str(amount),
                                           "symbol": symbol, "decimals": decimals})
             rows.append({"hash": tx_hash, "block": block, "timestamp": timestamps[block],
-                         **amounts, "via": row["via"]})
-        result = {"rows": rows}
+                         **amounts, "via": row["via"], "source": "chain"})
+        rows.sort(key=lambda item: (item["block"], item["hash"]), reverse=True)
+        page = rows[:HISTORY_LIMIT]
+        for row in page:
+            if row["source"] != "rhpools":
+                continue
+            for side in ("sent", "received"):
+                for leg in row[side]:
+                    token = leg["token"]
+                    if token == "native":
+                        decimals, symbol = 18, "ETH"
+                    else:
+                        with self._lock:
+                            meta = self._token_meta.get(token)
+                        if meta is None:
+                            try:
+                                meta = (_word(self._call(token, SEL_DECIMALS, "latest")),
+                                        _abi_string(self._call(token, SEL_SYMBOL, "latest")))
+                            except Exception as exc:
+                                raise TxError("rpc", "history token metadata unavailable") from exc
+                            with self._lock:
+                                self._token_meta[token] = meta
+                        decimals, symbol = meta
+                    leg.update(symbol=symbol, decimals=decimals)
+        result = {"rows": page, "next_before": page[-1]["block"] if len(rows) > HISTORY_LIMIT else None}
         with self._lock:
-            self._history_wallets[wallet] = (now + HISTORY_CACHE_SECONDS, result)
-            self._history_wallets.move_to_end(wallet)
+            self._history_wallets[cache_key] = (now + HISTORY_CACHE_SECONDS, result)
+            self._history_wallets.move_to_end(cache_key)
             if len(self._history_wallets) > HISTORY_WALLET_CACHE_LIMIT:
                 self._history_wallets.popitem(last=False)
         return result
@@ -1331,6 +1364,7 @@ class TxCore:
         tag = hex(block)
         if to == UR:
             parsed = self._swap_shape(wallet, data, value)
+            shape = parsed[0] if isinstance(parsed, tuple) else parsed
             ledger = Ledger(logs, traced=False)
             amounts: Amounts | LpAmounts = (
                 split_amounts(parsed[0], parsed[1], ledger, self.routes.hook_policy, net_shares=True)[0]
@@ -1351,7 +1385,38 @@ class TxCore:
             amounts = self.lps.amounts(shape, Ledger(logs, traced=False, native_flows={wallet: after - before + gas_cost}), 0, None)
         else:
             raise TxError("unknown_target", "transaction target is not an rhpools contract")
-        return Fill(tx_hash, "confirmed", block, amounts, gas_used, gas_cost)
+        fill = Fill(tx_hash, "confirmed", block, amounts, gas_used, gas_cost)
+        if self.trade_store is not None and (to in LP_TARGETS or (
+                shape.fee_recipient.lower() == self.policy.fee_recipient.lower()
+                and shape.fee_bps == self.policy.fee_bps)):
+            if isinstance(shape, SwapShape):
+                sent = [{"token": "native" if shape.currency_in == NATIVE else shape.currency_in,
+                         "amount": str(amounts.amount_in)}]
+                received = [{"token": "native" if shape.currency_out == NATIVE else shape.currency_out,
+                             "amount": str(amounts.net_out)}]
+                fee = amounts.rhpools_fee.to_json()
+                if fee["currency"] == NATIVE:
+                    fee["currency"] = "native"
+            else:
+                sent, received = [], []
+                for token, amount in ((shape.pool.token0, amounts.amount0), (shape.pool.token1, amounts.amount1)):
+                    if amount:
+                        target = sent if shape.op in (LpOp.MINT, LpOp.INCREASE) else received
+                        target.append({"token": "native" if token == NATIVE else token, "amount": str(amount)})
+                fee = None
+            header = self.rpc.call("eth_getBlockByNumber", [tag, False])
+            if not isinstance(header, dict):
+                raise TxError("rpc", "history block unavailable")
+            self.trade_store.save(wallet, {"hash": tx_hash, "block": block,
+                "timestamp": _hex_int(header.get("timestamp"), "block timestamp"),
+                "kind": "lp" if isinstance(shape, LpShape) else "swap", "sent": sent,
+                "received": received, "via": HISTORY_ROUTERS.get(to, "POSM" if to == POSM else "NFPM"),
+                "fee": fee})
+            with self._lock:
+                for key in tuple(self._history_wallets):
+                    if key[0] == wallet:
+                        del self._history_wallets[key]
+        return fill
 
 
 __all__ = [
