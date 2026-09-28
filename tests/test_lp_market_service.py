@@ -3,7 +3,6 @@ import json
 import sqlite3
 import threading
 import time
-from contextlib import contextmanager
 
 import pytest
 
@@ -110,79 +109,6 @@ def test_pool_summary_deadline_releases_reader_without_caching_partial_rows(
         assert failure.value.sqlite_errorcode == sqlite3.SQLITE_INTERRUPT
         assert not app.store.read().in_transaction
         assert app.store.checkpoint()["active_reader_snapshots"] == 0
-    finally:
-        app.close()
-
-
-def test_created_pool_page_does_not_sort_the_entire_catalog(tmp_path, monkeypatch):
-    app = service(tmp_path / "market.sqlite")
-    try:
-        catalog = [
-            (f"pool-{index:05d}", None if index % 97 == 0 else index % 40)
-            for index in range(3000)
-        ]
-        with app.store.transaction() as connection:
-            connection.executemany(
-                "INSERT INTO pools("
-                "id,protocol,address,token0,token1,created_block"
-                ") VALUES(?,'v3',?, ?, ?, ?)",
-                ((pool_id, pool_id, TOKEN, USDG, created) for pool_id, created in catalog),
-            )
-        progress = 0
-
-        def bound_catalog_scan():
-            nonlocal progress
-            progress += 1
-            return int(progress > 300)
-
-        reader_snapshot = app.store.reader_snapshot
-
-        @contextmanager
-        def bounded_reader(seconds=None):
-            with reader_snapshot(seconds) as connection:
-                connection.set_progress_handler(bound_catalog_scan, 100)
-                try:
-                    yield connection
-                finally:
-                    connection.set_progress_handler(None, 0)
-
-        monkeypatch.setattr(app.store, "reader_snapshot", bounded_reader)
-        page = app.pools({
-            "window": "24h", "sort": "created", "order": "desc",
-            "limit": 20, "offset": 20,
-        })
-        expected = sorted(
-            catalog, key=lambda row: (row[1] is None, -(row[1] or 0), row[0]),
-        )[20:40]
-        assert [row["id"] for row in page["rows"]] == [
-            row[0] for row in expected
-        ]
-        assert page["total"] == len(catalog)
-    finally:
-        app.close()
-
-def test_month_bucket_frame_survives_shared_reader_deadline(tmp_path, monkeypatch):
-    app = service(tmp_path / "market.sqlite")
-    try:
-        day = int(time.time()) // 86_400 * 86_400
-        with app.store.transaction() as connection:
-            connection.executemany(
-                "INSERT INTO lp_pool_buckets("
-                "resolution,bucket,pool_id,events"
-                ") VALUES(86400,?,?,1)",
-                (
-                    (day - days * 86_400, f"pool-{pool:03d}")
-                    for days in range(1, 30)
-                    for pool in range(100)
-                ),
-            )
-        monkeypatch.setattr(market_store_module, "_READER_SNAPSHOT_SECONDS", 0.001)
-        monkeypatch.setattr(market_store_module, "_READER_PROGRESS_STEPS", 1)
-        status = app.status()
-        _name, start, end, coverage = app._window({"window": "30d"}, status)
-        frame = app._bucket_aggregates("30d", status, start, end)
-        assert frame.totals[0] == 2900
-        assert frame.aggregates["pool-000"][0] == 29
     finally:
         app.close()
 

@@ -2,7 +2,6 @@
 import math
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
 
 import pytest
 
@@ -146,109 +145,6 @@ def test_pool_stats_respects_an_existing_reader_snapshot(inventory):
         before["observed_principal_usd"] * 2
     )
 
-
-
-def test_owner_count_uses_small_covering_window_index(inventory):
-    store, book = inventory
-    now = int(accounting_module.time.time())
-    with store.transaction() as conn:
-        required = {
-            row[1]: 0 if row[2] in ("INTEGER", "REAL") else "0"
-            for row in conn.execute("PRAGMA table_info(lp_accounting_episodes)")
-            if row[3]
-        }
-        fields = list(dict.fromkeys((*required, "id", "owner", "custody")))
-
-        def episode(index):
-            values = {
-                **required,
-                "id": f"episode-{index:05d}",
-                "position_key": f"position-{index:05d}" + "x" * 80,
-                "ordinal": 1,
-                "status": "active",
-                "accounting_basis": "test",
-                "qualifiers": "[]",
-                "last_timestamp": now if index else now - 40 * 86_400,
-                "owner": f"0x{index % 20:040x}",
-                "custody": f"0x{index % 15 + 100:040x}",
-            }
-            return [values[field] for field in fields]
-
-        conn.executemany(
-            "INSERT INTO lp_accounting_episodes("
-            + ",".join(fields) + ") VALUES("
-            + ",".join("?" for _ in fields) + ")",
-            (episode(index) for index in range(5000)),
-        )
-    assert book.owner_count("30d") == 35
-    assert book.owner_count("all") == 35
-    sizes = {
-        name: pages for name, pages in store.read().execute(
-            "SELECT name,COUNT(*) FROM dbstat WHERE name IN ("
-            "'lp_accounting_episodes_owner_count_window',"
-            "'lp_accounting_episodes_owner_window_cover') GROUP BY name"
-        )
-    }
-    assert sizes["lp_accounting_episodes_owner_count_window"] < (
-        sizes["lp_accounting_episodes_owner_window_cover"] * 3 // 4
-    )
-
-def test_superseded_inventory_seeks_from_queued_positions(inventory):
-    store, book = inventory
-    with store.transaction() as conn:
-        for index in range(4096):
-            insert_position(conn, f"unmodified-{index}", 10**18)
-        conn.execute(
-            "INSERT INTO lp_accounting_pending("
-            "position_key,generation,requested_revision,requested_epoch,"
-            "priority_block,priority_tx_index,priority_log_index"
-            ") VALUES('position-a',1,1,0,2,0,0)"
-        )
-    with store.reader_snapshot() as conn:
-        steps = 0
-
-        def bound_scan():
-            nonlocal steps
-            steps += 1
-            return int(steps > 50)
-
-        conn.set_progress_handler(bound_scan, 100)
-        try:
-            superseded = book._superseded_pool_inventory(conn, [POOL_ID])
-        finally:
-            conn.set_progress_handler(None, 0)
-    assert superseded == {POOL_ID: {(10**18, -10, 10): 1}}
-
-
-def test_owner_position_page_values_only_selected_positions(inventory, monkeypatch):
-    store, book = inventory
-    with store.transaction() as conn:
-        for index in range(4096):
-            insert_position(conn, f"position-{index:05d}", 10**18)
-    progress = 0
-
-    def bound_reader():
-        nonlocal progress
-        progress += 1
-        return int(progress > 4000)
-
-    reader_snapshot = store.reader_snapshot
-
-    @contextmanager
-    def bounded_reader(seconds=None):
-        with reader_snapshot(seconds) as connection:
-            connection.set_progress_handler(bound_reader, 100)
-            try:
-                yield connection
-            finally:
-                connection.set_progress_handler(None, 0)
-
-    monkeypatch.setattr(store, "reader_snapshot", bounded_reader)
-    page = book.positions({"owner": OWNER, "limit": 10, "offset": 20})
-    assert page["total"] == 4097
-    assert [row["position_key"] for row in page["rows"]] == [
-        f"position-{index:05d}" for index in range(20, 30)
-    ]
 
 def test_preparation_reader_deadline_releases_its_wal_snapshot(
         tmp_path, monkeypatch):

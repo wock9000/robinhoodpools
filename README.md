@@ -77,8 +77,6 @@ One running `rhpools` process owns a database. Do not point concurrent processes
 
 The service writer builds `pools_token0_id_idx` and `pools_token1_id_idx` on its first upgraded start. On a copy of 482,847 live pool rows, the indexes took 2.42 and 1.78 seconds to build and occupied 51.84 and 51.89 MiB. The migration then drops the two superseded token-only indexes.
 
-The service writer also builds `lp_accounting_episodes_owner_count_window` on its first upgraded start. A contiguous million-row sample from the live episodes table took 0.36 seconds to index and occupied 72.31 MiB on a temporary filesystem. Scaling that sample to 9.65 million rows suggests about 698 MiB of index pages, but the measured build time does not predict disk-bound startup or checkpoint time. Stop the service and allow a maintenance window and several GiB of free space before either upgrade. Later starts reuse the indexes.
-
 ## Data interpretation
 
 Results represent the service's indexed evidence and declared coverage, not guaranteed global truth. Unknown accounting stays `null`; consumers must not turn missing evidence into zero. USDG-denominated values are quote values, not an assertion that USDG equals fiat USD. Units and partial-history coverage are part of the API contract and must remain visible to consumers.
