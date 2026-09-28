@@ -40,6 +40,10 @@ _ASSETS = {
     "/research": ("lp_research.html", "text/html; charset=utf-8"),
     "/flow": ("lp_flow.html", "text/html; charset=utf-8"),
     "/api/v1/openapi.json": ("openapi.json", "application/json; charset=utf-8"),
+    "/favicon.ico": ("favicon.ico", "image/x-icon"),
+    "/static/rhp_logo.png": ("rhp_logo.png", "image/png"),
+    "/static/rhp_icon_180.png": ("rhp_icon_180.png", "image/png"),
+    "/static/rhp_icon_512.png": ("rhp_icon_512.png", "image/png"),
 }
 for _name in (
     "lp_theme.css", "lp_terminal.css", "lp_terminal.js", "lp_panes_boot.js", "lp_gate.css", "lp_gate.js", "lp_trade.css", "lp_trade.js",

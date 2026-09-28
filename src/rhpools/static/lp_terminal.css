@@ -75,7 +75,8 @@ a:hover { text-decoration: underline; }
   color: var(--black);
   white-space: nowrap;
 }
-.product-name { font-weight: 800; }
+.product-name { font-weight: 800; display: inline-flex; align-items: center; }
+.product-name img { display: block; height: 14px; width: auto; }
 .strip-label { font-weight: 700; }
 .block-readout { display: inline-flex; align-items: baseline; gap: 4px; }
 .block-readout a { color: #005d70; font-weight: 800; }
@@ -377,10 +378,10 @@ select:focus { border-color: var(--text); color: var(--text); }
 .terminal-table tbody tr:hover td { background: #101010; }
 .terminal-table tr.is-stale td { opacity: .7; }
 .terminal-table tr.event-add td,
-.terminal-table tr.event-donate td { color: var(--red); }
-.terminal-table tr.event-remove td,
+.terminal-table tr.event-donate td,
 .terminal-table tr.event-collect td,
 .terminal-table tr.event-fee td { color: var(--green); }
+.terminal-table tr.event-remove td { color: var(--red); }
 .terminal-table tr.event-swap td,
 .terminal-table tr.event-checkpoint td,
 .terminal-table tr.event-transfer td,
