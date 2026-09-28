@@ -934,25 +934,35 @@ class Handler(BaseHTTPRequestHandler):
 
     def _tags(self, query: dict[str, str]) -> None:
         try:
-            self.runtime.gate.require(self.headers, "flags")
+            principal, _ = self.runtime.gate.require(self.headers, "flags")
         except GateRefusal as refusal:
             return self._refuse(refusal)
         hashes = list(dict.fromkeys(h.strip().lower() for h in str(query.get("tx") or "").split(",") if h.strip()))
         if not hashes or len(hashes) > TAGS_MAX_TX or any(len(h) != 66 or not h.startswith("0x") for h in hashes):
             return self._json(400, {"error": f"tx must list 1 to {TAGS_MAX_TX} transaction hashes"}, private=True)
-        marks = ",".join("?" for _ in hashes)
-        with self.runtime.lp.store.reader_snapshot() as connection:
-            rows = [
-                {"tx_hash": row[0], "pool_id": row[1], "block_number": row[2], "timestamp": row[3]}
-                for row in connection.execute(
-                    "SELECT DISTINCT tx_hash,pool_id,block_number,timestamp FROM events INDEXED BY events_tx_log_idx "
-                    f"WHERE tx_hash IN ({marks}) AND pool_id IS NOT NULL", hashes,
-                )
-            ]
-        tagged: dict[str, dict[str, dict]] = {h: {} for h in hashes}
-        for tag in self.runtime.tags.tag(rows):
-            tagged.setdefault(tag.tx_hash, {})[tag.pool_id] = {"tags": sorted(tag.tags), "basis": sorted(tag.basis)}
-        return self._json(200, {"tags": tagged}, private=True)
+        try:
+            quota = self.runtime.gate.admit(principal, cost=len(hashes) // 10 + 1)
+        except GateRefusal as refusal:
+            return self._refuse(refusal)
+        slots = self.api_slots["keyed"]
+        if not slots.acquire(False):
+            return self._json(503, {"error": "API request capacity reached"}, retry=1)
+        try:
+            marks = ",".join("?" for _ in hashes)
+            with self.runtime.lp.store.reader_snapshot() as connection:
+                rows = [
+                    {"tx_hash": row[0], "pool_id": row[1], "block_number": row[2], "timestamp": row[3]}
+                    for row in connection.execute(
+                        "SELECT DISTINCT tx_hash,pool_id,block_number,timestamp FROM events INDEXED BY events_tx_log_idx "
+                        f"WHERE tx_hash IN ({marks}) AND pool_id IS NOT NULL", hashes,
+                    )
+                ]
+            tagged: dict[str, dict[str, dict]] = {h: {} for h in hashes}
+            for tag in self.runtime.tags.tag(rows):
+                tagged.setdefault(tag.tx_hash, {})[tag.pool_id] = {"tags": sorted(tag.tags), "basis": sorted(tag.basis)}
+            return self._json(200, {"tags": tagged}, private=True, headers=_quota_headers(quota))
+        finally:
+            slots.release()
 
     def _tx_principal(self, feature: str) -> Principal:
         principal, _ = self.runtime.gate.require(self.headers, feature)
