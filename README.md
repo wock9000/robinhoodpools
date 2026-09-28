@@ -75,7 +75,9 @@ RPC credentials, when needed, belong only in local mode-`0600` files containing 
 
 One running `rhpools` process owns a database. Do not point concurrent processes at the same SQLite file, inspect it with write-capable tools while the service is running, or use a live database in tests. Stop the owner before backup or migration work and copy the database together with its SQLite sidecar files when they exist.
 
-The accounting owner-count index `lp_accounting_episodes_owner_count_window` is created by the service writer during the first upgraded startup. Plan a maintenance window before deploying it to an existing large database: startup waits for the index build. At roughly 9.7 million episodes, a 150,000-row synthetic build projects about 0.8 GiB of new index pages, with additional temporary and WAL space. Reserve several GiB free and allow 30 minutes for disk-bound creation and checkpointing; actual build time depends on storage throughput. Later starts reuse the index.
+The service writer builds `pools_token0_id_idx` and `pools_token1_id_idx` on its first upgraded start. On a copy of 482,847 live pool rows, the indexes took 2.42 and 1.78 seconds to build and occupied 51.84 and 51.89 MiB. The migration then drops the two superseded token-only indexes.
+
+The service writer also builds `lp_accounting_episodes_owner_count_window` on its first upgraded start. A contiguous million-row sample from the live episodes table took 0.36 seconds to index and occupied 72.31 MiB on a temporary filesystem. Scaling that sample to 9.65 million rows suggests about 698 MiB of index pages, but the measured build time does not predict disk-bound startup or checkpoint time. Stop the service and allow a maintenance window and several GiB of free space before either upgrade. Later starts reuse the indexes.
 
 ## Data interpretation
 

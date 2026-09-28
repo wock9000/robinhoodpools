@@ -295,10 +295,24 @@ class PublicMarketAPI:
             total = int(connection.execute(
                 f"SELECT COUNT(*) FROM ({ids_query})", values,
             ).fetchone()[0])
+            page_query = (
+                "SELECT id FROM pools WHERE token0=? "
+                "UNION SELECT id FROM pools WHERE token1=?"
+            )
+            page_values: tuple[Any, ...] = (token, token)
+            if indexed:
+                page_query += (
+                    " UNION SELECT id FROM lp_catalog_search WHERE token0=? COLLATE NOCASE "
+                    "UNION SELECT id FROM lp_catalog_search WHERE token1=? COLLATE NOCASE"
+                )
+                page_values += (token, token)
+            if catalog_ids:
+                page_query += " UNION SELECT value AS id FROM json_each(?)"
+                page_values += (json.dumps(catalog_ids),)
             ids = [
                 str(row[0]).lower() for row in connection.execute(
-                    f"SELECT id FROM ({ids_query}) ORDER BY id LIMIT ? OFFSET ?",
-                    (*values, limit, offset),
+                    f"{page_query} ORDER BY id LIMIT ? OFFSET ?",
+                    (*page_values, limit, offset),
                 )
             ]
             if not ids:

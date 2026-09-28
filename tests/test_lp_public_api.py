@@ -449,6 +449,43 @@ def test_indexed_pool_pages_include_newly_discovered_unindexed_pools():
         api.close()
         store.close()
 
+def test_indexed_pool_page_merges_both_currency_sides_catalog_and_pending_ids():
+    pool_ids = [f"0x{index:040x}" for index in range(1, 6)]
+    store = MarketStore(":memory:")
+    _insert(store, [
+        _pool(pool_ids[0], "v3", TOKEN, HIGH, fee=500, spacing=10),
+        _pool(pool_ids[1], "v3", LOW, TOKEN, fee=500, spacing=10),
+        _pool(pool_ids[2], "v3", TOKEN, TOKEN, fee=500, spacing=10),
+        _pool(pool_ids[3], "v3", LOW, HIGH, fee=500, spacing=10),
+    ])
+    with store.transaction() as connection:
+        connection.executemany(
+            "INSERT INTO lp_catalog_search"
+            "(id,protocol,token0,token1,label,subtitle,href) "
+            "VALUES (?,'v3',?,?,'pool','pool','/pool')",
+            [
+                (pool_ids[1], LOW, TOKEN),
+                (pool_ids[2], TOKEN, TOKEN),
+                (pool_ids[4], TOKEN.upper(), HIGH),
+            ],
+        )
+    api = PublicMarketAPI(Service(store, SnapshotRpc({})))
+    try:
+        expected = [pool_ids[0], pool_ids[1], pool_ids[2], pool_ids[4]]
+        first, first_ids, total = api._stored_matches(
+            TOKEN, 2, 0, [pool_ids[4]], indexed=True,
+        )
+        second, second_ids, second_total = api._stored_matches(
+            TOKEN, 2, 2, [pool_ids[4]], indexed=True,
+        )
+        assert first_ids + second_ids == expected
+        assert total == second_total == len(expected)
+        assert {row["id"] for row in first} == set(first_ids)
+        assert {row["id"] for row in second} == {pool_ids[2]}
+    finally:
+        api.close()
+        store.close()
+
 
 def test_assets_keep_all_pool_identities_and_qualify_reserve_sum_beyond_state_budget():
     pool_ids = [f"0x{index + 1:040x}" for index in range(513)]
