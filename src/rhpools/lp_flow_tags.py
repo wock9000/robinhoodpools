@@ -243,8 +243,8 @@ class Rpc(Protocol):
     def batch(self, calls: Iterable[tuple[str, Sequence[Any]]]) -> list[Any]: ...
 
 
-def footprint_filters(from_block: int, to_block: int) -> list[tuple[str, list[Any]]]:
-    window = {"fromBlock": hex(from_block), "toBlock": hex(to_block)}
+def footprint_filters(block: int) -> list[tuple[str, list[Any]]]:
+    window = {"fromBlock": hex(block), "toBlock": hex(block)}
     return [
         ("eth_getLogs", [{**window, "address": DEPOSITORY, "topics": [[TOPIC_DEPOSIT, TOPIC_NATIVE_DEPOSIT]]}]),
         ("eth_getLogs", [{**window, "topics": [TOPIC_TRANSFER, EXECUTOR_TOPIC]}]),
@@ -253,16 +253,16 @@ def footprint_filters(from_block: int, to_block: int) -> list[tuple[str, list[An
 
 
 def fetch_envelopes(rpc: Rpc, requests: Sequence[tuple[str, int, int]]) -> dict[str, TxEnvelope]:
-    """One batch: every transaction by hash plus the Relay footprint logs over the
-    block span, so no receipt is ever read. Unknown transactions are absent."""
     times = {tx_hash.lower(): int(block_time) for tx_hash, _block, block_time in requests}
     if not times:
         return {}
     hashes = list(times)
-    blocks = [int(block) for _hash, block, _time in requests]
+    blocks = dict.fromkeys(int(block) for _hash, block, _time in requests)
     calls = [("eth_getTransactionByHash", [tx_hash]) for tx_hash in hashes]
-    calls += footprint_filters(min(blocks), max(blocks))
-    results = rpc.batch(calls)
+    calls.extend(call for block in blocks for call in footprint_filters(block))
+    results = []
+    for offset in range(0, len(calls), 50):
+        results.extend(rpc.batch(calls[offset:offset + 50]))
     logs_by_tx: dict[str, list[Mapping[str, Any]]] = {}
     for batch in results[len(hashes):]:
         for log in batch or ():
@@ -797,6 +797,8 @@ class FlowTagger:
             if not pool_id:
                 continue
             wanted[(tx_hash, pool_id)] = (int(row["block_number"]), int(row["timestamp"]))
+        now = int(self._clock())
+        wanted = {key: value for key, value in wanted.items() if value[1] >= now - self._store.retention_s}
         found = self._store.get(wanted)
         missing = [key for key in wanted if key not in found]
         if missing:

@@ -189,9 +189,9 @@ def test_fetch_envelopes_batches_transactions_and_footprint_logs():
     assert rpc.count("eth_getTransactionByHash") == len(unique) + 1
     assert rpc.count("eth_getTransactionReceipt") == 0
     log_queries = [params[0] for method, params in rpc.calls if method == "eth_getLogs"]
-    assert len(log_queries) == 3
-    assert {q["fromBlock"] for q in log_queries} == {hex(1)}
-    assert {q["toBlock"] for q in log_queries} == {hex(max(block for _h, block, _t in requests))}
+    assert len(log_queries) == 3 * len({block for _h, block, _t in requests})
+    assert {q["fromBlock"] for q in log_queries} == {hex(block) for _h, block, _t in requests}
+    assert all(q["fromBlock"] == q["toBlock"] for q in log_queries)
     for data in fixtures:
         assert envelopes[data["tx"]["hash"].lower()] == envelope_of(data), data["name"]
     assert tags.fetch_envelopes(rpc, []) == {}
@@ -444,8 +444,8 @@ def test_flow_tagger_classifies_persists_and_reuses(tmp_path):
     rows.append({"tx_hash": rows[0]["tx_hash"], "pool_id": None, "block_number": 1, "timestamp": 1})
     result = tagger.tag(rows)
     assert [(set(t.tags), set(t.basis)) for t in result] == [EXPECTED[f["name"]] for f in fixtures]
-    assert rpc.count("eth_getTransactionByHash") == len({f["tx"]["hash"] for f in fixtures}) + 1
-    assert rpc.count("eth_getLogs") == 3
+    assert rpc.count("eth_getTransactionByHash") == len({f["tx"]["hash"] for f in fixtures})
+    assert rpc.count("eth_getLogs") == 3 * len({int(f["tx"]["blockNumber"], 16) for f in fixtures})
     assert rpc.count("eth_getCode") == len({w for f in fixtures for w in envelope_of(f).wallets})
     assert rpc.count("eth_call") == len({f["pool"]["id"] for f in fixtures if f["pool"]["hook"] == tags.PONS_HOOK})
 
