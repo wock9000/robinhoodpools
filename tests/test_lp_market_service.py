@@ -485,6 +485,33 @@ def test_orphan_fees_disappear_and_replacement_branch_is_counted_once(tmp_path):
         app.close()
 
 
+def test_verified_high_static_v4_fee_remains_a_rate(tmp_path):
+    app = service(tmp_path / "market.sqlite")
+    try:
+        pool_id = ("0x6eb6a673b9403141af3f70b883d3a1cf"
+                   "1b4782a3126dc8dc4be92a47fbbd0b76")
+        configured_fee = 999_990
+        app.store.upsert_pools([{
+            **pools()[1], "id": pool_id, "fee_ppm": configured_fee,
+            "token0": "0x" + "00" * 20,
+            "token1": "0x" + "4ad6be87ea760753bf7ec207b77fa184f4f7548c",
+            "symbol0": "ETH", "symbol1": "CIB",
+            "decimals0": 18, "decimals1": 18,
+            "tick_spacing": 10_000, "hook": "0x" + "00" * 20,
+            "metadata_json": {"configured_fee": configured_fee, "dynamic_fee": False},
+        }])
+        block = header(100, int(time.time()) - 60)
+        app.store.ingest([block], [{**swap(block, pool_id, "v4"), "fee_ppm": 999_991}])
+        row = next(row for row in app.pools({"window": "1h"})["rows"] if row["id"] == pool_id)
+        assert row["fee_ppm"] == 999_991
+        assert row["fee_ppm"] < 0x800000
+        stored = app.store.pool(pool_id)
+        assert stored["fee_ppm"] == configured_fee
+        assert json.loads(stored["metadata_json"])["dynamic_fee"] is False
+    finally:
+        app.close()
+
+
 def test_backfill_insertion_order_does_not_reorder_live_tape(tmp_path):
     app = service(tmp_path / "market.sqlite")
     try:
@@ -552,12 +579,18 @@ def test_underfilled_lp_tape_stays_within_window(
 def test_zero_burn_checkpoint_is_not_lp_activity(tmp_path):
     app = service(tmp_path / "market.sqlite")
     try:
-        app.store.upsert_pools(pools())
+        pool_id = "0x4e8649be40ae67ebbcff99c291b92ee03015917b"
+        position_key = (
+            f"v3:{pool_id}:"
+            "0x96c6c215ec2dbd1afb4eb7d20cc88216"
+            "9db30884a7a58c08dcd22b3c61fced52"
+        )
+        app.store.upsert_pools([{**pools()[0], "id": pool_id, "address": pool_id}])
         block = header(100, int(time.time()) - 60)
         checkpoint = {
-            **swap(block, V3, "v3"),
+            **swap(block, pool_id, "v3", index=1),
             "kind": "checkpoint",
-            "position_key": f"v3:{V3}:0x" + "96" * 32,
+            "position_key": position_key,
             "liquidity_delta": "0",
             "amount0": "0",
             "amount1": "0",
@@ -568,18 +601,20 @@ def test_zero_burn_checkpoint_is_not_lp_activity(tmp_path):
             "accounting_basis": "zero_burn_fee_checkpoint",
         }
         add = {
-            **swap(block, V3, "v3", index=1),
+            **swap(block, pool_id, "v3"),
             "kind": "add",
-            "position_key": checkpoint["position_key"],
-            "liquidity_delta": "100",
+            "position_key": position_key,
+            "liquidity_delta": "6270951117623300456714",
+            "amount0": "2748253111457097274969",
+            "amount1": "323661737643136471",
         }
         app.store.ingest([block], [checkpoint, add])
         all_rows = app.tape({"kind": "all"})["rows"]
-        assert [row["kind"] for row in all_rows] == ["add", "checkpoint"]
-        assert all_rows[1]["amount0"] == all_rows[1]["amount1"] == "0"
+        assert [row["kind"] for row in all_rows] == ["checkpoint", "add"]
+        assert all_rows[0]["amount0"] == all_rows[0]["amount1"] == "0"
         assert [row["kind"] for row in app.tape({"kind": "lp"})["rows"]] == ["add"]
-        assert not app._current_event_matches(all_rows[1], {"kind": "lp"})
-        assert app._current_event_matches(all_rows[1], {"kind": "all"})
+        assert not app._current_event_matches(all_rows[0], {"kind": "lp"})
+        assert app._current_event_matches(all_rows[0], {"kind": "all"})
     finally:
         app.close()
 
