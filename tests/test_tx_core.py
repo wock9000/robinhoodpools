@@ -226,11 +226,11 @@ def usdg_buy_simulation(amount_out: int):
 def test_route_book_filters_and_orders_candidates(pools_db, rpc):
     routes = RouteBook(pools_db, rpc)
     buy = routes.candidates(PIPEDOG, NATIVE, Side.BUY)
-    assert [[h.pool.id for h in r.hops] for r in buy] == [[V3_POOL], [V2_POOL]]
+    assert [[h.pool.id for h in r.hops] for r in buy] == [[V3_POOL], [V2_POOL], ["0x" + "31" * 20]]
     assert buy[0].hops[0] == Hop(routes.pool(V3_POOL), WETH, PIPEDOG)
     sell = routes.candidates(PIPEDOG, USDG, Side.SELL)
     assert all(r.hops[0].currency_in == PIPEDOG and r.hops[-1].currency_out == USDG for r in sell)
-    assert {r.hops[1].pool.id for r in sell} == {b.id for b in DEFAULT_BRIDGES}
+    assert {r.hops[1].pool.id for r in sell} == {DEFAULT_BRIDGES[i].id for i in (0, 4, -1)}
     assert len(sell) == 6
     pons = routes.candidates(ITH, NATIVE, Side.BUY)
     assert [h.pool.hook for r in pons for h in r.hops] == [PONS_HOOK, NATIVE]
@@ -472,6 +472,8 @@ def test_quote_picks_best_route_and_reports_failures(core, rpc):
 
     def simulate(call, block):
         data = bytes.fromhex(call["data"][2:])
+        if call["to"] == tc.PANCAKE_SMART_ROUTER:
+            return {"status": "0x0", "logs": [], "gasUsed": "0x10", "returnData": "0x" + tc.selector("V3TooLittleReceived()").hex()}
         commands, _ = tc.decode_ur_execute(data)
         seen.append(type(commands[-1]).__name__)
         if type(commands[-1]).__name__ == "V2Swap":
@@ -625,8 +627,8 @@ def test_swap_shape_round_trips_through_calldata(core):
     cases = [
         (buy_intent(), Route((Hop(v3, WETH, PIPEDOG),))),
         (buy_intent(quote_currency=USDG, amount_in=10**9), Route((Hop(DEFAULT_BRIDGES[0], USDG, WETH), Hop(v2, WETH, PIPEDOG)))),
-        (buy_intent(side=Side.SELL, quote_currency=USDG, amount_in=10**9), Route((Hop(v3, PIPEDOG, WETH), Hop(DEFAULT_BRIDGES[1], WETH, USDG)))),
-        (SwapIntent(WALLET, Side.SELL, ITH, USDG, 10**18, 50), Route((Hop(PONS, ITH, NATIVE), Hop(DEFAULT_BRIDGES[2], NATIVE, USDG)))),
+        (buy_intent(side=Side.SELL, quote_currency=USDG, amount_in=10**9), Route((Hop(v3, PIPEDOG, WETH), Hop(DEFAULT_BRIDGES[0], WETH, USDG)))),
+        (SwapIntent(WALLET, Side.SELL, ITH, USDG, 10**18, 50), Route((Hop(PONS, ITH, NATIVE), Hop(DEFAULT_BRIDGES[-1], NATIVE, USDG)))),
         (SwapIntent(WALLET, Side.BUY, ITH, WETH, 10**18, 50), Route((Hop(PONS, NATIVE, ITH),))),
     ]
     for intent, route in cases:
