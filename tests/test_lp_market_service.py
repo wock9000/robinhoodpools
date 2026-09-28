@@ -620,6 +620,30 @@ def test_zero_burn_checkpoint_is_not_lp_activity(tmp_path):
         app.close()
 
 
+def test_bucket_pruning_skips_busy_writer(tmp_path):
+    app = service(tmp_path / "market.sqlite")
+    entered = threading.Event()
+    release = threading.Event()
+
+    def hold_writer():
+        with app.store.transaction():
+            entered.set()
+            assert release.wait(10)
+
+    worker = threading.Thread(target=hold_writer)
+    try:
+        app.store.upsert_pools(pools())
+        block = header(100, int(time.time()) - 40 * 86400)
+        app.store.ingest([block], [swap(block, V3, "v3")])
+        worker.start()
+        assert entered.wait(10)
+        assert app.store.prune_bucket_batch(int(time.time()) - 35 * 86400) == 0
+    finally:
+        release.set()
+        worker.join(timeout=2)
+        app.close()
+
+
 def test_bucket_prune_preserves_all_and_rolling_windows(tmp_path):
     app = service(tmp_path / "market.sqlite")
     try:
