@@ -49,6 +49,7 @@ GIGA_WETH_USDG = "0xb2a6ad51b3ea3cdc8d3508cca147a43471382e53"
 PANCAKE_FACTORY = "0x0bfbcf9fa4f9c56b0f40a671ad40e0805a091865"
 GIGA_FACTORY = "0xece6ecd61177336ea6fb9b17937ac439d85ee20b"
 BLOCKING_HOOK = "0x00000000000000000000000000000000dead0800"
+POOL_COLUMNS = "id, protocol, address, token0, token1, fee_ppm, tick_spacing, hook, factory"
 POOL_ROWS = [
     (PONS_POOL, "v4", POOL_MANAGER, NATIVE, ITH, 0, 200, PONS_HOOK, POOL_MANAGER),
     ("0xb7f10f74b39291b9290b779978e19a7637c742d6", "v3", "0xb7f10f74b39291b9290b779978e19a7637c742d6", WETH, PIPEDOG, 10000, 200, None, UR_V3_FACTORY),
@@ -176,10 +177,10 @@ def pools_db(tmp_path_factory):
     connection = sqlite3.connect(path)
     connection.executescript(
         "CREATE TABLE pools(id TEXT PRIMARY KEY, protocol TEXT NOT NULL, address TEXT NOT NULL, token0 TEXT NOT NULL, token1 TEXT NOT NULL,"
-        " fee_ppm INTEGER, tick_spacing INTEGER, hook TEXT, factory TEXT);"
+        " fee_ppm INTEGER, tick_spacing INTEGER, hook TEXT, factory TEXT, metadata_json TEXT);"
         "CREATE TABLE lp_pool_state(pool_id TEXT PRIMARY KEY, block_number INTEGER NOT NULL);"
     )
-    connection.executemany("INSERT INTO pools VALUES (?,?,?,?,?,?,?,?,?)", POOL_ROWS)
+    connection.executemany(f"INSERT INTO pools({POOL_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?)", POOL_ROWS)
     connection.commit()
     connection.close()
     return path
@@ -514,7 +515,7 @@ def test_hook_blocked_add_from_synthetic_before_add_hook(core, fork, pools_db):
     sqrt_price = int.from_bytes(fork.call(tc.STATE_VIEW, tc.state_view_slot0(PONS_POOL))[:32], "big")
     fork.raw(POOL_MANAGER, pool_manager_initialize(key, sqrt_price))
     connection = sqlite3.connect(pools_db)
-    connection.execute("INSERT INTO pools VALUES (?,?,?,?,?,?,?,?,?)", (key.id(), "v4", POOL_MANAGER, NATIVE, ITH, 3000, 60, BLOCKING_HOOK, POOL_MANAGER))
+    connection.execute(f"INSERT INTO pools({POOL_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?)", (key.id(), "v4", POOL_MANAGER, NATIVE, ITH, 3000, 60, BLOCKING_HOOK, POOL_MANAGER))
     connection.commit()
     connection.close()
     if fork.balance(ITH, fork.user) < 10**18:
