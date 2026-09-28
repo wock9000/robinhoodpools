@@ -72,6 +72,7 @@ def test_holder_lifecycle_on_the_fork(tmp_path, fork):
     assert fork.rpc("eth_getCode", [holder_address, "latest"]) == "0x"
     fork.set_balance(holder_address, 2 * THRESHOLD)
     assert fork.balance_of(holder_address) == 2 * THRESHOLD
+    fork.set_supply(1_000_000 * THRESHOLD)
     address, gate, clock, stop = serve(tmp_path, fork, owner.public_key.to_checksum_address())
     try:
         parsed, signature = signed_policy(bystander, 1, clock)
@@ -86,6 +87,7 @@ def test_holder_lifecycle_on_the_fork(tmp_path, fork):
         secret, me = sign_in(address, gate, holder, clock)
         assert me["state"] == "holder" and me["features"] == ["trade", "lp", "api", "flags"]
         assert me["holding"]["balance_raw"] == str(2 * THRESHOLD)
+        assert me["holding"]["total_supply_raw"] == str(1_000_000 * THRESHOLD)
 
         poor_secret, poor_me = sign_in(address, gate, bystander, clock)
         assert poor_me["state"] == "below" and poor_me["features"] == ["flags"]

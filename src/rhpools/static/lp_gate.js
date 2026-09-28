@@ -3,6 +3,7 @@
   const CHAIN_ID = 4663;
   const CHAIN_HEX = "0x1237";
   const FEATURES = ["trade", "lp", "api", "flags"];
+  const feeRate = (bps) => (bps / 100).toFixed(2) + "%";
   const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
   const chip = document.getElementById("gate-chip");
   const dialog = document.getElementById("gate-dialog");
@@ -179,6 +180,9 @@
         el("span", { class: "note", text: " · balance " }), document.createTextNode(have),
         el("span", { class: "note", text: me.holding ? " · block " + me.holding.block : "" }),
       ]));
+      const next = policy.fee_tiers[me.tier];
+      out.push(el("p", { class: "note", text: "tier " + me.tier + " · fee " + feeRate(me.fee_bps) +
+        (next ? " · " + feeRate(next.fee_bps) + " at " + feeRate(next.min_supply_bps) + " supply" : "") }));
       const rows = FEATURES.map((feature) => {
         const on = me.features.includes(feature);
         const until = me.grace_until && me.grace_until[feature];
@@ -251,10 +255,10 @@
     const policy = me.policy;
     const fields = {};
     const form = el("div", { class: "gate-form" });
-    const add = (name, value, attrs) => {
+    const add = (name, value, attrs, label) => {
       const id = "gate-policy-" + name;
       fields[name] = el("input", Object.assign({ type: "text", id: id, value: value, class: "wide" }, attrs || {}));
-      form.append(el("label", { for: id, text: name === "grace_s" ? "grace (s)" : name }), fields[name]);
+      form.append(el("label", { for: id, text: label || (name === "grace_s" ? "grace (s)" : name) }), fields[name]);
     };
     const previews = {};
     add("token", policy.token || "", { placeholder: "0x… (empty = unset)" });
@@ -265,6 +269,13 @@
       form.append(el("span"), previews[feature]);
     }
     add("grace_s", String(policy.grace_s), { inputmode: "numeric" });
+    add("base_fee_bps", String(policy.base_fee_bps), { inputmode: "numeric" }, "base fee bps");
+    for (let index = 0; index < 4; index++) {
+      const tier = policy.fee_tiers[index];
+      add("supply_" + index, tier ? feeRate(tier.min_supply_bps).slice(0, -1) : "", { inputmode: "decimal" }, "tier " + (index + 1) + " % supply");
+      add("fee_" + index, tier ? String(tier.fee_bps) : "", { inputmode: "numeric" }, "tier " + (index + 1) + " fee bps");
+    }
+    const tiersPreview = el("table", { class: "gate-table" });
     const summary = el("p", { class: "note" });
     const preview = () => {
       const draft = readPolicy(fields, policy.version + 1);
@@ -274,6 +285,15 @@
         previews[feature].className = "gate-preview " + (raw instanceof Error ? "bad" : "note");
       }
       summary.textContent = draft.summary;
+      tiersPreview.replaceChildren(el("thead", {}, [el("tr", {}, [
+        el("th", { text: "tier" }), el("th", { text: "% supply" }), el("th", { text: "fee" }),
+      ])]), el("tbody", {}, [
+        el("tr", {}, [el("td", { text: "base" }), el("td", { text: "—" }), el("td", { text: draft.base_fee_bps === null ? "?" : feeRate(draft.base_fee_bps) })]),
+        ...draft.fee_tiers.map((tier, index) => el("tr", {}, [
+          el("td", { text: String(index + 1) }), el("td", { text: feeRate(tier.min_supply_bps) }),
+          el("td", { text: feeRate(tier.fee_bps) }),
+        ])),
+      ]));
       summary.className = draft.valid ? "note" : "bad";
       apply.disabled = !draft.valid;
     };
@@ -283,6 +303,7 @@
       el("h3", { text: "POLICY v" + policy.version + " (owner)" }),
       form,
       summary,
+      tiersPreview,
       el("div", { class: "gate-row" }, [apply]),
     ];
     preview();
@@ -307,9 +328,32 @@
         valid = false;
       }
     }
+    const parseBps = (text, max) => /^\d{1,3}$/.test(text) && Number(text) <= max ? Number(text) : null;
+    const base_fee_bps = parseBps(fields.base_fee_bps.value.trim(), 100);
+    if (base_fee_bps === null) valid = false;
+    const fee_tiers = [];
+    let empty = false;
+    let previousSupply = -1;
+    let previousFee = base_fee_bps === null ? 101 : base_fee_bps + 1;
+    for (let index = 0; index < 4; index++) {
+      const supplyText = fields["supply_" + index].value.trim();
+      const feeText = fields["fee_" + index].value.trim();
+      if (!supplyText && !feeText) { empty = true; continue; }
+      const pieces = supplyText.split(".");
+      const supply = /^\d+(?:\.\d{1,2})?$/.test(supplyText) ? Number(pieces[0]) * 100 + Number((pieces[1] || "").padEnd(2, "0")) : NaN;
+      const fee = parseBps(feeText, 100);
+      if (empty || !Number.isInteger(supply) || supply > 10000 || fee === null || supply <= previousSupply || fee >= previousFee) {
+        valid = false;
+        continue;
+      }
+      fee_tiers.push({ min_supply_bps: supply, fee_bps: fee });
+      previousSupply = supply;
+      previousFee = fee;
+    }
     const summary = "v" + version + ": " + parts.join(" · ") + " · grace " + (grace === null ? "?" : grace) + " s" +
-      (token === "" ? " · token unset" : ADDRESS_RE.test(token) ? "" : " · token invalid");
-    return { version: version, token: token, decimals: decimals, grace_s: grace, threshold: threshold, valid: valid, summary: summary };
+      (token === "" ? " · token unset" : ADDRESS_RE.test(token) ? "" : " · token invalid") +
+      (valid ? "" : " · fee tiers invalid");
+    return { version, token, decimals, grace_s: grace, threshold, base_fee_bps, fee_tiers, valid, summary };
   }
 
   function renderDialog() {
@@ -461,6 +505,8 @@
       decimals: draft.decimals,
       threshold: draft.threshold,
       grace_s: draft.grace_s,
+      base_fee_bps: draft.base_fee_bps,
+      fee_tiers: draft.fee_tiers,
       issued_at: Math.floor(Date.now() / 1000),
     };
     const status = await api("/api/gate/policy").catch(() => null);
@@ -473,6 +519,8 @@
         version: String(policy.version), token: policy.token || "0x0000000000000000000000000000000000000000",
         decimals: String(policy.decimals), trade: policy.threshold.trade, lp: policy.threshold.lp,
         api: policy.threshold.api, flags: policy.threshold.flags, graceSeconds: String(policy.grace_s), issuedAt: String(policy.issued_at),
+        baseFeeBps: String(policy.base_fee_bps),
+        feeTiers: policy.fee_tiers.map((tier) => ({ minSupplyBps: String(tier.min_supply_bps), feeBps: String(tier.fee_bps) })),
       },
     };
     state.phase = "signing";

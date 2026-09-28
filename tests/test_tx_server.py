@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from golden.anonymous import stub_runtime
 from rhpools.lp_gate import Gate, Limits
 from rhpools.lp_server import Handler, LPHTTPServer
-from rhpools.tx_plan import SwapIntent, TxRefusal
+from rhpools.tx_plan import SwapIntent, TxPolicy, TxRefusal
 from test_gate import HOLDER, OWNER, Clock, FakeRpc, signed_policy
 from test_gate_server import ORIGIN, browser_sign_in, call
 
@@ -21,14 +21,15 @@ class FakeCore:
 
     def __init__(self):
         self.intents, self.kinds = [], {}
+        self.policy = TxPolicy(100, "0x" + "ab" * 20)
 
-    def quote(self, intent):
+    def quote(self, intent, *, policy):
         self.intents.append(intent)
         if isinstance(intent, SwapIntent) and intent.token == "0x" + "00" * 20:
             raise TxRefusal("no_route", "no pool")
         quote_id = f"{len(self.intents):064x}"
         self.kinds[quote_id] = "swap" if isinstance(intent, SwapIntent) else "lp"
-        return SimpleNamespace(to_json=lambda: {"quote_id": quote_id, "wallet": intent.wallet})
+        return SimpleNamespace(to_json=lambda: {"quote_id": quote_id, "wallet": intent.wallet, "fee_bps": policy.fee_bps})
 
     def kind_of(self, quote_id):
         return self.kinds.get(quote_id)
@@ -96,6 +97,22 @@ def test_quote_uses_the_session_wallet_not_the_body(tmp_path):
         assert core.intents[0].wallet == HOLDER.lower() and response_headers["Cache-Control"] == "private, no-store"
         status, _, body = call(address, "POST", "/api/tx/quote", {**SWAP, "token": "0x" + "00" * 20}, headers)
         assert status == 422 and body["refusal"] == "no_route"
+
+def test_quote_reports_wallet_tier_and_status_reports_policy(tmp_path):
+    core = FakeCore()
+    with serving(tmp_path, core) as (address, gate):
+        headers = signed_in(address, gate, balance=999_999, trade="0", lp="0", api="0", flags="0")
+        status, _, config = call(address, "GET", "/api/tx/status")
+        assert status == 200
+        assert config["base_fee_bps"] == 100
+        assert config["fee_tiers"] == [
+            {"min_supply_bps": 10, "fee_bps": 75}, {"min_supply_bps": 50, "fee_bps": 50},
+        ]
+        for balance, fee in ((999_999, 100), (1_000_000, 75), (5_000_000, 50)):
+            gate.rpc.balances[HOLDER.lower()] = balance
+            gate.clock.now += 31
+            status, _, body = call(address, "POST", "/api/tx/quote", SWAP, headers)
+            assert status == 200 and body["fee_bps"] == fee
 
 
 def test_cookie_posts_must_be_same_origin(tmp_path):

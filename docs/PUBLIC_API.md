@@ -313,6 +313,25 @@ Grace applies only while the balance oracle cannot return a fresh reading,
 for at most `grace_s` seconds after the last qualifying observation. Revoking
 one key never changes another key's outcome.
 
+The same policy sets swap fees. `base_fee_bps` defaults to `100`, and
+`fee_tiers` defaults to `[{"min_supply_bps":10,"fee_bps":75},
+{"min_supply_bps":50,"fee_bps":50}]`. Supply bps measure the wallet's share
+of the policy token's on-chain `totalSupply`: 10 bps means 0.10% of supply,
+50 bps means 0.50%. The highest threshold met wins, including at the exact
+boundary. The server caches `totalSupply` per token for 30 s, separate from
+the per-wallet balance cache. If it cannot read supply, the wallet pays the
+base fee. Holding grace never preserves a discounted rate.
+
+An owner can set zero to four tiers in the policy JSON used by the POLICY
+panel or passed to `rhpools-gate policy typed-data` and `rhpools-gate policy apply`.
+Tiers must increase by `min_supply_bps` (0..10000) and decrease strictly by
+`fee_bps` (0..100).
+No tier can exceed `base_fee_bps` (0..100). The EIP-712 domain version is
+`2`; its `GatePolicy` struct signs `baseFeeBps` and a `FeeTier[] feeTiers`
+array. Old policy signatures cannot authorize new policies. Policies already
+stored before this change read with the defaults above until the owner
+signs a replacement version.
+
 Sign in once with an EIP-4361 (SIWE) message. The message's domain must be
 `rhpools.lol`, its chain ID `4663`, and its nonce must come from `/api/gate/nonce`
 (single use, 600 s). The nonce endpoint limits requests per client IP and
@@ -344,7 +363,7 @@ bearer. A wallet may hold eight live keys and four concurrent keyed streams.
 | --- | --- | --- |
 | `GET /api/gate/nonce?wallet=` | none | Fresh nonce, timestamps, statement, checksummed address |
 | `POST /api/gate/session` | none | `{message, signature, label}` → session cookie plus the `/me` body |
-| `GET /api/gate/me` | optional | Wallet, features, holding, grace deadlines, policy; `{"signed_in": false}` otherwise |
+| `GET /api/gate/me` | optional | Wallet, features, holding (including `total_supply_raw`), `fee_bps`, `tier` (0 = base), grace deadlines, policy; `{"signed_in": false}` otherwise |
 | `GET /api/gate/keys` | required | Live and revoked keys for the wallet (no secrets) |
 | `POST /api/gate/keys` | required | `{"op":"mint","label","ttl_s"}`, `{"op":"revoke","key_id"}`, `{"op":"revoke_all"}` |
 | `POST /api/gate/logout` | cookie | Revokes the session key and clears the cookie |
@@ -384,15 +403,21 @@ These routes need a signed-in wallet entitled to `trade` (swaps) or `lp` (liquid
 
 | Route | Purpose |
 |---|---|
-| `GET /api/tx/status` | `enabled`, `reason`, `fee_bps` (75), `quote_ttl_s` |
-| `POST /api/tx/quote` | `{kind:"swap", side, token, quote_currency, amount_in, slippage_bps}` or `{kind:"lp", op, pool_id, slippage_bps, tick_lower, tick_upper, amount0, amount1, liquidity, token_id}`; amounts are raw integers as strings |
-| `POST /api/tx/prepare` | `{quote_id, permit_signature, batched}`; returns the unsigned transaction after re-simulating its exact bytes. With `batched: true` on an external-router quote it also returns `calls`: the exact-amount approval and the swap, simulated together, for one `wallet_sendCalls` confirmation |
+| `GET /api/tx/status` | `enabled`, `reason`, `base_fee_bps`, `fee_tiers`, `quote_ttl_s` |
+| `POST /api/tx/quote` | `{kind:"swap", side, token, quote_currency, amount_in, slippage_bps}` or `{kind:"lp", op, pool_id, slippage_bps, tick_lower, tick_upper, amount0, amount1, liquidity, token_id}`; amounts are raw integers as strings. Swap quotes carry the wallet's `fee_bps` |
+| `POST /api/tx/prepare` | `{quote_id, permit_signature, batched}`; returns the unsigned transaction after re-simulating its exact bytes with the quote's fee, without recalculating the tier. With `batched: true` on an external-router quote it also returns `calls`: the exact-amount approval and the swap, simulated together, for one `wallet_sendCalls` confirmation |
 | `GET /api/tx/receipt?hash=&feature=` | Fill reconciled from receipt logs: `pending`, `confirmed` with amounts, or `failed` |
 | `GET /api/tx/balances?currencies=&feature=` | Balance, decimals and symbol per currency (up to 8) |
 | `GET /api/tx/pool?pool_id=&ids=&feature=lp` | Pool tokens, tick, spacing, Pons flag and the wallet's positions, each verified on chain; `ids` adds the client's recent mints |
 | `GET /api/tx/history?feature=trade` | The signed-in browser wallet's swaps over the last 7 days, newest 50, read from chain logs: `sent`, `received`, `via` (router) and block time. Browser session only; API keys are refused |
 
 A swap quote lists `hops` (venue, `dex`, fee tier, Pons hook and creator bps), `legs` (one to three routes with each leg's input and output share of the order), `amounts` (`amount_in`, `net_out`, `min_out`, `hook_fee`, `creator_tax`, `rhpools_fee`, `impact_bps`), `steps` in order (`approve`, `permit` for EIP-712 signing, `send`), and `shortfall` (`{currency, have, need}`) when the wallet holds less than `amount_in`. Such a quote is priced as if funded, and prepare refuses it until the wallet holds the input. A split order runs in one UniversalRouter transaction: the fee is taken once on the whole input, and `min_out` is enforced on the total at the final sweep. Router approvals are exact amounts, and Permit2 signatures expire with the quote. Quotes expire after 60 s. Refusals return 422 with `refusal`: `no_route`, `insufficient_balance`, `impact_over_limit`, `unmodeled_fee`, `unsellable` (a buy whose sell-back simulation fails), `fee_wallet` (the fee recipient cannot trade), `off_market` (the execution price is more than 300 bps worse than the deepest pool), `incomplete_pool`, `unknown_pool`, `unsupported_pool`, `pons_add`, `hook_blocked_add`, `untrusted_hook` (liquidity adds only go to V4 pools without a hook), `not_executable`, `allowlist_mismatch`, `trading_disabled`. Pools charging more than 10% are never routed, and a quote warns (`high_pool_fee`) when a hop charges more than 1%. Quotes are charged against the caller's token bucket (quote 10, prepare 5, pool 5, other reads 1) and each wallet keeps at most 8 live quotes.
+
+LP adds carry no rhpools fee. A swap pays `floor(amount * fee_bps / 10000)`
+to the configured recipient in the same transaction. For an input-leg fee,
+`amount` is the input; for an output-leg fee, it is the gross output before
+the rhpools deduction. The quoted `fee_bps` stays with its plan through
+prepare, even if the wallet balance or policy changes meanwhile.
 
 ## Flow tags: `GET /api/v1/tags?tx=`
 

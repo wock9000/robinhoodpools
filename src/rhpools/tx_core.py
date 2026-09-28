@@ -243,6 +243,7 @@ class SwapQuote(QuoteBase):
         return {
             **self._base_json(),
             "kind": "swap",
+            "fee_bps": self.plan.shape.fee_bps,
             "intent": self.intent.to_json(),
             "route": self.route.describe(),
             "hops": hops(self.route, self.hop_policies),
@@ -268,6 +269,7 @@ class LpQuote(QuoteBase):
         return {
             **self._base_json(),
             "kind": "lp",
+            "fee_bps": 0,
             "intent": self.intent.to_json(),
             "pool_id": self.pool.id,
             "manager": self.plan.to,
@@ -543,10 +545,10 @@ class TxCore:
         expires_at = int(self._clock()) + self.ttl_s
         return expires_at, expires_at + DEADLINE_GRACE_S
 
-    def quote(self, intent: SwapIntent | LpIntent) -> Quote:
+    def quote(self, intent: SwapIntent | LpIntent, *, policy: TxPolicy | None = None) -> Quote:
         self._require_enabled()
         if isinstance(intent, SwapIntent):
-            return self._quote_swap(intent)
+            return self._quote_swap(intent, policy=policy or self.policy)
         if isinstance(intent, LpIntent):
             return self._quote_lp(intent)
         raise TxError("invalid_intent", "unknown intent")
@@ -573,8 +575,8 @@ class TxCore:
         return intent
 
     def _simulate_swap(self, intent: SwapIntent, route: Route, deadline: int, nonce: int, tag: str,
-                       funded: dict[str, Any] | None = None) -> tuple[Plan, SimResult, Amounts | None, TxError | None]:
-        plan = self.swaps.plan(intent, route, self.policy, deadline, nonce)
+                       policy: TxPolicy, funded: dict[str, Any] | None = None) -> tuple[Plan, SimResult, Amounts | None, TxError | None]:
+        plan = self.swaps.plan(intent, route, policy, deadline, nonce)
         sim = self.sim.run(intent.wallet, plan.staging, Call(plan.to, plan.calldata(), plan.value), tag, funded)
         if not sim.ok:
             assert sim.revert is not None
@@ -586,8 +588,8 @@ class TxCore:
         return plan, sim, amounts, None
 
     def _simulate_split(self, intent: SwapIntent, split: Split, deadline: int, nonce: int, tag: str,
-                        funded: dict[str, Any] | None, *, enforce_min: bool = False) -> tuple[Plan, SimResult, Amounts, Split] | None:
-        plan = self.swaps.plan_split(intent, split, self.policy, deadline, nonce)
+                        policy: TxPolicy, funded: dict[str, Any] | None, *, enforce_min: bool = False) -> tuple[Plan, SimResult, Amounts, Split] | None:
+        plan = self.swaps.plan_split(intent, split, policy, deadline, nonce)
         sim = self.sim.run(intent.wallet, plan.staging, Call(plan.to, plan.calldata(), plan.value), tag, funded)
         if not sim.ok:
             return None
@@ -614,10 +616,10 @@ class TxCore:
             sim, amounts, measured = exact, verified, verified_split
         return plan, sim, amounts, measured
 
-    def _require_sellable(self, intent: SwapIntent, bought: int) -> tuple[str, ...]:
+    def _require_sellable(self, intent: SwapIntent, bought: int, policy: TxPolicy) -> tuple[str, ...]:
         probe = replace(intent, side=Side.SELL, amount_in=max(1, bought // 2), slippage_bps=5_000)
         try:
-            self._quote_swap(probe, probe_only=True)
+            self._quote_swap(probe, policy=policy, probe_only=True)
         except TxRefusal as exc:
             if exc.code in ("unmodeled_fee", "no_route"):
                 raise TxRefusal("unsellable", f"selling it back fails: {exc.detail}"[:300]) from exc
@@ -627,7 +629,7 @@ class TxCore:
             return ("sell_unverified",)
         return ()
 
-    def _quote_swap(self, intent: SwapIntent, *, probe_only: bool = False) -> SwapQuote:
+    def _quote_swap(self, intent: SwapIntent, *, policy: TxPolicy, probe_only: bool = False) -> SwapQuote:
         intent = self._validate_swap(intent)
         block = self._header("latest")
         tag = hex(block.number)
@@ -650,7 +652,7 @@ class TxCore:
         failures: list[tuple[Route, TxError]] = []
         with ThreadPoolExecutor(max_workers=SPLIT_WORKERS) as executor:
             full = list(executor.map(
-                lambda route: self._simulate_swap(intent, route, deadline, nonce, tag, funded), candidates
+                lambda route: self._simulate_swap(intent, route, deadline, nonce, tag, policy, funded), candidates
             ))
             ur_routes: list[Route] = []
             ur_full: list[Amounts] = []
@@ -675,7 +677,7 @@ class TxCore:
                     share = intent.amount_in * k // SPLIT_STEPS
                     try:
                         _, _, got, _ = self._simulate_swap(
-                            replace(intent, amount_in=share), ur_routes[i], deadline, nonce, tag, funded
+                            replace(intent, amount_in=share), ur_routes[i], deadline, nonce, tag, policy, funded
                         )
                         return got.net_out if got else None
                     except TxError:
@@ -687,7 +689,7 @@ class TxCore:
                 try:
                     proposed = allocate_split(ur_routes, curves, intent.amount_in)
                     if len(proposed.legs) > 1:
-                        split_choice = self._simulate_split(intent, proposed, deadline, nonce, tag, funded, enforce_min=True)
+                        split_choice = self._simulate_split(intent, proposed, deadline, nonce, tag, policy, funded, enforce_min=True)
                 except TxError:
                     pass
         if best is None:
@@ -719,28 +721,28 @@ class TxCore:
         warnings: list[str] = []
         small_intent = replace(intent, amount_in=max(1, intent.amount_in // IMPACT_DIVISOR))
         if len(split.legs) == 1:
-            _, _, small, _ = self._simulate_swap(small_intent, route, deadline, nonce, tag, funded)
+            _, _, small, _ = self._simulate_swap(small_intent, route, deadline, nonce, tag, policy, funded)
         else:
             small_shares = [small_intent.amount_in * leg.amount_in // intent.amount_in for leg in split.legs]
             small_shares[-1] += small_intent.amount_in - sum(small_shares)
             if all(small_shares):
                 small_split = Split(tuple(SplitLeg(leg.route, share, 0) for leg, share in zip(split.legs, small_shares)))
-                result = self._simulate_split(small_intent, small_split, deadline, nonce, tag, funded)
+                result = self._simulate_split(small_intent, small_split, deadline, nonce, tag, policy, funded)
                 small = result[2] if result else None
             else:
                 small = None
         impact = impact_bps(amounts, small) if small is not None else None
         if candidates[0] != route or len(split.legs) > 1:
             try:
-                _, _, reference, _ = self._simulate_swap(small_intent, candidates[0], deadline, nonce, tag, funded)
+                _, _, reference, _ = self._simulate_swap(small_intent, candidates[0], deadline, nonce, tag, policy, funded)
             except TxError:
                 reference = None
             if reference is not None and small is not None and small.net_out * 10_000 < reference.net_out * (10_000 - OFF_MARKET_BPS):
                 raise TxRefusal("off_market", "execution price is more than 300 bps worse than the deepest pool")
         if impact is None:
             warnings.append("impact_unavailable")
-        elif impact > self.policy.max_impact_bps:
-            raise TxRefusal("impact_over_limit", f"impact {impact} bps exceeds {self.policy.max_impact_bps}")
+        elif impact > policy.max_impact_bps:
+            raise TxRefusal("impact_over_limit", f"impact {impact} bps exceeds {policy.max_impact_bps}")
         amounts = replace(amounts, min_out=min_out_for(amounts.net_out, intent.slippage_bps), impact_bps=impact)
         if amounts.hook_fee is not None:
             warnings.append("pons_fees")
@@ -748,7 +750,7 @@ class TxCore:
                for leg in split.legs for hop in leg.route.hops):
             warnings.append("high_pool_fee")
         if intent.side is Side.BUY:
-            warnings.extend(self._require_sellable(intent, amounts.net_out))
+            warnings.extend(self._require_sellable(intent, amounts.net_out, policy))
         steps = self._steps(intent.wallet, plan, tag)
         quote = SwapQuote(
             quote_id=self._quote_id(intent, block),

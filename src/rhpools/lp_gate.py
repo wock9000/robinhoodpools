@@ -12,7 +12,7 @@ import threading
 import time
 from collections import OrderedDict, deque
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterator, Literal, Mapping
 from urllib.request import Request, urlopen
@@ -35,11 +35,13 @@ _ZERO_ADDRESS = "0x" + "00" * 20
 _UINT256_MAX = 2**256 - 1
 _POLICY_TYPE = (
     "GatePolicy(uint64 version,address token,uint8 decimals,uint256 trade,uint256 lp,"
-    "uint256 api,uint256 flags,uint32 graceSeconds,uint64 issuedAt)"
+    "uint256 api,uint256 flags,uint32 graceSeconds,uint64 issuedAt,uint16 baseFeeBps,FeeTier[] feeTiers)"
+    "FeeTier(uint16 minSupplyBps,uint16 feeBps)"
 )
+_TIER_TYPE = "FeeTier(uint16 minSupplyBps,uint16 feeBps)"
 _DOMAIN_TYPE = "EIP712Domain(string name,string version,uint256 chainId)"
 _DOMAIN_NAME = "rhpools gate"
-_DOMAIN_VERSION = "1"
+_DOMAIN_VERSION = "2"
 
 Via = Literal["cookie", "bearer"]
 Kind = Literal["session", "key"]
@@ -63,6 +65,18 @@ def _uint(value: Any, bits: int, name: str) -> int:
 
 
 @dataclass(frozen=True)
+class FeeTier:
+    min_supply_bps: int
+    fee_bps: int
+
+    def public(self) -> dict:
+        return {"min_supply_bps": self.min_supply_bps, "fee_bps": self.fee_bps}
+
+
+DEFAULT_FEE_TIERS = (FeeTier(10, 75), FeeTier(50, 50))
+
+
+@dataclass(frozen=True)
 class GatePolicy:
     version: int
     token: str | None
@@ -70,12 +84,14 @@ class GatePolicy:
     threshold: Mapping[Feature, int]
     grace_s: int
     issued_at: int
+    base_fee_bps: int
+    fee_tiers: tuple[FeeTier, ...]
 
     @staticmethod
     def parse(obj: Any) -> "GatePolicy":
         if not isinstance(obj, Mapping):
             raise ValueError("policy must be an object")
-        unknown = set(obj) - {"version", "token", "decimals", "threshold", "grace_s", "issued_at"}
+        unknown = set(obj) - {"version", "token", "decimals", "threshold", "grace_s", "issued_at", "base_fee_bps", "fee_tiers"}
         if unknown:
             raise ValueError("unknown policy fields: " + ", ".join(sorted(unknown)))
         token = obj.get("token")
@@ -89,12 +105,30 @@ class GatePolicy:
         thresholds = obj.get("threshold")
         if not isinstance(thresholds, Mapping) or set(thresholds) != set(FEATURES):
             raise ValueError("threshold must name exactly " + ", ".join(FEATURES))
+        base_fee_bps = _uint(obj.get("base_fee_bps", 100), 16, "base_fee_bps")
+        if base_fee_bps > 100:
+            raise ValueError("base_fee_bps out of range")
+        entries = obj.get("fee_tiers", [tier.public() for tier in DEFAULT_FEE_TIERS])
+        if not isinstance(entries, list) or len(entries) > 4:
+            raise ValueError("fee_tiers must be a list of at most four tiers")
+        tiers = []
+        previous_supply, previous_fee = -1, base_fee_bps + 1
+        for entry in entries:
+            if not isinstance(entry, Mapping) or set(entry) != {"min_supply_bps", "fee_bps"}:
+                raise ValueError("fee tier must name min_supply_bps and fee_bps")
+            supply = _uint(entry["min_supply_bps"], 16, "min_supply_bps")
+            fee = _uint(entry["fee_bps"], 16, "fee_bps")
+            if supply > 10000 or fee > 100 or supply <= previous_supply or fee >= previous_fee:
+                raise ValueError("fee tiers require increasing supply and strictly decreasing fees within 0..100 bps")
+            tiers.append(FeeTier(supply, fee))
+            previous_supply, previous_fee = supply, fee
         return GatePolicy(
             version=_uint(obj.get("version"), 64, "version"), token=token,
             decimals=_uint(obj.get("decimals", 18), 8, "decimals"),
             threshold={feature: _uint(thresholds[feature], 256, feature) for feature in FEATURES},
             grace_s=_uint(obj.get("grace_s", 0), 32, "grace_s"),
             issued_at=_uint(obj.get("issued_at"), 64, "issued_at"),
+            base_fee_bps=base_fee_bps, fee_tiers=tuple(tiers),
         )
 
     def public(self) -> dict:
@@ -102,6 +136,8 @@ class GatePolicy:
             "version": self.version, "token": self.token, "decimals": self.decimals,
             "threshold": {feature: str(self.threshold[feature]) for feature in FEATURES},
             "grace_s": self.grace_s, "issued_at": self.issued_at,
+            "base_fee_bps": self.base_fee_bps,
+            "fee_tiers": [tier.public() for tier in self.fee_tiers],
         }
 
     def typed_data(self, chain_id: int = CHAIN_ID) -> dict:
@@ -116,7 +152,11 @@ class GatePolicy:
                     {"name": "decimals", "type": "uint8"}, {"name": "trade", "type": "uint256"},
                     {"name": "lp", "type": "uint256"}, {"name": "api", "type": "uint256"},
                     {"name": "flags", "type": "uint256"}, {"name": "graceSeconds", "type": "uint32"},
-                    {"name": "issuedAt", "type": "uint64"},
+                    {"name": "issuedAt", "type": "uint64"}, {"name": "baseFeeBps", "type": "uint16"},
+                    {"name": "feeTiers", "type": "FeeTier[]"},
+                ],
+                "FeeTier": [
+                    {"name": "minSupplyBps", "type": "uint16"}, {"name": "feeBps", "type": "uint16"},
                 ],
             },
             "primaryType": "GatePolicy",
@@ -126,6 +166,11 @@ class GatePolicy:
                 "decimals": str(self.decimals),
                 **{feature: str(self.threshold[feature]) for feature in FEATURES},
                 "graceSeconds": str(self.grace_s), "issuedAt": str(self.issued_at),
+                "baseFeeBps": str(self.base_fee_bps),
+                "feeTiers": [
+                    {"minSupplyBps": str(tier.min_supply_bps), "feeBps": str(tier.fee_bps)}
+                    for tier in self.fee_tiers
+                ],
             },
         }
 
@@ -134,15 +179,24 @@ class GatePolicy:
             ["bytes32", "bytes32", "bytes32", "uint256"],
             [keccak(text=_DOMAIN_TYPE), keccak(text=_DOMAIN_NAME), keccak(text=_DOMAIN_VERSION), chain_id],
         ))
+        tiers_hash = keccak(b"".join(
+            keccak(abi_encode(
+                ["bytes32", "uint16", "uint16"],
+                [keccak(text=_TIER_TYPE), tier.min_supply_bps, tier.fee_bps],
+            )) for tier in self.fee_tiers
+        ))
         struct = keccak(abi_encode(
-            ["bytes32", "uint64", "address", "uint8", "uint256", "uint256", "uint256", "uint256", "uint32", "uint64"],
+            ["bytes32", "uint64", "address", "uint8", "uint256", "uint256", "uint256", "uint256",
+             "uint32", "uint64", "uint16", "bytes32"],
             [keccak(text=_POLICY_TYPE), self.version, self.token or _ZERO_ADDRESS, self.decimals,
-             *(self.threshold[feature] for feature in FEATURES), self.grace_s, self.issued_at],
+             *(self.threshold[feature] for feature in FEATURES), self.grace_s, self.issued_at,
+             self.base_fee_bps, tiers_hash],
         ))
         return keccak(b"\x19\x01" + domain + struct)
 
 
-UNSET_POLICY = GatePolicy(version=0, token=None, decimals=18, threshold=dict.fromkeys(FEATURES, 0), grace_s=0, issued_at=0)
+UNSET_POLICY = GatePolicy(version=0, token=None, decimals=18, threshold=dict.fromkeys(FEATURES, 0), grace_s=0, issued_at=0,
+                          base_fee_bps=100, fee_tiers=DEFAULT_FEE_TIERS)
 
 
 @dataclass(frozen=True)
@@ -151,9 +205,11 @@ class Holding:
     balance_raw: int
     block: int
     observed_at: float
+    total_supply_raw: int | None = None
 
     def public(self) -> dict:
-        return {"balance_raw": str(self.balance_raw), "block": self.block, "observed_at": self.observed_at}
+        return {"balance_raw": str(self.balance_raw), "block": self.block, "observed_at": self.observed_at,
+                "total_supply_raw": None if self.total_supply_raw is None else str(self.total_supply_raw)}
 
 
 @dataclass(frozen=True)
@@ -170,6 +226,8 @@ class Entitlement:
     holding: Holding | None
     grace_until: Mapping[Feature, float]
     policy_version: int
+    fee_bps: int
+    tier: int
 
     def has(self, feature: Feature) -> bool:
         return feature in self.features
@@ -194,6 +252,7 @@ class Entitlement:
             "holding": None if self.holding is None else self.holding.public(),
             "grace_until": dict(self.grace_until),
             "policy_version": self.policy_version,
+            "fee_bps": self.fee_bps, "tier": self.tier,
         }
 
 
@@ -212,7 +271,14 @@ def entitle(policy: GatePolicy, state: HoldingState, now: float) -> Entitlement:
             if not fresh and anchor is not None and anchor[1] == policy.version and now - anchor[0] <= policy.grace_s:
                 features.add(feature)
                 grace_until[feature] = anchor[0] + policy.grace_s
-    return Entitlement(state.wallet, frozenset(features), state.holding, grace_until, policy.version)
+    tier, fee_bps = 0, policy.base_fee_bps
+    holding = state.holding
+    if (holding is not None and now - holding.observed_at < ORACLE_TTL_S
+            and holding.total_supply_raw is not None and holding.total_supply_raw > 0):
+        for index, candidate in enumerate(policy.fee_tiers, 1):
+            if holding.balance_raw * 10000 >= candidate.min_supply_bps * holding.total_supply_raw:
+                tier, fee_bps = index, candidate.fee_bps
+    return Entitlement(state.wallet, frozenset(features), holding, grace_until, policy.version, fee_bps, tier)
 
 
 @dataclass(frozen=True)
@@ -283,27 +349,34 @@ class _Oracle:
         self._lock = threading.Lock()
         self._cache: OrderedDict[str, Holding] = OrderedDict()
         self._inflight: dict[str, threading.Event] = {}
+        self._supplies: dict[str, tuple[int | None, float]] = {}
+        self._supply_inflight: dict[str, threading.Event] = {}
 
     def forget_all(self) -> None:
         with self._lock:
             self._cache.clear()
+            self._supplies.clear()
 
     def observe(self, token: str, wallet: str, grace_s: float) -> Holding | None:
         now = self._clock()
         with self._lock:
             cached = self._cache.get(wallet)
-            if cached is not None and now - cached.observed_at < self._ttl:
+            fresh = cached is not None and now - cached.observed_at < self._ttl
+            if fresh:
                 self._cache.move_to_end(wallet)
-                return cached
-            pending = self._inflight.get(wallet)
-            leader = pending is None
-            if leader:
-                pending = self._inflight[wallet] = threading.Event()
+            else:
+                pending = self._inflight.get(wallet)
+                leader = pending is None
+                if leader:
+                    pending = self._inflight[wallet] = threading.Event()
+        if fresh:
+            return replace(cached, total_supply_raw=self._supply(token, cached.block, now))
         if not leader:
             pending.wait(10)
             with self._lock:
                 cached = self._cache.get(wallet)
-            return self._usable(cached, now, grace_s)
+            result = self._usable(cached, now, grace_s)
+            return None if result is None else replace(result, total_supply_raw=self._supply(token, result.block, now))
         holding = None
         try:
             holding = self._fetch(token, wallet, now)
@@ -318,7 +391,8 @@ class _Oracle:
                         self._cache.popitem(last=False)
                 del self._inflight[wallet]
                 pending.set()
-        return holding if holding is not None else self._usable(cached, now, grace_s)
+        result = holding if holding is not None else self._usable(cached, now, grace_s)
+        return None if result is None else replace(result, total_supply_raw=self._supply(token, result.block, now))
 
     @staticmethod
     def _usable(cached: Holding | None, now: float, grace_s: float) -> Holding | None:
@@ -333,6 +407,36 @@ class _Oracle:
         if not isinstance(raw, str) or len(raw) != 66:
             raise ValueError("balanceOf returned no uint256")
         return Holding(wallet, int(raw, 16), block, now)
+
+    def _supply(self, token: str, block: int, now: float) -> int | None:
+        with self._lock:
+            cached = self._supplies.get(token)
+            if cached is not None and now - cached[1] < self._ttl:
+                return cached[0]
+            pending = self._supply_inflight.get(token)
+            leader = pending is None
+            if leader:
+                pending = self._supply_inflight[token] = threading.Event()
+        if not leader:
+            pending.wait(10)
+            with self._lock:
+                cached = self._supplies.get(token)
+            return cached[0] if cached is not None and now - cached[1] < self._ttl else None
+        supply = None
+        try:
+            raw = self._rpc("eth_call", [{"to": token, "data": "0x18160ddd"}, hex(block)])
+            if not isinstance(raw, str) or len(raw) != 66:
+                raise ValueError("totalSupply returned no uint256")
+            supply = int(raw, 16)
+        except (OSError, ValueError, TypeError, KeyError):
+            pass
+        finally:
+            with self._lock:
+                self._supplies[token] = (supply, now)
+                del self._supply_inflight[token]
+                pending.set()
+        return supply
+
 
 
 class _Window:
