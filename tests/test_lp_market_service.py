@@ -498,6 +498,7 @@ def test_verified_high_static_v4_fee_remains_a_rate(tmp_path):
             "symbol0": "ETH", "symbol1": "CIB",
             "decimals0": 18, "decimals1": 18,
             "tick_spacing": 10_000, "hook": "0x" + "00" * 20,
+            "factory": MANAGER, "created_block": None,
             "metadata_json": {"configured_fee": configured_fee, "dynamic_fee": False},
         }])
         block = header(100, int(time.time()) - 60)
