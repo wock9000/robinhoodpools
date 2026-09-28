@@ -756,6 +756,47 @@ def test_repeated_search_entities_do_not_duplicate_search_results():
         store.close()
 
 
+def test_broad_search_ranks_a_bounded_candidate_set_and_keeps_exact_tokens():
+    store = MarketStore(":memory:")
+    try:
+        with store.transaction() as connection:
+            connection.executemany(
+                "INSERT INTO lp_search_entities(kind,id,label,subtitle,href,rank) "
+                "VALUES('pool',?,?,'','/lp',10)",
+                [(f"pool-{index:05d}", f"ETH / {index}") for index in range(12000)],
+            )
+            connection.executemany(
+                "INSERT INTO lp_search_terms(term,kind,id,weight) "
+                "VALUES('eth','pool',?,10)",
+                [(f"pool-{index:05d}",) for index in range(12000)],
+            )
+            connection.execute(
+                "INSERT INTO lp_search_entities VALUES"
+                "('token','token-z','ETH','','/lp',1)"
+            )
+            connection.execute(
+                "INSERT INTO lp_search_terms VALUES('eth','token','token-z',10)"
+            )
+        reader = store.read()
+        steps = 0
+
+        def budget():
+            nonlocal steps
+            steps += 1000
+            return steps > 300_000
+
+        reader.set_progress_handler(budget, 1000)
+        try:
+            rows, total = store.search("eth")
+        finally:
+            reader.set_progress_handler(None, 0)
+        assert total == 12001
+        assert any(row["id"] == "token-z" for row in rows)
+        assert steps <= 300_000
+    finally:
+        store.close()
+
+
 def test_search_batch_skips_noop_updates_and_keeps_late_enrichment():
     store = MarketStore(":memory:")
     initial = {

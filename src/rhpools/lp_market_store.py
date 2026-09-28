@@ -2095,21 +2095,50 @@ class MarketStore:
                 "WHERE kind=m0.kind AND id=m0.id "
                 "AND term>=? COLLATE NOCASE AND term<? COLLATE NOCASE)"
             )
-        # Count matching identities from the term index, without fetching entity
-        # rows or weights. Ranking reads weights from the existing entity index.
         base = " FROM " + " ".join(matches)
         connection = self.read()
         total = int(connection.execute("SELECT COUNT(*)" + base, args).fetchone()[0])
         bounded = max(1, min(int(limit), 30))
+        if total == 0:
+            return [], 0
+        candidates = [
+            (str(row["kind"]), str(row["id"]))
+            for row in connection.execute(
+                "SELECT m0.kind,m0.id" + base + " LIMIT ?",
+                [*args, 256],
+            )
+        ]
+        if len(tokens) == 1:
+            candidates.extend(
+                (str(row["kind"]), str(row["id"]))
+                for row in connection.execute(
+                    "SELECT kind,id FROM lp_search_terms "
+                    "WHERE term=? COLLATE NOCASE AND kind='token' LIMIT 64",
+                    (tokens[0],),
+                )
+            )
+            if raw.startswith("0x"):
+                candidates.extend(
+                    (str(row["kind"]), str(row["id"]))
+                    for row in connection.execute(
+                        "SELECT kind,id FROM lp_search_terms "
+                        "WHERE term=? COLLATE NOCASE AND id=? LIMIT 8",
+                        (raw, raw),
+                    )
+                )
+        candidates = list(dict.fromkeys(candidates))
         exact_shape = raw if len(tokens) == 1 else ""
         label_shape = "".join(tokens)
+        values = ",".join("(?,?)" for _ in candidates)
         rows = connection.execute(
-            "SELECT e.kind,e.id,e.label,e.subtitle,e.href" + base +
-            " JOIN lp_search_entities e ON e.kind=m0.kind AND e.id=m0.id"
+            f"WITH m0(kind,id) AS (VALUES {values}) "
+            "SELECT e.kind,e.id,e.label,e.subtitle,e.href FROM m0 "
+            "JOIN lp_search_entities e ON e.kind=m0.kind AND e.id=m0.id"
             " ORDER BY (e.id=?) DESC,"
             "(LOWER(REPLACE(REPLACE(REPLACE(e.label,' ',''),'/',''),'-',''))=?) DESC,"
             f"({'+'.join(weights)}) ASC,e.rank,e.kind,e.id LIMIT ?",
-            [*args, exact_shape, label_shape, *args, bounded],
+            [*(value for candidate in candidates for value in candidate),
+             exact_shape, label_shape, *args, bounded],
         ).fetchall()
         return [dict(row) for row in rows], total
 
