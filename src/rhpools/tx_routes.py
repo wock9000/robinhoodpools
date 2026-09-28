@@ -129,13 +129,12 @@ class IncompletePool(ValueError):
         super().__init__(f"V4 pool has no verified {field}")
 
 
+TICK_SPACING_CANDIDATES = (1, 10, 50, 60, 100, 200)
+
+
 def _pool_from_row(row: tuple[Any, ...], *, strict: bool = False) -> Pool | None:
     id_, protocol, address, token0, token1, fee_ppm, tick_spacing, hook, factory, metadata_json = row[:10]
     if protocol == "v4":
-        if tick_spacing is None:
-            if strict:
-                raise IncompletePool("tick_spacing")
-            return None
         metadata = json.loads(metadata_json) if metadata_json else {}
         configured_fee = metadata.get("configured_fee")
         if configured_fee is None:
@@ -145,6 +144,15 @@ def _pool_from_row(row: tuple[Any, ...], *, strict: bool = False) -> Pool | None
                 raise IncompletePool("configured_fee")
             return None
         fee_ppm = configured_fee
+        if tick_spacing is None:
+            tick_spacing = next((
+                spacing for spacing in TICK_SPACING_CANDIDATES
+                if PoolKey(token0.lower(), token1.lower(), int(fee_ppm), spacing, (hook or NATIVE).lower()).id() == id_.lower()
+            ), None)
+        if tick_spacing is None:
+            if strict:
+                raise IncompletePool("tick_spacing")
+            return None
     pool = Pool(
         venue=Venue(protocol),
         id=id_.lower(),

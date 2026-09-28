@@ -23,6 +23,7 @@
     pons_add: "Pons pools pay LPs nothing: fee 0 and the hook keeps every swap fee",
     hook_blocked_add: "this pool's hook refuses new liquidity",
     unknown_pool: "pool is not in the rhpools index",
+    incomplete_pool: "this pool's details are still being indexed; try again later",
     unsupported_pool: "no supported position manager for this pool",
     not_owner: "that position is not owned by this wallet",
     not_executable: "the chain would reject this transaction",
@@ -226,27 +227,29 @@
     return [Math.floor((view.tick + down) / spacing) * spacing, Math.ceil((view.tick + up) / spacing) * spacing];
   }
 
-  function missingSide() {
+  function missingSides() {
     const lp = state.lp;
     const view = lp.view;
-    if (!view || (lp.op !== "mint" && lp.op !== "increase")) return null;
+    if (!view || (lp.op !== "mint" && lp.op !== "increase")) return [];
+    const deposit = lp.side === 0 ? view.token0 : view.token1;
     const other = lp.side === 0 ? view.token1 : view.token0;
-    if (BigInt(other.balance) > 0n) return null;
+    const missing = BigInt(deposit.balance) > 0n ? [] : [deposit.symbol];
+    if (BigInt(other.balance) > 0n) return missing;
     let [lower, upper] = lp.op === "mint" ? rangeTicks(view, lp.range) : [null, null];
     if (lp.op === "increase") {
       const position = lpPosition();
-      if (!position) return null;
+      if (!position) return missing;
       [lower, upper] = [position.tick_lower, position.tick_upper];
     }
     const inRange = view.tick >= lower && view.tick < upper;
     const needsOther = inRange || (lp.side === 0 ? view.tick >= upper : view.tick < lower);
-    return needsOther ? other.symbol : null;
+    return needsOther ? [...missing, other.symbol] : missing;
   }
 
   function lpPayload() {
     const lp = state.lp;
     const view = lp.view;
-    if (!view || missingSide()) return null;
+    if (!view || missingSides().length) return null;
     if (view.pool_id !== lp.poolId) return null;
     const base = { kind: "lp", op: lp.op, pool_id: view.pool_id, slippage_bps: state.slippage };
     if (lp.op === "collect") return lp.tokenId ? { ...base, token_id: lp.tokenId } : null;
@@ -783,8 +786,8 @@
       if (!lp.poolId) return { label: "pick a pool", disabled: true };
       if (!lp.view) return { label: state.note ? "pool unavailable" : "loading pool…", disabled: true };
       if ((lp.op === "mint" || lp.op === "increase") && lp.view.pons) return { label: "adds refused on Pons pools", disabled: true };
-      const missing = missingSide();
-      if (missing) return { label: "this range also needs " + missing + "; your balance is 0", disabled: true };
+      const missing = missingSides();
+      if (missing.length) return { label: "add " + missing.join(" and ") + " to this wallet to deposit", disabled: true };
       if (lpPayload() == null) return { label: lp.op === "decrease" || lp.op === "collect" ? "pick a position" : "enter a deposit amount", disabled: true };
     } else {
       if (!state.token) return { label: "pick a token", disabled: true };

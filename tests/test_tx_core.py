@@ -311,7 +311,8 @@ def test_real_initialize_dynamic_fee_key_survives_storage_and_route_decode(pools
 
 def test_route_book_decodes_dynamic_fee_and_refuses_incomplete_spacing(pools_db, rpc):
     dynamic = v4_pool(PoolKey(NATIVE, ITH, 0x800000, 10, NATIVE))
-    incomplete = v4_pool(PoolKey(NATIVE, PIPEDOG, 500, 10, NATIVE))
+    incomplete = v4_pool(PoolKey(NATIVE, PIPEDOG, 500, 7, NATIVE))
+    recovered = v4_pool(PoolKey(NATIVE, "0x" + "ab" * 20, 0, 200, PONS_HOOK))
     with pools_db() as reader:
         path = reader.execute("PRAGMA database_list").fetchone()[2]
     with sqlite3.connect(path) as connection:
@@ -325,8 +326,13 @@ def test_route_book_decodes_dynamic_fee_and_refuses_incomplete_spacing(pools_db,
             (incomplete.id, "v4", POOL_MANAGER, NATIVE, PIPEDOG, 500, None, NATIVE, POOL_MANAGER,
              '{"configured_fee":500,"dynamic_fee":false}'),
         )
+        connection.execute(
+            "INSERT INTO pools VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (recovered.id, "v4", POOL_MANAGER, NATIVE, "0x" + "ab" * 20, 0, None, PONS_HOOK, POOL_MANAGER, None),
+        )
     routes = RouteBook(pools_db, rpc)
     assert routes.pool(dynamic.id).key.id() == dynamic.id
+    assert routes.pool(recovered.id).tick_spacing == 200
     core = TxCore(rpc, routes, POLICY)
     with pytest.raises(TxRefusal, match="tick_spacing") as view_refusal:
         core.pool_view(incomplete.id, WALLET)
