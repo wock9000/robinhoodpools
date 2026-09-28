@@ -16,6 +16,7 @@
     no_route: "no route on supported pools for this pair",
     insufficient_balance: "balance too low for this amount",
     fee_wallet: "this is the rhpools fee wallet; trade from another wallet",
+    unsellable: "refused: this token can't be sold back (transfer tax or blocked sells)",
     impact_over_limit: "price impact above the 15% limit; lower the amount",
     unmodeled_fee: "this token takes a transfer fee the ticket cannot price; refused",
     allowlist_mismatch: "trading paused: a pinned contract's code changed",
@@ -812,6 +813,7 @@
       pons ? feeRow("creator tax", pons.creator_tax_bps / 100 + "%", amounts.creator_tax) : null,
       feeRow("rhpools fee", "0.75%", amounts.rhpools_fee),
       el("tr", {}, [el("th", { text: "price impact" }), el("td", {}), el("td", { class: "numeric " + impactClass, text: impact == null ? "—" : (impact / 100).toFixed(2) + "%" })]),
+      quote.warnings.includes("sell_unverified") ? el("tr", {}, [el("th", { text: "sell back" }), el("td", {}), el("td", { class: "numeric impact-warn", text: "unverified" })]) : null,
       el("tr", {}, [el("th", { text: "quote" }), el("td", { class: "dim", text: "block " + quote.block.number }), el("td", { class: "numeric dim" }, [refs.expiry = el("span")])]),
     ])]));
     tick();

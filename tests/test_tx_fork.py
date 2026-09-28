@@ -57,6 +57,7 @@ SLIPSTREAM_TOKEN = "0xd0601ce157db5bdc3162bbac2a2c8af5320d9eec"
 SLIPSTREAM_TOKEN_POOL = "0x18a5af4e442f8be68968cc1f00d537f8af2d12cd"
 SLIPSTREAM_FACTORY = "0x1ac9db4a2608ba45d6127b1737949b51bb54b7f3"
 BLOCKING_HOOK = "0x00000000000000000000000000000000dead0800"
+TAXED_ASSET = "0x002f6ee31b99f7b270b0587d7df01318d9f68888"
 POOL_COLUMNS = "id, protocol, address, token0, token1, fee_ppm, tick_spacing, hook, factory"
 POOL_ROWS = [
     (PONS_POOL, "v4", POOL_MANAGER, NATIVE, ITH, 0, 200, PONS_HOOK, POOL_MANAGER),
@@ -72,6 +73,7 @@ POOL_ROWS = [
     (GIGA_TOKEN_POOL, "v3", GIGA_TOKEN_POOL, USDG, GIGA_TOKEN, 3000, 60, None, GIGA_FACTORY),
     (SLIPSTREAM_TOKEN_POOL, "v3", SLIPSTREAM_TOKEN_POOL, USDG, SLIPSTREAM_TOKEN, 100, 60, None, SLIPSTREAM_FACTORY),
     (V4_ETH_USDG, "v4", POOL_MANAGER, NATIVE, USDG, 500, 10, NATIVE, POOL_MANAGER),
+    ("0x3e51b33694deffbc6033154874d3587b54594092", "v3", "0x3e51b33694deffbc6033154874d3587b54594092", TAXED_ASSET, USDG, 100, 1, None, PANCAKE_FACTORY),
 ]
 
 
@@ -413,6 +415,14 @@ def test_usdg_bought_and_sold_against_eth(core, fork):
     held = fork.balance(USDG, fork.user)
     quote, _ = trade(core, fork, swap(fork.user, Side.SELL, USDG, NATIVE, held // 2))
     assert len(quote.route.hops) == 1 and quote.amounts.rhpools_fee.currency == WETH
+
+
+def test_buying_a_token_that_cannot_be_sold_back_is_refused(core, fork):
+    with pytest.raises(TxRefusal) as refused:
+        core.quote(swap(fork.user, Side.BUY, TAXED_ASSET, NATIVE, 3 * 10**14))
+    assert refused.value.code == "unsellable"
+    quote = core.quote(swap(fork.user, Side.BUY, PIPEDOG, NATIVE, 10**16))
+    assert "sell_unverified" not in quote.warnings
 
 
 def test_v2_token_buy_and_sell(core, fork):

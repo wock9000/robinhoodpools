@@ -588,7 +588,20 @@ class TxCore:
             sim, amounts, measured = exact, verified, verified_split
         return plan, sim, amounts, measured
 
-    def _quote_swap(self, intent: SwapIntent) -> SwapQuote:
+    def _require_sellable(self, intent: SwapIntent, bought: int) -> tuple[str, ...]:
+        probe = replace(intent, side=Side.SELL, amount_in=max(1, bought // 2), slippage_bps=5_000)
+        try:
+            self._quote_swap(probe, probe_only=True)
+        except TxRefusal as exc:
+            if exc.code in ("unmodeled_fee", "no_route"):
+                raise TxRefusal("unsellable", f"selling it back fails: {exc.detail}"[:300]) from exc
+            if exc.code == "insufficient_balance":
+                return ("sell_unverified",)
+        except TxError:
+            return ("sell_unverified",)
+        return ()
+
+    def _quote_swap(self, intent: SwapIntent, *, probe_only: bool = False) -> SwapQuote:
         intent = self._validate_swap(intent)
         block = self._header("latest")
         tag = hex(block.number)
@@ -624,7 +637,7 @@ class TxCore:
                     ur_routes.append(route)
                     ur_full.append(candidate_amounts)
             split_choice = None
-            if best is not None and len(ur_routes) > 1 and intent.amount_in >= SPLIT_STEPS:
+            if not probe_only and best is not None and len(ur_routes) > 1 and intent.amount_in >= SPLIT_STEPS:
                 samples = [(i, k) for i in range(len(ur_routes)) for k in range(1, SPLIT_STEPS)]
                 def sample(pair: tuple[int, int]) -> int | None:
                     i, k = pair
@@ -669,6 +682,9 @@ class TxCore:
                 plan, sim, amounts, split = split_plan, split_sim, split_amounts_result, measured
                 route = split.legs[0].route
                 plan = replace(plan, body=replace(plan.body, split=split))
+        if probe_only:
+            return SwapQuote("", intent.wallet, plan, block, expires_at, deadline, (), (), sim.gas_used,
+                             intent=intent, route=route, amounts=amounts, split=split)
         warnings: list[str] = []
         small_intent = replace(intent, amount_in=max(1, intent.amount_in // IMPACT_DIVISOR))
         if len(split.legs) == 1:
@@ -690,6 +706,8 @@ class TxCore:
         amounts = replace(amounts, min_out=min_out_for(amounts.net_out, intent.slippage_bps), impact_bps=impact)
         if amounts.hook_fee is not None:
             warnings.append("pons_fees")
+        if intent.side is Side.BUY:
+            warnings.extend(self._require_sellable(intent, amounts.net_out))
         steps = self._steps(intent.wallet, plan, tag)
         quote = SwapQuote(
             quote_id=self._quote_id(intent, block),
