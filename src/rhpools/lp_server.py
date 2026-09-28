@@ -81,7 +81,7 @@ _LANE_SHARE = {"fast": 1.0, "slow": 0.5, "keyed": 0.5}
 _GATE_GET = {"/api/gate/nonce", "/api/gate/me", "/api/gate/keys", "/api/gate/policy"}
 _GATE_POST = {"/api/gate/session", "/api/gate/keys", "/api/gate/logout", "/api/gate/policy"}
 KEYED_STREAM = "/api/v1/stream"
-_TX_GET = {"/api/tx/status", "/api/tx/receipt", "/api/tx/balances", "/api/tx/pool"}
+_TX_GET = {"/api/tx/status", "/api/tx/receipt", "/api/tx/balances", "/api/tx/pool", "/api/tx/history"}
 _TX_POST = {"/api/tx/quote", "/api/tx/prepare"}
 TX_FEE_BPS = 75
 TAGS_PATH = "/api/v1/tags"
@@ -979,9 +979,15 @@ class Handler(BaseHTTPRequestHandler):
                 "enabled": tx is not None and tx.enabled, "reason": self.runtime.tx_unavailable,
                 "fee_bps": TX_FEE_BPS, "quote_ttl_s": tx.ttl_s if tx is not None else None,
             }, private=True)
+        if path == "/api/tx/history" and query.get("feature") != "trade":
+            return self._json(400, {"error": "feature must be trade"}, private=True)
         try:
             principal = self._tx_principal("lp" if query.get("feature") == "lp" else "trade")
+            if path == "/api/tx/history" and (principal.kind != "session" or principal.via != "cookie"):
+                raise GateRefusal(403, "browser session required", state="forbidden")
             core = self._tx_core()
+            if path == "/api/tx/history":
+                return self._json(200, core.history(principal.wallet), private=True)
             if path == "/api/tx/balances":
                 currencies = [c for c in str(query.get("currencies") or "").split(",") if c]
                 return self._json(200, {"wallet": principal.wallet, "balances": core.balances(principal.wallet, currencies)}, private=True)

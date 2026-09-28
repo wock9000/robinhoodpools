@@ -7,6 +7,7 @@ import os
 import re
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any
@@ -21,7 +22,8 @@ from .tx_chain import (
     PANCAKE_V3_FACTORY, PERMIT2, PONS_HOOK, POSM, SEL_PANCAKE_EXACT_INPUT,
     SEL_PANCAKE_EXACT_INPUT_SINGLE, SEL_ROUTER_MULTICALL_DEADLINE, SEL_SLIPSTREAM_EXACT_INPUT_SINGLE,
     SEL_SWEEP_WITH_FEE, SEL_UNWRAP_WITH_FEE, SEL_V3_EXACT_INPUT, SEL_V3_EXACT_INPUT_SINGLE,
-    SLIPSTREAM_FACTORY, SLIPSTREAM_SWAP_ROUTER, STATE_VIEW, UR, WETH,
+    SLIPSTREAM_FACTORY, SLIPSTREAM_SWAP_ROUTER, STATE_VIEW, TOPIC_PANCAKE_SWAP,
+    TOPIC_TRANSFER, TOPIC_V2_SWAP, TOPIC_V3_SWAP, TOPIC_V4_SWAP, UR, WETH,
     NfpmCollect, NfpmDecrease, NfpmIncrease, NfpmMint, PayPortion,
     Permit2TransferFrom, PoolKey, PosmDecrease, PosmIncrease, PosmMint, RevertKind, SEL_MULTICALL,
     SEL_POSM_PERMIT_BATCH, Sweep, UnwrapWeth, V2Swap, V3Swap, V4Swap, V4SwapExactInSingle,
@@ -51,6 +53,21 @@ LP_TARGETS = frozenset({POSM, NFPM_UNISWAP, NFPM_PANCAKE, NFPM_GIGA})
 
 SEL_DECIMALS = selector("decimals()")
 SEL_SYMBOL = selector("symbol()")
+TOPIC_WITHDRAWAL = "0x" + keccak(text="Withdrawal(address,uint256)").hex()
+HISTORY_BLOCKS_PER_DAY = 855_000
+HISTORY_DAYS = 7
+HISTORY_LIMIT = 50
+HISTORY_TRACE_LIMIT = 20
+HISTORY_TX_CACHE_LIMIT = 512
+HISTORY_WALLET_CACHE_LIMIT = 128
+HISTORY_CACHE_SECONDS = 15
+HISTORY_ROUTERS = {
+    UR: "UR",
+    PANCAKE_SMART_ROUTER: "Pancake",
+    GIGA_SWAP_ROUTER: "Giga",
+    SLIPSTREAM_SWAP_ROUTER: "Slipstream",
+}
+HISTORY_SWAP_TOPICS = frozenset({TOPIC_PANCAKE_SWAP, TOPIC_V2_SWAP, TOPIC_V3_SWAP, TOPIC_V4_SWAP})
 
 
 class JsonRpc:
@@ -336,6 +353,8 @@ class TxCore:
         self.sim = Simulator(rpc)
         self._quotes: dict[str, Quote] = {}
         self._token_meta: dict[str, tuple[int, str]] = {}
+        self._history_txs: OrderedDict[tuple[str, str], dict[str, Any]] = OrderedDict()
+        self._history_wallets: OrderedDict[str, tuple[float, dict[str, Any]]] = OrderedDict()
         self._balance_slots: dict[str, int | None] = {}
         self._allowance_slots: dict[str, int | None] = {}
         self._lock = threading.Lock()
@@ -348,6 +367,8 @@ class TxCore:
     def close(self) -> None:
         with self._lock:
             self._quotes.clear()
+            self._history_txs.clear()
+            self._history_wallets.clear()
 
     def _require_enabled(self) -> None:
         if self.mismatches:
@@ -959,6 +980,151 @@ class TxCore:
         if isinstance(call, NfpmCollect):
             return LpShape(wallet, LpOp.COLLECT, pool, to, call.token_id, lower, upper, 0)
         raise TxError("unknown_target", "calldata is not an rhpools lp action")
+
+    def history(self, wallet: str) -> dict[str, Any]:
+        wallet = _address(wallet, "wallet")
+        now = self._clock()
+        with self._lock:
+            cached = self._history_wallets.get(wallet)
+            if cached is not None and cached[0] > now:
+                self._history_wallets.move_to_end(wallet)
+                return cached[1]
+        latest = self._header("latest").number
+        earliest = max(0, latest - HISTORY_DAYS * HISTORY_BLOCKS_PER_DAY + 1)
+        wallet_topic = "0x" + wallet[2:].rjust(64, "0")
+        discovered: dict[str, tuple[int, int]] = {}
+        for day in range(HISTORY_DAYS):
+            upper = latest - day * HISTORY_BLOCKS_PER_DAY
+            if upper < earliest:
+                break
+            lower = max(earliest, upper - HISTORY_BLOCKS_PER_DAY + 1)
+            for position in (1, 2):
+                topics = [TOPIC_TRANSFER, None, None]
+                topics[position] = wallet_topic
+                try:
+                    logs = self.rpc.call("eth_getLogs", [{
+                        "fromBlock": hex(lower), "toBlock": hex(upper), "topics": topics,
+                    }])
+                except Exception as exc:
+                    raise TxError("rpc", "history log lookup failed") from exc
+                if not isinstance(logs, list):
+                    raise TxError("rpc", "malformed history logs")
+                for log in logs:
+                    tx_hash = str(log["transactionHash"]).lower()
+                    if _HASH_RE.fullmatch(tx_hash) is None:
+                        raise TxError("rpc", "malformed history transaction hash")
+                    order = (_hex_int(log["blockNumber"], "block number"),
+                             _hex_int(log["transactionIndex"], "transaction index"))
+                    discovered[tx_hash] = order
+        hashes = sorted(discovered, key=lambda tx_hash: (*discovered[tx_hash], tx_hash), reverse=True)
+        rows: list[dict[str, Any]] = []
+        timestamps: dict[int, int] = {}
+        traces = 0
+        for tx_hash in hashes:
+            if len(rows) == HISTORY_LIMIT:
+                break
+            key = (wallet, tx_hash)
+            with self._lock:
+                row = self._history_txs.get(key)
+                if row is not None:
+                    self._history_txs.move_to_end(key)
+            if row is None:
+                tx = self.rpc.call("eth_getTransactionByHash", [tx_hash])
+                receipt = self.rpc.call("eth_getTransactionReceipt", [tx_hash])
+                if not isinstance(tx, dict) or not isinstance(receipt, dict):
+                    raise TxError("rpc", "history transaction unavailable")
+                if (str(tx.get("to", "")).lower() not in HISTORY_ROUTERS
+                        and not any(log.get("topics") and str(log["topics"][0]).lower() in HISTORY_SWAP_TOPICS
+                                    for log in receipt.get("logs", []))):
+                    continue
+                sent: dict[str, int] = {}
+                received: dict[str, int] = {}
+                for log in receipt.get("logs", []):
+                    topics = log.get("topics", [])
+                    if len(topics) != 3 or str(topics[0]).lower() != TOPIC_TRANSFER:
+                        continue
+                    token = _address(log.get("address"), "token")
+                    amount = _hex_int(log.get("data"), "transfer amount")
+                    if str(topics[1]).lower() == wallet_topic:
+                        sent[token] = sent.get(token, 0) + amount
+                    if str(topics[2]).lower() == wallet_topic:
+                        received[token] = received.get(token, 0) + amount
+                sender = str(tx.get("from", "")).lower()
+                to = str(tx.get("to", "")).lower()
+                if sender == wallet:
+                    value = _hex_int(tx.get("value", "0x0"), "transaction value")
+                    if value:
+                        sent["native"] = value
+                withdrawal = any(
+                    log.get("address", "").lower() == WETH
+                    and len(log.get("topics", [])) == 2
+                    and str(log["topics"][0]).lower() == TOPIC_WITHDRAWAL
+                    and str(log["topics"][1]).lower() == "0x" + to[2:].rjust(64, "0")
+                    for log in receipt.get("logs", [])
+                )
+                needs_trace = (withdrawal and to in HISTORY_ROUTERS) or not received
+                incoming = 0
+                if needs_trace and traces < HISTORY_TRACE_LIMIT:
+                    try:
+                        trace = self.rpc.call("debug_traceTransaction", [tx_hash, {"tracer": "callTracer"}])
+                    except Exception as exc:
+                        raise TxError("rpc", "history native trace failed") from exc
+                    traces += 1
+                    stack = [trace]
+                    while stack:
+                        call = stack.pop()
+                        if not isinstance(call, dict):
+                            raise TxError("rpc", "malformed native trace")
+                        if (str(call.get("to", "")).lower() == wallet
+                                and str(call.get("from", "")).lower() != wallet
+                                and str(call.get("type", "CALL")).upper() == "CALL"):
+                            incoming += _hex_int(call.get("value", "0x0"), "trace value")
+                        stack.extend(call.get("calls") or [])
+                    if incoming:
+                        received["native"] = incoming
+                block = discovered[tx_hash][0]
+                row = {"hash": tx_hash, "block": block, "sent": sent, "received": received,
+                       "via": HISTORY_ROUTERS.get(to, "other")}
+                with self._lock:
+                    self._history_txs[key] = row
+                    self._history_txs.move_to_end(key)
+                    if len(self._history_txs) > HISTORY_TX_CACHE_LIMIT:
+                        self._history_txs.popitem(last=False)
+            block = row["block"]
+            if block not in timestamps:
+                header = self.rpc.call("eth_getBlockByNumber", [hex(block), False])
+                if not isinstance(header, dict):
+                    raise TxError("rpc", "history block unavailable")
+                timestamps[block] = _hex_int(header.get("timestamp"), "block timestamp")
+            amounts = {}
+            for side in ("sent", "received"):
+                amounts[side] = []
+                for token, amount in row[side].items():
+                    if token == "native":
+                        decimals, symbol = 18, "ETH"
+                    else:
+                        with self._lock:
+                            meta = self._token_meta.get(token)
+                        if meta is None:
+                            try:
+                                meta = (_word(self._call(token, SEL_DECIMALS, "latest")),
+                                        _abi_string(self._call(token, SEL_SYMBOL, "latest")))
+                            except Exception as exc:
+                                raise TxError("rpc", "history token metadata unavailable") from exc
+                            with self._lock:
+                                self._token_meta[token] = meta
+                        decimals, symbol = meta
+                    amounts[side].append({"token": token, "amount": str(amount),
+                                          "symbol": symbol, "decimals": decimals})
+            rows.append({"hash": tx_hash, "block": block, "timestamp": timestamps[block],
+                         **amounts, "via": row["via"]})
+        result = {"rows": rows}
+        with self._lock:
+            self._history_wallets[wallet] = (now + HISTORY_CACHE_SECONDS, result)
+            self._history_wallets.move_to_end(wallet)
+            if len(self._history_wallets) > HISTORY_WALLET_CACHE_LIMIT:
+                self._history_wallets.popitem(last=False)
+        return result
 
     def receipt(self, tx_hash: str, wallet: str) -> Fill:
         if not isinstance(tx_hash, str) or _HASH_RE.fullmatch(tx_hash.lower()) is None:
