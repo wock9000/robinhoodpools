@@ -904,6 +904,20 @@ def test_swap_shape_round_trips_through_calldata(core):
         assert core._swap_shape(WALLET, final.calldata(), final.value) == plan.shape
 
 
+def test_ur_calldata_resolves_uniswap_pools_not_a_same_fee_pancake_bridge(core, pools_db):
+    uniswap = Pool(Venue.V3, "0x" + "51" * 20, "0x" + "51" * 20, WETH, USDG, 500, 10, NATIVE, UR_V3_FACTORY)
+    with pools_db() as reader:
+        path = reader.execute("PRAGMA database_list").fetchone()[2]
+    with sqlite3.connect(path) as connection:
+        connection.execute("INSERT INTO pools VALUES (?,?,?,?,?,?,?,?,?,NULL)",
+                           (uniswap.id, "v3", uniswap.address, WETH, USDG, 500, 10, None, UR_V3_FACTORY))
+    intent = SwapIntent(WALLET, Side.SELL, WETH, USDG, 10**15, 50)
+    planner = SwapPlanner()
+    plan = planner.plan(intent, Route((Hop(uniswap, WETH, USDG),)), POLICY, 5_000, 0)
+    final = planner.finalize(plan, 42, Signatures(permit=b"\x02" * 65))
+    assert [hop.pool.id for hop in core._swap_shape(WALLET, final.calldata(), final.value).route.hops] == [uniswap.id]
+
+
 def test_lp_planner_bounds_and_permit_batch(core, rpc):
     hookless = v4_pool(PoolKey(NATIVE, ITH, 500, 10, NATIVE))
     intent = LpIntent(wallet=WALLET, op=LpOp.MINT, pool_id=hookless.id, slippage_bps=50, tick_lower=-100, tick_upper=100, amount0=10**18, amount1=10**18)

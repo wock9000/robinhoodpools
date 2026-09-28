@@ -31,7 +31,7 @@ from .tx_chain import (
     decode_multicall, decode_nfpm_call, decode_posm_modify_liquidities, decode_revert,
     decode_ur_execute, decode_v3_path, erc20_allowance, erc20_approve, erc20_balance_of,
     nfpm_positions, permit2_allowance, posm_pool_and_position,
-    posm_position_liquidity, selector, state_view_slot0,
+    posm_position_liquidity, selector, state_view_slot0, UR_V2_FACTORY, UR_V3_FACTORY,
 )
 from .tx_plan import (
     Amounts, Call, FeeLeg, Ledger, LpAmounts, LpIntent, LpOp, LpPlanner, LpShape, Plan,
@@ -1013,7 +1013,7 @@ class TxCore:
                     starts.append((len(hops), command.amount_in))
                 tokens, fees = decode_v3_path(command.path)
                 for a, b, fee_ppm in zip(tokens, tokens[1:], fees):
-                    pool = self.routes.pool_for(Venue.V3, a, b, fee_ppm)
+                    pool = self.routes.pool_for(Venue.V3, a, b, fee_ppm, factory=UR_V3_FACTORY)
                     if pool is None:
                         raise TxError("unknown_pool", f"no indexed V3 pool for {a}/{b}")
                     hops.append(Hop(pool, a, b))
@@ -1021,7 +1021,7 @@ class TxCore:
                 if command.amount_in != 1 << 255:
                     starts.append((len(hops), command.amount_in))
                 for a, b in zip(command.path, command.path[1:]):
-                    pool = self.routes.pool_for(Venue.V2, a, b)
+                    pool = self.routes.pool_for(Venue.V2, a, b, factory=UR_V2_FACTORY)
                     if pool is None:
                         raise TxError("unknown_pool", f"no indexed V2 pool for {a}/{b}")
                     hops.append(Hop(pool, a, b))

@@ -14,7 +14,7 @@ PAGE_HEADERS_ALLOWED_TO_MOVE = {"etag", "content-length"}
 
 def _comparable(entry: dict) -> dict:
     page = entry["request"]["path"] in TERMINAL_PAGES
-    headers = [pair for pair in entry["headers"] if not (page and pair[0].lower() in PAGE_HEADERS_ALLOWED_TO_MOVE)]
+    headers = [pair for pair in entry["headers"] if pair[0].lower() != "server" and not (page and pair[0].lower() in PAGE_HEADERS_ALLOWED_TO_MOVE)]
     return {key: value for key, value in entry.items() if key not in {"headers", "request"} and not (page and key == "body_sha256")} | {"headers": headers}
 
 

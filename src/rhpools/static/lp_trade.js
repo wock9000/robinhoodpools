@@ -477,8 +477,17 @@
           else loadBalances();
           return;
         }
-      } catch (_) {
-        // node briefly unaware of the transaction; keep polling
+      } catch (error) {
+        const pending = error && error.data && error.data.code === "unknown_tx";
+        if (!pending && error && error.status >= 400 && error.status < 500 && error.status !== 404) {
+          state.phase = "confirmed";
+          state.fill = null;
+          state.note = "on chain; amounts could not be reconciled (" + ((error.data && (error.data.code || error.data.refusal)) || error.status) + "); check the explorer";
+          render();
+          if (state.mode === "lp") loadPool();
+          else loadBalances();
+          return;
+        }
       }
       await new Promise((resolve) => setTimeout(resolve, 1000));
     }

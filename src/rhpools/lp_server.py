@@ -455,6 +455,8 @@ class Handler(BaseHTTPRequestHandler):
     # for it meanwhile. Data routes report 503 "starting", never a hang.
     runtime: Runtime | None = None
     startup: Startup | None = None
+    server_version = "rhpools"
+    sys_version = ""
     # Keep-alive lets cloudflared reuse origin connections instead of paying a
     # handshake and a new thread per poll. Every response carries Content-Length
     # or closes the connection.
