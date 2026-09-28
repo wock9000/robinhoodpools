@@ -199,7 +199,10 @@
         dialog.close();
         window.rhpTerminal?.openOwner(me.wallet);
       } }),
-      el("button", { type: "button", text: "my trades · unavailable", disabled: true, title: "Swap events do not include a wallet sender or recipient." }),
+      el("button", { type: "button", text: "trades", onclick: () => {
+        dialog.close();
+        window.rhpTerminal?.openOwner(me.wallet, true);
+      } }),
     ]));
     out.push(el("div", { class: "gate-row" }, [
       el("span", { class: "note", text: "session " + me.key_id + " · expires " + new Date(me.expires_at * 1000).toISOString().slice(0, 16).replace("T", " ") }),
