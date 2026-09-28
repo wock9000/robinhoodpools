@@ -193,15 +193,16 @@ def test_owner_count_uses_small_covering_window_index(inventory):
         sizes["lp_accounting_episodes_owner_window_cover"] * 3 // 4
     )
 
-def test_superseded_inventory_cost_follows_the_page_not_the_queue(inventory):
+def test_superseded_inventory_seeks_from_queued_positions(inventory):
     store, book = inventory
     with store.transaction() as conn:
-        conn.executemany(
+        for index in range(4096):
+            insert_position(conn, f"unmodified-{index}", 10**18)
+        conn.execute(
             "INSERT INTO lp_accounting_pending("
             "position_key,generation,requested_revision,requested_epoch,"
             "priority_block,priority_tx_index,priority_log_index"
-            ") VALUES(?,1,1,0,2,0,0)",
-            [("position-a",)] + [(f"elsewhere-{index:06d}",) for index in range(20_000)],
+            ") VALUES('position-a',1,1,0,2,0,0)"
         )
     with store.reader_snapshot() as conn:
         steps = 0

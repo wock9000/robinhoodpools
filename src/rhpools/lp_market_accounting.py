@@ -6954,10 +6954,9 @@ class AccountBook:
             rows = conn.execute(
                 "SELECT p.pool_id,p.protocol,p.liquidity,p.liquidity_known,"
                 "p.tick_lower,p.tick_upper "
-                "FROM lp_accounting_positions p "
-                "INDEXED BY lp_accounting_positions_active_replay "
-                "CROSS JOIN lp_accounting_pending q "
-                "WHERE q.position_key=p.position_key "
+                "FROM lp_accounting_pending q "
+                "CROSS JOIN lp_accounting_positions p "
+                "WHERE p.position_key=q.position_key "
                 f"AND p.active_episode_id IS NOT NULL AND p.pool_id IN ({marks}) "
                 "AND q.cost_only=0 AND " + _QUEUED_AFTER_PUBLISHED_SQL,
                 batch,
