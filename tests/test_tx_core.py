@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import sqlite3
+import json
 from dataclasses import replace
 
 import pytest
@@ -14,13 +15,14 @@ from rhpools.tx_chain import (
     UR_V3_FACTORY, USDG, WETH, NfpmMint, PayPortion, Permit2Permit, PoolKey, PosmMint, Sweep,
     UnwrapWeth, V3Swap,
 )
+from rhpools.lp_market_protocols import V4_INITIALIZE_TOPIC, _normalize_pool_creation
 from rhpools.tx_core import SwapQuote, TxCore
 from rhpools.lp_math import sqrt_ratio_at_tick
 from rhpools.tx_plan import (
     Amounts, Fee, FeeLeg, Ledger, LpIntent, LpOp, LpPlanner, LpShape, Signatures, SwapIntent,
     SwapPlanner, TxError, TxPolicy, TxRefusal, impact_bps, liquidity_for_amounts, swap_amounts,
 )
-from rhpools.tx_routes import DEFAULT_BRIDGES, Hop, HookPolicy, Pool, Route, RouteBook, Side, Venue, v4_pool
+from rhpools.tx_routes import DEFAULT_BRIDGES, Hop, HookPolicy, IncompletePool, Pool, Route, RouteBook, Side, Venue, v4_pool
 
 WALLET = "0x4444444444444444444444444444444444444444"
 FEE_TO = "0x00000000000000000000000000000000000fee75"
@@ -76,10 +78,10 @@ def pools_db(tmp_path):
     connection = sqlite3.connect(path)
     connection.executescript(
         "CREATE TABLE pools(id TEXT PRIMARY KEY, protocol TEXT NOT NULL, address TEXT NOT NULL, token0 TEXT NOT NULL, token1 TEXT NOT NULL,"
-        " fee_ppm INTEGER, tick_spacing INTEGER, hook TEXT, factory TEXT);"
+        " fee_ppm INTEGER, tick_spacing INTEGER, hook TEXT, factory TEXT, metadata_json TEXT);"
         "CREATE TABLE lp_pool_state(pool_id TEXT PRIMARY KEY, block_number INTEGER NOT NULL);"
     )
-    connection.executemany("INSERT INTO pools VALUES (?,?,?,?,?,?,?,?,?)", ROWS)
+    connection.executemany("INSERT INTO pools VALUES (?,?,?,?,?,?,?,?,?,NULL)", ROWS)
     connection.execute("INSERT INTO lp_pool_state VALUES (?, ?)", (V2_POOL, 500))
     connection.execute("INSERT INTO lp_pool_state VALUES (?, ?)", (V3_POOL, 900))
     connection.commit()
@@ -250,8 +252,8 @@ def test_route_book_hook_policy_is_cached_and_unknown_hooks_dropped(pools_db, rp
 def test_route_book_drops_v4_rows_whose_id_is_not_the_key_hash(rpc, tmp_path):
     path = tmp_path / "bad.sqlite"
     connection = sqlite3.connect(path)
-    connection.executescript("CREATE TABLE pools(id TEXT PRIMARY KEY, protocol TEXT, address TEXT, token0 TEXT, token1 TEXT, fee_ppm INTEGER, tick_spacing INTEGER, hook TEXT, factory TEXT); CREATE TABLE lp_pool_state(pool_id TEXT PRIMARY KEY, block_number INTEGER);")
-    connection.execute("INSERT INTO pools VALUES (?,?,?,?,?,?,?,?,?)", ("0x" + "99" * 32, "v4", POOL_MANAGER, NATIVE, ITH, 0, 200, PONS_HOOK, POOL_MANAGER))
+    connection.executescript("CREATE TABLE pools(id TEXT PRIMARY KEY, protocol TEXT, address TEXT, token0 TEXT, token1 TEXT, fee_ppm INTEGER, tick_spacing INTEGER, hook TEXT, factory TEXT, metadata_json TEXT); CREATE TABLE lp_pool_state(pool_id TEXT PRIMARY KEY, block_number INTEGER);")
+    connection.execute("INSERT INTO pools VALUES (?,?,?,?,?,?,?,?,?,NULL)", ("0x" + "99" * 32, "v4", POOL_MANAGER, NATIVE, ITH, 0, 200, PONS_HOOK, POOL_MANAGER))
     connection.commit()
     connection.close()
 
@@ -264,9 +266,75 @@ def test_route_book_drops_v4_rows_whose_id_is_not_the_key_hash(rpc, tmp_path):
             c.close()
 
     routes = RouteBook(reader, rpc)
-    assert routes.pool("0x" + "99" * 32) is None
+    with pytest.raises(IncompletePool, match="PoolKey identity"):
+        routes.pool("0x" + "99" * 32)
     assert routes.candidates(ITH, NATIVE, Side.BUY) == []
 
+
+def test_real_initialize_dynamic_fee_key_survives_storage_and_route_decode(pools_db, rpc):
+    pool_id = "0x90fc4fa48f86bca27b5da6a050361a51c87483a6c5bdb631a235e771f4c167b6"
+    log = {
+        "address": POOL_MANAGER, "blockNumber": "0x46d3fbe",
+        "topics": [
+            V4_INITIALIZE_TOPIC, pool_id,
+            "0x0000000000000000000000002e8c31162b855a2ffa90f6f8634643ad6f111e18",
+            "0x0000000000000000000000003521b8a7de164723c6c51aa80d106fa852111e18",
+        ],
+        "data": (
+            "0x0000000000000000000000000000000000000000000000000000000000800000"
+            "0000000000000000000000000000000000000000000000000000000000000008"
+            "0000000000000000000000004e3468951d49f2eea976ed0d6e75ffcb44a9a544"
+            "0000000000000000000000000000000000000066928603d12b55b292b1cf6f1b"
+            "00000000000000000000000000000000000000000000000000000000000169c8"
+        ),
+    }
+    decoded = _normalize_pool_creation(log, V4_INITIALIZE_TOPIC)
+    assert decoded["id"] == pool_id
+    assert decoded["fee_ppm"] is None
+    with pools_db() as reader:
+        path = reader.execute("PRAGMA database_list").fetchone()[2]
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "INSERT INTO pools VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (decoded["id"], decoded["protocol"], decoded["address"], decoded["token0"],
+             decoded["token1"], decoded["fee_ppm"], decoded["tick_spacing"], decoded["hook"],
+             decoded["factory"], json.dumps(decoded["metadata_json"])),
+        )
+    pool = RouteBook(pools_db, rpc).pool(pool_id)
+    assert pool.fee_ppm == 0x800000
+    assert pool.key.id() == pool_id
+
+
+def test_route_book_decodes_dynamic_fee_and_refuses_incomplete_spacing(pools_db, rpc):
+    dynamic = v4_pool(PoolKey(NATIVE, ITH, 0x800000, 10, NATIVE))
+    incomplete = v4_pool(PoolKey(NATIVE, PIPEDOG, 500, 10, NATIVE))
+    with pools_db() as reader:
+        path = reader.execute("PRAGMA database_list").fetchone()[2]
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "INSERT INTO pools VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (dynamic.id, "v4", POOL_MANAGER, NATIVE, ITH, None, 10, NATIVE, POOL_MANAGER,
+             '{"configured_fee":8388608,"dynamic_fee":true}'),
+        )
+        connection.execute(
+            "INSERT INTO pools VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (incomplete.id, "v4", POOL_MANAGER, NATIVE, PIPEDOG, 500, None, NATIVE, POOL_MANAGER,
+             '{"configured_fee":500,"dynamic_fee":false}'),
+        )
+    routes = RouteBook(pools_db, rpc)
+    assert routes.pool(dynamic.id).key.id() == dynamic.id
+    core = TxCore(rpc, routes, POLICY)
+    with pytest.raises(TxRefusal, match="tick_spacing") as view_refusal:
+        core.pool_view(incomplete.id, WALLET)
+    assert view_refusal.value.code == "incomplete_pool"
+    intent = LpIntent(
+        wallet=WALLET, op=LpOp.MINT, pool_id=incomplete.id, slippage_bps=50,
+        tick_lower=-100, tick_upper=100, amount0=10**18, amount1=10**18,
+    )
+    with pytest.raises(TxRefusal, match="tick_spacing") as quote_refusal:
+        core.quote(intent)
+    assert quote_refusal.value.code == "incomplete_pool"
+    assert all(pool.id != incomplete.id for pool in routes.token_pools(PIPEDOG))
 
 def test_route_rejects_non_contiguous_hops():
     v3 = Pool(Venue.V3, V3_POOL, V3_POOL, WETH, PIPEDOG, 10000, 200, NATIVE, UR_V3_FACTORY)

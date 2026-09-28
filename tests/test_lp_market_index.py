@@ -28,6 +28,7 @@ from rhpools.lp_market_protocols import (
     TRANSFER_TOPIC,
     V4_MODIFY_LIQUIDITY_TOPIC,
 )
+from rhpools.tx_chain import PoolKey
 
 
 ZERO_HASH = "0x" + "00" * 32
@@ -74,6 +75,29 @@ def indexer(store: MarketStore, rpc=None, **kwargs) -> MarketIndexer:
         store, Market(), "http://unused.invalid", rpc=rpc or StaticRpc(),
         history_disk_reserve_bytes=0, **kwargs,
     )
+
+
+def test_v4_legacy_repair_revisits_rows_inserted_after_initial_sweep():
+    store = MarketStore(":memory:")
+    scanner = indexer(store)
+    key = PoolKey("0x" + "00" * 20, "0x" + "11" * 20, 500, 10, "0x" + "00" * 20)
+    try:
+        assert scanner._recover_legacy_v4_pool_page() is False
+        store.upsert_pools([{
+            "id": key.id(), "protocol": "v4", "address": POOL_MANAGER,
+            "token0": key.currency0, "token1": key.currency1, "fee_ppm": key.fee,
+            "tick_spacing": None, "hook": key.hooks, "factory": POOL_MANAGER,
+            "source": "census", "metadata_json": {"dynamic_fee": False},
+        }])
+        assert scanner._recover_legacy_v4_pool_page() is False
+        scanner._legacy_v4_identity_next_scan = 0.0
+        assert scanner._recover_legacy_v4_pool_page() is True
+        assert store.pool(key.id())["tick_spacing"] == 10
+        assert scanner._recover_legacy_v4_pool_page() is False
+        assert store.pool(key.id())["tick_spacing"] == 10
+    finally:
+        scanner.close()
+        store.close()
 
 
 def test_pool_lookup_work_is_per_unique_candidate_not_per_log(monkeypatch):

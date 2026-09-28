@@ -115,6 +115,7 @@ DEFERRED_POOL_IDENTITY_CANDIDATES_PER_POOL = 4
 DEFERRED_POOL_IDENTITY_SEED_BUSY_S = 1.0
 DEFERRED_POOL_IDENTITY_PUBLICATION_SECONDS = 0.2
 LEGACY_V4_IDENTITY_BATCH = 4
+LEGACY_V4_IDENTITY_RESCAN_SECONDS = 300
 DEFERRED_POOL_IDENTITY_PREFIX = "pool_identity_pending:"
 # A bounded snapshot wave shares exact-block state roots through Multicall3.
 # The shared endpoint gate, not a fixed lane quota, limits archive traffic.
@@ -581,6 +582,7 @@ class MarketIndexer:
         self._deferred_identity_seed_kind = 0
         self._deferred_identity_seed_through_id: int | None = None
         self._legacy_v4_identity_after_id = ""
+        self._legacy_v4_identity_next_scan = 0.0
         self._legacy_v4_identity_complete = False
         self._deferred_identity_seed_complete = False
         self._pool_identity_replay_turn = 0
@@ -4870,8 +4872,11 @@ class MarketIndexer:
     def _recover_legacy_v4_pool_page(
         self, limit: int = LEGACY_V4_IDENTITY_BATCH,
     ) -> bool:
-        if self._legacy_v4_identity_complete:
+        if time.monotonic() < self._legacy_v4_identity_next_scan:
             return False
+        if self._legacy_v4_identity_complete:
+            self._legacy_v4_identity_after_id = ""
+            self._legacy_v4_identity_complete = False
         rows = self.store.read().execute(
             "SELECT * FROM pools WHERE protocol='v4' AND tick_spacing IS NULL "
             "AND id>? ORDER BY id LIMIT ?",
@@ -4882,6 +4887,7 @@ class MarketIndexer:
         ).fetchall()
         if not rows:
             self._legacy_v4_identity_complete = True
+            self._legacy_v4_identity_next_scan = time.monotonic() + LEGACY_V4_IDENTITY_RESCAN_SECONDS
             return False
         recovered: list[dict[str, Any]] = []
         for row in rows:
