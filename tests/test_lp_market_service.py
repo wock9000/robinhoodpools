@@ -4,9 +4,11 @@ import sqlite3
 import threading
 import time
 from contextlib import contextmanager
+from itertools import chain
 
 import pytest
 
+import rhpools.lp_market_service as service_module
 import rhpools.lp_market_store as market_store_module
 from rhpools.lp_market_protocols import (
     TRANSFER_TOPIC, V3_POOL_CREATED_TOPIC, V3_SWAP_TOPIC,
@@ -94,22 +96,29 @@ def test_failed_frame_read_does_not_pin_committed_wal(tmp_path, monkeypatch):
         app.close()
 
 
-def test_pool_summary_deadline_releases_reader_without_caching_partial_rows(
+def test_pool_summary_interruption_releases_reader_and_retries_full_page(
         tmp_path, monkeypatch):
     app = service(tmp_path / "market.sqlite")
     try:
         app.store.upsert_pools(pools())
-        monkeypatch.setattr(
-            market_store_module, "_READER_SNAPSHOT_SECONDS", 0.0,
-        )
-        monkeypatch.setattr(
-            market_store_module, "_READER_PROGRESS_STEPS", 1,
-        )
+        reader_snapshot = app.store.reader_snapshot
+
+        @contextmanager
+        def interrupted_reader(seconds=None):
+            with reader_snapshot(seconds) as connection:
+                connection.set_progress_handler(lambda: 1, 1)
+                yield connection
+
+        monkeypatch.setattr(app.store, "reader_snapshot", interrupted_reader)
         with pytest.raises(sqlite3.OperationalError) as failure:
             app.pools({"window": "1h"})
         assert failure.value.sqlite_errorcode == sqlite3.SQLITE_INTERRUPT
         assert not app.store.read().in_transaction
         assert app.store.checkpoint()["active_reader_snapshots"] == 0
+        monkeypatch.setattr(app.store, "reader_snapshot", reader_snapshot)
+        recovered = app.pools({"window": "1h"})
+        assert recovered["total"] == len(pools())
+        assert len(recovered["rows"]) == len(pools())
     finally:
         app.close()
 
@@ -161,11 +170,58 @@ def test_created_pool_page_does_not_sort_the_entire_catalog(tmp_path, monkeypatc
     finally:
         app.close()
 
+
+def test_dislocations_can_finish_after_shared_reader_deadline(tmp_path, monkeypatch):
+    app = service(tmp_path / "market.sqlite")
+    try:
+        app.store.upsert_pools(pools())
+        now = int(time.time())
+        with app.store.transaction() as connection:
+            connection.executemany(
+                "INSERT INTO pools("
+                "id,protocol,address,token0,token1,decimals0,decimals1"
+                ") VALUES(?,'v3',?,?,?,18,18)",
+                (
+                    (f"pool-{index:05d}", f"pool-{index:05d}", TOKEN, USDG)
+                    for index in range(3000)
+                ),
+            )
+            connection.executemany(
+                "INSERT INTO lp_pool_state("
+                "pool_id,block_number,tx_index,log_index,timestamp,"
+                "sqrt_price_x96,liquidity,price,price0_usd,price1_usd"
+                ") VALUES(?,0,0,0,?,?,?,?,1,1)",
+                (
+                    (pool_id, now, str(1 << 96), str(10**21), price)
+                    for pool_id, price in chain(
+                        ((V3, 1.0), (V4, 1.2)),
+                        ((f"pool-{index:05d}", 1.1) for index in range(3000)),
+                    )
+                ),
+            )
+        monkeypatch.setattr(market_store_module, "_READER_SNAPSHOT_SECONDS", 0.001)
+        monkeypatch.setattr(market_store_module, "_READER_PROGRESS_STEPS", 1)
+        result = app.dislocations({"min_depth_usd": "0"})
+        assert result["total"] == 1
+        assert result["rows"][0]["pool_count"] == 3002
+        assert result["rows"][0]["spread_bps"] == pytest.approx(2000)
+    finally:
+        app.close()
+
 def test_month_bucket_frame_survives_shared_reader_deadline(tmp_path, monkeypatch):
     app = service(tmp_path / "market.sqlite")
     try:
         day = int(time.time()) // 86_400 * 86_400
         with app.store.transaction() as connection:
+            connection.executemany(
+                "INSERT INTO pools("
+                "id,protocol,address,token0,token1,created_block"
+                ") VALUES(?,'v3',?,?,?,0)",
+                (
+                    (f"pool-{pool:03d}", f"pool-{pool:03d}", TOKEN, USDG)
+                    for pool in range(100)
+                ),
+            )
             connection.executemany(
                 "INSERT INTO lp_pool_buckets("
                 "resolution,bucket,pool_id,events"
@@ -183,9 +239,41 @@ def test_month_bucket_frame_survives_shared_reader_deadline(tmp_path, monkeypatc
         frame = app._bucket_aggregates("30d", status, start, end)
         assert frame.totals[0] == 2900
         assert frame.aggregates["pool-000"][0] == 29
+        page = app.pools({"window": "30d", "sort": "fees", "limit": 10})
+        assert len(page["rows"]) == 10
+        assert page["total"] == 100
     finally:
         app.close()
 
+
+
+def test_startup_warms_default_tape_before_other_windows(tmp_path, monkeypatch):
+    app = service(tmp_path / "market.sqlite")
+    try:
+        app.store.upsert_pools(pools())
+        block = header(1, int(time.time()) - 5)
+        app.store.ingest(
+            [block], [{**swap(block, V3, "v3"), "kind": "add", "owner": TOKEN}],
+        )
+        monkeypatch.setattr(service_module, "_WARM_KEYS", service_module._WARM_KEYS[:2])
+        monkeypatch.setattr(service_module, "_WARM_PAUSE_SECONDS", 0)
+        monkeypatch.setattr(app, "_warm_allowed", lambda: True)
+        assert app._warm_cycle() == 2
+
+        def reject_uncached_tape(action, table, column, _database, _source):
+            if action == sqlite3.SQLITE_READ and table == "events" and column == "data":
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        reader = app.store.read()
+        reader.set_authorizer(reject_uncached_tape)
+        try:
+            rows = app.tape({"window": "24h"})["rows"]
+        finally:
+            reader.set_authorizer(None)
+        assert [row["kind"] for row in rows] == ["add"]
+    finally:
+        app.close()
 
 def test_status_gap_uses_current_head_and_durable_cursor(tmp_path):
     app = service(tmp_path / "market.sqlite")

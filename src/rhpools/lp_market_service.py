@@ -62,6 +62,7 @@ _MISSING = object()
 _OWNER_SNAPSHOT_SECONDS = 900.0
 
 _BUCKET_SNAPSHOT_SECONDS = 60.0
+_DISLOCATION_SNAPSHOT_SECONDS = 60.0
 _WARM_PAUSE_SECONDS = 3.0
 _WARM_IDLE_SECONDS = 5.0
 _WARM_ACCOUNTING_LATENCY_LIMIT_SECONDS = 30.0
@@ -71,9 +72,10 @@ _STORED_POOL_RESTORE_SECONDS = 5.0
 _BUCKET_INCREMENTAL_POOL_LIMIT = 8_192
 _BUCKET_INDEXED_POOL_LIMIT = 1_024
 _WARM_WINDOWS = ("24h", "1h", "7d", "30d", "all")
-# Warm the terminal's default 24h view first, then the alternate windows.
 _WARM_KEYS: tuple[tuple[str, dict[str, Any]], ...] = (
-    *(("overview", {"window": window}) for window in _WARM_WINDOWS),
+    ("overview", {"window": "24h"}),
+    ("tape", {"window": "24h"}),
+    *(("overview", {"window": window}) for window in _WARM_WINDOWS[1:]),
     *(
         (
             "pools",
@@ -2910,7 +2912,7 @@ class LPMarketService:
                         execution_name, status, start, end,
                     )
                     same_epoch = False
-                    with self.store.reader_snapshot() as conn:
+                    with self.store.reader_snapshot(_BUCKET_SNAPSHOT_SECONDS) as conn:
                         page_status = self._load_status()
                         same_epoch = (
                             int(page_status.get("epoch") or 0)
@@ -3056,7 +3058,7 @@ class LPMarketService:
         since = head_timestamp - max_age_s
 
         def load():
-            with self.store.reader_snapshot() as conn:
+            with self.store.reader_snapshot(_DISLOCATION_SNAPSHOT_SECONDS) as conn:
                 oldest = conn.execute("SELECT MIN(number) FROM blocks").fetchone()[0]
                 since_block = self._block_at(conn, since, int(oldest or 0), head_block)
                 groups: dict[tuple[str, str], list[dict]] = {}
