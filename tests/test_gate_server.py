@@ -87,20 +87,18 @@ def test_session_cookie_and_credential_transports(tmp_path):
         assert status == 401
 
 
-def test_session_post_refuses_cross_site_origins_and_rate_limits(tmp_path):
+def test_session_post_refuses_cross_site_origins_without_charging_valid_signins(tmp_path):
     with serving(tmp_path) as (address, gate):
         message, signature = siwe(HOLDER_KEY, gate)
         status, _, body = call(address, "POST", "/api/gate/session", {"message": message, "signature": signature}, {"Origin": "https://evil.example", "Host": "rhpools.lol"})
         assert status == 403
         status, _, body = call(address, "POST", "/api/gate/session", {"message": message, "signature": signature}, {"Content-Type": "text/plain"})
         assert status == 415
-        status, _, body = call(address, "POST", "/api/gate/session", {"message": message, "signature": signature})
-        assert status == 200
-        for _ in range(5):
+        for _ in range(6):
             message, signature = siwe(HOLDER_KEY, gate)
             status, _, body = call(address, "POST", "/api/gate/session", {"message": message, "signature": signature}, ORIGIN)
-        assert status == 429 and body["error"] == "sign-in rate limit"
-        assert [row["action"] for row in gate.audit()].count("session.sign_in") == 5
+            assert status == 200
+        assert [row["action"] for row in gate.audit()].count("session.sign_in") == 6
 
 
 def test_keyed_rest_tier_carries_quota_headers_and_private_caching(tmp_path):
@@ -169,7 +167,60 @@ def test_policy_route_accepts_owner_only_and_audits(tmp_path):
         assert body["owner"] == OWNER and body["typed_data"]["primaryType"] == "GatePolicy"
         status, _, body = call(address, "POST", "/api/gate/policy", {"policy": {"version": "x"}, "signature": signature})
         assert status == 400
-        assert [row["action"] for row in gate.audit()][::-1] == ["policy.refused", "policy.apply"]
+        assert [row["action"] for row in gate.audit()][::-1] == ["policy.apply"]
+
+
+def test_policy_post_limits_ip_before_body_and_keeps_keyed_slot_free(tmp_path):
+    with serving(tmp_path, Limits(policy_per_ip_per_min=1)) as (address, gate):
+        parsed, signature = signed_policy(OTHER_KEY)
+        status, _, _ = call(address, "POST", "/api/gate/policy", {"policy": parsed.public(), "signature": signature})
+        assert status == 403
+        parsed, signature = signed_policy()
+        status, headers, body = call(address, "POST", "/api/gate/policy", {"policy": parsed.public(), "signature": signature})
+        assert status == 429 and headers["Retry-After"] == "60"
+        assert gate.policy().token is None
+        status, _, body = call(address, "POST", "/api/gate/policy", {"policy": parsed.public(), "signature": signature},
+                               {"CF-Connecting-IP": "198.51.100.23"})
+        assert status == 200 and gate.policy().token == parsed.token
+        gate._policy_slots.acquire()
+        gate._policy_slots.acquire()
+        try:
+            status, _, body = call(address, "POST", "/api/gate/policy",
+                                   {"policy": parsed.public(), "signature": signature},
+                                   {"CF-Connecting-IP": "198.51.100.24"})
+            assert status == 503
+            message, signature = siwe(HOLDER_KEY, gate)
+            status, _, body = call(address, "POST", "/api/gate/session",
+                                   {"message": message, "signature": signature})
+            assert status == 200 and body["wallet"] == HOLDER
+        finally:
+            gate._policy_slots.release()
+            gate._policy_slots.release()
+
+
+def test_policy_rejects_oversize_body_without_reading_it(tmp_path):
+    with serving(tmp_path) as (address, gate):
+        connection = http.client.HTTPConnection(*address, timeout=5)
+        try:
+            connection.putrequest("POST", "/api/gate/policy")
+            connection.putheader("Content-Type", "application/json")
+            connection.putheader("Content-Length", "3000")
+            connection.endheaders()
+            response = connection.getresponse()
+            assert response.status == 413
+            response.read()
+        finally:
+            connection.close()
+
+
+def test_nonce_http_rate_limit_groups_ipv6_64(tmp_path):
+    with serving(tmp_path, Limits(nonce_per_ip_per_min=1)) as (address, gate):
+        status, _, first = call(address, "GET", "/api/gate/nonce", headers={"CF-Connecting-IP": "2001:db8:1:2::1"})
+        assert status == 200
+        status, _, body = call(address, "GET", "/api/gate/nonce", headers={"CF-Connecting-IP": "2001:db8:1:2::2"})
+        assert status == 429
+        message, signature = siwe(HOLDER_KEY, gate, nonce=first["nonce"])
+        assert gate.sign_in(message, signature, label="holder", client_ip="2001:db8:1:2::2")[0].wallet == HOLDER
 
 
 def read_frames(response, count):

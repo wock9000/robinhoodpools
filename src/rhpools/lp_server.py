@@ -798,7 +798,7 @@ class Handler(BaseHTTPRequestHandler):
         gate = self.runtime.gate
         try:
             if path == "/api/gate/nonce":
-                return self._json(200, gate.nonce(query.get("wallet")), private=True)
+                return self._json(200, gate.nonce(query.get("wallet"), client_ip=self._client_ip()), private=True)
             if path == "/api/gate/policy":
                 return self._json(200, gate.status(), private=True)
             principal = gate.resolve(self.headers)
@@ -1032,16 +1032,30 @@ class Handler(BaseHTTPRequestHandler):
 
     def _gate_post(self, path: str) -> None:
         gate = self.runtime.gate
-        if not self.api_slots["keyed"].acquire(False):
+        policy_post = path == "/api/gate/policy"
+        slot = gate._policy_slots if policy_post else self.api_slots["keyed"]
+        try:
+            if policy_post:
+                gate.policy_admit(self._client_ip())
+                if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
+                    raise GateRefusal(415, "Expected application/json")
+                size = int(self.headers.get("Content-Length", "0"))
+                if not 0 < size <= 2048:
+                    raise GateRefusal(413, "Policy request must be between 1 and 2048 bytes")
+            if path == "/api/gate/session" and self.headers.get("Origin") is not None and not self._same_origin():
+                raise GateRefusal(403, "Configured same-origin request required")
+        except GateRefusal as refusal:
+            return self._refuse(refusal)
+        except (ValueError, KeyError, TypeError) as exc:
+            return self._json(400, {"error": str(exc)}, private=True)
+        if not slot.acquire(False):
             return self._json(503, {"error": "API request capacity reached"}, retry=1)
         try:
             payload = self._json_body()
-            if path == "/api/gate/policy":
+            if policy_post:
                 applied = gate.apply_policy(GatePolicy.parse(payload.get("policy")), str(payload.get("signature") or ""), via="web")
                 return self._json(200, {"applied": applied.public(), **gate.status()}, private=True)
             if path == "/api/gate/session":
-                if self.headers.get("Origin") is not None and not self._same_origin():
-                    raise GateRefusal(403, "Configured same-origin request required")
                 principal, secret = gate.sign_in(
                     str(payload.get("message") or ""), str(payload.get("signature") or ""),
                     label=str(payload.get("label") or "browser"), client_ip=self._client_ip(),
@@ -1076,7 +1090,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             self._json(503, {"error": "Upstream data is temporarily unavailable"}, retry=2, private=True)
         finally:
-            self.api_slots["keyed"].release()
+            slot.release()
 
     def do_POST(self) -> None:
         # A rejected POST leaves its body unread; closing keeps it out of the next request.

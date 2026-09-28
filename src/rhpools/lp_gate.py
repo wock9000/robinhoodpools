@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import ipaddress
 import json
+import logging
 import secrets
 import sqlite3
 import threading
@@ -201,12 +203,13 @@ def entitle(policy: GatePolicy, state: HoldingState, now: float) -> Entitlement:
     if policy.token is not None:
         for feature in FEATURES:
             threshold = policy.threshold[feature]
-            balance_ok = state.holding is not None and state.holding.balance_raw >= threshold
+            fresh = state.holding is not None and now - state.holding.observed_at < ORACLE_TTL_S
+            balance_ok = fresh and state.holding.balance_raw >= threshold
             if threshold == 0 or balance_ok:
                 features.add(feature)
                 continue
             anchor = state.last_ok.get(feature)
-            if anchor is not None and anchor[1] == policy.version and now - anchor[0] <= policy.grace_s:
+            if not fresh and anchor is not None and anchor[1] == policy.version and now - anchor[0] <= policy.grace_s:
                 features.add(feature)
                 grace_until[feature] = anchor[0] + policy.grace_s
     return Entitlement(state.wallet, frozenset(features), state.holding, grace_until, policy.version)
@@ -254,7 +257,8 @@ class Limits:
     key_burst: int = 40
     nonce_ttl_s: int = 600
     signin_per_ip_per_min: int = 5
-    signin_per_process_per_min: int = 60
+    nonce_per_ip_per_min: int = 20
+    policy_per_ip_per_min: int = 10
 
 
 def json_rpc(url: str, timeout: float = 5.0) -> Callable[[str, list], Any]:
@@ -332,28 +336,44 @@ class _Oracle:
 
 
 class _Window:
-    def __init__(self, per_key: int, total: int, *, clock: Callable[[], float]) -> None:
-        self._per_key, self._total, self._clock = per_key, total, clock
+    def __init__(self, per_key: int, *, clock: Callable[[], float]) -> None:
+        self._per_key, self._clock = per_key, clock
         self._lock = threading.Lock()
         self._keys: OrderedDict[str, deque] = OrderedDict()
-        self._all: deque = deque()
+
+    def allowed(self, key: str) -> bool:
+        now = self._clock()
+        with self._lock:
+            bucket = self._keys.get(key)
+            if bucket is None:
+                return True
+            while bucket and bucket[0] <= now - 60:
+                bucket.popleft()
+            return len(bucket) < self._per_key
 
     def admit(self, key: str) -> bool:
         now = self._clock()
         with self._lock:
-            while self._all and self._all[0] <= now - 60:
-                self._all.popleft()
             bucket = self._keys.setdefault(key, deque())
             self._keys.move_to_end(key)
             while bucket and bucket[0] <= now - 60:
                 bucket.popleft()
-            if len(self._all) >= self._total or len(bucket) >= self._per_key:
+            if len(bucket) >= self._per_key:
                 return False
-            self._all.append(now)
             bucket.append(now)
             while len(self._keys) > 4096:
                 self._keys.popitem(last=False)
             return True
+
+
+def _ip_bucket(address: str) -> str:
+    try:
+        parsed = ipaddress.ip_address(address)
+        if parsed.version == 6:
+            return str(ipaddress.ip_network((parsed, 64), strict=False))
+        return str(parsed)
+    except ValueError:
+        return address[:64]
 
 
 class Gate:
@@ -377,7 +397,12 @@ class Gate:
         self._nonces: OrderedDict[str, float] = OrderedDict()
         self._buckets: OrderedDict[str, tuple[float, float]] = OrderedDict()
         self._streams: dict[str, int] = {}
-        self._signins = _Window(limits.signin_per_ip_per_min, limits.signin_per_process_per_min, clock=clock)
+        self._signins = _Window(limits.signin_per_ip_per_min, clock=clock)
+        self._nonce_requests = _Window(limits.nonce_per_ip_per_min, clock=clock)
+        self._policy_requests = _Window(limits.policy_per_ip_per_min, clock=clock)
+        self._policy_slots = threading.BoundedSemaphore(2)
+        self._policy_refusals = 0
+        self._policy_log_at = float("-inf")
 
     def close(self) -> None:
         with self._lock:
@@ -406,6 +431,17 @@ class Gate:
                 "SELECT feature, last_ok_at, policy_version FROM qualified WHERE wallet = ?", (wallet,),
             ).fetchall()
         anchors = {feature: (float(at), int(version)) for feature, at, version in rows}
+        if holding is not None and now - holding.observed_at < ORACLE_TTL_S:
+            dropped = [feature for feature in anchors if policy.threshold[feature] > 0
+                       and holding.balance_raw < policy.threshold[feature]]
+            if dropped:
+                with self._lock:
+                    self._db.executemany(
+                        "DELETE FROM qualified WHERE wallet = ? AND feature = ?",
+                        [(wallet, feature) for feature in dropped],
+                    )
+                for feature in dropped:
+                    del anchors[feature]
         ent = entitle(policy, HoldingState(wallet, holding, anchors), now)
         moved = []
         for feature in ent.qualified:
@@ -481,29 +517,34 @@ class Gate:
                 else:
                     del self._streams[principal.wallet]
 
-    def nonce(self, wallet: str | None = None) -> dict:
+    def nonce(self, wallet: str | None = None, *, client_ip: str | None = None) -> dict:
+        if wallet:
+            try:
+                wallet = to_checksum_address(wallet)
+            except (ValueError, TypeError) as exc:
+                raise GateRefusal(400, "wallet must be an address") from exc
+        if client_ip is not None and not self._nonce_requests.admit(_ip_bucket(client_ip)):
+            raise GateRefusal(429, "nonce rate limit", retry_after=60)
         now = self._clock()
         value = secrets.token_hex(16)
         with self._lock:
             while self._nonces and next(iter(self._nonces.values())) <= now:
                 self._nonces.popitem(last=False)
-            while len(self._nonces) >= 4096:
-                self._nonces.popitem(last=False)
+            if len(self._nonces) >= 4096:
+                raise GateRefusal(503, "nonce capacity reached", retry_after=30)
             self._nonces[value] = now + self.limits.nonce_ttl_s
         reply = {
             "nonce": value, "issued_at": _iso(now), "expires_at": _iso(now + self.limits.nonce_ttl_s),
             "chain_id": self.chain_id, "statement": "Sign in to rhpools. No transaction, no fee.",
         }
         if wallet:
-            reply["address"] = to_checksum_address(wallet)
+            reply["address"] = wallet
         return reply
 
     def sign_in(self, message: str, signature: str, *, label: str, client_ip: str,
                 host: str | None = None) -> tuple[Principal, str]:
-        if not self._signins.admit(client_ip):
-            raise GateRefusal(429, "sign-in rate limit", retry_after=60)
+        bucket = _ip_bucket(client_ip)
         now = self._clock()
-        siwe = None
         try:
             siwe = parse_message(message)
             domain = siwe.domain.lower()
@@ -522,13 +563,17 @@ class Gate:
                 fresh = self._nonces.get(siwe.nonce)
             if fresh is None or fresh <= now:
                 raise ValueError("nonce unknown, used or expired")
+            if not self._signins.allowed(bucket):
+                raise GateRefusal(429, "sign-in rate limit", retry_after=60)
             if not verify_signer(siwe.address, personal_sign_hash(message), signature, self._rpc):
+                self._signins.admit(bucket)
                 raise ValueError("signature does not match the address")
             with self._lock:
                 if self._nonces.pop(siwe.nonce, None) is None:
                     raise ValueError("nonce unknown, used or expired")
+        except GateRefusal:
+            raise
         except ValueError as exc:
-            self._audit(siwe.address if siwe else "unknown", "web", "session.refused", {"reason": str(exc), "ip": client_ip})
             raise GateRefusal(401, "sign-in refused", state="refused", reason=str(exc)) from exc
         principal, secret = self._mint(siwe.address, "session", label, self.limits.session_ttl_s, "cookie")
         self._audit(siwe.address, "web", "session.sign_in", {"key_id": principal.key_id, "label": label, "ip": client_ip})
@@ -634,19 +679,19 @@ class Gate:
         try:
             signer = recover_signer(policy.digest(self.chain_id), signature)
         except ValueError as exc:
-            self._audit("unknown", via, "policy.refused", {"reason": str(exc), "version": policy.version})
+            self._record_policy_refusal()
             raise GateRefusal(400, "policy signature malformed", state="refused", reason=str(exc)) from exc
+        if self.owner is None or signer.lower() != self.owner.lower():
+            self._record_policy_refusal()
+            reason = "gate owner not configured" if self.owner is None else "signer is not the gate owner"
+            raise GateRefusal(403, "policy refused", state="refused", reason=reason, signer=signer)
         current = self.policy()
         with self._lock:
             row = self._db.execute("SELECT signature FROM policy WHERE version = ?", (policy.version,)).fetchone()
         if row is not None and row[0] == signature and policy.version == current.version:
             return current
         reason = None
-        if self.owner is None:
-            reason = "gate owner not configured"
-        elif signer.lower() != self.owner.lower():
-            reason = "signer is not the gate owner"
-        elif policy.version <= current.version:
+        if policy.version <= current.version:
             reason = f"version must exceed {current.version}"
         elif abs(policy.issued_at - now) > POLICY_SKEW_S:
             reason = f"issued_at outside +/-{POLICY_SKEW_S} s"
@@ -673,6 +718,19 @@ class Gate:
             self._policy_read_at = now
             self._oracle.forget_all()
         return policy
+
+    def policy_admit(self, client_ip: str) -> None:
+        if not self._policy_requests.admit(_ip_bucket(client_ip)):
+            raise GateRefusal(429, "policy rate limit", retry_after=60)
+
+    def _record_policy_refusal(self) -> None:
+        with self._lock:
+            self._policy_refusals += 1
+            now = self._clock()
+            if now - self._policy_log_at >= 60:
+                logging.getLogger(__name__).warning("Refused %d non-owner or malformed policy signatures", self._policy_refusals)
+                self._policy_refusals = 0
+                self._policy_log_at = now
 
     def audit(self, limit: int = 50) -> list[dict]:
         with self._lock:

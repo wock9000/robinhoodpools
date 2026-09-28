@@ -283,16 +283,19 @@ historical accounting. Preserve both freshness and completeness qualifications.
 Access above the anonymous tier is a property of a wallet, not of a key. The
 server reads the wallet's `balanceOf` on the token named in the owner-signed
 gate policy (cached 30 s, at most one read per wallet per 30 s regardless of
-how many keys or streams the wallet holds) and grants the `api` feature while
-the balance is at or above the policy threshold, or for `grace_s` seconds after
-the last qualifying observation. Revoking one key never changes another key's
-outcome; losing the balance affects every key at its next request.
+how many keys or streams the wallet holds). A fresh read below the threshold
+removes entitlement at the next recheck, even if `grace_s` has not elapsed.
+Grace applies only while the balance oracle cannot return a fresh reading,
+for at most `grace_s` seconds after the last qualifying observation. Revoking
+one key never changes another key's outcome.
 
 Sign in once with an EIP-4361 (SIWE) message. The message's domain must be
 `rhpools.lol`, its chain ID `4663`, and its nonce must come from `/api/gate/nonce`
-(single use, 600 s). `personal_sign` over the message text is enough; no
-transaction, no fee. Contract wallets are verified with ERC-1271; EIP-7702
-delegated accounts are verified like plain EOAs.
+(single use, 600 s). The nonce endpoint limits requests per client IP and
+returns `503` rather than evicting unexpired nonces when full. `personal_sign`
+over the message text is enough; no transaction, no fee. Contract wallets
+are verified with ERC-1271; EIP-7702 delegated accounts are verified like
+plain EOAs.
 
 ```sh
 NONCE=$(curl -s https://rhpools.lol/api/gate/nonce?wallet=$WALLET)
@@ -322,7 +325,7 @@ bearer. A wallet may hold eight live keys and four concurrent keyed streams.
 | `POST /api/gate/keys` | required | `{"op":"mint","label","ttl_s"}`, `{"op":"revoke","key_id"}`, `{"op":"revoke_all"}` |
 | `POST /api/gate/logout` | cookie | Revokes the session key and clears the cookie |
 | `GET /api/gate/policy` | none | Current owner-signed policy and its EIP-712 typed-data template |
-| `POST /api/gate/policy` | owner signature | `{policy, signature}`; refused and audited unless signed by the pinned owner |
+| `POST /api/gate/policy` | owner signature | `{policy, signature}`; owner-signed refusals and applications are audited; non-owner attempts are counted in memory |
 
 A cookie-authenticated POST must carry a same-origin `Origin`; a bearer POST
 need not. `Authorization: Bearer rhp_…` takes precedence over the cookie. Any
@@ -346,7 +349,7 @@ arrive as JSON text messages `{"event":…,"id":…,"data":…}` and the server
 never reads client data frames (send only pong or close).
 
 The server re-evaluates the wallet on every loop iteration. When the credential
-is revoked or the wallet drops below the threshold past grace, an SSE client
+is revoked or a fresh balance read falls below the threshold, an SSE client
 receives `event: gate` with the refusal body and the connection ends; a
 WebSocket client receives `{"event":"gate","data":{…}}` and close code `4403`.
 Reconnecting yields the refusal as a normal HTTP error.
@@ -384,7 +387,7 @@ raw-unit amounts.
 | `401` | A credential is required, or an `rhp_` bearer is unknown, expired, or revoked |
 | `403` | Signed in but not entitled (below threshold, policy unset), cross-site cookie POST, key minted from a bearer, or a policy signed by a non-owner |
 | `409` | Policy version does not exceed the current version |
-| `429` | Keyed quota, per-wallet stream limit, or sign-in rate limit (5 per minute per client, 60 per minute per service) |
+| `429` | Keyed quota, per-wallet stream limit, or per-client nonce, failed sign-in, or policy rate limit |
 | `503` | Bounded request capacity, required current/indexed service, canonical confirmation, or selected public publisher is unavailable or unusable |
 
 A canonical block changing before publication is `503`; retry the whole request.
