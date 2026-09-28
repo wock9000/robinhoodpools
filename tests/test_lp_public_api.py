@@ -406,12 +406,45 @@ def test_token_pages_include_all_matches_without_fetching_other_pages():
             api.pools({"token": TOKEN, "limit": "201"})
         with pytest.raises(ValueError, match="offset"):
             api.pools({"token": TOKEN, "offset": "-1"})
+        with pytest.raises(ValueError, match="offset"):
+            api.pools({"token": TOKEN, "offset": str(1 << 63)})
         assets = api.assets({"token": TOKEN})
         assert assets["pool_count"] == 205
         assert assets["groups"][0]["pool_count"] == 205
         assert assets["groups"][0]["state_coverage"]["measured_pools"] == 205
         assert assets["coverage"]["state"]["requested_pools"] == 205
         assert rpc.multicalls == 4
+    finally:
+        api.close()
+        store.close()
+
+
+def test_indexed_pool_pages_include_newly_discovered_unindexed_pools():
+    indexed = "0x" + "a1" * 20
+    discovered = "0x" + "b2" * 20
+    store = MarketStore(":memory:")
+    _insert(store, [_pool(indexed, "v3", TOKEN, HIGH, fee=500, spacing=10)])
+    with store.transaction() as connection:
+        store._set_metadata(connection, "catalog_search_signature", "ready")
+    rpc = SnapshotRpc({
+        (pool_id, LIQUIDITY_SELECTOR): abi_encode(["uint128"], [1])
+        for pool_id in (indexed, discovered)
+    })
+    service = Service(store, rpc)
+    api = PublicMarketAPI(service, cache_ttl=0)
+    try:
+        assert api.pools({"token": TOKEN, "limit": "1"})["pool_count"] == 1
+        service.market._discovered[discovered] = SimpleNamespace(
+            id=discovered, address=discovered, kind="v3",
+            token0=TOKEN, token1=HIGH, fee_ppm=500, tick_spacing=10,
+            factory=V3_FACTORY, source="factory event",
+        )
+        first = api.pools({"token": TOKEN, "limit": "1"})
+        second = api.pools({"token": TOKEN, "limit": "1", "offset": "1"})
+        assert first["pool_count"] == second["pool_count"] == 2
+        assert [row["pool_id"] for row in first["pools"] + second["pools"]] == [
+            indexed, discovered,
+        ]
     finally:
         api.close()
         store.close()

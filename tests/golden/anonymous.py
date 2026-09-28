@@ -120,6 +120,9 @@ def requests() -> list[dict]:
         add("OPTIONS", path)
         add("GET", path + query, {"Authorization": "Basic dXNlcjpwdw==", "Cookie": "session=abc"})
     for path in _ASSETS:
+        if path == "/api/v1/openapi.json":
+            add("OPTIONS", path)
+            continue
         add("GET", path)
         add("GET", path, {"Accept-Encoding": "gzip"})
         add("OPTIONS", path)

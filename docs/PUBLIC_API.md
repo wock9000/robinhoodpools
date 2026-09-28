@@ -55,9 +55,10 @@ curl --fail --get 'https://rhpools.lol/api/v1/assets' \
 A pool matches when the queried address is either `currency0.address` or
 `currency1.address`; `matched_currency` identifies the side. Responses use
 deterministic pool-id order. `limit` defaults to 100 and accepts integers from
-1 through 200; `offset` defaults to 0 and accepts nonnegative integers. Pass
-`next_offset` as the next request's `offset` until it is null. Invalid values
-return `400`. Repeating a page may see a changed catalog or chain head; the
+1 through 200; `offset` defaults to 0 and accepts integers from 0 through
+9,223,372,036,854,775,807. Pass `next_offset` as the next request's `offset`
+until it is null. Invalid values return `400`. Repeating a page may see a
+changed catalog or chain head; the
 offset is not a stable cross-request snapshot cursor.
 
 The response contains:

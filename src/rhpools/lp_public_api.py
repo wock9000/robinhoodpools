@@ -183,7 +183,8 @@ class PublicMarketAPI:
         self.max_cache_entries = int(max_cache_entries)
         self._cache: OrderedDict[tuple[Any, ...], tuple[float, dict[str, Any]]] = OrderedDict()
         self._known_cache: OrderedDict[
-            tuple[str, int, int], tuple[tuple[int, int], tuple[dict[str, Any], ...], dict[str, Any], int]
+            tuple[str, int | None, int],
+            tuple[tuple[int, ...], tuple[dict[str, Any], ...], dict[str, Any], int],
         ] = OrderedDict()
         self._pending: dict[tuple[Any, ...], Future[dict[str, Any]]] = {}
         self._cache_lock = threading.Lock()
@@ -211,7 +212,10 @@ class PublicMarketAPI:
             value = params.get(name, default)
             if isinstance(value, bool) or not str(value).isascii() or not str(value).isdecimal():
                 raise ValueError(f"{name} must be a nonnegative decimal integer")
-            return int(value)
+            parsed = int(value)
+            if parsed > (1 << 63) - 1:
+                raise ValueError(f"{name} exceeds the supported range")
+            return parsed
 
         limit = parse("limit", _POOL_PAGE_DEFAULT)
         offset = parse("offset", 0)
@@ -279,6 +283,9 @@ class PublicMarketAPI:
                     "WHERE token0=? COLLATE NOCASE OR token1=? COLLATE NOCASE"
                 )
                 values: tuple[Any, ...] = (token, token, token, token)
+                if catalog_ids:
+                    ids_query += " UNION SELECT value AS id FROM json_each(?)"
+                    values += (json.dumps(catalog_ids),)
             else:
                 ids_query = (
                     "SELECT id FROM pools WHERE token0=? OR token1=? "
@@ -472,14 +479,19 @@ class PublicMarketAPI:
             or isinstance(token1, str) and token1.lower() == token
         )
 
+    def _known_revision(self) -> tuple[int, ...]:
+        return (
+            _integer(getattr(self.store, "pool_metadata_token", None)) or 0,
+            _integer(getattr(self.market, "pool_publication_revision", None)) or 0,
+            _integer(getattr(self.market, "_checkpoint_revision", None)) or 0,
+            len(self.market._discovered),
+        )
 
     def _known_pools(
         self, token: str, limit: int, offset: int,
     ) -> tuple[list[dict[str, Any]], dict[str, Any], int]:
-        revision = (
-            _integer(getattr(self.store, "pool_metadata_token", None)) or 0,
-            _integer(getattr(self.market, "pool_publication_revision", None)) or 0,
-        )
+        discovered = self.market._discovered
+        revision = self._known_revision()
         cache_key = (token, limit, offset)
         with self._cache_lock:
             cached = self._known_cache.get(cache_key)
@@ -495,8 +507,19 @@ class PublicMarketAPI:
             except Exception:
                 indexed = False
         if indexed:
+            marker = getattr(self.lp_service, "_catalog_discovery_marker", None)
+            pending_ids: list[str] = []
+            if marker != (revision[2], revision[3]):
+                lock = getattr(self.market, "_lock", None)
+                if lock is not None:
+                    lock.acquire()
+                try:
+                    pending_ids = [pool.id for pool in discovered.containing(token)]
+                finally:
+                    if lock is not None:
+                        lock.release()
             stored, page_ids, total = self._stored_matches(
-                token, limit, offset, (), indexed=True,
+                token, limit, offset, pending_ids, indexed=True,
             )
         lock = getattr(self.market, "_lock", None)
         if lock is not None:
@@ -563,6 +586,14 @@ class PublicMarketAPI:
         return pools, result_issues, total
 
     def _known_all_pools(self, token: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        revision = self._known_revision()
+        cache_key = (token, None, 0)
+        with self._cache_lock:
+            cached = self._known_cache.get(cache_key)
+            if cached is not None and cached[0] == revision:
+                self._known_cache.move_to_end(cache_key)
+                _revision, pools, issues, _total = cached
+                return list(pools), dict(issues)
         connection = self.store.read()
         try:
             stored = [
@@ -607,7 +638,14 @@ class PublicMarketAPI:
         finally:
             if lock is not None:
                 lock.release()
-        return self._verify_pools(token, universe, stored, catalog_raw)
+        pools, issues = self._verify_pools(token, universe, stored, catalog_raw)
+        with self._cache_lock:
+            if not self._closed:
+                self._known_cache[cache_key] = (revision, tuple(pools), issues, len(pools))
+                self._known_cache.move_to_end(cache_key)
+                while len(self._known_cache) > self.max_cache_entries:
+                    self._known_cache.popitem(last=False)
+        return pools, issues
 
     def _verify_pools(
         self, token: str, universe: Any, stored: Sequence[Any],
