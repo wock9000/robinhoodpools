@@ -181,7 +181,9 @@ class Entitlement:
             return "unset"
         if any(policy.threshold[feature] > 0 for feature in self.qualified):
             return "holder"
-        return "grace" if self.grace_until else "below"
+        if self.grace_until:
+            return "grace"
+        return "holder" if self.features == frozenset(FEATURES) else "below"
 
     def public(self) -> dict:
         return {

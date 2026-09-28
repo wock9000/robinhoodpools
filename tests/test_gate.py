@@ -205,6 +205,13 @@ def test_entitle_rule_is_pure_and_covers_grace_and_threshold_zero():
     assert entitle(live, HoldingState(HOLDER, None), 1000.0).features == {"flags"}
 
 
+def test_open_policy_makes_every_signed_in_wallet_a_holder():
+    open_policy = policy(threshold={"trade": "0", "lp": "0", "api": "0", "flags": "0"})
+    ent = entitle(open_policy, HoldingState(HOLDER, Holding(HOLDER, 0, 100, 1000.0)), 1000.0)
+    assert ent.features == {"trade", "lp", "api", "flags"}
+    assert ent.state(open_policy) == "holder"
+
+
 def test_entitlement_transitions_below_holder_grace_below(gate):
     gate.apply_policy(*signed_policy(), via="cli")
     assert gate.entitlement(HOLDER).features == {"flags"}
