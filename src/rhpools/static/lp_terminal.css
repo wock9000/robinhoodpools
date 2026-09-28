@@ -482,9 +482,10 @@ select:focus { border-color: var(--text); color: var(--text); }
 #owners-table th:nth-child(6) { width: 10%; }
 #owners-table th:nth-child(7) { width: 11%; }
 #owners-table th:nth-child(8) { width: 14%; }
-#pools-table th:nth-child(1) { width: 13%; }
+#pools-table th:nth-child(1) { width: 12%; }
 #pools-table th:nth-child(2), #pools-table th:nth-child(13) { width: 4%; }
-#pools-table th:nth-child(3), #pools-table th:nth-child(10), #pools-table th:nth-child(11) { width: 5%; }
+#pools-table th:nth-child(3) { width: 6%; }
+#pools-table th:nth-child(10), #pools-table th:nth-child(11) { width: 5%; }
 #pools-table th:nth-child(4), #pools-table th:nth-child(12), #pools-table th:nth-child(15) { width: 6%; }
 #pools-table th:nth-child(5), #pools-table th:nth-child(7), #pools-table th:nth-child(8) { width: 7%; }
 #pools-table th:nth-child(6) { width: 9%; }

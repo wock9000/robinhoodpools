@@ -17,7 +17,7 @@
   const OWNER_SORT_API = { activity: "activity", net_pnl_usd: "net", fees_usd: "fees" };
   const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
   const SEARCH_KINDS = new Set(["pool", "token", "protocol", "owner", "custody", "transaction", "position"]);
-  const LP_EVENT_KINDS = new Set(["add", "remove", "collect", "checkpoint", "donate", "fee"]);
+  const LP_EVENT_KINDS = new Set(["add", "remove", "collect"]);
   const TOUCH_NAVIGATION = window.matchMedia("(hover: none) and (pointer: coarse)");
   const PANE_STORAGE_KEY = "lp-terminal-pane-layout-v1";
   const PANE_LAYOUT_MEDIA = window.matchMedia("(max-width: 520px), (max-height: 520px) and (max-width: 900px)");
@@ -1004,10 +1004,13 @@
     });
     setTextCell(cells[1], item.protocol || "—", "protocol");
     const fee = finite(item.fee_ppm);
-    setTextCell(cells[2], fee == null ? "—" : `${(fee / 10_000).toFixed(fee % 100 === 0 ? 2 : 4)}%`, "numeric dim");
-    setTextCell(cells[3], formatUsd(item.tvl_usd), `numeric ${item.tvl_usd == null ? "unknown" : ""}`, item.tvl_basis || "");
-    setTextCell(cells[4], formatUsd(item.active_tvl_usd), `numeric desktop-column ${item.active_tvl_usd == null ? "unknown" : ""}`);
-    setTextCell(cells[5], formatUsd(item.observed_active_tvl_usd), `numeric desktop-column ${item.observed_active_tvl_usd == null ? "unknown" : ""}`);
+    setTextCell(cells[2], fee == null ? "—" : `${(fee / 10_000).toFixed(fee % 100 === 0 ? 2 : 4)}%`, "numeric dim", fee == null ? "" : `${fee} ppm; ${item.protocol === "v4" ? "current swap fee" : "pool fee"}`);
+    const inventoryTitle = item.coverage && item.coverage.inventory_complete === false
+      ? "Position inventory incomplete; TVL is unavailable. Observed active is only the indexed portion."
+      : "";
+    setTextCell(cells[3], formatUsd(item.tvl_usd), `numeric ${item.tvl_usd == null ? "unknown" : ""}`, item.tvl_basis || inventoryTitle);
+    setTextCell(cells[4], formatUsd(item.active_tvl_usd), `numeric desktop-column ${item.active_tvl_usd == null ? "unknown" : ""}`, inventoryTitle);
+    setTextCell(cells[5], formatUsd(item.observed_active_tvl_usd), `numeric desktop-column ${item.observed_active_tvl_usd == null ? "unknown" : ""}`, inventoryTitle);
     setTextCell(cells[6], formatUsd(item.volume_usd), `numeric ${item.volume_usd == null ? "unknown" : ""}`);
     setTextCell(cells[7], formatUsd(item.fees_usd), `numeric ${item.fees_usd == null ? "unknown" : "positive"}`);
     setTextCell(cells[8], formatSignedUsd(item.net_deposits_usd), `numeric ${valueClass(item.net_deposits_usd)}`);

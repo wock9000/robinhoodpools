@@ -549,6 +549,41 @@ def test_underfilled_lp_tape_stays_within_window(
         connection.set_progress_handler(None, 0)
         app.close()
 
+def test_zero_burn_checkpoint_is_not_lp_activity(tmp_path):
+    app = service(tmp_path / "market.sqlite")
+    try:
+        app.store.upsert_pools(pools())
+        block = header(100, int(time.time()) - 60)
+        checkpoint = {
+            **swap(block, V3, "v3"),
+            "kind": "checkpoint",
+            "position_key": f"v3:{V3}:0x" + "96" * 32,
+            "liquidity_delta": "0",
+            "amount0": "0",
+            "amount1": "0",
+            "fee_amount0": None,
+            "fee_amount1": None,
+            "cashflow0": None,
+            "cashflow1": None,
+            "accounting_basis": "zero_burn_fee_checkpoint",
+        }
+        add = {
+            **swap(block, V3, "v3", index=1),
+            "kind": "add",
+            "position_key": checkpoint["position_key"],
+            "liquidity_delta": "100",
+        }
+        app.store.ingest([block], [checkpoint, add])
+        all_rows = app.tape({"kind": "all"})["rows"]
+        assert [row["kind"] for row in all_rows] == ["add", "checkpoint"]
+        assert all_rows[1]["amount0"] == all_rows[1]["amount1"] == "0"
+        assert [row["kind"] for row in app.tape({"kind": "lp"})["rows"]] == ["add"]
+        assert not app._current_event_matches(all_rows[1], {"kind": "lp"})
+        assert app._current_event_matches(all_rows[1], {"kind": "all"})
+    finally:
+        app.close()
+
+
 def test_backfilled_price_repairs_existing_flows_after_restart(tmp_path):
     path = tmp_path / "market.sqlite"
     app = service(path)

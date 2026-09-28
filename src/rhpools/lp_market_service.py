@@ -3322,10 +3322,7 @@ class LPMarketService:
 
     def _current_event_matches(self, event: Mapping[str, Any], params) -> bool:
         kind = str(params.get("kind") or "lp")
-        if kind == "lp" and not (
-            event.get("kind") in {"add", "remove", "collect"}
-            or event.get("kind") == "checkpoint" and event.get("position_key")
-        ):
+        if kind == "lp" and event.get("kind") not in {"add", "remove", "collect"}:
             return False
         if kind not in {"lp", "all"}:
             raise ValueError("kind must be lp or all")
@@ -3395,6 +3392,7 @@ class LPMarketService:
         if kind == "lp":
             conditions.append("(e.kind IN ('add','remove','collect') OR "
                               "(e.kind='checkpoint' AND e.position_key IS NOT NULL))")
+            conditions.append("e.kind<>'checkpoint'")
         elif kind != "all":
             raise ValueError("kind must be lp or all")
         pool = str(params.get("pool") or "").lower()[:66]
