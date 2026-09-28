@@ -504,7 +504,7 @@ class SwapPlanner:
                 FeeLeg.OUTPUT, intent.currency_out, policy.fee_recipient, policy.fee_bps,
             )
             approvals = () if intent.currency_in == NATIVE else (
-                ApprovalNeed(intent.currency_in, router, MAX_UINT256, intent.amount_in),
+                ApprovalNeed(intent.currency_in, router, intent.amount_in, intent.amount_in),
             )
             staging = tuple(Call(a.token, erc20_approve(a.spender, a.approve_amount)) for a in approvals)
             return Plan(router, intent.amount_in if intent.currency_in == NATIVE else 0,

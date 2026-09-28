@@ -320,7 +320,7 @@ def test_pons_buy_and_sell_from_usdg(core, fork):
     before_quote = core.quote(intent)
     expect_steps(fork, before_quote, {USDG: intent.amount_in})
     quote, fill = trade(core, fork, intent)
-    assert [h.pool.venue.value for h in quote.route.hops] == ["v3", "v4"]
+    assert len(quote.route.hops) == 2 and quote.route.hops[-1].pool.hook == PONS_HOOK
     assert quote.amounts.hook_fee.amount == quote.amounts.pool_out * 100 // 10_000
     assert quote.amounts.creator_tax.amount == quote.amounts.pool_out * 200 // 10_000
     assert quote.amounts.net_out == quote.amounts.pool_out - quote.amounts.hook_fee.amount - quote.amounts.creator_tax.amount
@@ -330,7 +330,7 @@ def test_pons_buy_and_sell_from_usdg(core, fork):
     sell = swap(fork.user, Side.SELL, ITH, USDG, held // 2)
     expect_steps(fork, core.quote(sell), {ITH: sell.amount_in})
     quote, fill = trade(core, fork, sell)
-    assert [h.pool.venue.value for h in quote.route.hops] == ["v4", "v3"]
+    assert len(quote.route.hops) == 2 and quote.route.hops[0].pool.hook == PONS_HOOK
     assert quote.amounts.rhpools_fee.currency == USDG
 
 
