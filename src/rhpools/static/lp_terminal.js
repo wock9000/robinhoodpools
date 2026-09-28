@@ -3214,7 +3214,7 @@
     byId("owners-title").textContent = state.ownerScope === "wallets" ? "LP WALLETS" : "LP CUSTODY";
     byId("owners-table").tHead.rows[0].cells[0].textContent = state.ownerScope === "wallets" ? "LP wallet" : "Custody contract";
     document.querySelector(".wallet-description").textContent = state.ownerScope === "wallets"
-      ? "Who is providing liquidity, and where? Select a wallet for positions and accounting."
+      ? ""
       : "Contracts holding positions for multiple wallets. Custody activity is not one trader’s portfolio.";
     invalidateOwners("Identity scope changed");
     openStream(true);
