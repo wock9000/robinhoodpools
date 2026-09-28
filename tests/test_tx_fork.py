@@ -295,6 +295,29 @@ def test_protocol_router_buy_sell(core, fork, token, router):
     assert quote.amounts.rhpools_fee.amount == quote.amounts.pool_out * 75 // 10_000
 
 
+def test_batched_pancake_sell_consumes_router_allowance(core, fork):
+    fork.get_usdg(10**18)
+    trade(core, fork, swap(fork.user, Side.BUY, PANCAKE_TOKEN, USDG, 100_000))
+    amount = fork.balance(PANCAKE_TOKEN, fork.user) // 2
+    intent = swap(fork.user, Side.SELL, PANCAKE_TOKEN, USDG, amount)
+    quote = core.quote(intent)
+    assert quote.plan.to == tc.PANCAKE_SMART_ROUTER
+    assert [step.kind for step in quote.steps] == ["approve", "send"]
+    prepared = core.prepare(quote.quote_id, fork.user, Signatures(), batched=True)
+    assert [call["to"] for call in prepared.calls] == [PANCAKE_TOKEN, tc.PANCAKE_SMART_ROUTER]
+    before_fee = fork.balance(USDG, FEE_TO)
+    before_out = fork.balance(USDG, fork.user)
+    for call in prepared.calls:
+        receipt = fork.send(call)
+        assert receipt["status"] == "0x1"
+    assert int.from_bytes(fork.call(PANCAKE_TOKEN, tc.erc20_allowance(fork.user, tc.PANCAKE_SMART_ROUTER)), "big") == 0
+    fill = core.receipt(receipt["transactionHash"], fork.user)
+    assert fill.status == "confirmed"
+    assert fill.amounts.net_out == quote.amounts.net_out == fork.balance(USDG, fork.user) - before_out
+    assert fill.amounts.rhpools_fee.amount == quote.amounts.rhpools_fee.amount == fork.balance(USDG, FEE_TO) - before_fee
+    assert fill.amounts.rhpools_fee.amount == quote.amounts.pool_out * 75 // 10_000
+
+
 @pytest.mark.parametrize("token,router,amount", [
     (PANCAKE_TOKEN, tc.PANCAKE_SMART_ROUTER, 10**13),
     (GIGA_TOKEN, tc.GIGA_SWAP_ROUTER, 10**14),

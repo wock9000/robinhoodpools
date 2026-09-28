@@ -1010,7 +1010,7 @@ class Handler(BaseHTTPRequestHandler):
             principal = self._tx_principal("lp" if core.kind_of(quote_id) == "lp" else "trade")
             signature = str(payload.get("permit_signature") or "")
             sigs = Signatures(permit=bytes.fromhex(signature[2:]) if signature.startswith("0x") else None)
-            return self._json(200, core.prepare(quote_id, principal.wallet, sigs).to_json(), private=True)
+            return self._json(200, core.prepare(quote_id, principal.wallet, sigs, batched=payload.get("batched") is True).to_json(), private=True)
         except GateRefusal as refusal:
             self._refuse(refusal)
         except TxError as exc:

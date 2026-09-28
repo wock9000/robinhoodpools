@@ -33,7 +33,7 @@ class FakeCore:
     def kind_of(self, quote_id):
         return self.kinds.get(quote_id)
 
-    def prepare(self, quote_id, wallet, sigs):
+    def prepare(self, quote_id, wallet, sigs, batched=False):
         return SimpleNamespace(to_json=lambda: {"quote_id": quote_id, "wallet": wallet, "permit": sigs.permit.hex() if sigs.permit else None})
 
 

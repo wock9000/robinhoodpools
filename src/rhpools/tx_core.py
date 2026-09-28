@@ -93,6 +93,7 @@ class SimResult:
     logs: list[dict[str, Any]]
     gas_used: int
     revert: RevertKind | None
+    staging_gas: tuple[int, ...] = ()
 
 
 class Simulator:
@@ -120,9 +121,10 @@ class Simulator:
                 raise TxError("staging_failed", f"staging call {index} reverted: {_revert_bytes(out).hex()[:80]}")
         last = outs[-1]
         gas = int(last.get("gasUsed", "0x0"), 16)
+        stages = tuple(int(out.get("gasUsed", "0x0"), 16) for out in outs[:-1])
         if last.get("status") == "0x1":
-            return SimResult(True, list(last.get("logs", [])), gas, None)
-        return SimResult(False, [], gas, decode_revert(_revert_bytes(last)))
+            return SimResult(True, list(last.get("logs", [])), gas, None, stages)
+        return SimResult(False, [], gas, decode_revert(_revert_bytes(last)), stages)
 
 
 def _mapping_key(holder: str, slot: int) -> str:
@@ -248,9 +250,13 @@ class Prepared:
     transaction: dict[str, Any]
     gas_used: int
     expires_at: int
+    calls: tuple[dict[str, Any], ...] = ()
 
     def to_json(self) -> dict[str, Any]:
-        return {"transaction": dict(self.transaction), "simulation": {"gas_used": self.gas_used}, "expires_at": self.expires_at}
+        result = {"transaction": dict(self.transaction), "simulation": {"gas_used": self.gas_used}, "expires_at": self.expires_at}
+        if self.calls:
+            result["calls"] = [dict(call) for call in self.calls]
+        return result
 
 
 @dataclass(frozen=True)
@@ -331,6 +337,7 @@ class TxCore:
         self._quotes: dict[str, Quote] = {}
         self._token_meta: dict[str, tuple[int, str]] = {}
         self._balance_slots: dict[str, int | None] = {}
+        self._allowance_slots: dict[str, int | None] = {}
         self._lock = threading.Lock()
         self.mismatches = tx_allowlist.verify(rpc)
 
@@ -395,6 +402,31 @@ class TxCore:
     def _allowance(self, token: str, owner: str, spender: str, tag: str) -> int:
         return _word(self._call(token, erc20_allowance(owner, spender), tag))
 
+    def _allowance_override(self, token: str, owner: str, spender: str, amount: int) -> dict[str, Any] | None:
+        with self._lock:
+            known = token in self._allowance_slots
+            slot = self._allowance_slots.get(token)
+        if not known:
+            marker = (1 << 128) + 7
+            data = "0x" + erc20_allowance(owner, spender).hex()
+            slot = None
+            for candidate in range(BALANCE_SLOT_SEARCH):
+                key = _mapping_key(spender, int.from_bytes(bytes.fromhex(_mapping_key(owner, candidate)[2:]), "big"))
+                try:
+                    out = self.rpc.call("eth_call", [{"to": token, "data": data}, "latest",
+                                                     {token: {"stateDiff": {key: "0x" + marker.to_bytes(32, "big").hex()}}}])
+                except Exception:
+                    break
+                if _word(out) == marker:
+                    slot = candidate
+                    break
+            with self._lock:
+                self._allowance_slots[token] = slot
+        if slot is None:
+            return None
+        key = _mapping_key(spender, int.from_bytes(bytes.fromhex(_mapping_key(owner, slot)[2:]), "big"))
+        return {token: {"stateDiff": {key: "0x" + amount.to_bytes(32, "big").hex()}}}
+
     def balances(self, wallet: str, currencies: list[str]) -> dict[str, dict[str, Any]]:
         """Wallet balance, decimals and symbol per currency at latest; NATIVE is ETH."""
         if _ADDRESS_RE.fullmatch(wallet.lower()) is None:
@@ -428,7 +460,8 @@ class TxCore:
     def _steps(self, wallet: str, plan: Plan, tag: str) -> tuple[Step, ...]:
         steps: list[Step] = []
         for need in plan.approvals:
-            if self._allowance(need.token, wallet, need.spender, tag) < need.required:
+            allowance = self._allowance(need.token, wallet, need.spender, tag)
+            if allowance < need.required or (plan.to == need.spender and allowance != need.approve_amount):
                 steps.append(Step("approve", tx=self._tx(wallet, need.token, erc20_approve(need.spender, need.approve_amount))))
         typed = plan.permit_typed_data()
         if typed is not None:
@@ -712,7 +745,7 @@ class TxCore:
             quote = self._quotes.get(quote_id)
         return None if quote is None else "lp" if isinstance(quote, LpQuote) else "swap"
 
-    def prepare(self, quote_id: str, wallet: str, sigs: Signatures) -> Prepared:
+    def prepare(self, quote_id: str, wallet: str, sigs: Signatures, batched: bool = False) -> Prepared:
         if not isinstance(quote_id, str) or re.fullmatch(r"[0-9a-f]{64}", quote_id) is None:
             raise TxError("unknown_quote", "quote_id is malformed")
         wallet = _address(wallet, "wallet")
@@ -732,28 +765,50 @@ class TxCore:
             raise TxError("reorg", "quoted block was reorganized; re-quote")
         if isinstance(quote, SwapQuote) and self._balance(quote.intent.currency_in, wallet, "latest") < quote.intent.amount_in:
             raise TxRefusal("insufficient_balance", "wallet holds less than amount_in; fund it and re-quote")
-        for need in quote.plan.approvals:
-            if self._allowance(need.token, wallet, need.spender, "latest") < need.required:
-                raise TxError("approve_pending", f"approve {need.token} for {need.spender} first")
+        batch_approval = batched and isinstance(quote, SwapQuote) and quote.plan.to != UR and bool(quote.plan.approvals)
+        if not batch_approval:
+            for need in quote.plan.approvals:
+                allowance = self._allowance(need.token, wallet, need.spender, "latest")
+                if allowance < need.required or (quote.plan.to == need.spender and allowance != need.approve_amount):
+                    raise TxError("approve_pending", f"approve {need.token} for {need.spender} first")
         if isinstance(quote, SwapQuote):
             plan = self.swaps.finalize(quote.plan, quote.amounts.min_out, sigs)
         else:
             plan = self.lps.finalize(quote.plan, (quote.amounts.bound0, quote.amounts.bound1), sigs)
         data = plan.calldata()
-        sim = self.sim.run(wallet, (), Call(plan.to, data, plan.value), "latest")
+        approval = plan.staging if batch_approval else ()
+        sim = self.sim.run(wallet, approval, Call(plan.to, data, plan.value), "latest")
         if not sim.ok:
             assert sim.revert is not None
             code = sim.revert.kind if sim.revert.kind != "unknown" else "no_longer_executable"
             raise TxError(code, f"{sim.revert.selector} {sim.revert.detail}".strip())
         request = {"from": wallet, "to": plan.to, "data": "0x" + data.hex(), "value": hex(plan.value)}
+        override = None
+        if batch_approval:
+            need = plan.approvals[0]
+            override = self._allowance_override(need.token, wallet, need.spender, need.approve_amount)
         try:
-            estimate = _hex_int(self.rpc.call("eth_estimateGas", [request, "latest"]), "gas estimate")
+            params = [request, "latest", override] if override else [request, "latest"]
+            estimate = _hex_int(self.rpc.call("eth_estimateGas", params), "gas estimate")
         except TxError:
             raise
         except Exception as exc:
-            raise TxError("no_longer_executable", " ".join(str(exc).split())[:200]) from exc
+            if not batch_approval:
+                raise TxError("no_longer_executable", " ".join(str(exc).split())[:200]) from exc
+            estimate = 0
         gas = max(sim.gas_used * GAS_HEADROOM_PCT // 100, estimate * ESTIMATE_HEADROOM_PCT // 100)
-        return Prepared(self._tx(wallet, plan.to, data, plan.value, gas), sim.gas_used, quote.expires_at)
+        transaction = self._tx(wallet, plan.to, data, plan.value, gas)
+        if not batch_approval:
+            return Prepared(transaction, sim.gas_used, quote.expires_at)
+        approve = plan.staging[0]
+        approve_request = {"from": wallet, "to": approve.to, "data": "0x" + approve.data.hex(), "value": hex(approve.value)}
+        try:
+            approve_estimate = _hex_int(self.rpc.call("eth_estimateGas", [approve_request, "latest"]), "approve gas estimate")
+        except Exception:
+            approve_estimate = 0
+        approve_gas = max(sim.staging_gas[0] * GAS_HEADROOM_PCT // 100, approve_estimate * ESTIMATE_HEADROOM_PCT // 100)
+        approve_tx = self._tx(wallet, approve.to, approve.data, approve.value, approve_gas)
+        return Prepared(transaction, sim.gas_used, quote.expires_at, (approve_tx, transaction))
 
     def _swap_shape(self, wallet: str, data: bytes, value: int) -> SwapShape:
         commands, _ = decode_ur_execute(data)
