@@ -359,12 +359,12 @@ These routes need a signed-in wallet entitled to `trade` (swaps) or `lp` (liquid
 |---|---|
 | `GET /api/tx/status` | `enabled`, `reason`, `fee_bps` (75), `quote_ttl_s` |
 | `POST /api/tx/quote` | `{kind:"swap", side, token, quote_currency, amount_in, slippage_bps}` or `{kind:"lp", op, pool_id, slippage_bps, tick_lower, tick_upper, amount0, amount1, liquidity, token_id}`; amounts are raw integers as strings |
-| `POST /api/tx/prepare` | `{quote_id, permit_signature}`; returns the unsigned transaction after re-simulating its exact bytes |
+| `POST /api/tx/prepare` | `{quote_id, permit_signature, batched}`; returns the unsigned transaction after re-simulating its exact bytes. With `batched: true` on an external-router quote it also returns `calls`: the exact-amount approval and the swap, simulated together, for one `wallet_sendCalls` confirmation |
 | `GET /api/tx/receipt?hash=&feature=` | Fill reconciled from receipt logs: `pending`, `confirmed` with amounts, or `failed` |
 | `GET /api/tx/balances?currencies=&feature=` | Balance, decimals and symbol per currency (up to 8) |
 | `GET /api/tx/pool?pool_id=&ids=&feature=lp` | Pool tokens, tick, spacing, Pons flag and the wallet's positions, each verified on chain; `ids` adds the client's recent mints |
 
-A swap quote lists `hops` (venue, fee tier, Pons hook and creator bps), `amounts` (`amount_in`, `net_out`, `min_out`, `hook_fee`, `creator_tax`, `rhpools_fee`, `impact_bps`) and `steps` in order: `approve` (ERC-20 to Permit2, once per token), `permit` (EIP-712 to sign), `send`. Quotes expire after 60 s. Refusals return 422 with `refusal`: `no_route`, `insufficient_balance`, `impact_over_limit`, `unmodeled_fee`, `pons_add`, `hook_blocked_add`, `allowlist_mismatch`, `trading_disabled`.
+A swap quote lists `hops` (venue, `dex`, fee tier, Pons hook and creator bps), `legs` (one to three routes with each leg's input and output share of the order), `amounts` (`amount_in`, `net_out`, `min_out`, `hook_fee`, `creator_tax`, `rhpools_fee`, `impact_bps`), `steps` in order (`approve`, `permit` for EIP-712 signing, `send`), and `shortfall` (`{currency, have, need}`) when the wallet holds less than `amount_in`. Such a quote is priced as if funded, and prepare refuses it until the wallet holds the input. A split order runs in one UniversalRouter transaction: the fee is taken once on the whole input, and `min_out` is enforced on the total at the final sweep. Router approvals are exact amounts, and Permit2 signatures expire with the quote. Quotes expire after 60 s. Refusals return 422 with `refusal`: `no_route`, `insufficient_balance`, `impact_over_limit`, `unmodeled_fee`, `unsellable` (a buy whose sell-back simulation fails), `fee_wallet` (the fee recipient cannot trade), `incomplete_pool`, `pons_add`, `hook_blocked_add`, `allowlist_mismatch`, `trading_disabled`.
 
 ## Flow tags: `GET /api/v1/tags?tx=`
 
