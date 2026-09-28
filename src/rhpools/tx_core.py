@@ -15,7 +15,7 @@ from urllib.request import Request, urlopen
 from eth_abi import decode
 from . import tx_allowlist
 from .tx_chain import (
-    ADD_GOVERNING_FLAGS, CHAIN_ID, GIGA_SWAP_ROUTER, GIGA_V3_FACTORY, MSG_SENDER, NATIVE,
+    ADD_GOVERNING_FLAGS, CHAIN_ID, DEX_BY_FACTORY, GIGA_SWAP_ROUTER, GIGA_V3_FACTORY, MSG_SENDER, NATIVE,
     NFPM_BY_FACTORY, NFPM_GIGA, NFPM_PANCAKE, NFPM_UNISWAP, PANCAKE_SMART_ROUTER,
     PANCAKE_V3_FACTORY, PERMIT2, PONS_HOOK, POSM, SEL_PANCAKE_EXACT_INPUT,
     SEL_PANCAKE_EXACT_INPUT_SINGLE, SEL_ROUTER_MULTICALL_DEADLINE, SEL_SLIPSTREAM_EXACT_INPUT_SINGLE,
@@ -199,7 +199,8 @@ class SwapQuote(QuoteBase):
             "route": self.route.describe(),
             "hops": [
                 {
-                    "venue": hop.pool.venue.value, "pool_id": hop.pool.id, "fee_ppm": hop.pool.fee_ppm,
+                    "venue": hop.pool.venue.value, "dex": DEX_BY_FACTORY.get(hop.pool.factory or "", "uniswap"),
+                    "pool_id": hop.pool.id, "fee_ppm": hop.pool.fee_ppm,
                     "currency_in": hop.currency_in, "currency_out": hop.currency_out,
                     "hook_fee_bps": hook_bps, "creator_tax_bps": creator_bps,
                 }

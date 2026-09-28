@@ -185,6 +185,7 @@
       const view = await api("/api/tx/pool?feature=lp&pool_id=" + poolId + "&ids=" + knownIds().join(","));
       if (lp.poolId !== poolId) return;
       lp.view = view;
+      lp.caps = null;
       state.note = null;
     } catch (error) {
       if (lp.poolId !== poolId) return;
@@ -668,7 +669,7 @@
     const parts = [symbolOf(quote.hops[0].currency_in)];
     for (const hop of quote.hops) {
       const pons = hop.hook_fee_bps || hop.creator_tax_bps;
-      parts.push(hop.venue + (pons ? " pons" : hop.fee_ppm & 0x800000 ? " dyn" : " " + (hop.fee_ppm / 10000) + "%"));
+      parts.push((hop.dex && hop.dex !== "uniswap" ? hop.dex + " " : "") + hop.venue + (pons ? " pons" : hop.fee_ppm & 0x800000 ? " dyn" : " " + (hop.fee_ppm / 10000) + "%"));
       parts.push(symbolOf(hop.currency_out));
     }
     return parts.join(" → ");
@@ -863,6 +864,11 @@
     render();
     if (entitled("trade") && state.token && !state.meta[state.token]) loadBalances();
     if (state.mode === "lp" && entitled("lp") && state.lp.poolId && !state.lp.view) loadPool();
+  });
+  window.addEventListener("focus", () => {
+    if (!dialog.open || busy() || settled()) return;
+    if (state.mode === "lp") loadPool();
+    else if (state.token) loadBalances();
   });
   async function openFromInspector(mode) {
     const link = document.getElementById("pool-inspector-new-tab");

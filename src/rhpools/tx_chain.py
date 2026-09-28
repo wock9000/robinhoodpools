@@ -32,6 +32,13 @@ V3_ROUTER_BY_FACTORY = {
     GIGA_V3_FACTORY: GIGA_SWAP_ROUTER,
     SLIPSTREAM_FACTORY: SLIPSTREAM_SWAP_ROUTER,
 }
+DEX_BY_FACTORY = {
+    UR_V2_FACTORY: "uniswap",
+    UR_V3_FACTORY: "uniswap",
+    PANCAKE_V3_FACTORY: "pancake",
+    GIGA_V3_FACTORY: "giga",
+    SLIPSTREAM_FACTORY: "up",
+}
 NFPM_BY_FACTORY = {
     UR_V3_FACTORY: NFPM_UNISWAP,
     PANCAKE_V3_FACTORY: NFPM_PANCAKE,
@@ -936,7 +943,7 @@ def decode_revert(data: bytes) -> RevertKind:
 
 __all__ = [
     "ADDRESS_THIS", "ADD_GOVERNING_FLAGS", "CHAIN_ID", "CONTRACT_BALANCE", "Cmd", "MAX_UINT128",
-    "MAX_UINT160", "MAX_UINT256", "MSG_SENDER", "NATIVE", "NFPM_BY_FACTORY", "NFPM_GIGA",
+    "MAX_UINT160", "MAX_UINT256", "MSG_SENDER", "NATIVE", "DEX_BY_FACTORY", "NFPM_BY_FACTORY", "NFPM_GIGA",
     "NFPM_PANCAKE", "NFPM_UNISWAP", "NfpmCollect", "NfpmDecrease", "NfpmIncrease", "NfpmMint",
     "OPEN_DELTA", "PERMIT2", "PONS_HOOK", "POOL_MANAGER", "POSM", "PayPortion", "Permit2Permit",
     "Permit2TransferFrom", "PermitBatch", "PermitDetails", "PermitSingle", "PoolKey",
