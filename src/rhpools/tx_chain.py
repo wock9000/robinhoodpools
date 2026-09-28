@@ -21,10 +21,21 @@ PONS_HOOK = "0xe5e702641ea86f4ae6cc3cdaed2b886f976be044"
 NFPM_UNISWAP = "0x73991a25c818bf1f1128deaab1492d45638de0d3"
 NFPM_PANCAKE = "0x46a15b0b27311cedf172ab29e4f4766fbe7f4364"
 NFPM_GIGA = "0xa79f5775b0b49e51202c48ddf03f380faa96f641"
+GIGA_SWAP_ROUTER = "0x56b2e2ee0487223663b458cf3492bccbe04536f2"
+PANCAKE_SMART_ROUTER = "0x13f4ea83d0bd40e75c8222255bc855a974568dd4"
+PANCAKE_V3_FACTORY = "0x0bfbcf9fa4f9c56b0f40a671ad40e0805a091865"
+GIGA_V3_FACTORY = "0xece6ecd61177336ea6fb9b17937ac439d85ee20b"
+SLIPSTREAM_FACTORY = "0x1ac9db4a2608ba45d6127b1737949b51bb54b7f3"
+SLIPSTREAM_SWAP_ROUTER = "0xc062b870e813fca720f1e002c234369ab3ab9415"
+V3_ROUTER_BY_FACTORY = {
+    PANCAKE_V3_FACTORY: PANCAKE_SMART_ROUTER,
+    GIGA_V3_FACTORY: GIGA_SWAP_ROUTER,
+    SLIPSTREAM_FACTORY: SLIPSTREAM_SWAP_ROUTER,
+}
 NFPM_BY_FACTORY = {
     UR_V3_FACTORY: NFPM_UNISWAP,
-    "0x0bfbcf9fa4f9c56b0f40a671ad40e0805a091865": NFPM_PANCAKE,
-    "0xece6ecd61177336ea6fb9b17937ac439d85ee20b": NFPM_GIGA,
+    PANCAKE_V3_FACTORY: NFPM_PANCAKE,
+    GIGA_V3_FACTORY: NFPM_GIGA,
 }
 
 MSG_SENDER = "0x0000000000000000000000000000000000000001"
@@ -96,6 +107,7 @@ SEL_POOL_INITIALIZE = selector("initialize((address,address,uint24,int24,address
 TOPIC_TRANSFER = topic("Transfer(address,address,uint256)")
 TOPIC_V4_SWAP = topic("Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)")
 TOPIC_V3_SWAP = topic("Swap(address,address,int256,int256,uint160,uint128,int24)")
+TOPIC_PANCAKE_SWAP = topic("Swap(address,address,int256,int256,uint160,uint128,int24,uint128,uint128)")
 TOPIC_V2_SWAP = topic("Swap(address,uint256,uint256,uint256,uint256,address)")
 TOPIC_V4_MODIFY_LIQUIDITY = topic("ModifyLiquidity(bytes32,address,int24,int24,int256,bytes32)")
 TOPIC_NFPM_INCREASE = topic("IncreaseLiquidity(uint256,uint128,uint256,uint256)")
@@ -243,6 +255,52 @@ def decode_v3_path(path: bytes) -> tuple[tuple[str, ...], tuple[int, ...]]:
         tokens.append("0x" + rest[3:23].hex())
         rest = rest[23:]
     return tuple(tokens), tuple(fees)
+
+SEL_V3_EXACT_INPUT_SINGLE = selector("exactInputSingle((address,address,uint24,address,uint256,uint256,uint256,uint160))")
+SEL_V3_EXACT_INPUT = selector("exactInput((bytes,address,uint256,uint256,uint256))")
+SEL_PANCAKE_EXACT_INPUT_SINGLE = selector("exactInputSingle((address,address,uint24,address,uint256,uint256,uint160))")
+SEL_PANCAKE_EXACT_INPUT = selector("exactInput((bytes,address,uint256,uint256))")
+SEL_SLIPSTREAM_EXACT_INPUT_SINGLE = selector("exactInputSingle((address,address,int24,address,uint256,uint256,uint256,uint160))")
+SEL_ROUTER_MULTICALL_DEADLINE = selector("multicall(uint256,bytes[])")
+SEL_SWEEP_WITH_FEE = selector("sweepTokenWithFee(address,uint256,address,uint256,address)")
+SEL_UNWRAP_WITH_FEE = selector("unwrapWETH9WithFee(uint256,address,uint256,address)")
+
+
+def v3_router_swap(tokens: tuple[str, ...], fees: tuple[int, ...], amount: int, deadline: int, recipient: str, *, pancake: bool = False, slipstream: bool = False) -> bytes:
+    if len(fees) == 1:
+        if pancake:
+            return SEL_PANCAKE_EXACT_INPUT_SINGLE + encode(
+                ["address", "address", "uint24", "address", "uint256", "uint256", "uint160"],
+                [tokens[0], tokens[1], fees[0], recipient, amount, 0, 0],
+            )
+        if slipstream:
+            return SEL_SLIPSTREAM_EXACT_INPUT_SINGLE + encode(
+                ["address", "address", "int24", "address", "uint256", "uint256", "uint256", "uint160"],
+                [tokens[0], tokens[1], fees[0], recipient, deadline, amount, 0, 0],
+            )
+        return SEL_V3_EXACT_INPUT_SINGLE + encode(
+            ["address", "address", "uint24", "address", "uint256", "uint256", "uint256", "uint160"],
+            [tokens[0], tokens[1], fees[0], recipient, deadline, amount, 0, 0],
+        )
+    if pancake:
+        return SEL_PANCAKE_EXACT_INPUT + encode(
+            ["(bytes,address,uint256,uint256)"],
+            [(v3_path(tokens, fees), recipient, amount, 0)],
+        )
+    return SEL_V3_EXACT_INPUT + encode(
+        ["(bytes,address,uint256,uint256,uint256)"],
+        [(v3_path(tokens, fees), recipient, deadline, amount, 0)],
+    )
+
+
+def v3_router_fee(token: str, minimum: int, wallet: str, bps: int, recipient: str) -> bytes:
+    if token == NATIVE:
+        return SEL_UNWRAP_WITH_FEE + encode(
+            ["uint256", "address", "uint256", "address"], [minimum, wallet, bps, recipient],
+        )
+    return SEL_SWEEP_WITH_FEE + encode(
+        ["address", "uint256", "address", "uint256", "address"], [token, minimum, wallet, bps, recipient],
+    )
 
 
 class UrCommand:

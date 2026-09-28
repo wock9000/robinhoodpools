@@ -1,8 +1,7 @@
 """Candidate swap routes from the market ``pools`` table (read-only) plus hook policy.
 
-Only venues the UniversalRouter can execute are returned: V2 pairs of the
-factory embedded in the router, Uniswap-factory V3 pools, and V4 pools whose
-hook is either absent or the Pons launch hook.
+V3 routers use only pools created by their own factory. Bridged routes keep
+both hops in the same router when using a protocol-specific SwapRouter.
 """
 from __future__ import annotations
 
@@ -15,7 +14,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-from .tx_chain import NATIVE, PONS_HOOK, POOL_MANAGER, UR_V2_FACTORY, UR_V3_FACTORY, USDG, WETH, PoolKey, pons_launches
+from .tx_chain import GIGA_V3_FACTORY, NATIVE, PANCAKE_V3_FACTORY, PONS_HOOK, POOL_MANAGER, SLIPSTREAM_FACTORY, UR_V2_FACTORY, UR_V3_FACTORY, USDG, WETH, PoolKey, pons_launches
 
 MAX_CANDIDATES = 6
 QUOTE_CURRENCIES = frozenset({NATIVE, WETH, USDG})
@@ -58,11 +57,11 @@ class Pool:
         raise ValueError("currency is not in the pool")
 
     @property
-    def ur_swappable(self) -> bool:
+    def swappable(self) -> bool:
         if self.venue is Venue.V2:
             return self.factory == UR_V2_FACTORY
         if self.venue is Venue.V3:
-            return self.factory == UR_V3_FACTORY
+            return self.factory in (UR_V3_FACTORY, GIGA_V3_FACTORY, PANCAKE_V3_FACTORY, SLIPSTREAM_FACTORY)
         return self.hook in (NATIVE, PONS_HOOK)
 
 
@@ -170,6 +169,9 @@ def v4_pool(key: PoolKey) -> Pool:
 
 DEFAULT_BRIDGES: tuple[Pool, ...] = (
     Pool(Venue.V3, "0x52e65b17fb6e5ba00ed806f37afcd2daa50271ca", "0x52e65b17fb6e5ba00ed806f37afcd2daa50271ca", WETH, USDG, 100, 1, NATIVE, UR_V3_FACTORY),
+    Pool(Venue.V3, "0xb2a6ad51b3ea3cdc8d3508cca147a43471382e53", "0xb2a6ad51b3ea3cdc8d3508cca147a43471382e53", WETH, USDG, 100, 1, NATIVE, GIGA_V3_FACTORY),
+    Pool(Venue.V3, "0x88a8e96e7785d378825e8b5d7fc0e6f62487061e", "0x88a8e96e7785d378825e8b5d7fc0e6f62487061e", WETH, USDG, 500, 10, NATIVE, PANCAKE_V3_FACTORY),
+    Pool(Venue.V3, "0x16679e2ac1a798865ecf1c1639e67693ddb1c220", "0x16679e2ac1a798865ecf1c1639e67693ddb1c220", WETH, USDG, 89, 10, NATIVE, SLIPSTREAM_FACTORY),
     Pool(Venue.V2, "0x8803c117ccae7b5146297876c2a25df135141c4d", "0x8803c117ccae7b5146297876c2a25df135141c4d", WETH, USDG, 0, 0, NATIVE, UR_V2_FACTORY),
     v4_pool(PoolKey(NATIVE, USDG, 500, 10, NATIVE)),
 )
@@ -215,14 +217,16 @@ class RouteBook:
                 return []
         return sorted({int(row[0]) for row in rows if str(row[0]).isdigit()})
 
-    def pool_for(self, venue: Venue, token_a: str, token_b: str, fee_ppm: int | None = None, factory: str | None = None) -> Pool | None:
-        """``factory`` narrows to one deployer; without it only UR-swappable pools match."""
+    def pool_for(self, venue: Venue, token_a: str, token_b: str, fee_ppm: int | None = None, factory: str | None = None, tick_spacing: int | None = None) -> Pool | None:
+        """``factory`` narrows to one deployer; without it only supported pools match."""
         token0, token1 = sorted((token_a.lower(), token_b.lower()))
 
         def accepts(pool: Pool) -> bool:
             if fee_ppm is not None and pool.fee_ppm != fee_ppm:
                 return False
-            return pool.factory == factory if factory is not None else pool.ur_swappable
+            if tick_spacing is not None and pool.tick_spacing != tick_spacing:
+                return False
+            return pool.factory == factory if factory is not None else pool.swappable
 
         for bridge in self._bridges:
             if bridge.venue is venue and (bridge.token0, bridge.token1) == (token0, token1) and accepts(bridge):
@@ -264,7 +268,7 @@ class RouteBook:
         direct: list[Route] = []
         bridged: list[Route] = []
         for pool in self.token_pools(token):
-            if not pool.ur_swappable:
+            if not pool.swappable:
                 continue
             other = pool.other(token)
             if pool.hook == PONS_HOOK:
@@ -283,6 +287,12 @@ class RouteBook:
                 near = next((c for c in ends if same_asset(c, other)), None)
                 far = next((c for c in ends if same_asset(c, quote_currency)), None)
                 if near is None or far is None or near == far:
+                    continue
+                if pool.factory in (GIGA_V3_FACTORY, PANCAKE_V3_FACTORY, SLIPSTREAM_FACTORY) and (
+                    bridge.venue is not Venue.V3 or bridge.factory != pool.factory
+                ):
+                    continue
+                if bridge.factory in (GIGA_V3_FACTORY, PANCAKE_V3_FACTORY, SLIPSTREAM_FACTORY) and pool.factory != bridge.factory:
                     continue
                 bridge_hop = Hop(bridge, far, near) if side is Side.BUY else Hop(bridge, near, far)
                 hops = (bridge_hop, token_hop) if side is Side.BUY else (token_hop, bridge_hop)

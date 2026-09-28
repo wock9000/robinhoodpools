@@ -48,6 +48,13 @@ PANCAKE_WETH_USDG = "0x88a8e96e7785d378825e8b5d7fc0e6f62487061e"
 GIGA_WETH_USDG = "0xb2a6ad51b3ea3cdc8d3508cca147a43471382e53"
 PANCAKE_FACTORY = "0x0bfbcf9fa4f9c56b0f40a671ad40e0805a091865"
 GIGA_FACTORY = "0xece6ecd61177336ea6fb9b17937ac439d85ee20b"
+PANCAKE_TOKEN = "0x9ac6678e9258822879baf0dc451f9b0fcdd74ba3"
+GIGA_TOKEN = "0xf3081494b87e8d5fb7960f066e931d1d0e6e3d67"
+PANCAKE_TOKEN_POOL = "0xd05e187dfa4740c30802f919f05b1b060ce2f6f2"
+GIGA_TOKEN_POOL = "0x129b392490aac7b4320aeade8d1054c06c2ce224"
+SLIPSTREAM_TOKEN = "0xd0601ce157db5bdc3162bbac2a2c8af5320d9eec"
+SLIPSTREAM_TOKEN_POOL = "0x18a5af4e442f8be68968cc1f00d537f8af2d12cd"
+SLIPSTREAM_FACTORY = "0x1ac9db4a2608ba45d6127b1737949b51bb54b7f3"
 BLOCKING_HOOK = "0x00000000000000000000000000000000dead0800"
 POOL_COLUMNS = "id, protocol, address, token0, token1, fee_ppm, tick_spacing, hook, factory"
 POOL_ROWS = [
@@ -57,6 +64,9 @@ POOL_ROWS = [
     (UNI_WETH_USDG, "v3", UNI_WETH_USDG, WETH, USDG, 100, 1, None, UR_V3_FACTORY),
     (PANCAKE_WETH_USDG, "v3", PANCAKE_WETH_USDG, WETH, USDG, 500, 10, None, PANCAKE_FACTORY),
     (GIGA_WETH_USDG, "v3", GIGA_WETH_USDG, WETH, USDG, 100, 1, None, GIGA_FACTORY),
+    (PANCAKE_TOKEN_POOL, "v3", PANCAKE_TOKEN_POOL, USDG, PANCAKE_TOKEN, 100, 1, None, PANCAKE_FACTORY),
+    (GIGA_TOKEN_POOL, "v3", GIGA_TOKEN_POOL, USDG, GIGA_TOKEN, 3000, 60, None, GIGA_FACTORY),
+    (SLIPSTREAM_TOKEN_POOL, "v3", SLIPSTREAM_TOKEN_POOL, USDG, SLIPSTREAM_TOKEN, 100, 60, None, SLIPSTREAM_FACTORY),
     (V4_ETH_USDG, "v4", POOL_MANAGER, NATIVE, USDG, 500, 10, NATIVE, POOL_MANAGER),
 ]
 
@@ -249,7 +259,7 @@ def trade(core: TxCore, fork: Fork, intent: SwapIntent) -> tuple[SwapQuote, Fill
         assert delta[(NATIVE, fork.user)] == amounts.net_out - user_gas
     else:
         assert delta[(intent.currency_out, fork.user)] == amounts.net_out
-    if intent.side is Side.BUY:
+    if intent.side is Side.BUY and fee.currency == intent.currency_in:
         assert fee.amount == intent.amount_in * 75 // 10_000
     return quote, fill
 
@@ -262,6 +272,46 @@ def expect_steps(fork: Fork, quote, permit_tokens: dict[str, int]) -> None:
     approvals = sum(1 for t, amount in permit_tokens.items() if int.from_bytes(fork.call(t, tc.erc20_allowance(fork.user, tc.PERMIT2)), "big") < amount)
     permit = ["permit"] if permit_tokens else []
     assert [s.kind for s in quote.steps] == ["approve"] * approvals + permit + ["send"]
+
+
+
+@pytest.mark.parametrize("token,router", [
+    (PANCAKE_TOKEN, tc.PANCAKE_SMART_ROUTER),
+    (GIGA_TOKEN, tc.GIGA_SWAP_ROUTER),
+    (SLIPSTREAM_TOKEN, tc.SLIPSTREAM_SWAP_ROUTER),
+])
+def test_protocol_router_buy_sell(core, fork, token, router):
+    fork.get_usdg(2 * 10**18)
+    buy = swap(fork.user, Side.BUY, token, USDG, 100_000 if token == PANCAKE_TOKEN else 10 * 10**6)
+    quote, _ = trade(core, fork, buy)
+    assert quote.plan.to == router
+    assert quote.amounts.rhpools_fee.currency == token
+    assert quote.amounts.rhpools_fee.amount == quote.amounts.pool_out * 75 // 10_000
+    held = fork.balance(token, fork.user)
+    sell = swap(fork.user, Side.SELL, token, USDG, held // 2)
+    quote, _ = trade(core, fork, sell)
+    assert quote.plan.to == router
+    assert quote.amounts.rhpools_fee.currency == USDG
+    assert quote.amounts.rhpools_fee.amount == quote.amounts.pool_out * 75 // 10_000
+
+
+@pytest.mark.parametrize("token,router,amount", [
+    (PANCAKE_TOKEN, tc.PANCAKE_SMART_ROUTER, 10**13),
+    (GIGA_TOKEN, tc.GIGA_SWAP_ROUTER, 10**14),
+    (SLIPSTREAM_TOKEN, tc.SLIPSTREAM_SWAP_ROUTER, 10**14),
+])
+def test_protocol_router_bridged_buy_sell(core, fork, token, router, amount):
+    fork.get_weth(amount * 3)
+    buy = swap(fork.user, Side.BUY, token, WETH, amount)
+    candidates = core.routes.candidates(token, WETH, Side.BUY)
+    assert any(len(route.hops) == 2 for route in candidates)
+    quote, _ = trade(core, fork, buy)
+    assert quote.plan.to == router
+    assert quote.amounts.rhpools_fee.currency == token
+    held = fork.balance(token, fork.user)
+    quote, _ = trade(core, fork, swap(fork.user, Side.SELL, token, WETH, held // 2))
+    assert quote.plan.to == router
+    assert quote.amounts.rhpools_fee.currency == WETH
 
 
 def test_pons_buy_and_sell_from_usdg(core, fork):

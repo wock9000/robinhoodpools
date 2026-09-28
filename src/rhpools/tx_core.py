@@ -12,15 +12,21 @@ from dataclasses import dataclass, replace
 from typing import Any
 from urllib.request import Request, urlopen
 
+from eth_abi import decode
 from . import tx_allowlist
 from .tx_chain import (
-    ADD_GOVERNING_FLAGS, CHAIN_ID, MSG_SENDER, NATIVE, NFPM_BY_FACTORY, NFPM_GIGA, NFPM_PANCAKE,
-    NFPM_UNISWAP, PERMIT2, PONS_HOOK, POSM, STATE_VIEW, UR, NfpmCollect,
-    NfpmDecrease, NfpmIncrease, NfpmMint, PayPortion, Permit2TransferFrom, PoolKey, PosmDecrease,
-    PosmIncrease, PosmMint, RevertKind, SEL_MULTICALL, SEL_POSM_PERMIT_BATCH, Sweep, UnwrapWeth, V2Swap, V3Swap, V4Swap,
-    V4SwapExactInSingle, decode_multicall, decode_nfpm_call, decode_posm_modify_liquidities,
-    decode_revert, decode_ur_execute, decode_v3_path, erc20_allowance, erc20_approve,
-    erc20_balance_of, hook_flags, nfpm_positions, permit2_allowance, posm_pool_and_position,
+    ADD_GOVERNING_FLAGS, CHAIN_ID, GIGA_SWAP_ROUTER, GIGA_V3_FACTORY, MSG_SENDER, NATIVE,
+    NFPM_BY_FACTORY, NFPM_GIGA, NFPM_PANCAKE, NFPM_UNISWAP, PANCAKE_SMART_ROUTER,
+    PANCAKE_V3_FACTORY, PERMIT2, PONS_HOOK, POSM, SEL_PANCAKE_EXACT_INPUT,
+    SEL_PANCAKE_EXACT_INPUT_SINGLE, SEL_ROUTER_MULTICALL_DEADLINE, SEL_SLIPSTREAM_EXACT_INPUT_SINGLE,
+    SEL_SWEEP_WITH_FEE, SEL_UNWRAP_WITH_FEE, SEL_V3_EXACT_INPUT, SEL_V3_EXACT_INPUT_SINGLE,
+    SLIPSTREAM_FACTORY, SLIPSTREAM_SWAP_ROUTER, STATE_VIEW, UR, WETH,
+    NfpmCollect, NfpmDecrease, NfpmIncrease, NfpmMint, PayPortion,
+    Permit2TransferFrom, PoolKey, PosmDecrease, PosmIncrease, PosmMint, RevertKind, SEL_MULTICALL,
+    SEL_POSM_PERMIT_BATCH, Sweep, UnwrapWeth, V2Swap, V3Swap, V4Swap, V4SwapExactInSingle,
+    decode_multicall, decode_nfpm_call, decode_posm_modify_liquidities, decode_revert,
+    decode_ur_execute, decode_v3_path, erc20_allowance, erc20_approve, erc20_balance_of,
+    hook_flags, nfpm_positions, permit2_allowance, posm_pool_and_position,
     posm_position_liquidity, selector, state_view_slot0,
 )
 from .tx_plan import (
@@ -452,7 +458,9 @@ class TxCore:
             raise TxRefusal("insufficient_balance", "wallet holds less than amount_in")
         candidates = self.routes.candidates(intent.token, intent.quote_currency, intent.side)
         if not candidates:
-            raise TxRefusal("no_route", "no UniversalRouter-executable pool for this token")
+            factories = sorted({pool.factory for pool in self.routes.token_pools(intent.token) if not pool.swappable})
+            detail = "unsupported pool factories: " + ", ".join(factories) if factories else "no compatible route with a deployed router"
+            raise TxRefusal("no_route", detail)
         expires_at, deadline = self._times()
         nonce = 0 if intent.currency_in == NATIVE else self._permit_nonce(intent.wallet, intent.currency_in, UR, tag)
         best: tuple[Plan, SimResult, Amounts, Route] | None = None
@@ -739,6 +747,63 @@ class TxCore:
             fee_bps=fee.bips,
         )
 
+    def _router_swap_shape(self, wallet: str, to: str, data: bytes, value: int) -> SwapShape:
+        pancake = to == PANCAKE_SMART_ROUTER
+        calls = decode(["uint256", "bytes[]"], data[4:])[1] if pancake and data[:4] == SEL_ROUTER_MULTICALL_DEADLINE else decode_multicall(data)
+        if len(calls) != 2:
+            raise TxError("unknown_target", "router swap must contain swap and fee sweep")
+        swap, sweep = calls
+        if pancake and swap[:4] == SEL_PANCAKE_EXACT_INPUT_SINGLE:
+            token_in, token_out, fee, _, amount_in, _, _ = decode(
+                ["address", "address", "uint24", "address", "uint256", "uint256", "uint160"], swap[4:],
+            )
+            tokens, fees = (token_in, token_out), (fee,)
+        elif to == SLIPSTREAM_SWAP_ROUTER and swap[:4] == SEL_SLIPSTREAM_EXACT_INPUT_SINGLE:
+            token_in, token_out, spacing, _, _, amount_in, _, _ = decode(
+                ["address", "address", "int24", "address", "uint256", "uint256", "uint256", "uint160"], swap[4:],
+            )
+            tokens, fees = (token_in, token_out), (spacing,)
+        elif not pancake and swap[:4] == SEL_V3_EXACT_INPUT_SINGLE:
+            token_in, token_out, fee, _, _, amount_in, _, _ = decode(
+                ["address", "address", "uint24", "address", "uint256", "uint256", "uint256", "uint160"], swap[4:],
+            )
+            tokens, fees = (token_in, token_out), (fee,)
+        elif pancake and swap[:4] == SEL_PANCAKE_EXACT_INPUT:
+            (path, _, amount_in, _), = decode(["(bytes,address,uint256,uint256)"], swap[4:])
+            tokens, fees = decode_v3_path(path)
+        elif not pancake and swap[:4] == SEL_V3_EXACT_INPUT:
+            (path, _, _, amount_in, _), = decode(
+                ["(bytes,address,uint256,uint256,uint256)"], swap[4:],
+            )
+            tokens, fees = decode_v3_path(path)
+        else:
+            raise TxError("unknown_target", "router calldata has no supported swap")
+        factory = PANCAKE_V3_FACTORY if pancake else SLIPSTREAM_FACTORY if to == SLIPSTREAM_SWAP_ROUTER else GIGA_V3_FACTORY
+        hops = []
+        for a, b, fee in zip(tokens, tokens[1:], fees):
+            pool = self.routes.pool_for(Venue.V3, a, b, factory=factory, **(
+                {"tick_spacing": fee} if to == SLIPSTREAM_SWAP_ROUTER else {"fee_ppm": fee}
+            ))
+            if pool is None:
+                raise TxError("unknown_pool", f"no indexed pool for {a}/{b}")
+            hops.append(Hop(pool, a, b))
+        if sweep[:4] == SEL_UNWRAP_WITH_FEE:
+            _, recipient, bps, fee_recipient = decode(["uint256", "address", "uint256", "address"], sweep[4:])
+            currency_out = NATIVE
+        elif sweep[:4] == SEL_SWEEP_WITH_FEE:
+            currency_out, _, recipient, bps, fee_recipient = decode(
+                ["address", "uint256", "address", "uint256", "address"], sweep[4:],
+            )
+        else:
+            raise TxError("unknown_target", "router calldata has no fee sweep")
+        if recipient.lower() != wallet or not (currency_out == tokens[-1] or currency_out == NATIVE and tokens[-1] == WETH):
+            raise TxError("unknown_target", "router settlement differs from swap")
+        currency_in = NATIVE if value else tokens[0]
+        if value and value != amount_in:
+            raise TxError("unknown_target", "router input value differs from swap")
+        return SwapShape(wallet, Route(tuple(hops)), currency_in, currency_out, amount_in,
+                         FeeLeg.OUTPUT, currency_out, fee_recipient.lower(), bps)
+
     def _lp_shape(self, wallet: str, to: str, data: bytes, tag: str) -> LpShape:
         calls = decode_multicall(data) if data[:4] == SEL_MULTICALL else (data,)
         if to == POSM:
@@ -806,6 +871,14 @@ class TxCore:
         tag = hex(block)
         if to == UR:
             amounts: Amounts | LpAmounts = swap_amounts(self._swap_shape(wallet, data, value), Ledger(logs, traced=False), self.routes.hook_policy)
+        elif to in (GIGA_SWAP_ROUTER, PANCAKE_SMART_ROUTER, SLIPSTREAM_SWAP_ROUTER):
+            shape = self._router_swap_shape(wallet, to, data, value)
+            native_flows = {}
+            if shape.currency_out == NATIVE:
+                before = _hex_int(self.rpc.call("eth_getBalance", [wallet, hex(block - 1)]), "balance")
+                after = _hex_int(self.rpc.call("eth_getBalance", [wallet, tag]), "balance")
+                native_flows[wallet] = after - before + gas_cost + value
+            amounts = swap_amounts(shape, Ledger(logs, traced=False, native_flows=native_flows), self.routes.hook_policy)
         elif to in LP_TARGETS:
             shape = self._lp_shape(wallet, to, data, tag)
             before = _hex_int(self.rpc.call("eth_getBalance", [wallet, hex(block - 1)]), "balance")

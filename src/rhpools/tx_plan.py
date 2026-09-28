@@ -10,18 +10,21 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any
+from eth_abi import encode
 
 from .lp_math import Q96, amount0_delta, amount1_delta, sqrt_ratio_at_tick
 from .tx_chain import (
-    ADDRESS_THIS, CONTRACT_BALANCE, MAX_UINT128, MAX_UINT256, MSG_SENDER, NATIVE, NFPM_BY_FACTORY,
-    OPEN_DELTA, PERMIT2, POOL_MANAGER, POSM, TOPIC_NFPM_COLLECT, TOPIC_NFPM_DECREASE,
-    TOPIC_NFPM_INCREASE, TOPIC_TRANSFER, TOPIC_V2_SWAP, TOPIC_V3_SWAP, TOPIC_V4_MODIFY_LIQUIDITY,
-    TOPIC_V4_SWAP, UR, WETH, NfpmCollect, NfpmDecrease, NfpmIncrease, NfpmMint, PayPortion,
-    Permit2Permit, Permit2TransferFrom, PermitBatch, PermitDetails, PermitSingle, PosmDecrease,
-    PosmIncrease, PosmMint, PosmParam, PosmSettlePair, PosmSweep, PosmTakePair, Sweep,
-    UnwrapWeth, UrCommand, V2Swap, V3Swap, V4Settle, V4Swap, V4SwapExactInSingle, V4Take,
-    WrapEth, erc20_approve, multicall, permit2_approve, permit_batch_typed_data,
-    permit_single_typed_data, posm_modify_liquidities, posm_permit_batch, ur_execute, v3_path,
+    ADDRESS_THIS, CONTRACT_BALANCE, MAX_UINT128, MAX_UINT256, MSG_SENDER, NATIVE,
+    NFPM_BY_FACTORY, OPEN_DELTA, PANCAKE_SMART_ROUTER, PERMIT2, POOL_MANAGER, POSM,
+    SLIPSTREAM_SWAP_ROUTER, V3_ROUTER_BY_FACTORY,
+    TOPIC_NFPM_COLLECT, TOPIC_NFPM_DECREASE, TOPIC_NFPM_INCREASE, TOPIC_PANCAKE_SWAP,
+    TOPIC_TRANSFER, TOPIC_V2_SWAP, TOPIC_V3_SWAP, TOPIC_V4_MODIFY_LIQUIDITY, TOPIC_V4_SWAP, UR, WETH, NfpmCollect,
+    NfpmDecrease, NfpmIncrease, NfpmMint, PayPortion, Permit2Permit, Permit2TransferFrom,
+    PermitBatch, PermitDetails, PermitSingle, PosmDecrease, PosmIncrease, PosmMint, PosmParam,
+    PosmSettlePair, PosmSweep, PosmTakePair, Sweep, UnwrapWeth, UrCommand, V2Swap, V3Swap,
+    V4Settle, V4Swap, V4SwapExactInSingle, V4Take, WrapEth, erc20_approve, multicall,
+    permit2_approve, permit_batch_typed_data, permit_single_typed_data, posm_modify_liquidities,
+    posm_permit_batch, SEL_ROUTER_MULTICALL_DEADLINE, ur_execute, v3_path, v3_router_fee, v3_router_swap,
 )
 from .tx_routes import Hop, HookPolicy, Pool, Route, Side, Venue, same_asset
 
@@ -185,6 +188,12 @@ class SwapBody:
     shape: SwapShape
 
 
+
+@dataclass(frozen=True)
+class RouterBody:
+    shape: SwapShape
+    gross_min_out: int = 0
+
 @dataclass(frozen=True)
 class NfpmBody:
     call: NfpmMint | NfpmIncrease | NfpmDecrease | NfpmCollect
@@ -203,7 +212,7 @@ class Plan:
     to: str
     value: int
     deadline: int
-    body: SwapBody | NfpmBody | PosmBody
+    body: SwapBody | RouterBody | NfpmBody | PosmBody
     approvals: tuple[ApprovalNeed, ...]
     permit: PermitSingle | PermitBatch | None
     staging: tuple[Call, ...]
@@ -220,6 +229,18 @@ class Plan:
             if body.collect is not None:
                 return multicall((body.call.encode(), body.collect.encode()))
             return body.call.encode()
+        if isinstance(body, RouterBody):
+            hops = body.shape.route.hops
+            tokens = (hops[0].currency_in, *(hop.currency_out for hop in hops))
+            fees = tuple(hop.pool.tick_spacing if self.to == SLIPSTREAM_SWAP_ROUTER else hop.pool.fee_ppm for hop in hops)
+            output = body.shape.currency_out
+            pancake = self.to == PANCAKE_SMART_ROUTER
+            calls = (
+                v3_router_swap(tokens, fees, body.shape.amount_in, self.deadline, self.to, pancake=pancake,
+                               slipstream=self.to == SLIPSTREAM_SWAP_ROUTER),
+                v3_router_fee(output, body.gross_min_out, body.shape.wallet, body.shape.fee_bps, body.shape.fee_recipient),
+            )
+            return SEL_ROUTER_MULTICALL_DEADLINE + encode(["uint256", "bytes[]"], [self.deadline, calls]) if pancake else multicall(calls)
         modify = posm_modify_liquidities(body.params, self.deadline)
         if self.signature is not None and isinstance(self.permit, PermitBatch):
             return multicall((posm_permit_batch(body.shape.wallet, self.permit, self.signature), modify))
@@ -340,7 +361,7 @@ class Ledger:
             elif sig == TOPIC_V4_SWAP and address == POOL_MANAGER:
                 w = _words(data)
                 self.swaps.append(SwapLog(topics[1], _signed(w[0], 256), _signed(w[1], 256), Venue.V4))
-            elif sig == TOPIC_V3_SWAP:
+            elif sig in (TOPIC_V3_SWAP, TOPIC_PANCAKE_SWAP):
                 w = _words(data)
                 self.swaps.append(SwapLog(address, _signed(w[0], 256), _signed(w[1], 256), Venue.V3))
             elif sig == TOPIC_V2_SWAP:
@@ -473,6 +494,21 @@ class SwapPlanner:
     def plan(self, intent: SwapIntent, route: Route, policy: TxPolicy, deadline: int, permit_nonce: int) -> Plan:
         if not same_asset(route.currency_in, intent.currency_in) or not same_asset(route.currency_out, intent.currency_out):
             raise TxError("internal", "route does not serve the intent")
+        factory = route.hops[0].pool.factory
+        if factory in V3_ROUTER_BY_FACTORY and all(
+            h.pool.venue is Venue.V3 and h.pool.factory == factory for h in route.hops
+        ):
+            router = V3_ROUTER_BY_FACTORY[factory]
+            shape = SwapShape(
+                intent.wallet, route, intent.currency_in, intent.currency_out, intent.amount_in,
+                FeeLeg.OUTPUT, intent.currency_out, policy.fee_recipient, policy.fee_bps,
+            )
+            approvals = () if intent.currency_in == NATIVE else (
+                ApprovalNeed(intent.currency_in, router, MAX_UINT256, intent.amount_in),
+            )
+            staging = tuple(Call(a.token, erc20_approve(a.spender, a.approve_amount)) for a in approvals)
+            return Plan(router, intent.amount_in if intent.currency_in == NATIVE else 0,
+                        deadline, RouterBody(shape), approvals, None, staging)
         currency_in, currency_out = intent.currency_in, intent.currency_out
         commands: list[UrCommand] = []
         held = currency_in
@@ -532,6 +568,11 @@ class SwapPlanner:
 
     def finalize(self, plan: Plan, min_out: int, sigs: Signatures) -> Plan:
         body = plan.body
+        if isinstance(body, RouterBody):
+            if min_out and min_out > 0 and body.shape.fee_bps >= 10_000:
+                raise TxError("internal", "invalid fee")
+            gross_min = (min_out * 10_000 + (10_000 - body.shape.fee_bps) - 1) // (10_000 - body.shape.fee_bps)
+            return replace(plan, body=replace(body, gross_min_out=gross_min))
         if not isinstance(body, SwapBody):
             raise TxError("internal", "not a swap plan")
         if plan.permit is not None and sigs.permit is None:
