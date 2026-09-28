@@ -49,6 +49,7 @@ _IDENTITY_PUBLICATION_SECONDS = 1.0
 _POSITION_INTEREST_LIMIT = 2048
 _POSITION_INTEREST_SECONDS = 180.0
 _PREPARATION_SNAPSHOT_SECONDS = 15.0
+_OWNER_COUNT_SNAPSHOT_SECONDS = 60.0
 _PREPARATION_PROGRESS_STEPS = 1_000
 _PREPARATION_SNAPSHOT_MAX_SECONDS = 300.0
 _PREPARATION_EVENTS_PER_SECOND = 2_000.0
@@ -324,6 +325,8 @@ CREATE INDEX IF NOT EXISTS lp_accounting_episodes_owner_window_cover
         id,gross_pnl_usd,gas_usd,history_complete,fees_complete,pricing_complete,
         fees_usd,deposit_usd,proceeds_usd
     );
+CREATE INDEX IF NOT EXISTS lp_accounting_episodes_owner_count_window
+    ON lp_accounting_episodes(last_timestamp,owner,custody);
 CREATE INDEX IF NOT EXISTS lp_accounting_episodes_closed_order
     ON lp_accounting_episodes(
         closed_at DESC, opened_block DESC,
@@ -5138,21 +5141,24 @@ class AccountBook:
     def owner_count(self, window: str) -> int:
         """Count beneficial-owner and custody groups without enrichment."""
         cutoff_seconds = _cutoff({"window": str(window or "all").lower()})
-        where = ""
-        source = " FROM lp_accounting_episodes"
-        args: tuple[Any, ...] = ()
-        if cutoff_seconds is not None:
-            # Covering: the plain last_timestamp index dereferenced every
-            # episode row, which exceeded the reader deadline for 7d and 30d.
-            source += " INDEXED BY lp_accounting_episodes_owner_window_cover"
-            where = " WHERE last_timestamp>=?"
+        if cutoff_seconds is None:
+            query = (
+                "SELECT (SELECT COUNT(DISTINCT owner) FROM "
+                "lp_accounting_episodes INDEXED BY lp_accounting_episodes_owner)"
+                "+(SELECT COUNT(DISTINCT custody) FROM "
+                "lp_accounting_episodes INDEXED BY lp_accounting_episodes_custody)"
+            )
+            args: tuple[Any, ...] = ()
+        else:
+            query = (
+                "SELECT COUNT(DISTINCT owner)+COUNT(DISTINCT custody) "
+                "FROM lp_accounting_episodes "
+                "INDEXED BY lp_accounting_episodes_owner_count_window "
+                "WHERE last_timestamp>=?"
+            )
             args = (int(time.time()) - cutoff_seconds,)
-        with self.store.reader_snapshot() as conn:
-            row = conn.execute(
-                "SELECT COUNT(DISTINCT owner)+COUNT(DISTINCT custody)"
-                + source + where,
-                args,
-            ).fetchone()
+        with self.store.reader_snapshot(_OWNER_COUNT_SNAPSHOT_SECONDS) as conn:
+            row = conn.execute(query, args).fetchone()
         return int(row[0] or 0)
 
     @staticmethod
@@ -6243,7 +6249,7 @@ class AccountBook:
                         "lp_accounting_pending_identities_scope_timestamp"
                     )
                     episode_source += (
-                        " INDEXED BY lp_accounting_episodes_last_timestamp"
+                        " INDEXED BY lp_accounting_episodes_owner_window_cover"
                     )
                 scoped_keys = (
                     "SELECT h.position_key" + hint_source + " JOIN "
@@ -6601,8 +6607,20 @@ class AccountBook:
             (" WHERE " + " AND ".join(clauses) if clauses else "") +
             " ORDER BY p.last_timestamp DESC,p.position_key"
         )
+        query = str(params.get("q") or "").strip().lower()
         with self.store.reader_snapshot() as conn:
-            rows = _dict_rows(conn.execute(sql, args))
+            if query:
+                rows = _dict_rows(conn.execute(sql, args))
+                total = None
+            else:
+                scope = " WHERE " + " AND ".join(clauses) if clauses else ""
+                total = int(conn.execute(
+                    "SELECT COUNT(*) FROM lp_accounting_positions p" + scope,
+                    args,
+                ).fetchone()[0])
+                rows = _dict_rows(conn.execute(
+                    sql + " LIMIT ? OFFSET ?", [*args, limit, offset],
+                ))
             for row in rows:
                 row["projection"] = self._projection_state(row)
             active_keys = [
@@ -6613,7 +6631,6 @@ class AccountBook:
             values: dict[str, dict[str, Any]] = {}
             for batch in _batches(active_keys):
                 values.update(self._current_values(conn, position_keys=batch))
-        query = str(params.get("q") or "").strip().lower()
         output: list[dict[str, Any]] = []
         for row in rows:
             pair = _pair(row)
@@ -6699,8 +6716,11 @@ class AccountBook:
                     "qualified": not reasons, "reasons": reasons,
                 },
             })
-        total = len(output)
-        selected = output[offset:offset + limit]
+        if total is None:
+            total = len(output)
+            selected = output[offset:offset + limit]
+        else:
+            selected = output
         coverage = self._status_coverage()
         coverage.update({"rows": len(selected), "qualified_rows": sum(
             bool(row["coverage"]["qualified"]) for row in selected)})
@@ -6934,10 +6954,9 @@ class AccountBook:
             rows = conn.execute(
                 "SELECT p.pool_id,p.protocol,p.liquidity,p.liquidity_known,"
                 "p.tick_lower,p.tick_upper "
-                "FROM lp_accounting_positions p "
-                "INDEXED BY lp_accounting_positions_active_replay "
-                "CROSS JOIN lp_accounting_pending q "
-                "WHERE q.position_key=p.position_key "
+                "FROM lp_accounting_pending q "
+                "CROSS JOIN lp_accounting_positions p "
+                "WHERE p.position_key=q.position_key "
                 f"AND p.active_episode_id IS NOT NULL AND p.pool_id IN ({marks}) "
                 "AND q.cost_only=0 AND " + _QUEUED_AFTER_PUBLISHED_SQL,
                 batch,

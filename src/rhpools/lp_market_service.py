@@ -60,6 +60,8 @@ _MISSING = object()
 # completed envelope, so the materialization keeps its snapshot until a
 # checkpoint drain evicts it rather than dying at the shared 15 s reader cap.
 _OWNER_SNAPSHOT_SECONDS = 900.0
+
+_BUCKET_SNAPSHOT_SECONDS = 60.0
 _WARM_PAUSE_SECONDS = 3.0
 _WARM_IDLE_SECONDS = 5.0
 _WARM_ACCOUNTING_LATENCY_LIMIT_SECONDS = 30.0
@@ -2267,7 +2269,7 @@ class LPMarketService:
                 break
             pending.result()
         try:
-            with self.store.reader_snapshot() as connection:
+            with self.store.reader_snapshot(_BUCKET_SNAPSHOT_SECONDS) as connection:
                 snapshot_status = self._load_status()
                 _snapshot_name, snapshot_start, snapshot_end, coverage = (
                     self._window({"window": name}, snapshot_status)
@@ -2683,6 +2685,15 @@ class LPMarketService:
                 )
 
                 def load_page_ids():
+                    if sort in {"created", "new"} and order == "desc":
+                        return tuple(
+                            str(row["id"]) for row in conn.execute(
+                                f"SELECT p.id FROM pools p WHERE {where} "
+                                "ORDER BY p.created_block DESC,p.id "
+                                "LIMIT ? OFFSET ?",
+                                [*filters, limit, offset],
+                            )
+                        )
                     direction = "DESC" if order == "desc" else "ASC"
                     base = (
                         f"SELECT p.id,{ordering_value} AS sort_value "
