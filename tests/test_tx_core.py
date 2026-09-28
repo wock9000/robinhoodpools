@@ -16,11 +16,11 @@ from rhpools.tx_chain import (
     UnwrapWeth, V3Swap,
 )
 from rhpools.lp_market_protocols import V4_INITIALIZE_TOPIC, _normalize_pool_creation
-from rhpools.tx_core import SwapQuote, TxCore
+from rhpools.tx_core import SwapQuote, TxCore, allocate_split
 from rhpools.lp_math import sqrt_ratio_at_tick
 from rhpools.tx_plan import (
-    Amounts, Fee, FeeLeg, Ledger, LpIntent, LpOp, LpPlanner, LpShape, Signatures, SwapIntent,
-    SwapPlanner, TxError, TxPolicy, TxRefusal, impact_bps, liquidity_for_amounts, swap_amounts,
+    Amounts, Fee, FeeLeg, Ledger, LpIntent, LpOp, LpPlanner, LpShape, Signatures, Split, SplitLeg, SwapIntent,
+    SwapPlanner, SwapShape, TxError, TxPolicy, TxRefusal, impact_bps, liquidity_for_amounts, split_amounts, swap_amounts,
 )
 from rhpools.tx_routes import DEFAULT_BRIDGES, Hop, HookPolicy, IncompletePool, Pool, Route, RouteBook, Side, Venue, v4_pool
 
@@ -397,6 +397,23 @@ def test_min_out_lives_in_sweep_or_unwrap_for_output_fee_plans():
     assert [type(c).__name__ for c in plan.body.commands] == ["Permit2TransferFrom", "V4Swap", "WrapEth", "PayPortion", "Sweep"]
 
 
+def test_split_finalizer_protects_total_and_leg_outputs():
+    v3 = Pool(Venue.V3, V3_POOL, V3_POOL, WETH, PIPEDOG, 10000, 200, NATIVE, UR_V3_FACTORY)
+    v2 = Pool(Venue.V2, V2_POOL, V2_POOL, WETH, PIPEDOG, 0, 0, NATIVE, UR_V2_FACTORY)
+    split = Split((SplitLeg(Route((Hop(v3, WETH, PIPEDOG),)), 600, 70),
+                   SplitLeg(Route((Hop(v2, WETH, PIPEDOG),)), 400, 30)))
+    intent = buy_intent(amount_in=1000)
+    planner = SwapPlanner()
+    plan = planner.plan_split(intent, split, POLICY, 5000, 0)
+    final = planner.finalize(plan, 99, Signatures())
+    commands, deadline = tc.decode_ur_execute(final.calldata())
+    assert deadline == 5000
+    assert commands.count(PayPortion(NATIVE, FEE_TO, 75)) == 1
+    assert [c.amount_in for c in commands if isinstance(c, (tc.V2Swap, V3Swap))] == [595, 398]
+    assert [c.min_out for c in commands if isinstance(c, (tc.V2Swap, V3Swap))] == [69, 30]
+    assert commands[-1] == Sweep(PIPEDOG, MSG_SENDER, 99)
+
+
 def test_ledger_hop_io_sign_conventions():
     v3 = Pool(Venue.V3, V3_POOL, V3_POOL, WETH, PIPEDOG, 10000, 200, NATIVE, UR_V3_FACTORY)
     v2 = Pool(Venue.V2, V2_POOL, V2_POOL, WETH, PIPEDOG, 0, 0, NATIVE, UR_V2_FACTORY)
@@ -461,6 +478,42 @@ def test_impact_bps():
     assert impact_bps(full, small) == 1000
     assert impact_bps(full, replace(small, net_out=0)) is None
     assert impact_bps(replace(full, net_out=10**4), small) == 0
+
+def test_split_allocator_follows_marginal_curves():
+    routes = [
+        Route((Hop(Pool(Venue.V3, f"0x{i:040x}", f"0x{i:040x}", WETH, PIPEDOG, 500, 10, NATIVE, UR_V3_FACTORY), WETH, PIPEDOG),))
+        for i in (101, 102, 103)
+    ]
+    curves = [[100 * n - n * n for n in range(21)], [85 * n - n * n // 2 for n in range(21)],
+              [20 * n for n in range(21)]]
+    result = allocate_split(routes, curves, 1_000)
+    assert 0 < result.legs[0].amount_in < 1_000
+    assert 0 < result.legs[1].amount_in < 1_000
+    assert sum(leg.amount_in for leg in result.legs) == 1_000
+    assert sum(leg.amount_out for leg in result.legs) > max(curve[-1] for curve in curves)
+    assert len(allocate_split(routes, [[200 * n for n in range(21)], curves[1], curves[2]], 1_000).legs) == 1
+
+
+def test_split_reconciles_shared_pool_swaps_in_execution_order():
+    shared = Pool(Venue.V3, V3_POOL, V3_POOL, USDG, PIPEDOG, 10000, 200, NATIVE, UR_V3_FACTORY)
+    a, b = "0x" + "72" * 20, "0x" + "73" * 20
+    bridge_a = Pool(Venue.V3, a, a, WETH, USDG, 100, 1, NATIVE, UR_V3_FACTORY)
+    bridge_b = Pool(Venue.V3, b, b, WETH, USDG, 500, 10, NATIVE, UR_V3_FACTORY)
+    route_a = Route((Hop(bridge_a, WETH, USDG), Hop(shared, USDG, PIPEDOG)))
+    route_b = Route((Hop(bridge_b, WETH, USDG), Hop(shared, USDG, PIPEDOG)))
+    shape = SwapShape(WALLET, route_a, NATIVE, PIPEDOG, 1000, FeeLeg.INPUT, NATIVE, FEE_TO, 75)
+    split = Split((SplitLeg(route_a, 500, 0), SplitLeg(route_b, 500, 0)))
+    logs = [transfer(NATIVE, UR, FEE_TO, 7), v3_swap_log(a, 496, -450),
+            v3_swap_log(V3_POOL, 450, -260), v3_swap_log(b, 497, -400),
+            v3_swap_log(V3_POOL, 400, -240), transfer(PIPEDOG, UR, WALLET, 500)]
+    amounts, measured = split_amounts(shape, split, Ledger(logs, traced=True), lambda _: HookPolicy())
+    assert amounts.rhpools_fee.amount == 7 and amounts.net_out == 500
+    assert [leg.amount_out for leg in measured.legs] == [260, 240]
+    assert amounts.net_out < 510
+    logs[4] = v3_swap_log(V3_POOL, 450, -240)
+    with pytest.raises(TxError, match="hop input"):
+        split_amounts(shape, split, Ledger(logs, traced=True), lambda _: HookPolicy())
+
 
 
 def test_quote_prepare_round_trip_and_idempotence(core, rpc):
