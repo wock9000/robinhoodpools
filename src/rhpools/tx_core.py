@@ -1063,8 +1063,10 @@ class TxCore:
                     for log in receipt.get("logs", [])
                 )
                 needs_trace = (withdrawal and to in HISTORY_ROUTERS) or not received
+                if needs_trace and traces >= HISTORY_TRACE_LIMIT:
+                    continue
                 incoming = 0
-                if needs_trace and traces < HISTORY_TRACE_LIMIT:
+                if needs_trace:
                     try:
                         trace = self.rpc.call("debug_traceTransaction", [tx_hash, {"tracer": "callTracer"}])
                     except Exception as exc:

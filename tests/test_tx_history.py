@@ -129,8 +129,9 @@ def test_history_caps_rows_and_traces_without_extra_log_requests():
     entries = dict(entry(i, block - 1, [transfer("", block - 1, 0, TOKEN, WALLET, OTHER, i)]) for i in range(1, 61))
     rpc = HistoryRPC(entries, block)
     rows = make_core(rpc, [100]).history(WALLET)["rows"]
-    assert len(rows) == 50
+    assert len(rows) == 20
     assert rows[0]["hash"] == "0x" + f"{60:064x}"
+    assert rows[-1]["hash"] == "0x" + f"{41:064x}"
     assert len(methods(rpc, "debug_traceTransaction")) == 20
     assert len(methods(rpc, "eth_getLogs")) == 14
     logs = methods(rpc, "eth_getLogs")
