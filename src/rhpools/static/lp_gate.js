@@ -196,7 +196,7 @@
         el("thead", {}, [el("tr", {}, [el("th", { text: "feature" }), el("th", { text: "threshold" }), el("th", { text: "state" })])]),
         el("tbody", {}, rows),
       ]));
-      out.push(el("p", { class: "note", text: "grace " + policy.grace_s + " s after the last qualifying balance · policy v" + policy.version + " · token " + policy.token }));
+      out.push(el("p", { class: "note", text: "policy v" + policy.version + " · token " + short(policy.token) }));
     }
     out.push(el("div", { class: "gate-row" }, [
       el("button", { type: "button", text: "positions & history", onclick: () => {
