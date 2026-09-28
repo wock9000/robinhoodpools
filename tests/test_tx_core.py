@@ -757,10 +757,10 @@ def test_quote_refuses_shallow_execution_price_below_deep_reference(core, rpc):
     from rhpools.tx_core import SimResult
     from rhpools.tx_plan import Fee
 
-    def simulated(intent, route, deadline, nonce, tag, funded=None):
+    def simulated(intent, route, deadline, nonce, tag, policy, funded=None):
         shallow = route.hops[0].pool.id == V2_POOL
         output = (1_100_000 if shallow else 1_000_000) if intent.amount_in == 10**18 else (9_000 if shallow else 10_000)
-        plan = core.swaps.plan(intent, route, core.policy, deadline, nonce)
+        plan = core.swaps.plan(intent, route, policy, deadline, nonce)
         return plan, SimResult(True, [], 150_000, None), Amounts(intent.amount_in, output, None, None, Fee(NATIVE, 0), output, 0, None), None
 
     core._simulate_swap = simulated

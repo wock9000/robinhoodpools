@@ -28,7 +28,7 @@ POLICY_JSON = {
     "threshold": {"trade": "1000000", "lp": "2000000", "api": "3000000", "flags": "0"},
     "grace_s": 900, "issued_at": 1790000000,
 }
-CAST_POLICY_SIGNATURE = (
+OLD_POLICY_SIGNATURE = (
     "0x31d52bfe2e8971dd76ca1fd9a9c62d7877d88ffe46857b20ac83fde00196ee11"
     "0395c160ffa4d543aa373fbf9f6a6f89089f8cdc398fd0c08bc83e9c45bc16641c"
 )
@@ -51,6 +51,8 @@ class FakeRpc:
     def __init__(self):
         self.balances = {}
         self.code = {}
+        self.total_supply = 1_000_000_000
+        self.supply_down = False
         self.erc1271 = {}
         self.block = 100
         self.down = False
@@ -68,6 +70,10 @@ class FakeRpc:
             data = params[0]["data"]
             if data.startswith("0x70a08231"):
                 return "0x" + f"{self.balances.get('0x' + data[-40:].lower(), 0):064x}"
+            if data == "0x18160ddd":
+                if self.supply_down:
+                    raise OSError("totalSupply unavailable")
+                return "0x" + f"{self.total_supply:064x}"
             if data.startswith("0x1626ba7e"):
                 return self.erc1271.get(params[0]["to"].lower(), "0x" + "00" * 32)
         raise ValueError(method)
@@ -175,10 +181,72 @@ def test_fresh_below_threshold_cancels_grace_but_oracle_outage_keeps_it(gate):
 
 
 def test_policy_digest_matches_cast_wallet_sign(gate):
-    applied = gate.apply_policy(policy(), CAST_POLICY_SIGNATURE, via="cli")
+    with pytest.raises(GateRefusal) as refused:
+        gate.apply_policy(policy(), OLD_POLICY_SIGNATURE, via="cli")
+    assert refused.value.status == 403
+    applied = gate.apply_policy(policy(), sign(OWNER_KEY, policy().digest()), via="cli")
     assert applied.token == USDG and applied.threshold["api"] == 3000000
     assert gate.policy() == applied
     assert audit_actions(gate) == [("policy.apply", OWNER)]
+
+
+def test_policy_fee_tiers_parse_sign_and_reject_bad_orders():
+    parsed = policy()
+    assert parsed.public()["base_fee_bps"] == 100
+    assert parsed.public()["fee_tiers"] == [
+        {"min_supply_bps": 10, "fee_bps": 75}, {"min_supply_bps": 50, "fee_bps": 50},
+    ]
+    typed = parsed.typed_data()
+    assert typed["domain"]["version"] == "2"
+    assert typed["types"]["GatePolicy"][-2:] == [
+        {"name": "baseFeeBps", "type": "uint16"}, {"name": "feeTiers", "type": "FeeTier[]"},
+    ]
+    assert typed["message"]["feeTiers"] == [
+        {"minSupplyBps": "10", "feeBps": "75"}, {"minSupplyBps": "50", "feeBps": "50"},
+    ]
+    assert policy(fee_tiers=[]).digest() != parsed.digest()
+    assert policy(base_fee_bps=90).digest() != parsed.digest()
+    cases = [
+        {"base_fee_bps": 101},
+        {"base_fee_bps": 74},
+        {"fee_tiers": [{"min_supply_bps": 50, "fee_bps": 50}, {"min_supply_bps": 10, "fee_bps": 25}]},
+        {"fee_tiers": [{"min_supply_bps": 10, "fee_bps": 75}, {"min_supply_bps": 10, "fee_bps": 50}]},
+        {"fee_tiers": [{"min_supply_bps": 10, "fee_bps": 75}, {"min_supply_bps": 50, "fee_bps": 75}]},
+        {"fee_tiers": [{"min_supply_bps": 10, "fee_bps": 101}]},
+        {"fee_tiers": [{"min_supply_bps": 10001, "fee_bps": 75}]},
+        {"fee_tiers": [{"min_supply_bps": index, "fee_bps": 99 - index} for index in range(5)]},
+    ]
+    for overrides in cases:
+        with pytest.raises(ValueError):
+            policy(**overrides)
+
+
+def test_fee_tier_thresholds_are_inclusive_and_supply_outage_uses_base(gate):
+    gate.apply_policy(*signed_policy(), via="cli")
+    for balance, tier, fee in ((999_999, 0, 100), (1_000_000, 1, 75),
+                               (4_999_999, 1, 75), (5_000_000, 2, 50)):
+        gate.rpc.balances[HOLDER.lower()] = balance
+        gate.clock.now += 31
+        ent = gate.entitlement(HOLDER)
+        assert (ent.public()["tier"], ent.public()["fee_bps"]) == (tier, fee)
+        assert ent.holding.total_supply_raw == gate.rpc.total_supply
+    gate.rpc.supply_down = True
+    gate.clock.now += 31
+    ent = gate.entitlement(HOLDER)
+    assert (ent.fee_bps, ent.tier) == (100, 0)
+    assert ent.holding.balance_raw == 5_000_000 and ent.holding.total_supply_raw is None
+
+
+def test_supply_is_cached_per_token_across_wallets(gate):
+    gate.apply_policy(*signed_policy(), via="cli")
+    before = gate.rpc.calls
+    gate.entitlement(HOLDER)
+    gate.entitlement(OTHER)
+    assert gate.rpc.calls == before + 5
+    gate.clock.now += 30
+    gate.entitlement(HOLDER)
+    gate.entitlement(OTHER)
+    assert gate.rpc.calls == before + 10
 
 
 def test_siwe_signature_matches_cast_wallet_sign():
@@ -231,15 +299,16 @@ def test_owner_unset_refuses_every_signer(tmp_path):
 
 
 def test_cli_applies_through_the_same_path(gate, tmp_path, capsys):
-    parsed, signature = signed_policy(issued_at=int(time.time()))
-    (tmp_path / "policy.json").write_text(json.dumps({**POLICY_JSON, "issued_at": parsed.issued_at}))
+    parsed, signature = signed_policy(issued_at=int(time.time()), base_fee_bps=90,
+                                      fee_tiers=[{"min_supply_bps": 25, "fee_bps": 60}])
+    (tmp_path / "policy.json").write_text(json.dumps(parsed.public()))
     db = str(tmp_path / "gate.sqlite")
     assert gate_cli(["--db", db, "--owner", OWNER, "policy", "typed-data", str(tmp_path / "policy.json")]) == 0
     assert json.loads(capsys.readouterr().out) == parsed.typed_data()
     assert gate_cli(["--db", db, "--owner", OTHER, "policy", "apply", str(tmp_path / "policy.json"), "--signature", signature]) == 2
     assert gate_cli(["--db", db, "--owner", OWNER, "policy", "apply", str(tmp_path / "policy.json"), "--signature", signature]) == 0
     gate.clock.now += 6
-    assert gate.policy().version == 1
+    assert gate.policy().fee_tiers == parsed.fee_tiers and gate.policy().base_fee_bps == 90
     assert gate_cli(["--db", db, "audit"]) == 0
     actions = [json.loads(line)["action"] for line in capsys.readouterr().out.splitlines() if line.startswith("{\"id\"")]
     assert actions == ["policy.apply"]
@@ -314,10 +383,10 @@ def test_oracle_caches_per_wallet_for_thirty_seconds(gate):
     before = gate.rpc.calls
     for _ in range(5):
         gate.entitlement(HOLDER)
-    assert gate.rpc.calls == before + 2
+    assert gate.rpc.calls == before + 3
     gate.clock.now += 30
     gate.entitlement(HOLDER)
-    assert gate.rpc.calls == before + 4
+    assert gate.rpc.calls == before + 6
 
 
 def test_sign_in_mints_a_session_and_refusals_are_specific(gate):
@@ -469,4 +538,5 @@ def test_cast_signs_the_same_policy_digest():
     fresh = subprocess.check_output(
         ["cast", "wallet", "sign", "--private-key", OWNER_KEY.to_hex(), "--data", "--from-file", str(typed)],
     ).decode().strip()
-    assert fresh == CAST_POLICY_SIGNATURE
+    local = sign(OWNER_KEY, parsed.digest())
+    assert fresh[:-2] == local[:-2] and int(fresh[-2:], 16) == int(local[-2:], 16) + 27

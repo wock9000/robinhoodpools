@@ -12,12 +12,13 @@ import sys
 import threading
 import time
 import zlib
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import NamedTuple
 from urllib.parse import parse_qs, urlsplit
 
-from .lp_gate import COOKIE_NAME, Gate, GatePolicy, GateRefusal, Principal
+from .lp_gate import COOKIE_NAME, Entitlement, Gate, GatePolicy, GateRefusal, Principal
 from .lp_gate_ws import CLOSE_NOT_ENTITLED, WebSocketPush
 from .lp_flow_tags import FlowTagger, PostgresListener, TagStore
 from .tx_core import JsonRpc, TxCore
@@ -84,7 +85,6 @@ _GATE_POST = {"/api/gate/session", "/api/gate/keys", "/api/gate/logout", "/api/g
 KEYED_STREAM = "/api/v1/stream"
 _TX_GET = {"/api/tx/status", "/api/tx/receipt", "/api/tx/balances", "/api/tx/pool", "/api/tx/history"}
 _TX_POST = {"/api/tx/quote", "/api/tx/prepare"}
-TX_FEE_BPS = 75
 TAGS_PATH = "/api/v1/tags"
 TAGS_MAX_TX = 100
 _MINT_TTL_DEFAULT_S = 90 * 86400
@@ -288,7 +288,7 @@ class Runtime:
                     rpc = JsonRpc(args.gate_rpc_url)
                     self.tx = TxCore(
                         rpc, RouteBook(self.lp.store.reader_snapshot, rpc),
-                        TxPolicy(TX_FEE_BPS, str(args.tx_fee_recipient).lower()),
+                        TxPolicy(100, str(args.tx_fee_recipient).lower()),
                         trade_store=TradeStore(args.gate_db.parent / "trades.sqlite"),
                     )
                     self.tx_unavailable = None
@@ -968,12 +968,12 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             slots.release()
 
-    def _tx_principal(self, feature: str, cost: int = 1) -> Principal:
-        principal, _ = self.runtime.gate.require(self.headers, feature)
+    def _tx_principal(self, feature: str, cost: int = 1) -> tuple[Principal, Entitlement]:
+        principal, entitlement = self.runtime.gate.require(self.headers, feature)
         if principal.via == "cookie" and self.command == "POST" and not self._same_origin():
             raise GateRefusal(403, "Configured same-origin request required")
         self.runtime.gate.admit(principal, cost=cost)
-        return principal
+        return principal, entitlement
 
     def _tx_core(self) -> TxCore:
         if self.runtime.tx is None:
@@ -990,16 +990,19 @@ class Handler(BaseHTTPRequestHandler):
     def _tx_get(self, path: str, query: dict[str, str]) -> None:
         tx = self.runtime.tx
         if path == "/api/tx/status":
+            policy = self.runtime.gate.policy()
             return self._json(200, {
                 "enabled": tx is not None and tx.enabled, "reason": self.runtime.tx_unavailable,
-                "fee_bps": TX_FEE_BPS, "quote_ttl_s": tx.ttl_s if tx is not None else None,
+                "base_fee_bps": policy.base_fee_bps,
+                "fee_tiers": [tier.public() for tier in policy.fee_tiers],
+                "quote_ttl_s": tx.ttl_s if tx is not None else None,
             }, private=True)
         if path == "/api/tx/history" and query.get("feature") != "trade":
             return self._json(400, {"error": "feature must be trade"}, private=True)
         if not self.api_slots["keyed"].acquire(False):
             return self._json(503, {"error": "API request capacity reached"}, retry=1)
         try:
-            principal = self._tx_principal("lp" if query.get("feature") == "lp" else "trade", cost=5 if path == "/api/tx/pool" else 1)
+            principal, _ = self._tx_principal("lp" if query.get("feature") == "lp" else "trade", cost=5 if path == "/api/tx/pool" else 1)
             if path == "/api/tx/history" and (principal.kind != "session" or principal.via != "cookie"):
                 raise GateRefusal(403, "browser session required", state="forbidden")
             core = self._tx_core()
@@ -1031,11 +1034,13 @@ class Handler(BaseHTTPRequestHandler):
                 kind = payload.get("kind")
                 if kind not in ("swap", "lp"):
                     raise ValueError("kind must be swap or lp")
-                principal = self._tx_principal("trade" if kind == "swap" else "lp", cost=10)
-                return self._json(200, self._tx_core().quote(_tx_intent(payload, principal.wallet)).to_json(), private=True)
+                principal, entitlement = self._tx_principal("trade" if kind == "swap" else "lp", cost=10)
+                core = self._tx_core()
+                request_policy = replace(core.policy, fee_bps=entitlement.fee_bps)
+                return self._json(200, core.quote(_tx_intent(payload, principal.wallet), policy=request_policy).to_json(), private=True)
             core = self._tx_core()
             quote_id = str(payload.get("quote_id") or "")
-            principal = self._tx_principal("lp" if core.kind_of(quote_id) == "lp" else "trade", cost=5)
+            principal, _ = self._tx_principal("lp" if core.kind_of(quote_id) == "lp" else "trade", cost=5)
             signature = str(payload.get("permit_signature") or "")
             sigs = Signatures(permit=bytes.fromhex(signature[2:]) if signature.startswith("0x") else None)
             return self._json(200, core.prepare(quote_id, principal.wallet, sigs, batched=payload.get("batched") is True).to_json(), private=True)

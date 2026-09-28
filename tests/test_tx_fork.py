@@ -23,6 +23,9 @@ from dataclasses import replace
 import pytest
 from eth_utils import keccak
 
+from gate_fork import STANDIN_ERC20, STANDIN_TOKEN, balance_slot
+from test_gate import Clock, OWNER, OWNER_KEY
+from rhpools.lp_gate import Gate, GatePolicy
 from rhpools import tx_chain as tc
 from rhpools.tx_chain import (
     ADDRESS_THIS, CONTRACT_BALANCE, MSG_SENDER, NATIVE, NFPM_GIGA, NFPM_PANCAKE, NFPM_UNISWAP,
@@ -238,8 +241,8 @@ def run_steps(core: TxCore, fork: Fork, quote) -> tuple[dict, Signatures]:
     return prepared.transaction, sigs
 
 
-def trade(core: TxCore, fork: Fork, intent: SwapIntent) -> tuple[SwapQuote, Fill]:
-    quote = core.quote(intent)
+def trade(core: TxCore, fork: Fork, intent: SwapIntent, *, policy: TxPolicy | None = None) -> tuple[SwapQuote, Fill]:
+    quote = core.quote(intent, policy=policy)
     assert isinstance(quote, SwapQuote)
     tx, _ = run_steps(core, fork, quote)
     watched = {(c, w) for c in (intent.currency_in, intent.currency_out, quote.amounts.rhpools_fee.currency) for w in (fork.user, FEE_TO)}
@@ -268,8 +271,47 @@ def trade(core: TxCore, fork: Fork, intent: SwapIntent) -> tuple[SwapQuote, Fill
     else:
         assert delta[(intent.currency_out, fork.user)] == amounts.net_out
     if intent.side is Side.BUY and fee.currency == intent.currency_in:
-        assert fee.amount == intent.amount_in * 75 // 10_000
+        assert fee.amount == intent.amount_in * quote.to_json()["fee_bps"] // 10_000
     return quote, fill
+
+
+def test_holder_tiers_pay_exact_fee_and_receive_quoted_output(core, fork, tmp_path):
+    fork.rpc.call("anvil_setCode", [STANDIN_TOKEN, STANDIN_ERC20])
+    fork.rpc.call("anvil_setStorageAt", [STANDIN_TOKEN, "0x" + f"{1:064x}", "0x" + f"{1_000_000_000:064x}"])
+    clock = Clock(time.time())
+    gate = Gate(tmp_path / "fee-tiers.sqlite", owner=OWNER, rpc_url=fork.rpc.url, hosts=frozenset(),
+                rpc=fork.rpc.call, clock=clock)
+    try:
+        parsed = GatePolicy.parse({
+            "version": 1, "token": STANDIN_TOKEN, "decimals": 18,
+            "threshold": {"trade": "0", "lp": "0", "api": "0", "flags": "0"},
+            "issued_at": int(clock.now),
+        })
+        gate.apply_policy(parsed, OWNER_KEY.sign_msg_hash(parsed.digest()).to_hex(), via="cli")
+        for balance, bps in ((0, 100), (1_000_000, 75), (5_000_000, 50)):
+            fork.rpc.call("anvil_setStorageAt", [STANDIN_TOKEN, balance_slot(fork.user), "0x" + f"{balance:064x}"])
+            fork.rpc.call("anvil_mine", ["0x1"])
+            clock.now += 31
+            entitlement = gate.entitlement(fork.user)
+            assert entitlement.fee_bps == bps
+            amount = 10**16
+            quote, fill = trade(core, fork, swap(fork.user, Side.BUY, ITH, NATIVE, amount),
+                                policy=replace(core.policy, fee_bps=entitlement.fee_bps))
+            assert quote.to_json()["fee_bps"] == bps
+            assert quote.amounts.rhpools_fee.amount == amount * bps // 10_000
+            assert fill.amounts.net_out == quote.amounts.net_out
+        quote = core.quote(swap(fork.user, Side.BUY, ITH, NATIVE, amount),
+                           policy=replace(core.policy, fee_bps=50))
+        fork.rpc.call("anvil_setStorageAt", [STANDIN_TOKEN, balance_slot(fork.user), "0x" + "00" * 32])
+        fork.rpc.call("anvil_mine", ["0x1"])
+        clock.now += 31
+        assert gate.entitlement(fork.user).fee_bps == 100
+        prepared = core.prepare(quote.quote_id, fork.user, Signatures())
+        assert quote.plan.shape.fee_bps == 50
+        assert prepared.transaction["data"] == "0x" + core.swaps.finalize(
+            quote.plan, quote.amounts.min_out, Signatures()).calldata().hex()
+    finally:
+        gate.close()
 
 
 def swap(wallet: str, side: Side, token: str, quote_currency: str, amount_in: int, slippage_bps: int = 100) -> SwapIntent:

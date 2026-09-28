@@ -17,9 +17,11 @@ FORK_RPC = os.environ.get("RHP_TEST_FORK_RPC", "http://127.0.0.1:8547")
 CHAIN_ID = 4663
 STANDIN_TOKEN = to_checksum_address("0x" + "d00d" * 10)
 STANDIN_ERC20 = (
-    "0x60003560e01c806370a0823114601e578063313ce56714603857600080fd"
+    "0x60003560e01c806370a08231146028578063313ce56714604257"
+    "806318160ddd14604d57600080fd"
     "5b600435600052600060205260406000205460005260206000f3"
     "5b601260005260206000f3"
+    "5b60015460005260206000f3"
 )
 
 
@@ -88,6 +90,10 @@ class Fork:
 
     def set_balance(self, wallet: str, amount: int) -> None:
         self.rpc("anvil_setStorageAt", [STANDIN_TOKEN, balance_slot(wallet), "0x" + f"{amount:064x}"])
+        self.rpc("anvil_mine", ["0x1"])
+
+    def set_supply(self, amount: int) -> None:
+        self.rpc("anvil_setStorageAt", [STANDIN_TOKEN, "0x" + f"{1:064x}", "0x" + f"{amount:064x}"])
         self.rpc("anvil_mine", ["0x1"])
 
     def fund_gas(self, wallet: str, wei: int = 10**18) -> None:
