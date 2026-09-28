@@ -6913,6 +6913,8 @@ class MarketIndexer:
 
     def _maintenance_run(self) -> None:
         backoff = self.maintenance_interval_s
+        prune_due = 0.0
+        empty_prune_batches = 0
         try:
             while not self._stop.is_set():
                 try:
@@ -6963,6 +6965,26 @@ class MarketIndexer:
                     backoff = min(30.0, backoff * 2.0)
                 else:
                     backoff = self.maintenance_interval_s
+                    if (
+                        2 <= time.gmtime().tm_hour < 5
+                        and time.monotonic() >= prune_due
+                        and self._bulk_work_allowed()
+                        and not self._stop.is_set()
+                    ):
+                        try:
+                            removed = self.store.prune_bucket_batch(
+                                int(time.time()) - 35 * 86400
+                            )
+                        except Exception:
+                            logger.exception("bucket pruning failed")
+                            prune_due = time.monotonic() + 300
+                        else:
+                            empty_prune_batches = (
+                                empty_prune_batches + 1 if not removed else 0
+                            )
+                            if empty_prune_batches >= 2:
+                                prune_due = time.monotonic() + 300
+                                empty_prune_batches = 0
                     self._stop.wait(self.maintenance_interval_s)
         finally:
             self.store.cancel_checkpoint_drain()

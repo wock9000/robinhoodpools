@@ -1335,6 +1335,47 @@ class MarketStore:
             else:
                 self._local.writer_priority = previous
 
+    def prune_bucket_batch(self, cutoff: int, limit: int = 512) -> int:
+        if limit < 1 or limit > 512:
+            raise ValueError("bucket prune batch must contain 1 to 512 rows")
+        with self.transaction(priority="background", blocking=False) as connection:
+            if connection is None:
+                return 0
+            if not self._bucket_rollup_ready:
+                self._bucket_rollup_ready = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lp_pool_buckets'"
+                ).fetchone() is not None
+                if not self._bucket_rollup_ready:
+                    return 0
+            cursor = self._metadata(connection, "bucket_prune_cursor", [60, -1, ""])
+            resolution, bucket, pool_id = cursor
+            rows = connection.execute(
+                "SELECT bucket,pool_id FROM lp_pool_buckets "
+                "WHERE resolution=? AND bucket<? AND (bucket,pool_id)>(?,?) "
+                "ORDER BY bucket,pool_id LIMIT ?",
+                (resolution, cutoff, bucket, pool_id, limit),
+            ).fetchall()
+            if not rows:
+                self._set_metadata(
+                    connection, "bucket_prune_cursor",
+                    [3600, -1, ""] if resolution == 60 else [60, -1, ""],
+                )
+                return 0
+            connection.executemany(
+                "DELETE FROM lp_pool_buckets WHERE resolution=? AND bucket=? AND pool_id=?",
+                ((resolution, row["bucket"], row["pool_id"]) for row in rows),
+            )
+            self._set_metadata(
+                connection, "bucket_prune_cursor",
+                [resolution, rows[-1]["bucket"], rows[-1]["pool_id"]],
+            )
+            self._set_metadata(
+                connection, "bucket_prune_before", max(
+                    cutoff, int(self._metadata(connection, "bucket_prune_before", 0))
+                ),
+            )
+            return len(rows)
+
     @contextlib.contextmanager
     def transaction(
         self, *, priority: str | None = None, blocking: bool = True,

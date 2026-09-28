@@ -36,6 +36,23 @@ _BUCKET_JSON_FIELDS = ",".join(
     for name in BUCKET_FIELDS
 )
 _BUCKET_INDEX = {name: index for index, name in enumerate(BUCKET_FIELDS)}
+_BUCKET_EVENT_SUMS = (
+    "COUNT(*) AS events,SUM(e.kind='swap') AS swaps,"
+    "SUM(e.kind='add') AS adds,SUM(e.kind='remove') AS removes,"
+    "SUM(e.kind='collect') AS collects,"
+    "SUM(CASE WHEN e.kind='swap' THEN e.volume_usd ELSE 0 END) AS volume_usd,"
+    "SUM(CASE WHEN e.kind='swap' THEN e.fees_usd ELSE 0 END) AS fees_usd,"
+    "SUM(e.deposit_usd) AS deposit_usd,SUM(e.withdrawal_usd) AS withdrawal_usd,"
+    "SUM(e.kind='swap' AND e.volume_usd IS NOT NULL) AS priced_swaps,"
+    "SUM(e.kind='swap' AND e.fees_usd IS NOT NULL) AS priced_fees,"
+    "SUM((e.kind IN ('add','remove','collect') OR "
+    "(e.kind='checkpoint' AND e.position_key IS NOT NULL)) "
+    "AND e.deposit_usd IS NOT NULL AND e.withdrawal_usd IS NOT NULL) "
+    "AS priced_flows,"
+    "SUM(e.kind IN ('add','remove','collect') OR "
+    "(e.kind='checkpoint' AND e.position_key IS NOT NULL)) AS flows,"
+    "MAX(e.block_number) AS max_block "
+)
 
 
 @dataclass
@@ -778,6 +795,32 @@ class PriceProjection:
         return state
 
     @staticmethod
+    def _restore_old_rollups(conn, pool_id, minute, ancestor=None):
+        columns = ",".join("?" for _ in range(len(BUCKET_FIELDS) + 4))
+        for resolution in (3600, 86400):
+            bucket = minute // resolution * resolution
+            row = conn.execute(
+                f"SELECT {_BUCKET_EVENT_SUMS} FROM events e INDEXED BY events_pool_time_idx "
+                "WHERE e.pool_id=? AND e.timestamp>=? AND e.timestamp<?"
+                + (" AND e.block_number<=?" if ancestor is not None else ""),
+                (pool_id, bucket, bucket + resolution)
+                + ((ancestor,) if ancestor is not None else ()),
+            ).fetchone()
+            if row["events"]:
+                conn.execute(
+                    f"INSERT OR REPLACE INTO lp_pool_buckets VALUES({columns})",
+                    (resolution, bucket, pool_id,
+                     *(row[name] or 0 for name in BUCKET_FIELDS),
+                     row["max_block"] or 0),
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM lp_pool_buckets "
+                    "WHERE resolution=? AND bucket=? AND pool_id=?",
+                    (resolution, bucket, pool_id),
+                )
+
+    @staticmethod
     def _bucket(conn, pool_id, minute, ancestor=None):
         old = conn.execute("SELECT * FROM lp_pool_buckets WHERE resolution=60 AND bucket=? AND pool_id=?",
                            (minute, pool_id)).fetchone()
@@ -810,7 +853,13 @@ class PriceProjection:
                          (minute, pool_id))
             if old is not None:
                 delta = [-old[name] for name in BUCKET_FIELDS]
+        prune_row = conn.execute(
+            "SELECT value FROM metadata WHERE key='bucket_prune_before'"
+        ).fetchone()
+        pruned = prune_row is not None and minute < json.loads(prune_row[0])
         if delta is None:
+            if pruned:
+                PriceProjection._restore_old_rollups(conn, pool_id, minute, ancestor)
             return
         columns = ",".join(BUCKET_FIELDS)
         update = ",".join(f"{name}={name}+excluded.{name}" for name in BUCKET_FIELDS)
@@ -826,6 +875,8 @@ class PriceProjection:
                 "DELETE FROM lp_pool_buckets WHERE resolution=? AND bucket=? AND pool_id=? AND events<=0",
                 (resolution, key, pool_id),
             )
+        if pruned:
+            PriceProjection._restore_old_rollups(conn, pool_id, minute, ancestor)
 
     @staticmethod
     def _buckets(conn, keys):
@@ -846,24 +897,9 @@ class PriceProjection:
                 old_rows[(row["pool_id"], row["bucket"])] = row
             for row in conn.execute(
                 f"WITH affected(pool_id,minute) AS (VALUES {values}) "
-                "SELECT a.pool_id,a.minute AS bucket,"
-                "COUNT(*) AS events,SUM(e.kind='swap') AS swaps,"
-                "SUM(e.kind='add') AS adds,SUM(e.kind='remove') AS removes,"
-                "SUM(e.kind='collect') AS collects,"
-                "SUM(CASE WHEN e.kind='swap' THEN e.volume_usd ELSE 0 END) AS volume_usd,"
-                "SUM(CASE WHEN e.kind='swap' THEN e.fees_usd ELSE 0 END) AS fees_usd,"
-                "SUM(e.deposit_usd) AS deposit_usd,"
-                "SUM(e.withdrawal_usd) AS withdrawal_usd,"
-                "SUM(e.kind='swap' AND e.volume_usd IS NOT NULL) AS priced_swaps,"
-                "SUM(e.kind='swap' AND e.fees_usd IS NOT NULL) AS priced_fees,"
-                "SUM((e.kind IN ('add','remove','collect') OR "
-                "(e.kind='checkpoint' AND e.position_key IS NOT NULL)) "
-                "AND e.deposit_usd IS NOT NULL AND e.withdrawal_usd IS NOT NULL) "
-                "AS priced_flows,"
-                "SUM(e.kind IN ('add','remove','collect') OR "
-                "(e.kind='checkpoint' AND e.position_key IS NOT NULL)) AS flows,"
-                "MAX(e.block_number) AS max_block "
-                "FROM affected a JOIN events e ON e.pool_id=a.pool_id "
+                f"SELECT a.pool_id,a.minute AS bucket,{_BUCKET_EVENT_SUMS}"
+                "FROM affected a JOIN events e INDEXED BY events_pool_time_idx "
+                "ON e.pool_id=a.pool_id "
                 "AND e.timestamp>=a.minute AND e.timestamp<a.minute+60 "
                 "GROUP BY a.pool_id,a.minute",
                 args,
@@ -919,6 +955,17 @@ class PriceProjection:
             "AND events<=0",
             ((resolution, bucket, pool_id) for resolution, pool_id, bucket in rollup_deltas),
         )
+        prune_row = conn.execute(
+            "SELECT value FROM metadata WHERE key='bucket_prune_before'"
+        ).fetchone()
+        prune_before = json.loads(prune_row[0]) if prune_row else 0
+        if prune_before:
+            affected = {
+                (pool_id, minute // 3600 * 3600)
+                for pool_id, minute in ordered if minute < prune_before
+            }
+            for pool_id, hour in sorted(affected):
+                PriceProjection._restore_old_rollups(conn, pool_id, hour)
 
     def _queue_successors(self, conn, sources, revision):
         """Repair old consumers, never rows just priced in this delivery."""
@@ -1182,6 +1229,16 @@ class PriceProjection:
         buckets = conn.execute(
             "SELECT bucket,pool_id FROM lp_pool_buckets WHERE resolution=60 AND max_block>?", (ancestor,),
         ).fetchall()
+        prune_row = conn.execute(
+            "SELECT value FROM metadata WHERE key='bucket_prune_before'"
+        ).fetchone()
+        if prune_row:
+            buckets.extend(conn.execute(
+                "SELECT DISTINCT timestamp/60*60 AS bucket,pool_id FROM events "
+                "INDEXED BY events_block_idx WHERE block_number>? "
+                "AND timestamp<? AND pool_id IS NOT NULL",
+                (ancestor, json.loads(prune_row[0])),
+            ).fetchall())
         affected = conn.execute("SELECT pool_id FROM lp_pool_state WHERE block_number>?", (ancestor,)).fetchall()
         conn.execute("DELETE FROM lp_price_marks WHERE block_number>?", (ancestor,))
         conn.execute("DELETE FROM lp_price_samples WHERE block_number>?", (ancestor,))
