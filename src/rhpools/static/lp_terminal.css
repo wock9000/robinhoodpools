@@ -137,7 +137,7 @@ main {
   flex: 1 1 0;
   position: relative;
   display: grid;
-  grid-template-rows: auto auto minmax(84px, var(--pane-tape-size)) var(--pane-separator-size) minmax(104px, var(--pane-owners-size)) var(--pane-separator-size) minmax(104px, var(--pane-pools-size));
+  grid-template-rows: min-content min-content minmax(84px, var(--pane-tape-size)) var(--pane-separator-size) minmax(104px, var(--pane-owners-size)) var(--pane-separator-size) minmax(104px, var(--pane-pools-size));
   overflow-x: hidden;
   overflow-y: auto;
   scrollbar-color: var(--dimmer) var(--black);
@@ -177,7 +177,6 @@ main > section { scroll-margin-block-start: 4px; }
 body.is-resizing-panes { cursor: row-resize; user-select: none; }
 #pool-panel { display: flex; flex: 1 1 0; flex-direction: column; min-height: 0; }
 #tape-section > .section-head { height: 25px; }
-#tape-section > .section-head > div:first-child { display: none; }
 .readout {
   min-width: 0;
   height: 29px;
@@ -307,26 +306,11 @@ button.readout-line:hover { color: var(--white); }
   color: var(--cyan);
   font-weight: 700;
 }
-.section-head > div:first-child { min-width: 0; }
 .section-head h1, .section-head h2 { display: inline; margin: 0; font: inherit; font-weight: 800; }
+.section-head > h1 { flex: none; white-space: nowrap; }
 .section-note { margin-left: 7px; color: var(--dimmer); font-weight: 400; }
 .tools { display: flex; align-items: center; gap: 6px; margin-left: auto; font-weight: 400; }
-#owners-section > .section-head { height: auto; min-height: 55px; align-items: flex-start; padding-bottom: 5px; }
-.owners-heading {
-  min-width: 0;
-  display: grid;
-  grid-template-columns: auto 1fr;
-  align-items: baseline;
-  gap: 3px 10px;
-}
-.wallet-description {
-  min-width: 0;
-  grid-column: 1 / -1;
-  overflow: hidden;
-  color: var(--dim);
-  font-weight: 400;
-  text-overflow: ellipsis;
-}
+#owners-section > .section-head { height: 25px; align-items: center; }
 .filter-field {
   height: 20px;
   display: flex;
@@ -655,11 +639,9 @@ select:focus { border-color: var(--text); color: var(--text); }
   .section-nav a { display: inline-flex; min-height: 32px; align-items: center; }
   .readout { height: 35px; grid-template-columns: minmax(0, 1fr) auto; gap: 0 8px; padding-top: 3px; font-size: 11px; }
   .readout #overview-readout { grid-column: 1 / -1; grid-row: 2; overflow-x: auto; text-overflow: clip; scrollbar-width: thin; }
-  .section-head { height: auto; min-height: 47px; align-items: flex-start; flex-wrap: wrap; gap: 3px; overflow: visible; }
-  .section-head > div:first-child { flex-basis: 100%; }
+  .section-head { height: 25px; min-height: 0; gap: 6px; }
   .section-note { margin-left: 4px; }
-  .owners-heading { gap: 6px; }
-  .tools { flex: 1 0 100%; margin-left: 0; overflow-x: auto; scrollbar-width: thin; }
+  .tools { flex: 0 1 auto; min-width: 0; overflow-x: auto; scrollbar-width: thin; }
   .tools > * { flex: none; }
   .filter-field { flex: 0 0 150px; }
   .filter-field input { width: 100%; }
@@ -791,7 +773,6 @@ select:focus { border-color: var(--text); color: var(--text); }
   .readout #overview-readout::before { content: "USDG · "; }
   #tape-section > .section-head { display: none; min-height: 0; padding: 4px 6px; }
   #tape-section > .section-head:has(#tape-tools.is-open) { display: flex; }
-  #tape-section > .section-head > div:first-child { display: none; }
   #mobile-filter-toggle { min-height: 44px; min-width: 64px; margin: 0; padding: 4px; border: 1px solid var(--dim); color: var(--text); background: var(--black); }
   #tape-tools { display: none; }
   #tape-tools.is-open { display: grid; padding-bottom: 4px; }
@@ -851,23 +832,10 @@ select:focus { border-color: var(--text); color: var(--text); }
     min-height: 0;
     padding: 6px;
   }
-  .owners-heading {
-    width: 100%;
-    min-height: 36px;
-    display: grid;
-    grid-template-columns: 1fr;
-    align-items: center;
-    gap: 1px 6px;
-    white-space: normal;
-  }
-  .wallet-description { display: none; }
-  .tools {
-    width: 100%;
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 5px;
-    overflow: visible;
-  }
+  #owners-section > .section-head { height: 55px; flex-wrap: nowrap; align-items: center; }
+  #owners-section .tools { width: auto; flex: 1 1 0; display: flex; gap: 5px; overflow: hidden; }
+  #owners-section .tools select { min-width: 0; flex: 1 1 0; }
+  #tape-section .tools { width: 100%; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; }
   .tools > * { min-width: 0; width: 100%; }
   .filter-field {
     min-height: 44px;
