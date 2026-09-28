@@ -127,6 +127,7 @@ a:hover { text-decoration: underline; }
 }
 .section-nav a { color: var(--dim); font-weight: 700; }
 .section-nav a:hover, .section-nav a:focus-visible { color: var(--cyan); }
+.section-nav a[aria-current="location"] { color: var(--cyan); border-bottom: 2px solid var(--cyan); }
 .mobile-only { display: none; }
 .lp-search-status:empty { display: none; }
 
@@ -736,7 +737,7 @@ select:focus { border-color: var(--text); color: var(--text); }
     width: 100%;
     min-height: 44px;
     display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(5, minmax(0, 1fr));
     gap: 0;
     padding: 0 4px;
     overflow: visible;
@@ -751,7 +752,6 @@ select:focus { border-color: var(--text); color: var(--text); }
     color: var(--text);
     text-align: center;
   }
-  .section-nav > a[href="#search"],
   .section-nav > #trade-nav,
   .section-nav > a:not([href^="#"]) { display: none; }
   .mobile-more { position: relative; }

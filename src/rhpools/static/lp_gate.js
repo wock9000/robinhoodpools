@@ -195,6 +195,16 @@
       out.push(el("p", { class: "note", text: "grace " + policy.grace_s + " s after the last qualifying balance · policy v" + policy.version + " · token " + policy.token }));
     }
     out.push(el("div", { class: "gate-row" }, [
+      el("button", { type: "button", text: "positions & history", onclick: () => {
+        dialog.close();
+        window.rhpTerminal?.openOwner(me.wallet);
+      } }),
+      el("button", { type: "button", text: "trades", onclick: () => {
+        dialog.close();
+        window.rhpTerminal?.openOwner(me.wallet, true);
+      } }),
+    ]));
+    out.push(el("div", { class: "gate-row" }, [
       el("span", { class: "note", text: "session " + me.key_id + " · expires " + new Date(me.expires_at * 1000).toISOString().slice(0, 16).replace("T", " ") }),
       el("button", { type: "button", text: "sign out", onclick: signOut }),
     ]));

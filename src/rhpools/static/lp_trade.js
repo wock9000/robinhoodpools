@@ -908,7 +908,7 @@
   async function open(options) {
     if (!dialog.open) dialog.showModal();
     if (options && options.pool) {
-      Object.assign(state.lp, { poolId: String(options.pool).toLowerCase(), view: null, tokenId: null, op: "mint", amount: "", caps: null });
+      Object.assign(state.lp, { poolId: String(options.pool).toLowerCase(), view: null, tokenId: options.tokenId == null ? null : String(options.tokenId), op: options.tokenId == null ? "mint" : "increase", amount: "", caps: null });
       refs.lpPool.value = state.lp.poolId;
       refs.lpAmount.value = "";
       clearQuote();
@@ -916,6 +916,7 @@
       state.hash = null;
       state.fill = null;
     }
+    if (options && options.pool && options.tokenId != null) rememberId(options.tokenId);
     if (options && options.mode && options.mode !== state.mode) setMode(options.mode);
     else if (state.mode === "lp") loadPool();
     if (options && options.token && ADDRESS_RE.test(options.token)) pickToken(options.token, options.label || null);

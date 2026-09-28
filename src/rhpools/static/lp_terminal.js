@@ -83,6 +83,8 @@
     ownerFollow: byId("owner-follow"),
     ownerLiveState: byId("owner-live-state"),
     copyStatus: byId("copy-status"),
+    ownerTrades: byId("owner-trades"),
+    ownerTradesBody: byId("owner-trades-body"),
     terminalMain: byId("terminal-main"),
     poolInspector: byId("pool-inspector"),
     poolInspectorShell: byId("pool-inspector-shell"),
@@ -1067,7 +1069,18 @@
     setTextCell(cells[7], valuation, "dim");
     setTextCell(cells[8], item.status || "open", "dim");
     const poolId = item.pool_id || "";
-    setNodeCell(cells[9], `${poolId}|${state.ownerAddress}`, "cyan", () => internalPoolLink(poolId, state.ownerAddress));
+    setNodeCell(cells[9], `${poolId}|${state.ownerAddress}|${item.token_id}|${window.rhpGate?.snapshot().wallet || ""}`, "cyan", () => {
+      const link = internalPoolLink(poolId, state.ownerAddress);
+      const wallet = window.rhpGate?.snapshot().wallet;
+      if (wallet && wallet.toLowerCase() === state.ownerAddress && item.token_id && poolId) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = "manage";
+        button.addEventListener("click", () => window.rhpTrade?.open({ mode: "lp", pool: poolId, tokenId: item.token_id }));
+        link.append(" ", button);
+      }
+      return link;
+    });
   }
 
   function patchOwnerClosedRow(row, item) {
@@ -2583,6 +2596,68 @@
     }
   }
 
+  function tradeAmount(leg) {
+    const raw = String(leg.amount || "0");
+    const decimals = Number(leg.decimals || 0);
+    const padded = raw.padStart(decimals + 1, "0");
+    const whole = decimals ? padded.slice(0, -decimals) : padded;
+    const fractional = decimals ? padded.slice(-decimals).replace(/0+$/, "").slice(0, 6) : "";
+    const symbol = leg.symbol || shortIdentifier(leg.token);
+    if (raw !== "0" && whole === "0" && !/[1-9]/.test(fractional)) return `<0.000001 ${symbol}`;
+    return `${whole}${fractional ? "." + fractional : ""} ${symbol}`;
+  }
+
+  async function loadWalletTrades(address) {
+    const section = elements.ownerTrades;
+    const body = elements.ownerTradesBody;
+    const gate = window.rhpGate?.snapshot();
+    const visible = gate?.me?.signed_in && gate.wallet?.toLowerCase() === address
+      && gate.me.wallet?.toLowerCase() === address;
+    section.hidden = !visible;
+    if (!visible) return;
+    body.replaceChildren(el("tr", "", ""));
+    body.firstChild.append(el("td", "dim", "loading trades"));
+    body.firstChild.firstChild.colSpan = 5;
+    try {
+      const response = await fetch("/api/tx/history?feature=trade", { credentials: "same-origin" });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const payload = await response.json();
+      if (state.ownerAddress !== address || section.hidden) return;
+      const rows = payload.rows || [];
+      body.replaceChildren(...rows.map((trade) => {
+        const row = el("tr");
+        const link = el("a", "cyan", shortIdentifier(trade.hash));
+        link.href = `${ROBINSCAN}/tx/${trade.hash}`;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        for (const content of [
+          formatAge(Math.max(0, Date.now() / 1000 - trade.timestamp)),
+          trade.sent.map(tradeAmount).join(" + ") || "—",
+          trade.received.map(tradeAmount).join(" + ") || "—",
+          trade.via
+        ]) row.append(el("td", "", content));
+        const tx = el("td");
+        tx.append(link);
+        row.append(tx);
+        return row;
+      }));
+      if (!rows.length) {
+        const row = el("tr");
+        const cell = el("td", "dim", "no trades in 7d");
+        cell.colSpan = 5;
+        row.append(cell);
+        body.append(row);
+      }
+    } catch (error) {
+      if (state.ownerAddress !== address || section.hidden) return;
+      const row = el("tr");
+      const cell = el("td", "dim", `trades unavailable · ${error.message}`);
+      cell.colSpan = 5;
+      row.append(cell);
+      body.replaceChildren(row);
+    }
+  }
+
   function openOwner(address, trigger, historyMode = "push") {
     const normalized = String(address || "").trim().toLowerCase();
     if (!ADDRESS_RE.test(normalized)) return;
@@ -2621,6 +2696,7 @@
     elements.dialog.focus({ preventScroll: true });
     elements.modal.scrollIntoView({ behavior: "auto", block: "start" });
     loadOwner(normalized);
+    loadWalletTrades(normalized);
   }
 
   function closeOwner(historyMode = "push") {
@@ -3186,6 +3262,28 @@
   });
   elements.paneReset.addEventListener("click", resetPaneLayouts);
   PANE_LAYOUT_MEDIA.addEventListener("change", applyPaneLayout);
+  const sectionLinks = Array.from(document.querySelectorAll('.section-nav > a[href^="#"]'))
+    .filter((link) => ["#search", "#tape-section", "#owners-section", "#pools-section"].includes(link.getAttribute("href")));
+  function activateSection() {
+    const hash = sectionLinks.some((link) => link.getAttribute("href") === location.hash) ? location.hash : "#tape-section";
+    sectionLinks.forEach((link) => {
+      if (link.getAttribute("href") === hash) link.setAttribute("aria-current", "location");
+      else link.removeAttribute("aria-current");
+    });
+    if (hash === "#search") {
+      elements.lpSearchInput.focus();
+    } else if (!PANE_LAYOUT_MEDIA.matches) {
+      const index = ["#tape-section", "#owners-section", "#pools-section"].indexOf(hash);
+      const sizes = [0.12, 0.12, 0.12];
+      sizes[index] = 0.76;
+      setPaneProperties("desktop", sizes);
+      requestAnimationFrame(updatePaneSeparatorValues);
+    }
+  }
+  sectionLinks.forEach((link) => link.addEventListener("click", () => {
+    if (location.hash === link.getAttribute("href")) activateSection();
+  }));
+  window.addEventListener("hashchange", activateSection);
   byId("pools-table").addEventListener("click", (event) => {
     const button = event.target.closest("[data-pool-sort]");
     if (button) setPoolSort(button.dataset.poolSort);
@@ -3317,6 +3415,7 @@
   setOwnerFollow(true);
   setTab("pools", false, false);
   applyPaneLayout();
+  activateSection();
   renderStatus();
   renderOverview();
   renderAllTables();
@@ -3329,6 +3428,10 @@
   reloadTape("initial");
   const initialOwner = String(initialUrl.searchParams.get("owner") || "").toLowerCase();
   if (ADDRESS_RE.test(initialOwner)) openOwner(initialOwner, null, "replace");
+  window.rhpTerminal = { openOwner: (address, trades = false) => {
+    openOwner(address, document.activeElement);
+    if (trades && !elements.ownerTrades.hidden) elements.ownerTrades.scrollIntoView({ behavior: "auto", block: "start" });
+  } };
   requestAnimationFrame(() => {
     setTimeout(() => {
       startSummaryObservers();

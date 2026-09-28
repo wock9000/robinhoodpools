@@ -35,6 +35,10 @@ class FakeCore:
 
     def prepare(self, quote_id, wallet, sigs, batched=False):
         return SimpleNamespace(to_json=lambda: {"quote_id": quote_id, "wallet": wallet, "permit": sigs.permit.hex() if sigs.permit else None})
+    def history(self, wallet):
+        self.history_wallet = wallet
+        return {"rows": [{"hash": "0x" + "ab" * 32, "block": 42, "timestamp": 84,
+                          "sent": [], "received": [], "via": "UR"}]}
 
 
 @contextmanager
@@ -115,3 +119,22 @@ def test_trading_disabled_without_fee_recipient(tmp_path):
         headers = signed_in(address, gate, balance=5_000_000)
         status, _, body = call(address, "POST", "/api/tx/quote", SWAP, headers)
         assert status == 422 and body["refusal"] == "trading_disabled"
+
+
+def test_history_requires_trade_browser_session_and_uses_only_session_wallet(tmp_path):
+    core = FakeCore()
+    with serving(tmp_path, core) as (address, gate):
+        path = "/api/tx/history?feature=trade&wallet=" + OTHER_WALLET
+        assert call(address, "GET", path)[0] == 401
+        headers = signed_in(address, gate, balance=5_000_000)
+        assert call(address, "GET", "/api/tx/history?feature=lp", headers=headers)[0] == 400
+        secret = headers["Cookie"].split("=", 1)[1]
+        assert call(address, "GET", path, headers={"Authorization": "Bearer " + secret})[0] == 403
+        status, _, key = call(address, "POST", "/api/gate/keys",
+                              {"op": "mint", "label": "bot", "ttl_s": 3600}, headers)
+        assert status == 200
+        assert call(address, "GET", path, headers={"Authorization": "Bearer " + key["secret"]})[0] == 403
+        status, response_headers, body = call(address, "GET", path, headers=headers)
+        assert status == 200 and body["rows"][0]["via"] == "UR"
+        assert core.history_wallet.lower() == HOLDER.lower()
+        assert response_headers["Cache-Control"] == "private, no-store"
