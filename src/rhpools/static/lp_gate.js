@@ -122,8 +122,8 @@
     if (me.wallet.toLowerCase() !== state.wallet.toLowerCase()) return { key: "mismatch", text: short(state.wallet) + " ≠ session " + short(me.wallet) + " · sign in" };
     const owner = me.owner ? " owner" : "";
     if (me.state === "unset") return { key: "unset", text: short(me.wallet) + " token not launched" + owner, dim: !me.owner };
-    if (me.state === "holder") return { key: "holder", text: short(me.wallet) + " holder" + owner, cls: "is-holder", features: me.features };
-    if (me.state === "grace") return { key: "grace", text: short(me.wallet) + " grace " + clock(graceLeft() || 0) + owner, cls: "is-grace", features: me.features };
+    if (me.state === "holder") return { key: "holder", text: short(me.wallet) + " holder" + owner, cls: "is-holder" };
+    if (me.state === "grace") return { key: "grace", text: short(me.wallet) + " grace " + clock(graceLeft() || 0) + owner, cls: "is-grace" };
     const need = FEATURES.map((f) => BigInt(me.policy.threshold[f])).filter((n) => n > 0n).sort((a, b) => (a < b ? -1 : 1))[0];
     const have = me.holding ? me.holding.balance_raw : null;
     return {
@@ -136,12 +136,7 @@
     const current = view();
     chip.className = "gate-chip" + (current.dim ? " is-dim" : "") + (current.cls ? " " + current.cls : "");
     chip.dataset.state = current.key;
-    chipText.replaceChildren(document.createTextNode(current.text + (current.features ? " " : "")));
-    if (current.features) {
-      for (const feature of FEATURES) {
-        chipText.append(el("span", { class: "badge" + (current.features.includes(feature) ? "" : " off"), text: feature }));
-      }
-    }
+    chipText.replaceChildren(document.createTextNode(current.text));
     chip.title = state.error ? state.error.full : "";
     if (current.key === "grace" && !ticker) ticker = setInterval(renderChip, 1000);
     if (current.key !== "grace" && ticker) { clearInterval(ticker); ticker = null; }

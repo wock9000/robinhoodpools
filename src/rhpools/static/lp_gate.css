@@ -17,8 +17,6 @@
 .gate-chip.is-holder { color: #276827; }
 .gate-chip.is-grace { color: #7b3600; }
 .gate-chip.is-below { color: #a00000; }
-.gate-chip .badge { margin-right: 2px; border-color: #276827; color: #276827; vertical-align: 1px; }
-.gate-chip .badge.off { border-color: var(--rhp-dimmer); color: var(--rhp-dim); }
 
 .gate-dialog {
   width: min(600px, calc(100vw - 12px));

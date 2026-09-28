@@ -695,6 +695,7 @@ select:focus { border-color: var(--text); color: var(--text); }
   }
   .product-name { grid-column: 1; }
   .chain-id { grid-column: 2; }
+  .gate-chip { grid-column: 1 / -1; justify-self: start; max-width: 100%; }
   .status-context { display: none; }
   .block-readout { min-width: 0; grid-column: 1 / -1; }
   .strip-state {
@@ -751,6 +752,7 @@ select:focus { border-color: var(--text); color: var(--text); }
     text-align: center;
   }
   .section-nav > a[href="#search"],
+  .section-nav > #trade-nav,
   .section-nav > a:not([href^="#"]) { display: none; }
   .mobile-more { position: relative; }
   .mobile-more summary { display: flex; min-height: 44px; align-items: center; justify-content: center; cursor: pointer; font-weight: 700; list-style: none; }

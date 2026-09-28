@@ -901,8 +901,14 @@
     const button = document.getElementById(id);
     if (button) button.addEventListener("click", () => openFromInspector(mode));
   }
-  const nav = document.getElementById("trade-nav");
-  if (nav) nav.addEventListener("click", (event) => { event.preventDefault(); open(); });
+  for (const link of document.querySelectorAll('a[href="#trade"]')) {
+    link.addEventListener("click", (event) => {
+      event.preventDefault();
+      const menu = link.closest("details");
+      if (menu) menu.open = false;
+      open();
+    });
+  }
   document.addEventListener("keydown", (event) => {
     const target = event.target;
     const typing = target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName));
