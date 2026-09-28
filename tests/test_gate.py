@@ -117,6 +117,62 @@ def sign_in(gate, key=HOLDER_KEY, ip="10.0.0.1", **kw):
 def audit_actions(gate):
     return [(row["action"], row["actor"]) for row in gate.audit()]
 
+def test_nonce_flood_cannot_evict_pending_sign_in(gate):
+    message, signature = siwe(HOLDER_KEY, gate)
+    for _ in range(4096):
+        try:
+            gate.nonce()
+        except GateRefusal as refusal:
+            assert refusal.status == 503
+            break
+    principal, _ = gate.sign_in(message, signature, label="holder", client_ip="2001:db8::1")
+    assert principal.wallet == HOLDER
+
+
+def test_signin_garbage_from_many_ips_does_not_block_valid_wallet(gate):
+    for index in range(65):
+        with pytest.raises(GateRefusal):
+            gate.sign_in("garbage", "0x", label="bad", client_ip=f"198.51.100.{index}")
+    assert gate.audit() == []
+    principal, _ = sign_in(gate)
+    assert principal.wallet == HOLDER
+
+
+def test_failed_signin_rate_limit_groups_ipv6_64_and_not_successes(gate):
+    message, _ = siwe(HOLDER_KEY, gate)
+    for index in range(5):
+        with pytest.raises(GateRefusal) as refused:
+            gate.sign_in(message, "0x", label="bad", client_ip=f"2001:db8:feed:1234::{index}")
+        assert refused.value.status == 401
+    message, signature = siwe(HOLDER_KEY, gate)
+    with pytest.raises(GateRefusal) as refused:
+        gate.sign_in(message, signature, label="holder", client_ip="2001:db8:feed:1234::99")
+    assert refused.value.status == 429
+    principal, _ = gate.sign_in(message, signature, label="holder", client_ip="2001:db8:feed:5678::1")
+    assert principal.wallet == HOLDER
+
+
+def test_nonowner_and_malformed_policy_refusals_never_write_audit(gate):
+    parsed, signature = signed_policy(OTHER_KEY)
+    for candidate in (signature, "broken"):
+        with pytest.raises(GateRefusal):
+            gate.apply_policy(parsed, candidate, via="web")
+    assert gate.audit() == []
+
+
+def test_fresh_below_threshold_cancels_grace_but_oracle_outage_keeps_it(gate):
+    gate.apply_policy(*signed_policy(), via="cli")
+    gate.rpc.balances[HOLDER.lower()] = 5_000_000
+    assert gate.entitlement(HOLDER).has("api")
+    gate.clock.now += 31
+    gate.rpc.down = True
+    assert gate.entitlement(HOLDER).has("api")
+    gate.rpc.down = False
+    gate.rpc.balances[HOLDER.lower()] = 0
+    gate.clock.now += 31
+    assert not gate.entitlement(HOLDER).has("api")
+
+
 
 def test_policy_digest_matches_cast_wallet_sign(gate):
     applied = gate.apply_policy(policy(), CAST_POLICY_SIGNATURE, via="cli")
@@ -136,7 +192,7 @@ def test_siwe_signature_matches_cast_wallet_sign():
     assert (parsed.domain, parsed.address, parsed.nonce, parsed.chain_id) == ("rhpools.lol", OWNER, "abcdef0123456789", 4663)
 
 
-def test_policy_refusals_are_audited_with_the_signer(gate):
+def test_policy_refusals_audit_only_owner_signed_attempts(gate):
     parsed, signature = signed_policy(OTHER_KEY)
     with pytest.raises(GateRefusal) as refused:
         gate.apply_policy(parsed, signature, via="web")
@@ -154,10 +210,9 @@ def test_policy_refusals_are_audited_with_the_signer(gate):
     with pytest.raises(GateRefusal):
         gate.apply_policy(parsed, "0x" + "11" * 65, via="cli")
     assert [action for action, _ in audit_actions(gate)] == [
-        "policy.refused", "policy.refused", "policy.apply", "policy.refused", "policy.refused",
+        "policy.refused", "policy.apply", "policy.refused",
     ]
-    assert audit_actions(gate)[-1][1] == OTHER
-    assert audit_actions(gate)[2][1] == OWNER
+    assert audit_actions(gate)[1][1] == OWNER
 
 
 def test_policy_apply_is_idempotent_on_the_same_signature(gate):
@@ -187,7 +242,7 @@ def test_cli_applies_through_the_same_path(gate, tmp_path, capsys):
     assert gate.policy().version == 1
     assert gate_cli(["--db", db, "audit"]) == 0
     actions = [json.loads(line)["action"] for line in capsys.readouterr().out.splitlines() if line.startswith("{\"id\"")]
-    assert actions[:2] == ["policy.apply", "policy.refused"]
+    assert actions == ["policy.apply"]
 
 
 def test_entitle_rule_is_pure_and_covers_grace_and_threshold_zero():
@@ -197,6 +252,9 @@ def test_entitle_rule_is_pure_and_covers_grace_and_threshold_zero():
     assert ent.features == {"trade", "lp", "flags"} and not ent.grace_until
     anchors = {"api": (900.0, 1)}
     ent = entitle(live, HoldingState(HOLDER, holding, anchors), 1000.0)
+    assert not ent.has("api") and not ent.grace_until
+    stale = Holding(HOLDER, 2500000, 100, 900.0)
+    ent = entitle(live, HoldingState(HOLDER, stale, anchors), 1000.0)
     assert ent.has("api") and ent.grace_until == {"api": 1800.0}
     assert entitle(live, HoldingState(HOLDER, holding, anchors), 1801.0).has("api") is False
     assert entitle(live, HoldingState(HOLDER, holding, {"api": (999.0, 0)}), 1000.0).has("api") is False
@@ -212,7 +270,7 @@ def test_open_policy_makes_every_signed_in_wallet_a_holder():
     assert ent.state(open_policy) == "holder"
 
 
-def test_entitlement_transitions_below_holder_grace_below(gate):
+def test_entitlement_transitions_holder_below_and_outage_grace(gate):
     gate.apply_policy(*signed_policy(), via="cli")
     assert gate.entitlement(HOLDER).features == {"flags"}
     gate.rpc.balances[HOLDER.lower()] = 5_000_000
@@ -221,20 +279,17 @@ def test_entitlement_transitions_below_holder_grace_below(gate):
     gate.rpc.balances[HOLDER.lower()] = 10
     gate.clock.now += 31
     ent = gate.entitlement(HOLDER)
-    assert ent.features == set(FEATURES) and set(ent.grace_until) == {"trade", "lp", "api"}
-    assert ent.state(gate.policy()) == "grace"
-    gate.clock.now = ent.grace_until["api"] - 1
-    assert gate.entitlement(HOLDER).has("api")
-    gate.clock.now = ent.grace_until["api"] + 1
-    ent = gate.entitlement(HOLDER)
     assert ent.features == {"flags"} and ent.state(gate.policy()) == "below"
+    gate.rpc.down = True
+    gate.clock.now += 31
+    assert gate.entitlement(HOLDER).features == {"flags"}
 
 
 def test_grace_earned_under_an_older_policy_does_not_carry_over(gate):
     gate.apply_policy(*signed_policy(), via="cli")
     gate.rpc.balances[HOLDER.lower()] = 5_000_000
     assert gate.entitlement(HOLDER).has("api")
-    gate.rpc.balances[HOLDER.lower()] = 10
+    gate.rpc.down = True
     gate.clock.now += 31
     assert "api" in gate.entitlement(HOLDER).grace_until
     gate.apply_policy(*signed_policy(version=2, issued_at=int(gate.clock.now)), via="cli")
@@ -290,22 +345,26 @@ def test_sign_in_mints_a_session_and_refusals_are_specific(gate):
     with pytest.raises(GateRefusal) as reused:
         gate.sign_in(message, signature, label="x", client_ip="10.1.1.3")
     assert "nonce" in reused.value.payload["gate"]["reason"]
-    assert audit_actions(gate).count(("session.refused", HOLDER)) == 8
+    assert audit_actions(gate).count(("session.refused", HOLDER)) == 0
 
 
-def test_sign_in_accepts_loopback_host_and_is_rate_limited(gate):
+def test_sign_in_accepts_loopback_host_and_limits_failed_signatures(gate):
     message, signature = siwe(HOLDER_KEY, gate, domain="127.0.0.1:8196", uri="http://127.0.0.1:8196/")
     with pytest.raises(GateRefusal):
         gate.sign_in(message, signature, label="x", client_ip="9.9.9.9")
     message, signature = siwe(HOLDER_KEY, gate, domain="127.0.0.1:8196", uri="http://127.0.0.1:8196/")
     assert gate.sign_in(message, signature, label="x", client_ip="9.9.9.9", host="127.0.0.1:8196")[0].wallet == HOLDER
-    for _ in range(3):
-        sign_in(gate, ip="9.9.9.9")
+    for _ in range(5):
+        message, _ = siwe(HOLDER_KEY, gate)
+        with pytest.raises(GateRefusal) as refused:
+            gate.sign_in(message, "0x", label="x", client_ip="9.9.9.9")
+        assert refused.value.status == 401
+    message, signature = siwe(HOLDER_KEY, gate)
     with pytest.raises(GateRefusal) as limited:
-        sign_in(gate, ip="9.9.9.9")
+        gate.sign_in(message, signature, label="x", client_ip="9.9.9.9")
     assert limited.value.status == 429
     gate.clock.now += 61
-    sign_in(gate, ip="9.9.9.9")
+    gate.sign_in(message, signature, label="x", client_ip="9.9.9.9")
 
 
 def test_eip7702_delegated_eoa_and_erc1271_contract_wallets(gate):

@@ -81,7 +81,7 @@ def test_holder_lifecycle_on_the_fork(tmp_path, fork):
         parsed, signature = signed_policy(owner, 1, clock)
         status, _, body = call(address, "POST", "/api/gate/policy", {"policy": parsed.public(), "signature": signature})
         assert status == 200 and body["policy"]["token"] == STANDIN_TOKEN
-        assert [row["action"] for row in gate.audit()][::-1] == ["policy.refused", "policy.apply"]
+        assert [row["action"] for row in gate.audit()][::-1] == ["policy.apply"]
 
         secret, me = sign_in(address, gate, holder, clock)
         assert me["state"] == "holder" and me["features"] == ["trade", "lp", "api", "flags"]
@@ -109,9 +109,8 @@ def test_holder_lifecycle_on_the_fork(tmp_path, fork):
         fork.set_balance(holder_address, THRESHOLD - 1)
         clock.now += 31
         status, _, me = call(address, "GET", "/api/gate/me", headers=bearer)
-        assert me["state"] == "grace" and me["features"] == ["trade", "lp", "api", "flags"]
+        assert me["state"] == "below" and me["features"] == ["flags"]
         assert me["holding"]["balance_raw"] == str(THRESHOLD - 1)
-        clock.now = max(me["grace_until"].values()) + 1
         frames = read_frames(response, 2)
         assert frames[0]["event"] == "gate" and frames[0]["data"]["gate"]["state"] == "below"
         assert frames[1] is None
