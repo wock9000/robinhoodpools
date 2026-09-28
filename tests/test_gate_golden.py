@@ -7,7 +7,7 @@ import pytest
 from golden.anonymous import record
 
 GOLDEN = json.loads((Path(__file__).parent / "golden" / "anonymous.json").read_text())
-TERMINAL_PAGES = {"/", "/pools", "/lp", "/guide", "/research", "/flow", "/static/lp_terminal.js", "/static/lp_terminal.css", "/static/lp_guide.css", "/static/lp_flow.css", "/api/v1/openapi.json"}
+TERMINAL_PAGES = {"/", "/pools", "/lp", "/guide", "/research", "/flow", "/static/lp_terminal.js", "/static/lp_terminal.css", "/static/lp_guide.css", "/static/lp_flow.css", "/api/v1/openapi.json", "/pool", "/static/workbench.css", "/static/workbench.js"}
 NEW_SURFACE = {"/api/gate/me", "/api/v1/stream"}
 PAGE_HEADERS_ALLOWED_TO_MOVE = {"etag", "content-length"}
 

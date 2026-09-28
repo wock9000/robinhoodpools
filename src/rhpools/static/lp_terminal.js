@@ -3007,9 +3007,8 @@
   }
 
   function setPaneProperties(layout, sizes) {
-    const unit = layout === "mobile" ? "dvh" : "fr";
     sizes.forEach((size, index) => {
-      document.documentElement.style.setProperty(PANE_PROPERTIES[index], `${size}${unit}`);
+      document.documentElement.style.setProperty(PANE_PROPERTIES[index], layout === "mobile" ? `${size}dvh` : `${size * 100}fr`);
     });
   }
 
@@ -3297,7 +3296,7 @@
     });
     if (hash === "#search") {
       elements.lpSearchInput.focus();
-    } else if (!PANE_LAYOUT_MEDIA.matches) {
+    } else if (!PANE_LAYOUT_MEDIA.matches && location.hash) {
       const index = ["#tape-section", "#owners-section", "#pools-section"].indexOf(hash);
       const sizes = [0.12, 0.12, 0.12];
       sizes[index] = 0.76;
