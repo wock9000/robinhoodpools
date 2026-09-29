@@ -48,6 +48,11 @@ a:hover { text-decoration: underline; }
 .is-embedded .application-shell { min-height: calc(100dvh - var(--bar)); }
 .is-embedded .pool-content { max-width: none; }
 .is-embedded .allocation-panel { height: auto; }
+.your-positions { padding: 7px 10px; border-block: 1px solid var(--line); }
+.your-positions h2 { margin: 0 0 4px; color: var(--cyan); font-size: 10px; }
+.your-position { display: flex; align-items: center; flex-wrap: wrap; gap: 5px 14px; padding: 4px 0; border-top: 1px solid var(--line); }
+.your-position span { color: var(--dim); }
+.your-position button { margin-left: auto; padding: 2px 8px; border: 1px solid var(--cyan); color: var(--cyan); background: transparent; }
 
 .terminal-bar { position: sticky; z-index: 30; top: 0; height: var(--bar); display: grid; grid-template-columns: auto minmax(220px, 440px) 1fr auto; align-items: center; gap: 10px; padding: 2px 7px; border-bottom: 1px solid var(--line); color: var(--black); background: var(--white); white-space: nowrap; }
 .terminal-id { display: flex; align-items: center; gap: 10px; min-width: 0; font-size: 9px; font-weight: 700; }

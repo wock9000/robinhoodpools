@@ -43,6 +43,8 @@
     poolContent: $("pool-content"),
     poolError: $("pool-error"),
     poolCoverage: $("pool-coverage"),
+    yourPositions: $("your-positions"),
+    yourPositionsList: $("your-positions-list"),
     selectedKind: $("selected-kind"),
     selectedProtocol: $("selected-protocol"),
     selectedPair: $("selected-pair"),
@@ -237,6 +239,7 @@
     }
     if (state.selectedId) {
       loadDetail({ quiet: true });
+      loadYourPositions();
       openStream();
     }
     loadMarketStatus();
@@ -580,6 +583,7 @@
     if (id === INITIAL_POOL && INITIAL_TX) url.searchParams.set("tx", INITIAL_TX);
     if (EMBEDDED) url.searchParams.set("embedded", "1");
     window.history.replaceState(null, "", url);
+    loadYourPositions();
     loadDetail();
     openStream();
     if (window.innerWidth <= 760) elements.poolWorkbench.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -602,6 +606,48 @@
     if (ADDRESS_RE.test(state.owner || "")) params.set("owner", state.owner);
     if (id === INITIAL_POOL && INITIAL_TX) params.set("tx", INITIAL_TX);
     return params;
+  }
+
+  let positionsRequest = 0;
+
+  async function loadYourPositions() {
+    const request = ++positionsRequest;
+    elements.yourPositions.classList.add("is-hidden");
+    elements.yourPositionsList.replaceChildren();
+    const gate = window.parent !== window && window.parent.rhpGate?.snapshot();
+    const wallet = gate?.wallet;
+    if (!state.selectedId || !wallet || gate.me?.wallet?.toLowerCase() !== wallet.toLowerCase() || !gate.me.signed_in || !gate.me.features?.includes("lp")) return;
+    const pool = state.selectedId;
+    let ids = [];
+    try {
+      const stored = JSON.parse(localStorage.getItem("rhp:lp:" + wallet.toLowerCase() + ":" + pool) || "[]");
+      if (Array.isArray(stored)) ids = stored.filter((id) => /^\d+$/.test(String(id))).slice(0, 20);
+    } catch (_) {
+      ids = [];
+    }
+    try {
+      const view = await api("/api/tx/pool?" + new URLSearchParams({ feature: "lp", pool_id: pool, ids: ids.join(",") }));
+      if (request !== positionsRequest || pool !== state.selectedId || window.parent.rhpGate?.snapshot().wallet !== wallet) return;
+      const positions = view.positions.filter((position) => BigInt(position.liquidity) > 0n || BigInt(position.fees0 || "0") > 0n || BigInt(position.fees1 || "0") > 0n);
+      if (!positions.length) return;
+      for (const position of positions) {
+        const row = el("div", "your-position");
+        const label = el("strong", "", "#" + position.token_id);
+        const range = el("span", "", "ticks " + position.tick_lower + "–" + position.tick_upper);
+        const liquidity = el("span", "", "liquidity " + BigInt(position.liquidity).toLocaleString());
+        const inRange = el("span", "", view.tick >= position.tick_lower && view.tick < position.tick_upper ? "IN RANGE" : "OUT OF RANGE");
+        row.append(label, range, liquidity, inRange);
+        if (position.fees0 != null && position.fees1 != null) row.append(el("span", "", "fees " + position.fees0 + " / " + position.fees1));
+        const manage = el("button", "", "manage");
+        manage.type = "button";
+        manage.addEventListener("click", () => window.top.rhpTrade?.open({ mode: "lp", pool, tokenId: position.token_id }));
+        row.append(manage);
+        elements.yourPositionsList.append(row);
+      }
+      elements.yourPositions.classList.remove("is-hidden");
+    } catch (_) {
+      return;
+    }
   }
 
   async function loadDetail({ quiet = false } = {}) {
@@ -3706,6 +3752,7 @@
       if (!payload || payload.type !== "lp-workbench:visibility" || typeof payload.open !== "boolean") return;
       setEmbeddedVisibility(payload.open);
     });
+    if (window.parent !== window) window.parent.document.addEventListener("rhp:gate", loadYourPositions);
     const stopSubscriptions = () => {
       closeStream();
       window.clearTimeout(state.allocationTimer);

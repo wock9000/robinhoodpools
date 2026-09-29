@@ -89,17 +89,6 @@ a:hover { text-decoration: underline; }
   color: #444;
   text-overflow: ellipsis;
 }
-.mode-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  font-weight: 800;
-}
-.mode-badge span {
-  width: 5px;
-  height: 5px;
-  background: #177317;
-}
 .global-nav {
   display: flex;
   align-items: center;
@@ -557,7 +546,6 @@ td:nth-child(3) { color: #aaa; }
     padding-top: 5px;
     padding-bottom: 0;
   }
-  .mode-badge { justify-self: end; }
   .global-nav {
     grid-column: 1 / -1;
     margin: 0 -8px;
@@ -616,8 +604,7 @@ td:nth-child(3) { color: #aaa; }
 @media (max-width: 440px) {
   body { font-size: 11px; line-height: 1.62; }
   .terminal-bar { min-height: 40px; }
-  .product-link,
-  .mode-badge { min-height: 27px; display: inline-flex; align-items: center; }
+  .product-link { min-height: 27px; display: inline-flex; align-items: center; }
   .global-nav { gap: 16px; }
   .guide-hero { padding: 12px 10px; }
   .guide-hero h1 { font-size: 19px; }

@@ -40,6 +40,24 @@ Run `uv run rhpools --help` for the installed command's complete option list. `-
 
 The equivalent environment settings are `RHP_HTTP_HOST`, `RHP_HTTP_PORT`, `RHP_RPC_URL`, `RHP_DATA_DIR`, `RHP_DATABASE`, `LP_HISTORY_DAYS`, and `LP_DISK_RESERVE_GIB`. Additional origins and preparation of supported direct-pool transactions require explicit CLI flags; there is no environment switch that silently enables preparation.
 
+### Holder gate
+
+Token-gated features (wallet sign-in, API keys, the keyed `/api/v1/stream`) are configured by three settings: `--gate-owner` / `RHP_GATE_OWNER` pins the EOA whose EIP-712 signature is the only way to change the policy; `--gate-rpc-url` / `RHP_GATE_RPC_URL` (default `http://127.0.0.1:8547`) is the JSON-RPC endpoint the balance oracle reads `balanceOf` from; `--gate-db` / `RHP_GATE_DB` (default `<data-dir>/gate.sqlite`) holds credentials, grace anchors, policy versions and the audit log. With the owner unset or no policy applied, every gated feature refuses and the anonymous site is unchanged. The systemd unit ships these lines commented out.
+
+Trading, liquidity management and flow tags add two settings. `RHP_TX_FEE_RECIPIENT` receives the 75 bps fee on holder trades; unset, `/api/tx/status` reports trading disabled and no quote is served. `RHP_LISTENER_DSN` is an optional read-only Postgres DSN for relay-listener observations (install the `listener` extra for `psycopg`); without it, PONS and FOMO tags come from chain data alone. Tags are cached in `<data-dir>/tags.sqlite` for 7 days.
+
+The owner applies a policy from the terminal's wallet dialog (`eth_signTypedData_v4`) or from the host with the same signature:
+
+```sh
+uv run rhpools-gate policy typed-data policy.json > typed.json
+cast wallet sign --data --from-file typed.json --ledger
+uv run rhpools-gate policy apply policy.json --signature 0x…
+uv run rhpools-gate audit --limit 20
+uv run rhpools-gate keys revoke --key-id 5c1d9b2e0a7f43aa
+```
+
+`policy.json` is `{"version", "token", "decimals", "threshold": {"trade","lp","api","flags"}, "grace_s", "issued_at"}` with raw-unit thresholds as decimal strings; `version` must increase and `issued_at` must be within 600 s of the apply time. The API contract for keys and the stream is in [`docs/PUBLIC_API.md`](docs/PUBLIC_API.md#api-keys).
+
 ### Serving health is not index freshness
 
 A successful request to `/` establishes only that the HTTP process can serve the installed UI. Index progress and source coverage are separate; inspect `/api/lp/status` and its observed head, indexed head, lag, history coverage, and provider status before treating results as current. During startup, catch-up, provider failure, or a chain reorganization, the server can remain available while indexed data is incomplete or stale.
@@ -51,13 +69,13 @@ curl -fsS http://127.0.0.1:8196/api/lp/status
 
 ## Safety model
 
-The default service observes and simulates; it never signs or broadcasts a transaction. Transaction preparation is disabled unless `--enable-transaction-prepare` is supplied. Enabling it permits generation of unsigned direct-pool remove and collect transaction data for independent inspection and external signing; it does not enable server signing or broadcasting. Add-liquidity execution is not offered: the service rejects new add requests and preparation from old add or approval quotes. Never give this process, its browser UI, configuration, or repository a seed phrase or private key.
+The default service observes and simulates; it never signs or broadcasts a transaction. Transaction preparation is disabled unless `--enable-transaction-prepare` is supplied. Enabling it permits generation of unsigned direct-pool remove and collect transaction data for independent inspection and external signing; it does not enable server signing or broadcasting. Add-liquidity execution through MiniRouter2 `0x5295e633dfb504298d4a1896ba0738acb6c89e6a` is retired because that deployment is unsafe, and the service rejects both new add requests and preparation from old add or approval quotes. Revoke any remaining token allowances to that router independently. Never give this process, its browser UI, configuration, or repository a seed phrase or private key.
 
 RPC credentials, when needed, belong only in local mode-`0600` files containing one URL per line. Point a capability-specific variable such as `LP_RPC_STATE_URL_FILES` or `LP_RPC_TRACE_URL_FILES` at the file; `LP_RPC_HEAD_URL_FILES`, `LP_RPC_HISTORY_STATE_URL_FILES`, `LP_RPC_LOG_URL_FILES`, and `LP_RPC_RECEIPT_URL_FILES` follow the same convention. Generic runtime RPC files use `RHP_RPC_URL_FILES`. Do not put credential-bearing URLs in CLI arguments, browser storage, committed environment files, fixtures, screenshots, or logs.
 
-Private WebSocket endpoints use `LP_RPC_HEAD_WSS_URL_FILES` with the same file permissions and size limit. These files contain `ws://` or `wss://` URLs. See [RPC operations](docs/RPC_OPERATIONS.md) for Quicknode setup and capability checks.
-
 One running `rhpools` process owns a database. Do not point concurrent processes at the same SQLite file, inspect it with write-capable tools while the service is running, or use a live database in tests. Stop the owner before backup or migration work and copy the database together with its SQLite sidecar files when they exist.
+
+The service writer builds `pools_token0_id_idx` and `pools_token1_id_idx` on its first upgraded start. On a copy of 482,847 live pool rows, the indexes took 2.42 and 1.78 seconds to build and occupied 51.84 and 51.89 MiB. The migration then drops the two superseded token-only indexes.
 
 ## Data interpretation
 
@@ -68,6 +86,7 @@ The versioned public API is described in [`docs/PUBLIC_API.md`](docs/PUBLIC_API.
 ## Repository map
 
 - `src/rhpools/lp_server.py` — installed `rhpools` CLI, process lifecycle, HTTP, static assets, and route boundaries
+- `src/rhpools/lp_gate.py`, `lp_gate_siwe.py`, `lp_gate_ws.py`, `lp_gate_cli.py` — holder gate: owner-signed policy, balance oracle, SIWE sign-in, one credential type, keyed streams, `rhpools-gate` CLI
 - `src/rhpools/lp_chain.py` — side-effect-free chain ID and reviewed public deployment registry
 - `src/rhpools/lp_rpc.py` — runtime RPC source selection and capability handling
 - `src/rhpools/lp_market_protocols.py` — protocol decoding and pool identity rules

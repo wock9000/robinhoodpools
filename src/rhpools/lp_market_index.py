@@ -40,6 +40,10 @@ from .lp_market_protocols import (
     V4_MODIFY_LIQUIDITY_TOPIC,
     V4_PROTOCOL_FEE_UPDATED_TOPIC,
     V4_SWAP_TOPIC,
+    MODIFY_LIQUIDITY_SELECTOR,
+    SWAP_SELECTOR,
+    ProtocolDecodeError,
+    _walk_trace,
     decode_gas_record,
     decode_logs,
     decode_position_state_results,
@@ -60,6 +64,10 @@ MAX_LOGS_PER_RESPONSE = 10_000
 LIVE_MIN_CHUNK = 1
 LIVE_INITIAL_CHUNK = 256
 LIVE_MAX_CHUNK = 2_048
+# Dense live intervals are committed at a whole-block boundary near this log
+# target. Fetches may be larger; their untouched suffix is retried from the
+# durable cursor instead of extending one non-preemptible writer transaction.
+LIVE_MAX_STORE_LOGS = 2_000
 HISTORY_MIN_CHUNK = 1
 HISTORY_INITIAL_CHUNK = 8
 HISTORY_MAX_CHUNK = 32_768
@@ -67,18 +75,18 @@ HISTORY_MAX_CHUNK = 32_768
 # Background history uses a shorter writer target so financial lanes can run.
 MAX_INTERVAL_STORE_SECONDS = 2.0
 HISTORY_MAX_INTERVAL_STORE_SECONDS = 2.0
-# An archive source (the local node) has no page quota, so the archive chunk is
-# sized by events per transaction: raw inserts cost per event, and a 10k-event
-# transaction stays inside the writer page cache; larger ones spill and slow down.
+# Archive fetches may span large ranges, but their durable commits use the same
+# bounded log budget as provider history. Density estimates alone cannot bound
+# a newly encountered dense interval's non-preemptible writer transaction.
 ARCHIVE_MAX_CHUNK = 262_144
-ARCHIVE_TARGET_EVENTS = 10_000
+HISTORY_MAX_STORE_LOGS = 2_000
 ARCHIVE_MAX_STORE_SECONDS = 4.0
 ARCHIVE_PAGE_LOGS = MAX_LOGS_PER_RESPONSE * 4 // 5
 ARCHIVE_FETCH_WORKERS = 8
-# The archive lane yields the writer to live catch-up only for real debt, not
-# for the one-batch jitter of a live worker trailing a moving tip.
+# Keep canonical data within the live UI's two-second ingestion budget.
+# Bulk writers resume between catch-up bursts, rather than borrowing 30s.
 RECENT_CATCHUP_YIELD_CHUNKS = 4
-RECENT_CATCHUP_YIELD_SECONDS = 30.0
+RECENT_CATCHUP_YIELD_SECONDS = 2.0
 ENRICH_BATCH = 8
 ENRICHMENT_CAPABILITY_RECHECK_S = 300.0
 ENRICH_TRACE_BATCH = 8
@@ -86,6 +94,8 @@ ENRICH_WORKERS = 8
 ENRICH_TRACE_WORKERS = 4
 ENRICH_REGULAR_INFLIGHT_LIMIT = ENRICH_BATCH * ENRICH_WORKERS
 ENRICH_TRACE_INFLIGHT_LIMIT = ENRICH_TRACE_BATCH * ENRICH_TRACE_WORKERS
+ENRICH_MAX_PUBLICATION_BATCH = ENRICH_REGULAR_INFLIGHT_LIMIT + ENRICH_TRACE_INFLIGHT_LIMIT
+ENRICH_MAX_STORE_SECONDS = 2.0
 REPROJECT_MIN_BATCH = 1
 REPROJECT_INITIAL_BATCH = 128
 REPROJECT_MAX_BATCH = 2048
@@ -105,10 +115,13 @@ DEFERRED_POOL_IDENTITY_CANDIDATES_PER_POOL = 4
 DEFERRED_POOL_IDENTITY_SEED_BUSY_S = 1.0
 DEFERRED_POOL_IDENTITY_PUBLICATION_SECONDS = 0.2
 LEGACY_V4_IDENTITY_BATCH = 4
+LEGACY_V4_IDENTITY_RESCAN_SECONDS = 300
 DEFERRED_POOL_IDENTITY_PREFIX = "pool_identity_pending:"
 # A bounded snapshot wave shares exact-block state roots through Multicall3.
 # The shared endpoint gate, not a fixed lane quota, limits archive traffic.
 BALANCE_BATCH = 64
+BALANCE_MAX_BATCH = 128
+BALANCE_MAX_STORE_SECONDS = 1.0
 BALANCE_OF_SELECTOR = "0x70a08231"
 SYMBOL_SELECTOR = "0x95d89b41"
 DECIMALS_SELECTOR = "0x313ce567"
@@ -127,6 +140,11 @@ WAL_RESET_RETRY_S = 60.0
 DEFAULT_WAL_BACKLOG_PAUSE_BYTES = 512 * 1024 ** 2
 DEFAULT_WAL_BACKLOG_RESUME_BYTES = 128 * 1024 ** 2
 DEFAULT_WAL_RESET_BYTES = 1024 ** 3
+# Above this WAL size every writer, including live, waits at its next
+# transaction boundary until a drained TRUNCATE succeeds. A fresh process must
+# read the whole WAL before its first statement, so an unbounded WAL turns
+# every restart into hours of recovery that a watchdog then interrupts.
+DEFAULT_WAL_HOLD_BYTES = 4 * 1024 ** 3
 DEFAULT_STORAGE_RECOVERY_BYTES = 1024 ** 3
 MAX_POOL_CACHE_ENTRIES = 16_384
 MAX_POOL_MISSES = 8_192
@@ -146,6 +164,15 @@ CURRENT_UNKNOWN_POOL_MAX = 8
 CURRENT_POOL_RESOLUTION_MAX_PENDING = 32
 CURRENT_POOL_FAILURE_CACHE_SIZE = 2048
 CURRENT_POOL_FAILURE_RETRY_S = 30.0
+CURRENT_POOL_TRACE_BUDGET_SECONDS = 1.0
+V4_DONATE_SELECTOR = "0x" + keccak(
+    text="donate((address,address,uint24,int24,address),uint256,uint256,bytes)"
+).hex()[:8]
+V4_POOL_KEY_TRACE_SELECTORS = frozenset({
+    MODIFY_LIQUIDITY_SELECTOR,
+    SWAP_SELECTOR,
+    V4_DONATE_SELECTOR,
+})
 CURRENT_TRUSTED_EVENT_EMITTERS = frozenset({
     POOL_MANAGER, SLIPSTREAM_FACTORY, *V2_FACTORIES, *V3_FACTORIES,
     *NFT_MANAGER_ADDRESSES,
@@ -173,6 +200,10 @@ class RpcError(RuntimeError):
             "too many", "more than", "response size", "query returned", "block range",
             "limit exceeded", "request entity too large", "timeout",
         ))
+
+
+class _UnresolvedPoolIdentity(RuntimeError):
+    """Canonical evidence did not contain the requested pool identity."""
 
 
 class _InvalidTokenMetadata(ValueError):
@@ -366,6 +397,7 @@ class MarketIndexer:
         wal_backlog_pause_bytes: int = DEFAULT_WAL_BACKLOG_PAUSE_BYTES,
         wal_backlog_resume_bytes: int = DEFAULT_WAL_BACKLOG_RESUME_BYTES,
         wal_reset_bytes: int = DEFAULT_WAL_RESET_BYTES,
+        wal_hold_bytes: int = DEFAULT_WAL_HOLD_BYTES,
         maintenance_interval_s: float = WAL_CHECKPOINT_INTERVAL_S,
         current_observer: Any | None = None,
         accounting_projector: Callable[[], bool] | None = None,
@@ -385,6 +417,10 @@ class MarketIndexer:
             raise ValueError("WAL resume threshold must not exceed pause threshold")
         if wal_reset_bytes < 0:
             raise ValueError("wal_reset_bytes must be nonnegative")
+        if wal_hold_bytes < 0:
+            raise ValueError("wal_hold_bytes must be nonnegative")
+        if wal_hold_bytes and wal_hold_bytes < wal_reset_bytes:
+            raise ValueError("wal_hold_bytes must not be below wal_reset_bytes")
         if maintenance_interval_s <= 0:
             raise ValueError("maintenance_interval_s must be positive")
         self.store = store
@@ -410,6 +446,7 @@ class MarketIndexer:
         self.wal_backlog_pause_bytes = int(wal_backlog_pause_bytes)
         self.wal_backlog_resume_bytes = int(wal_backlog_resume_bytes)
         self.wal_reset_bytes = int(wal_reset_bytes)
+        self.wal_hold_bytes = int(wal_hold_bytes)
         self.maintenance_interval_s = float(maintenance_interval_s)
         self._rpc_factory = rpc if callable(rpc) and not hasattr(rpc, "call") else None
         self._owns_clients = rpc is None or (callable(rpc) and not hasattr(rpc, "call"))
@@ -465,7 +502,10 @@ class MarketIndexer:
         for lane, client in self._clients.items():
             if not callable(getattr(client, "call", None)):
                 raise TypeError(f"injected {lane} RPC must implement call(method, params)")
-        self._runtime_status: dict[str, Any] = {}
+        self._runtime_status: dict[str, Any] = {
+            "pool_resolution_failure_count": 0,
+            "pool_resolution_failures": {},
+        }
         self._runtime_persist_at = 0.0
         self._runtime_error_signature: tuple[tuple[str, str], ...] = ()
         self._runtime_persistence_error: str | None = None
@@ -490,6 +530,9 @@ class MarketIndexer:
         # concurrent archive pages so each stays under the response cap.
         self._history_density = 8.0
         self._reproject_batch = REPROJECT_INITIAL_BATCH
+        self._history_projection_resume_at: int | None = None
+        self._enrichment_publication_batch = max(ENRICH_BATCH, ENRICH_TRACE_BATCH)
+        self._balance_batch = BALANCE_BATCH
         self._metadata_failures: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._threads: list[threading.Thread] = []
         self._bulk_paused = False
@@ -502,11 +545,12 @@ class MarketIndexer:
         self._wal_checkpoint_stall_observations = 0
         self._wal_last_progress_at: float | None = None
         self._wal_reset_after = 0.0
+        self._wal_held_since: float | None = None
         self._process_lock_fd: int | None = None
         self._history_verified = False
         self._enrichment_verified = False
         self._balance_verified = False
-        self._publish_after_id = ""
+        self._publish_after_rowid = 0
         self._market_epoch = int(self.store.status().get("epoch", 0))
         self._enrichment_local = threading.local()
         self._enrichment_jobs: dict[
@@ -523,14 +567,22 @@ class MarketIndexer:
         self._observed_blocks: OrderedDict[int, tuple[dict[str, Any], list[dict[str, Any]]]] = OrderedDict()
         self._observed_last_header: dict[str, Any] | None = None
         self._current_receipt_lock = threading.Lock()
+        self._pool_resolution_status_lock = threading.Lock()
         self._current_receipt_pending: set[tuple[str, str]] = set()
         self._current_receipt_cache: OrderedDict[tuple[str, str], bool] = OrderedDict()
         self._current_pool_pending: set[str] = set()
         self._current_pool_failures: OrderedDict[tuple[str, str], float] = OrderedDict()
         self._current_pool_failure_details: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._activity_stale_blocks_discarded = 0
+        self._activity_backlog_error_active = False
+        self._activity_backlog_recovery_through: int | None = None
+        self._activity_backpressure_disconnects = 0
         self._deferred_identity_seed_at = 0.0
-        self._deferred_identity_seed_after_id = ""
+        self._deferred_identity_seed_after_id = 0
+        self._deferred_identity_seed_kind = 0
+        self._deferred_identity_seed_through_id: int | None = None
         self._legacy_v4_identity_after_id = ""
+        self._legacy_v4_identity_next_scan = 0.0
         self._legacy_v4_identity_complete = False
         self._deferred_identity_seed_complete = False
         self._pool_identity_replay_turn = 0
@@ -1140,6 +1192,19 @@ class MarketIndexer:
             and _lower(log.get("address")) == POOL_MANAGER
         ]
         events = decode_logs(manager_logs, {}, {number: header})
+        # Initialize proves the full PoolKey without moving currencies or
+        # populating PositionManager.poolKeys. Reuse its hash-checked decoder.
+        for event in events:
+            if event.get("kind") != "create" or event.get("pool_id") != pool_id:
+                continue
+            pool = self._normalize_pool(event["data"]["pool"])
+            if pool is not None:
+                pool.update({
+                    "_observed_block": number,
+                    "_observed_hash": block_hash,
+                    "_observation_basis": "PoolManager.Initialize:full_poolKey_hash",
+                })
+                return pool
         if not any(_lower(event.get("pool_id")) == pool_id for event in events):
             return None
         encoded = transaction.get("input")
@@ -1187,6 +1252,89 @@ class MarketIndexer:
                         return pool
         return None
 
+    @staticmethod
+    def _current_v4_trace_key(encoded: str) -> bytes:
+        try:
+            raw = bytes.fromhex(encoded[2:])
+        except ValueError as exc:
+            raise RpcError("PoolKey manager trace input is not hex") from exc
+        if len(raw) < 4 + 160:
+            raise RpcError("PoolKey manager trace input is truncated")
+        return raw[4:4 + 160]
+
+    def _current_v4_trace_pools(
+        self, trace: Mapping[str, Any], number: int, block_hash: str,
+        requested_pool_ids: Sequence[str],
+    ) -> dict[str, dict[str, Any]]:
+        pools: dict[str, dict[str, Any]] = {}
+        remaining = set(requested_pool_ids)
+        deadline = time.monotonic() + CURRENT_POOL_TRACE_BUDGET_SECONDS
+        try:
+            for _path, frame, failed in _walk_trace(trace):
+                if time.monotonic() >= deadline:
+                    raise RpcError(
+                        "PoolKey call trace exceeded its processing deadline"
+                    )
+                encoded = frame.get("input")
+                selector = (
+                    encoded[:10].lower() if isinstance(encoded, str) else ""
+                )
+                if (
+                    failed
+                    or _lower(frame.get("to")) != POOL_MANAGER
+                    or selector not in V4_POOL_KEY_TRACE_SELECTORS
+                ):
+                    continue
+                if (
+                    not encoded.startswith("0x")
+                    or len(encoded) > 2 + CURRENT_POOL_INPUT_MAX_BYTES * 2
+                ):
+                    raise RpcError(
+                        "PoolKey manager trace input exceeds the bounded size"
+                    )
+                raw = self._current_v4_trace_key(encoded)
+                pool_id = "0x" + keccak(raw).hex()
+                if pool_id not in remaining:
+                    continue
+                pool = self._current_v4_pool_key(
+                    pool_id, raw, number, block_hash,
+                    source="trace.PoolKey",
+                )
+                if pool is None:
+                    raise RpcError(
+                        "PoolKey manager trace failed full-key verification"
+                    )
+                pools[pool_id] = pool
+                remaining.remove(pool_id)
+                # Later unrelated calls cannot invalidate a verified PoolKey.
+                # Stop only after every requested identity has been recovered.
+                if not remaining:
+                    return pools
+        except ProtocolDecodeError as exc:
+            raise RpcError(f"PoolKey call trace is malformed: {exc}") from exc
+        except RecursionError as exc:
+            raise RpcError("PoolKey call trace exceeds the bounded depth") from exc
+        return pools
+
+    @staticmethod
+    def _pool_key_rpc_mapping(
+        value: Any, description: str,
+    ) -> tuple[Mapping[str, Any] | None, Exception | None]:
+        if isinstance(value, Exception):
+            if isinstance(value, (RpcError, CanonicalConflict)):
+                return None, value
+            return None, RpcError(f"{description} RPC failed: {value}")
+        if isinstance(value, Mapping):
+            if "error" not in value:
+                return value, None
+            error = value["error"]
+            code = error.get("code") if isinstance(error, Mapping) else None
+            return None, RpcError(f"{description} RPC failed: {error}", code=code)
+        if value is None:
+            return None, RpcError(f"{description} was not found")
+        return None, RpcError(f"{description} RPC returned an invalid result")
+
+
     def _resolve_current_v4_inputs(
         self,
         candidates: Mapping[
@@ -1222,28 +1370,47 @@ class MarketIndexer:
             (pool_id, tx_hashes[pool_id])
             for pool_id in sorted(tx_hashes)
         ]
+        transaction_hashes = list(dict.fromkeys(
+            tx_hash for _pool_id, tx_hash in ordered
+        ))
         client = self._clients["pool"]
-        fetched = self._rpc_state_batch([
+        # These are receipt-capability methods even though they retain the
+        # latency-sensitive pool-resolution request context. Do not pass them
+        # through the state-read batching path: per-item transport failures and
+        # null results are evidence needed to diagnose an unresolved identity.
+        fetched = self._batch_results_on(client, [
             (method, [tx_hash])
-            for _pool_id, tx_hash in ordered
+            for tx_hash in transaction_hashes
             for method in (
                 "eth_getTransactionByHash", "eth_getTransactionReceipt",
             )
-        ], client)
-        errors: dict[str, Exception] = {}
+        ])
+        fetched_by_hash = {
+            tx_hash: tuple(fetched[offset * 2:(offset + 1) * 2])
+            for offset, tx_hash in enumerate(transaction_hashes)
+        }
+        errors: dict[str, Exception] = {
+            pool_id: _UnresolvedPoolIdentity(
+                "PoolKey transaction hash is unavailable"
+            )
+            for pool_id in missing
+        }
         prepared: dict[str, dict[str, Any]] = {}
-        for offset, (pool_id, tx_hash) in enumerate(ordered):
-            transaction, receipt = fetched[offset * 2:(offset + 1) * 2]
-            if not isinstance(transaction, Mapping) or "error" in transaction:
-                errors[pool_id] = RpcError(
-                    "PoolKey transaction is temporarily unavailable"
-                )
+        for pool_id, tx_hash in ordered:
+            raw_transaction, raw_receipt = fetched_by_hash[tx_hash]
+            transaction, transaction_error = self._pool_key_rpc_mapping(
+                raw_transaction, "PoolKey transaction",
+            )
+            if transaction_error is not None:
+                errors[pool_id] = transaction_error
                 continue
-            if not isinstance(receipt, Mapping) or "error" in receipt:
-                errors[pool_id] = RpcError(
-                    "PoolKey transaction receipt is temporarily unavailable"
-                )
+            receipt, receipt_error = self._pool_key_rpc_mapping(
+                raw_receipt, "PoolKey transaction receipt",
+            )
+            if receipt_error is not None:
+                errors[pool_id] = receipt_error
                 continue
+            assert transaction is not None and receipt is not None
             try:
                 number = _hex_int(
                     transaction.get("blockNumber"), "PoolKey transaction block",
@@ -1269,21 +1436,23 @@ class MarketIndexer:
                     entry["cached"] = True
                 else:
                     header_ids.append(pool_id)
-        headers = self._rpc_state_batch([
+        headers = self._batch_results_on(client, [
             ("eth_getBlockByNumber", [hex(prepared[pool_id]["number"]), False])
             for pool_id in header_ids
-        ], client)
+        ])
         for pool_id, raw_header in zip(header_ids, headers):
             entry = prepared[pool_id]
-            if not isinstance(raw_header, Mapping) or "error" in raw_header:
-                errors[pool_id] = RpcError(
-                    "PoolKey transaction header is temporarily unavailable"
-                )
+            parsed_header, header_error = self._pool_key_rpc_mapping(
+                raw_header, "PoolKey transaction header",
+            )
+            if header_error is not None:
+                errors[pool_id] = header_error
                 continue
+            assert parsed_header is not None
             try:
                 matches = (
-                    _number(raw_header) == entry["number"]
-                    and _lower(raw_header.get("hash")) == entry["block_hash"]
+                    _number(parsed_header) == entry["number"]
+                    and _lower(parsed_header.get("hash")) == entry["block_hash"]
                 )
             except RpcError as exc:
                 errors[pool_id] = exc
@@ -1293,7 +1462,7 @@ class MarketIndexer:
                     "PoolKey transaction is no longer canonical"
                 )
                 continue
-            entry["header"] = raw_header
+            entry["header"] = parsed_header
             entry["cached"] = False
 
         decoded: dict[str, dict[str, Any] | None] = {}
@@ -1312,42 +1481,206 @@ class MarketIndexer:
             if entry["cached"]:
                 with self._feed_condition:
                     current = self._observed_blocks.get(entry["number"])
-                    if (
-                        current is None
-                        or current[0]["hash"] != entry["block_hash"]
-                    ):
+                    if current is None:
+                        recheck_ids.append(pool_id)
+                    elif current[0]["hash"] != entry["block_hash"]:
                         errors[pool_id] = CanonicalConflict(
                             "PoolKey transaction changed during identity recovery"
                         )
             else:
                 recheck_ids.append(pool_id)
 
-        canonical = self._rpc_state_batch([
+        canonical = self._batch_results_on(client, [
             ("eth_getBlockByNumber", [hex(prepared[pool_id]["number"]), False])
             for pool_id in recheck_ids
-        ], client)
+        ])
         for pool_id, raw_header in zip(recheck_ids, canonical):
             entry = prepared[pool_id]
+            parsed_header, header_error = self._pool_key_rpc_mapping(
+                raw_header, "PoolKey canonical header recheck",
+            )
+            if header_error is not None:
+                errors[pool_id] = header_error
+                continue
+            assert parsed_header is not None
             try:
                 matches = (
-                    isinstance(raw_header, Mapping)
-                    and "error" not in raw_header
-                    and _number(raw_header) == entry["number"]
-                    and _lower(raw_header.get("hash")) == entry["block_hash"]
+                    _number(parsed_header) == entry["number"]
+                    and _lower(parsed_header.get("hash")) == entry["block_hash"]
                 )
-            except RpcError:
-                matches = False
+            except RpcError as exc:
+                errors[pool_id] = exc
+                continue
             if not matches:
                 errors[pool_id] = CanonicalConflict(
                     "PoolKey transaction changed during identity recovery"
                 )
 
+        trace_ids = [
+            pool_id for pool_id, pool in decoded.items()
+            if pool is None and pool_id not in errors
+        ]
+        traced_ids: list[str] = []
+        if trace_ids:
+            pools_by_transaction: dict[str, list[str]] = {}
+            for pool_id in trace_ids:
+                pools_by_transaction.setdefault(
+                    prepared[pool_id]["tx_hash"], [],
+                ).append(pool_id)
+            trace_hashes = list(pools_by_transaction)
+            trace_results = self._batch_results_on(self._worker_rpc(), [
+                ("debug_traceTransaction", [
+                    tx_hash, {
+                        "tracer": "callTracer",
+                        "tracerConfig": {"withLog": True},
+                        "reexec": 0,
+                        "timeout": "5s",
+                    },
+                ])
+                for tx_hash in trace_hashes
+            ])
+            for tx_hash, raw_trace in zip(trace_hashes, trace_results):
+                pool_ids = pools_by_transaction[tx_hash]
+                trace, trace_error = self._pool_key_rpc_mapping(
+                    raw_trace, "PoolKey call trace",
+                )
+                if trace_error is not None:
+                    code = (
+                        trace_error.code
+                        if isinstance(trace_error, RpcError) else None
+                    )
+                    error = RpcError(
+                        f"PoolKey trace fallback failed after top-level "
+                        f"calldata miss: {trace_error}",
+                        code=code,
+                    )
+                    errors.update({pool_id: error for pool_id in pool_ids})
+                    continue
+                assert trace is not None
+                entry = prepared[pool_ids[0]]
+                try:
+                    trace_pools = self._current_v4_trace_pools(
+                        trace, entry["number"], entry["block_hash"],
+                        pool_ids,
+                    )
+                except Exception as exc:
+                    errors.update({pool_id: exc for pool_id in pool_ids})
+                    continue
+                for pool_id in pool_ids:
+                    pool = trace_pools.get(pool_id)
+                    if pool is None:
+                        errors[pool_id] = _UnresolvedPoolIdentity(
+                            "canonical transaction input and successful "
+                            "PoolManager trace did not contain the PoolKey"
+                        )
+                        continue
+                    decoded[pool_id] = pool
+                    traced_ids.append(pool_id)
+
+        trace_recheck_ids: list[str] = []
+        for pool_id in traced_ids:
+            entry = prepared[pool_id]
+            if entry["cached"]:
+                with self._feed_condition:
+                    current = self._observed_blocks.get(entry["number"])
+                    if current is None:
+                        trace_recheck_ids.append(pool_id)
+                    elif current[0]["hash"] != entry["block_hash"]:
+                        errors[pool_id] = CanonicalConflict(
+                            "PoolKey transaction changed during trace recovery"
+                        )
+            else:
+                trace_recheck_ids.append(pool_id)
+        trace_canonical = self._batch_results_on(client, [
+            ("eth_getBlockByNumber", [hex(prepared[pool_id]["number"]), False])
+            for pool_id in trace_recheck_ids
+        ])
+        for pool_id, raw_header in zip(trace_recheck_ids, trace_canonical):
+            entry = prepared[pool_id]
+            parsed_header, header_error = self._pool_key_rpc_mapping(
+                raw_header, "PoolKey trace canonical header recheck",
+            )
+            if header_error is not None:
+                errors[pool_id] = header_error
+                continue
+            assert parsed_header is not None
+            try:
+                matches = (
+                    _number(parsed_header) == entry["number"]
+                    and _lower(parsed_header.get("hash")) == entry["block_hash"]
+                )
+            except RpcError as exc:
+                errors[pool_id] = exc
+                continue
+            if not matches:
+                errors[pool_id] = CanonicalConflict(
+                    "PoolKey transaction changed during trace recovery"
+                )
+
+        for pool_id, pool in decoded.items():
+            if pool is None and pool_id not in errors:
+                errors[pool_id] = _UnresolvedPoolIdentity(
+                    "canonical transaction input and trace did not contain "
+                    "the PoolKey"
+                )
         resolved = {
             pool_id: pool
             for pool_id, pool in decoded.items()
             if pool is not None and pool_id not in errors
         }
         return resolved, errors
+
+    @staticmethod
+    def _pool_key_resolution_error(
+        getter_error: Exception | None, fallback_error: Exception | None,
+    ) -> Exception | None:
+        if fallback_error is None:
+            return getter_error
+        if getter_error is None or isinstance(
+            fallback_error, CanonicalConflict,
+        ):
+            return fallback_error
+        if isinstance(getter_error, CanonicalConflict):
+            return getter_error
+        code = (
+            getter_error.code if isinstance(getter_error, RpcError)
+            else fallback_error.code if isinstance(fallback_error, RpcError)
+            else None
+        )
+        return RpcError(
+            f"PoolKey getter failed: {getter_error}; "
+            f"transaction fallback failed: {fallback_error}",
+            code=code,
+        )
+
+    def _publish_pool_resolution_failures(self) -> None:
+        with self._pool_resolution_status_lock:
+            with self._current_receipt_lock:
+                snapshot = {
+                    key: dict(value)
+                    for key, value in self._current_pool_failure_details.items()
+                }
+            first_failure = next(iter(sorted(snapshot.items())), None)
+            self._set_runtime(
+                "pool_resolution",
+                error=(
+                    None if first_failure is None
+                    else f"{first_failure[0]}: {first_failure[1]['error']}"
+                ),
+                pool_resolution_failure_count=len(snapshot),
+                pool_resolution_failures=snapshot,
+            )
+
+    def _clear_current_pool_resolution_failure(self, pool_id: str) -> None:
+        pool_id = _lower(pool_id)
+        with self._current_receipt_lock:
+            changed = self._current_pool_failure_details.pop(pool_id, None) is not None
+            for key in tuple(self._current_pool_failures):
+                if key[0] == pool_id:
+                    self._current_pool_failures.pop(key, None)
+                    changed = True
+        if changed:
+            self._publish_pool_resolution_failures()
 
     def _resolve_current_pool(
         self, address: str, number: int, block_hash: str,
@@ -1362,16 +1695,18 @@ class MarketIndexer:
                 getter_pools, getter_failures = self._resolve_current_v4_pools(
                     [address], number, block_hash,
                 )
-                if address in getter_failures:
-                    raise getter_failures[address]
                 pool = getter_pools.get(address)
                 if pool is None:
                     recovered, failures = self._resolve_current_v4_inputs({
                         address: (logs, transaction_hash),
                     })
-                    if address in failures:
-                        raise failures[address]
                     pool = recovered.get(address)
+                    if pool is None:
+                        error = self._pool_key_resolution_error(
+                            getter_failures.get(address), failures.get(address),
+                        )
+                        if error is not None:
+                            raise error
             else:
                 pools = self._pools_for_logs(logs)
                 self._resolve_unknown_pools("pool", logs, pools)
@@ -1408,6 +1743,8 @@ class MarketIndexer:
                     classification = (
                         "canonical_conflict"
                         if isinstance(resolution_error, CanonicalConflict)
+                        else "unresolved"
+                        if isinstance(resolution_error, _UnresolvedPoolIdentity)
                         else "rpc"
                         if isinstance(resolution_error, RpcError)
                         else "internal"
@@ -1439,34 +1776,22 @@ class MarketIndexer:
                         > CURRENT_POOL_FAILURE_CACHE_SIZE
                     ):
                         self._current_pool_failures.popitem(last=False)
-                failure_details = {
-                    key: dict(value)
-                    for key, value in self._current_pool_failure_details.items()
-                }
             if resolution_error is not None or resolved:
-                first_failure = next(iter(sorted(failure_details.items())), None)
-                self._set_runtime(
-                    "pool_resolution",
-                    error=(
-                        None if first_failure is None
-                        else f"{first_failure[0]}: {first_failure[1]['error']}"
-                    ),
-                    pool_resolution_failures=failure_details,
-                )
+                self._publish_pool_resolution_failures()
 
     def _publish_late_current_logs(
         self, number: int, logs: Sequence[Mapping[str, Any]], *, source: str,
-    ) -> None:
+    ) -> int | None:
         with self._feed_condition:
             cached = self._observed_blocks.get(int(number))
         if cached is None:
-            return
+            return None
         header, _ = cached
         selected = [dict(log) for log in logs
                     if not log.get("removed")
                     and _lower(log.get("blockHash")) == header["hash"]]
         if not selected:
-            return
+            return 0
         events = self._decode_current(selected, {int(number): header})
         fresh: list[dict[str, Any]] = []
         enriched: list[dict[str, Any]] = []
@@ -1497,16 +1822,22 @@ class MarketIndexer:
         self._schedule_current_pool_resolutions(
             header, selected, source=source,
         )
+        return len(selected)
 
-    def _publish_enriched_current_events(
-        self, events: Sequence[Mapping[str, Any]], *, source: str,
+    def _publish_canonical_current_events(
+        self,
+        events: Sequence[Mapping[str, Any]],
+        *,
+        source: str,
+        add_unseen: bool = False,
     ) -> None:
-        """Replace still-current provisional rows with canonical enrichment."""
+        """Merge canonical durable facts into matching current-branch rows."""
         by_block: dict[int, list[Mapping[str, Any]]] = {}
         for event in events:
             by_block.setdefault(int(event["block_number"]), []).append(event)
         for number, block_events in sorted(by_block.items()):
             updates: list[dict[str, Any]] = []
+            fresh: list[dict[str, Any]] = []
             with self._feed_condition:
                 current = self._observed_blocks.get(number)
                 if current is None:
@@ -1516,22 +1847,38 @@ class MarketIndexer:
                     self._current_event_key(event): index
                     for index, event in enumerate(current_events)
                 }
-                for enriched in sorted(block_events, key=lambda row: (
+                for canonical in sorted(block_events, key=lambda row: (
                     int(row["tx_index"]), int(row["log_index"]),
                 )):
-                    if _lower(enriched.get("block_hash")) != header["hash"]:
+                    if _lower(canonical.get("block_hash")) != header["hash"]:
                         continue
-                    index = indexes.get(self._current_event_key(enriched))
+                    key = self._current_event_key(canonical)
+                    index = indexes.get(key)
                     if index is None:
+                        if not add_unseen:
+                            continue
+                        merged = dict(canonical)
+                        current_events.append(merged)
+                        indexes[key] = len(current_events) - 1
+                        fresh.append(dict(merged))
+                        updates.append(dict(merged))
                         continue
                     previous = current_events[index]
-                    merged = {**previous, **dict(enriched)}
+                    merged = dict(previous)
+                    for field, value in canonical.items():
+                        if value is not None or merged.get(field) is None:
+                            merged[field] = value
                     previous_data = previous.get("data")
-                    enriched_data = enriched.get("data")
-                    merged["data"] = {
-                        **(dict(previous_data) if isinstance(previous_data, Mapping) else {}),
-                        **(dict(enriched_data) if isinstance(enriched_data, Mapping) else {}),
-                    }
+                    canonical_data = canonical.get("data")
+                    merged_data = (
+                        dict(previous_data)
+                        if isinstance(previous_data, Mapping) else {}
+                    )
+                    if isinstance(canonical_data, Mapping):
+                        for field, value in canonical_data.items():
+                            if value is not None or merged_data.get(field) is None:
+                                merged_data[field] = value
+                    merged["data"] = merged_data
                     if (
                         merged.get("position_key") is not None
                         and merged.get("cashflow0") is not None
@@ -1542,12 +1889,16 @@ class MarketIndexer:
                         merged["flow_qualification"] = (
                             merged.get("accounting_basis") or "event_exact"
                         )
+                    if merged == previous:
+                        continue
                     current_events[index] = merged
                     updates.append(dict(merged))
                 if updates:
                     self._emit_current_activity(
                         header, updates, source=source, late=True,
                     )
+            if fresh:
+                self._schedule_current_receipts(header, fresh, source=source)
 
     def _publish_current_block(
         self, header: Mapping[str, Any], logs: Sequence[Mapping[str, Any]],
@@ -1755,6 +2106,135 @@ class MarketIndexer:
                     continue
                 receive(json.loads(raw_message))
 
+    def _flush_activity_logs(
+        self,
+        pending_logs: dict[int, list[dict[str, Any]]],
+        first_seen: dict[int, float],
+        newest_log_block: int,
+        *,
+        source: str,
+        force: bool = False,
+    ) -> None:
+        now = time.monotonic()
+        with self._feed_condition:
+            observed = (
+                _number(self._observed_last_header)
+                if self._observed_last_header else -1
+            )
+            cached_numbers = set(self._observed_blocks)
+        ready = sorted(
+            number for number in pending_logs
+            if number in cached_numbers and (
+                number < newest_log_block
+                or force and observed >= number
+                or observed == number
+                and now - first_seen.get(number, now) >= HEAD_LOG_GRACE_S
+            )
+        )
+        published = False
+        publish_error: Exception | None = None
+        for number in ready:
+            try:
+                consumed = self._publish_late_current_logs(
+                    number, pending_logs[number], source=source,
+                )
+            except Exception as exc:
+                publish_error = exc
+                continue
+            if consumed is None:
+                continue
+            pending_logs.pop(number, None)
+            first_seen.pop(number, None)
+            published = published or consumed > 0
+
+        health_error: BaseException | str | None = publish_error
+        health_values: dict[str, Any] = {"activity_feed_source": source}
+        backlog_error = False
+        discarded: list[int] = []
+        if len(pending_logs) > HEAD_REPLAY_LIMIT * 2:
+            live = self.store.cursor("live") or {}
+            try:
+                durable_through = int(live.get("block_number", -1))
+            except (TypeError, ValueError):
+                durable_through = -1
+            discard_needed = len(pending_logs) - HEAD_REPLAY_LIMIT
+            discarded = [
+                number for number in sorted(pending_logs)
+                if number not in cached_numbers and number <= durable_through
+            ][:discard_needed]
+            for number in discarded:
+                pending_logs.pop(number, None)
+                first_seen.pop(number, None)
+            if discarded:
+                self._activity_stale_blocks_discarded += len(discarded)
+                health_values.update({
+                    "activity_feed_stale_blocks_discarded":
+                        self._activity_stale_blocks_discarded,
+                    "activity_feed_last_discard": {
+                        "count": len(discarded),
+                        "from": discarded[0],
+                        "to": discarded[-1],
+                        "durable_through": durable_through,
+                        "at": time.time(),
+                    },
+                })
+            if len(pending_logs) > HEAD_REPLAY_LIMIT * 2:
+                # Only an uncovered queue beyond the bound needs recovery.
+                # Dropping durable duplicates leaves the normal pending tail.
+                backlog_through = max(pending_logs)
+                prior_through = self._activity_backlog_recovery_through
+                self._activity_backlog_recovery_through = max(
+                    backlog_through,
+                    prior_through if prior_through is not None else backlog_through,
+                )
+                backlog_error = True
+                health_error = (
+                    f"activity backlog has {len(pending_logs)} blocks outside "
+                    f"canonical replay while durable live index is at "
+                    f"{durable_through}"
+                )
+        backpressure = len(pending_logs) > HEAD_REPLAY_LIMIT * 2
+        if backpressure:
+            self._activity_backpressure_disconnects += 1
+            health_values.update({
+                "activity_feed_backpressure_disconnects":
+                    self._activity_backpressure_disconnects,
+                "activity_feed_recovery_through":
+                    self._activity_backlog_recovery_through,
+            })
+        if health_error is not None:
+            if backlog_error:
+                self._activity_backlog_error_active = True
+            self._set_runtime(
+                "activity_feed", error=health_error, **health_values,
+            )
+            if backpressure:
+                raise RpcError(str(health_error))
+            return
+        recovery_ready = False
+        if self._activity_backlog_error_active:
+            live = self.store.cursor("live") or {}
+            try:
+                durable_through = int(live.get("block_number", -1))
+            except (TypeError, ValueError):
+                durable_through = -1
+            target = self._activity_backlog_recovery_through
+            recovery_ready = target is None or durable_through >= target
+        if recovery_ready:
+            self._activity_backlog_error_active = False
+            self._activity_backlog_recovery_through = None
+        if recovery_ready or published and not self._activity_backlog_error_active:
+            health_values["activity_feed_recovered_at"] = time.time()
+        if recovery_ready or published or discarded:
+            with self._status_lock:
+                active_error = (
+                    self._errors.get("activity_feed")
+                    if self._activity_backlog_error_active else None
+                )
+            self._set_runtime(
+                "activity_feed", error=active_error, **health_values,
+            )
+
     def _activity_wss_once(
         self, url: str, *, session_deadline: float | None = None,
     ) -> None:
@@ -1806,8 +2286,14 @@ class MarketIndexer:
                     f"activity log subscriptions incomplete "
                     f"({accepted}/{len(specifications)} accepted)"
                 )
+            with self._status_lock:
+                active_backlog_error = (
+                    self._errors.get("activity_feed")
+                    if self._activity_backlog_error_active else None
+                )
             self._set_runtime(
-                "activity_feed", activity_feed_source=source,
+                "activity_feed", error=active_backlog_error,
+                activity_feed_source=source,
                 activity_feed_subscriptions=accepted,
             )
             pending_logs: dict[int, list[dict[str, Any]]] = {}
@@ -1829,40 +2315,10 @@ class MarketIndexer:
                 newest_log_block = max(newest_log_block, number)
 
             def flush_ready(force: bool = False) -> None:
-                now = time.monotonic()
-                with self._feed_condition:
-                    observed = (
-                        _number(self._observed_last_header)
-                        if self._observed_last_header else -1
-                    )
-                    cached_numbers = set(self._observed_blocks)
-                ready = sorted(
-                    number for number in pending_logs
-                    if number in cached_numbers and (
-                        number < newest_log_block
-                        or force and observed >= number
-                        or observed == number
-                        and now - first_seen.get(number, now) >= HEAD_LOG_GRACE_S
-                    )
+                self._flush_activity_logs(
+                    pending_logs, first_seen, newest_log_block,
+                    source=source, force=force,
                 )
-                for number in ready:
-                    logs = pending_logs.pop(number)
-                    first_seen.pop(number, None)
-                    try:
-                        self._publish_late_current_logs(number, logs, source=source)
-                    except Exception as exc:
-                        self._set_runtime("activity_feed", error=exc,
-                                          activity_feed_source=source)
-                if len(pending_logs) > HEAD_REPLAY_LIMIT * 2:
-                    discarded = sorted(pending_logs)[:-HEAD_REPLAY_LIMIT]
-                    for number in discarded:
-                        pending_logs.pop(number, None)
-                        first_seen.pop(number, None)
-                    self._set_runtime(
-                        "activity_feed",
-                        error=f"discarded {len(discarded)} stale activity blocks",
-                        activity_feed_source=source,
-                    )
 
             for message in early:
                 receive(message)
@@ -2159,13 +2615,13 @@ class MarketIndexer:
         if not persist:
             return
         try:
-            if not self.store.lock.acquire(blocking=False):
-                return
-            try:
+            with self.store.transaction(
+                priority="background", blocking=False,
+            ) as connection:
+                if connection is None:
+                    return
                 # Operational health must never queue behind ledger writers.
                 self.store.update_status(**payload)
-            finally:
-                self.store.lock.release()
         except Exception as exc:
             with self._status_lock:
                 self._runtime_persistence_error = str(exc)[:1000]
@@ -2271,6 +2727,12 @@ class MarketIndexer:
         self._sync_market_reorg()
         return head_number, head, time.monotonic() - started
 
+    def _run_with_writer_priority(
+        self, priority: str, worker: Callable[[], None],
+    ) -> None:
+        with self.store.writer_priority(priority):
+            worker()
+
     def start(self, *, deferred: bool = False) -> "MarketIndexer":
         with self._lifecycle_lock:
             if self._started:
@@ -2303,6 +2765,7 @@ class MarketIndexer:
                     storage_assessment_pending=True,
                     storage_pause_reasons=["assessment_pending"],
                     storage_pressure={
+                        "wal_ceiling": False,
                         "wal_backlog": False,
                         "free_space": False,
                         "disk_measurement": False,
@@ -2316,6 +2779,8 @@ class MarketIndexer:
                     wal_backlog_pause_bytes=self.wal_backlog_pause_bytes,
                     wal_backlog_resume_bytes=self.wal_backlog_resume_bytes,
                     wal_reset_bytes=self.wal_reset_bytes,
+                    wal_hold_bytes=self.wal_hold_bytes,
+                    wal_held_seconds=None,
                     wal_checkpoint_interval_seconds=self.maintenance_interval_s,
                     bulk_work="paused",
                 )
@@ -2325,44 +2790,61 @@ class MarketIndexer:
                         name="lp-market-maintenance",
                         daemon=True,
                     ),
-                    threading.Thread(target=self._live_run, name="lp-market-live", daemon=True),
-                    threading.Thread(target=self._history_run, name="lp-market-history", daemon=True),
                     threading.Thread(
-                        target=self._enrichment_run,
+                        target=self._run_with_writer_priority,
+                        args=("live", self._live_run),
+                        name="lp-market-live",
+                        daemon=True,
+                    ),
+                    threading.Thread(
+                        target=self._run_with_writer_priority,
+                        args=("background", self._history_run),
+                        name="lp-market-history",
+                        daemon=True,
+                    ),
+                    threading.Thread(
+                        target=self._run_with_writer_priority,
+                        args=("background", self._enrichment_run),
                         name="lp-market-enrichment",
                         daemon=True,
                     ),
                     threading.Thread(
-                        target=self._projection_run,
+                        target=self._run_with_writer_priority,
+                        args=("background", self._projection_run),
                         name="lp-market-projection",
                         daemon=True,
                     ),
                     threading.Thread(
-                        target=self._metadata_run,
+                        target=self._run_with_writer_priority,
+                        args=("background", self._metadata_run),
                         name="lp-market-metadata",
                         daemon=True,
                     ),
                     threading.Thread(
-                        target=self._source_repair_run,
+                        target=self._run_with_writer_priority,
+                        args=("background", self._source_repair_run),
                         name="lp-market-repair",
                         daemon=True,
                     ),
                 ]
                 if self.v3_balances:
                     self._threads.append(threading.Thread(
-                        target=self._balance_run,
+                        target=self._run_with_writer_priority,
+                        args=("background", self._balance_run),
                         name="lp-market-balances",
                         daemon=True,
                     ))
                 if self._accounting_projector is not None:
                     self._threads.append(threading.Thread(
-                        target=self._accounting_run,
+                        target=self._run_with_writer_priority,
+                        args=("background", self._accounting_run),
                         name="lp-market-accounting",
                         daemon=True,
                     ))
                 if self._accounting_recovery is not None:
                     self._threads.append(threading.Thread(
-                        target=self._accounting_recovery_run,
+                        target=self._run_with_writer_priority,
+                        args=("background", self._accounting_recovery_run),
                         name="lp-market-identity-recovery",
                         daemon=True,
                     ))
@@ -2927,10 +3409,14 @@ class MarketIndexer:
 
         # A complete stored identity is a read-only lookup and must not queue
         # behind the long projection transaction of either scanner lane. Only
-        # legacy normalization repair needs the writer lock. Re-read under that
-        # lock so a concurrent repair cannot be overwritten with stale data.
-        with self.store.lock:
-            current = self.store.pool(candidate) or dict(stored)
+        # legacy normalization repair needs a writer transaction. Re-read
+        # inside it so a concurrent repair cannot be overwritten with stale
+        # data, and verify the uncommitted repair on that same connection.
+        with self.store.transaction() as connection:
+            current_row = connection.execute(
+                "SELECT * FROM pools WHERE id=?", (candidate,),
+            ).fetchone()
+            current = dict(current_row) if current_row is not None else dict(stored)
             decoded = self._stored_pool(current)
             normalized = self._normalize_pool(decoded)
             if normalized is None or not self._identity_verified(normalized):
@@ -2939,11 +3425,15 @@ class MarketIndexer:
                 # Publish only after the complete, hash-qualified identity is
                 # durable. This is independent of a chain checkpoint: the
                 # missing legacy word is proven by the pool id itself.
-                self.store.upsert_pools([normalized])
-                durable = self.store.pool(candidate)
-                if durable is None:
+                self.store.upsert_pools([normalized], conn=connection)
+                durable_row = connection.execute(
+                    "SELECT * FROM pools WHERE id=?", (candidate,),
+                ).fetchone()
+                if durable_row is None:
                     raise RuntimeError("recovered V4 pool persistence was lost")
-                normalized = self._normalize_pool(self._stored_pool(durable))
+                normalized = self._normalize_pool(
+                    self._stored_pool(dict(durable_row)),
+                )
                 if normalized is None or not self._identity_verified(normalized):
                     raise RuntimeError("persisted V4 pool identity is not canonical")
             return normalized
@@ -3402,7 +3892,8 @@ class MarketIndexer:
 
     def _queue_deferred_pool_identities(
         self, connection: Any, logs: list[dict[str, Any]],
-        events: Iterable[Mapping[str, Any]],
+        events: Iterable[Mapping[str, Any]], *,
+        per_pool_limit: int = DEFERRED_POOL_IDENTITY_CANDIDATES_PER_POOL,
     ) -> int:
         pools = self._verified_pools_for_deferred_logs(logs, events)
         unknown = self._unresolved_pool_identities(logs, pools)
@@ -3417,7 +3908,7 @@ class MarketIndexer:
                 for identity in self._pool_identity_candidates(log).intersection(unknown)
                 if tx_hash in assigned.get(identity, set())
                 or len(assigned.get(identity, set()))
-                < DEFERRED_POOL_IDENTITY_CANDIDATES_PER_POOL
+                < per_pool_limit
             }
             if not identities:
                 continue
@@ -3574,58 +4065,56 @@ class MarketIndexer:
             or now < self._deferred_identity_seed_at
         ):
             return 0
-        pool_rows = self.store.read().execute(
-            "SELECT DISTINCT pool_id FROM events INDEXED BY events_pool_time_idx "
-            "WHERE pool_id>? AND protocol='v4' "
-            "AND kind IN ('add','remove','collect') "
-            "ORDER BY pool_id LIMIT ?",
+        if self._deferred_identity_seed_through_id is None:
+            self._deferred_identity_seed_through_id = int(
+                self.store.read().execute("SELECT COALESCE(MAX(id),0) FROM events").fetchone()[0]
+            )
+        kinds = ("add", "remove", "collect")
+        rows = self.store.read().execute(
+            "SELECT e.*,p.last_error AS enrichment_error "
+            "FROM events e INDEXED BY events_kind_id_idx "
+            "LEFT JOIN pending_enrichment p ON p.tx_hash=e.tx_hash "
+            "WHERE e.kind=? AND e.id>? AND e.id<=? ORDER BY e.id LIMIT ?",
             (
+                kinds[self._deferred_identity_seed_kind],
                 self._deferred_identity_seed_after_id,
+                self._deferred_identity_seed_through_id,
                 DEFERRED_POOL_IDENTITY_RPC_BATCH,
             ),
         ).fetchall()
-        if not pool_rows:
-            self._deferred_identity_seed_complete = True
+        if not rows:
+            self._deferred_identity_seed_kind += 1
+            self._deferred_identity_seed_after_id = 0
+            self._deferred_identity_seed_complete = (
+                self._deferred_identity_seed_kind == len(kinds)
+            )
             return 0
-        next_after = _lower(pool_rows[-1]["pool_id"])
         logs: list[dict[str, Any]] = []
-        reader = self.store.read()
-        for pool_row in pool_rows:
-            pool_id = _lower(pool_row["pool_id"])
-            stored = self.store.pool(pool_id)
-            if stored is not None and self._identity_verified(stored):
+        verified: dict[str, bool] = {}
+        for row in rows:
+            if row["protocol"] != "v4":
                 continue
-            rows = reader.execute(
-                "SELECT e.*,p.last_error AS enrichment_error FROM events e "
-                "LEFT JOIN pending_enrichment p ON p.tx_hash=e.tx_hash "
-                "WHERE e.pool_id=? AND e.protocol='v4' "
-                "AND e.kind IN ('add','remove','collect') "
-                "ORDER BY e.timestamp DESC,e.id DESC LIMIT ?",
-                (
-                    pool_id,
-                    DEFERRED_POOL_IDENTITY_CANDIDATES_PER_POOL,
-                ),
-            ).fetchall()
-            for row in rows:
-                # Check only this canonical candidate's job, not every
-                # serialized error payload in the global receipt backlog.
-                pending = self._pool_identity_marker(row["enrichment_error"])
-                if pending is not None and pool_id in pending["addresses"]:
-                    continue
-                log = self._stored_v4_modify_log(dict(row))
-                if log is not None:
-                    logs.append(log)
+            pool_id = _lower(row["pool_id"])
+            if pool_id not in verified:
+                stored = self.store.pool(pool_id)
+                verified[pool_id] = stored is not None and self._identity_verified(stored)
+            if verified[pool_id]:
+                continue
+            pending = self._pool_identity_marker(row["enrichment_error"])
+            if pending is not None and pool_id in pending["addresses"]:
+                continue
+            log = self._stored_v4_modify_log(dict(row))
+            if log is not None:
+                logs.append(log)
         if logs:
             with self.store.transaction() as connection:
                 queued = self._queue_deferred_pool_identities(
-                    connection, logs, (),
+                    connection, logs, (), per_pool_limit=DEFERRED_POOL_IDENTITY_RPC_BATCH,
                 )
         else:
             queued = 0
-        self._deferred_identity_seed_after_id = next_after
-        self._deferred_identity_seed_at = (
-            now + DEFERRED_POOL_IDENTITY_SEED_BUSY_S
-        )
+        self._deferred_identity_seed_after_id = int(rows[-1]["id"])
+        self._deferred_identity_seed_at = now + DEFERRED_POOL_IDENTITY_SEED_BUSY_S
         return queued
 
 
@@ -3932,6 +4421,7 @@ class MarketIndexer:
                 address for address in selected_network if len(address) == 66
             }
             if v4_ids:
+                getter_failures: dict[str, Exception] = {}
                 try:
                     getter_pools, getter_failures = (
                         self._resolve_current_v4_pools(
@@ -3939,46 +4429,49 @@ class MarketIndexer:
                         )
                     )
                     resolved_v4.update(getter_pools)
-                    transient.update(getter_failures)
-                    if getter_failures:
-                        batch_error = getter_failures[
-                            sorted(getter_failures)[0]
-                        ]
                 except Exception as exc:
-                    batch_error = exc
-                    transient.update({pool_id: exc for pool_id in v4_ids})
-                else:
-                    fallback_ids = (
-                        v4_ids.difference(resolved_v4).difference(transient)
+                    getter_failures = {pool_id: exc for pool_id in v4_ids}
+                fallback_ids = v4_ids.difference(resolved_v4)
+                fallback_candidates = {
+                    pool_id: (
+                        tuple(
+                            log for log in combined_logs.values()
+                            if pool_id in self._pool_identity_candidates(log)
+                        ),
+                        "",
                     )
-                    fallback_candidates = {
-                        pool_id: (
-                            tuple(
-                                log for log in combined_logs.values()
-                                if pool_id in self._pool_identity_candidates(log)
-                            ),
-                            "",
-                        )
-                        for pool_id in fallback_ids
+                    for pool_id in fallback_ids
+                }
+                fallback_failures: dict[str, Exception] = {}
+                try:
+                    recovered, fallback_failures = (
+                        self._resolve_current_v4_inputs(fallback_candidates)
+                    )
+                except Exception as exc:
+                    fallback_failures = {
+                        pool_id: exc for pool_id in fallback_ids
                     }
-                    try:
-                        recovered, failures = self._resolve_current_v4_inputs(
-                            fallback_candidates,
+                else:
+                    resolved_v4.update(recovered)
+                combined_failures = {
+                    pool_id: error
+                    for pool_id in fallback_ids.difference(resolved_v4)
+                    if (
+                        error := self._pool_key_resolution_error(
+                            getter_failures.get(pool_id),
+                            fallback_failures.get(pool_id),
                         )
-                    except Exception as exc:
-                        batch_error = exc
-                        transient.update({
-                            pool_id: exc for pool_id in fallback_ids
-                        })
-                    else:
-                        resolved_v4.update(recovered)
-                        transient.update(failures)
-                        if failures:
-                            batch_error = failures[sorted(failures)[0]]
-                        processed_network.update(
-                            fallback_ids.difference(failures)
-                        )
-                    processed_network.update(resolved_v4)
+                    ) is not None
+                }
+                transient.update(combined_failures)
+                if combined_failures:
+                    batch_error = combined_failures[
+                        sorted(combined_failures)[0]
+                    ]
+                processed_network.update(
+                    fallback_ids.difference(combined_failures)
+                )
+                processed_network.update(resolved_v4)
 
             legacy_ids = {
                 address for address in selected_network if len(address) == 42
@@ -4166,6 +4659,9 @@ class MarketIndexer:
                 resolved_count = sum(
                     pool is not None for pool in resolved_pools.values()
                 )
+                for pool_id, pool in resolved_pools.items():
+                    if pool is not None:
+                        self._clear_current_pool_resolution_failure(pool_id)
                 replayed += resolved_count
                 rejected += len(processed) - resolved_count
                 publish = list(inserted)
@@ -4323,7 +4819,7 @@ class MarketIndexer:
                     register(dict(pool))
                     published.add(pool_id)
         except BaseException:
-            self._publish_after_id = ""
+            self._publish_after_rowid = 0
             raise
 
     @staticmethod
@@ -4341,25 +4837,46 @@ class MarketIndexer:
         register = getattr(self.market, "register_index_pool", None)
         if not callable(register):
             return False
+        # A rowid walk reads the table sequentially. Ordering by the text
+        # primary key would fetch every row through its index at random.
         rows = self.store.read().execute(
-            "SELECT * FROM pools WHERE id>? ORDER BY id LIMIT ?",
-            (self._publish_after_id, max(1, min(int(limit), 1024))),
+            "SELECT rowid AS pool_rowid,* FROM pools WHERE rowid>? "
+            "ORDER BY rowid LIMIT ?",
+            (self._publish_after_rowid, max(1, min(int(limit), 1024))),
         ).fetchall()
         if not rows:
             return False
         for row in rows:
             pool = self._stored_pool(row)
+            pool.pop("pool_rowid", None)
             if self._identity_verified(pool):
                 register(pool)
-        self._publish_after_id = str(rows[-1]["id"])
+        self._publish_after_rowid = int(rows[-1]["pool_rowid"])
         return True
+
+    def publish_stored_pools(self, *, seconds: float | None = None) -> bool:
+        """Publish stored pools page by page; True once the walk is complete.
+
+        The metadata lane resumes the same walk after ``seconds`` elapse, so a
+        caller may bound its synchronous share of a large catalog.
+        """
+        deadline = None if seconds is None else time.monotonic() + max(0.0, seconds)
+        while not self._stop.is_set():
+            if not self._publish_stored_pool_page():
+                return True
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
+        return False
 
 
     def _recover_legacy_v4_pool_page(
         self, limit: int = LEGACY_V4_IDENTITY_BATCH,
     ) -> bool:
-        if self._legacy_v4_identity_complete:
+        if time.monotonic() < self._legacy_v4_identity_next_scan:
             return False
+        if self._legacy_v4_identity_complete:
+            self._legacy_v4_identity_after_id = ""
+            self._legacy_v4_identity_complete = False
         rows = self.store.read().execute(
             "SELECT * FROM pools WHERE protocol='v4' AND tick_spacing IS NULL "
             "AND id>? ORDER BY id LIMIT ?",
@@ -4370,6 +4887,7 @@ class MarketIndexer:
         ).fetchall()
         if not rows:
             self._legacy_v4_identity_complete = True
+            self._legacy_v4_identity_next_scan = time.monotonic() + LEGACY_V4_IDENTITY_RESCAN_SECONDS
             return False
         recovered: list[dict[str, Any]] = []
         for row in rows:
@@ -4422,17 +4940,36 @@ class MarketIndexer:
         if lane == "live":
             return (
                 LIVE_MIN_CHUNK, LIVE_MAX_CHUNK, MAX_INTERVAL_STORE_SECONDS,
-                MAX_LOGS_PER_RESPONSE * 4 // 5,
+                LIVE_MAX_STORE_LOGS,
             )
         if self._archive_source(lane):
             return (
                 HISTORY_MIN_CHUNK, ARCHIVE_MAX_CHUNK, ARCHIVE_MAX_STORE_SECONDS,
-                ARCHIVE_TARGET_EVENTS,
+                HISTORY_MAX_STORE_LOGS,
             )
         return (
             HISTORY_MIN_CHUNK, HISTORY_MAX_CHUNK,
-            HISTORY_MAX_INTERVAL_STORE_SECONDS, MAX_LOGS_PER_RESPONSE * 4 // 5,
+            HISTORY_MAX_INTERVAL_STORE_SECONDS, HISTORY_MAX_STORE_LOGS,
         )
+
+    @staticmethod
+    def _store_log_boundary(
+        logs: Sequence[Mapping[str, Any]], limit: int, *, newest_first: bool = False,
+    ) -> int:
+        counts: dict[int, int] = {}
+        for log in logs:
+            number = _hex_int(log.get("blockNumber"), "log block number")
+            counts[number] = counts.get(number, 0) + 1
+        kept = 0
+        boundary = -1
+        for number in sorted(counts, reverse=newest_first):
+            count = counts[number]
+            # A block is indivisible, including a first block over the budget.
+            if kept and kept + count > limit:
+                break
+            boundary = number
+            kept += count
+        return boundary
 
     def _resize_after_success(
         self, lane: str, log_count: int, store_seconds: float = 0.0,
@@ -4462,9 +4999,8 @@ class MarketIndexer:
             else:
                 self._history_chunk = resized
             return
-        # Size by measured density toward the lane's log target: 20% headroom
-        # under a provider's 10k-log page, or the archive's per-transaction
-        # event budget where pages are fetched concurrently.
+        # Fetch toward the lane's whole-block commit budget. A density jump is
+        # bounded again after fetching, before taking the writer.
         count = max(0, int(log_count))
         if count == 0:
             candidate = current * 2
@@ -4655,6 +5191,10 @@ class MarketIndexer:
                 - int(cursor.get("timestamp") or _timestamp(head)),
             ),
         )
+        # History is not the only observer of recent debt. Refresh scheduling
+        # from the head/cursor pair the live worker just measured so a blocked
+        # history writer cannot leave this state stale for subsequent work.
+        self._recent_catchup_pending()
         # A lagging provider is not reorg evidence. Keep the durable cursor and
         # retry until this provider can show either the cursor or its child.
         if head_number < current_number:
@@ -4688,6 +5228,22 @@ class MarketIndexer:
             fetch_started = time.monotonic()
             logs, headers = self._fetch_interval("live", start, end)
             fetch_s = time.monotonic() - fetch_started
+            fetched_end = end
+            fetched_logs = len(logs)
+            if fetched_logs > LIVE_MAX_STORE_LOGS:
+                end = min(end, self._store_log_boundary(logs, LIVE_MAX_STORE_LOGS))
+                logs = [
+                    log for log in logs
+                    if _hex_int(log.get("blockNumber"), "log block number") <= end
+                ]
+                headers = {
+                    number: header for number, header in headers.items()
+                    if start <= number <= end
+                }
+                self._live_chunk = max(
+                    LIVE_MIN_CHUNK,
+                    min(self._live_chunk, end - start + 1),
+                )
             if headers[start]["parentHash"] != current_hash:
                 self._recover_reorg(
                     cursor,
@@ -4702,7 +5258,7 @@ class MarketIndexer:
             decode_s = time.monotonic() - decode_started
             interval_end = headers[end]
             store_started = time.monotonic()
-            with self.store.transaction() as connection:
+            with self.store.transaction(priority="live") as connection:
                 store_acquired = time.monotonic()
                 store_wait_s = store_acquired - store_started
                 deferred_identities = self._queue_deferred_pool_identities(
@@ -4741,6 +5297,12 @@ class MarketIndexer:
             self._publish_event_pools(inserted)
         except Exception as exc:
             self._set_runtime("metadata", error=exc)
+        with self._reorg_lock:
+            _, publish_epoch = self.store.cursor_state("live")
+            if publish_epoch == cursor_epoch:
+                self._publish_canonical_current_events(
+                    inserted, source="live-index", add_unseen=True,
+                )
         postprocess_s = time.monotonic() - postprocess_started
         self._resize_after_success(
             "live", len(logs), store_s, end - start + 1,
@@ -4773,6 +5335,9 @@ class MarketIndexer:
             "store_seconds": round(store_s, 6),
             "store_lock_wait_seconds": round(store_wait_s, 6),
             "postprocess_seconds": round(postprocess_s, 6),
+            "fetched_to_block": fetched_end,
+            "fetched_logs": fetched_logs,
+            "store_log_cap": LIVE_MAX_STORE_LOGS,
             "blocks_per_second": round(blocks / max(elapsed, 1e-9), 3),
             "events_per_second": round(
                 len(events) / max(elapsed, 1e-9), 3,
@@ -4789,35 +5354,95 @@ class MarketIndexer:
             lag_s=max(0, _timestamp(head) - _timestamp(interval_end)),
             live_scan=scan,
         )
+        self._recent_catchup_pending()
         return True
 
     def _bulk_work_allowed(self) -> bool:
         with self._status_lock:
             return not self._bulk_paused
 
+    def _engage_wal_hold(self, wal_bytes: int, now: float) -> None:
+        if (
+            not self.wal_hold_bytes
+            or self._wal_held_since is not None
+            or wal_bytes < self.wal_hold_bytes
+        ):
+            return
+        self._wal_held_since = now
+        with self._status_lock:
+            self._bulk_paused = True
+            assessment_pending = self._storage_assessment_pending
+            wal_paused = self._wal_backlog_paused
+            disk_paused = self._disk_free_paused
+        # Publish before closing admission: the passive backfill that follows
+        # can run for hours and the status write itself needs a writer turn.
+        self._set_runtime(
+            "storage",
+            error=(
+                f"writers held: WAL {wal_bytes} bytes at or above the "
+                f"{self.wal_hold_bytes} byte ceiling; every writer waits for "
+                "a drained reset"
+            ),
+            storage_observed_at=time.time(),
+            storage_paused=True,
+            storage_pause_reasons=(
+                ["wal_ceiling", "assessment_pending"]
+                if assessment_pending else ["wal_ceiling"]
+            ),
+            storage_pressure={
+                "wal_ceiling": True,
+                "wal_backlog": wal_paused,
+                "free_space": disk_paused,
+                "disk_measurement": False,
+                "checkpoint_error": False,
+                "reader_drain": False,
+                "assessment_pending": assessment_pending,
+            },
+            wal_hold_bytes=self.wal_hold_bytes,
+            wal_held_seconds=0.0,
+            bulk_work="paused",
+        )
+        self.store.hold_writers("wal_ceiling")
+        logger.warning(
+            "WAL %d bytes reached the %d byte ceiling; holding every "
+            "writer until a drained reset succeeds",
+            wal_bytes, self.wal_hold_bytes,
+        )
+
     def _storage_maintenance_once(self) -> None:
         started = time.monotonic()
+        # An inherited WAL can take hours to backfill. Stop writers adding to
+        # it before that passive pass, not after.
+        self._engage_wal_hold(self.store.wal_bytes(), started)
         passive = self.store.checkpoint("PASSIVE")
         if passive["busy"]:
             raise RuntimeError("another connection owns the WAL checkpoint")
         checkpoint = passive
         reset_mode: str | None = None
         now = time.monotonic()
-        if (
+        self._engage_wal_hold(checkpoint["wal_bytes"], now)
+        wal_held = self._wal_held_since is not None
+        drain_needed = bool(
+            wal_held
+            or checkpoint["reader_drain_pending"]
+            or (
+                self.wal_backlog_pause_bytes
+                and checkpoint["backlog_bytes"] >= self.wal_backlog_pause_bytes
+            )
+        )
+        if wal_held or (
             self.wal_reset_bytes
             and (
                 checkpoint["wal_bytes"] >= self.wal_reset_bytes
-                or checkpoint["reader_drain_pending"]
+                or drain_needed
             )
-            and now >= self._wal_reset_after
+            and (now >= self._wal_reset_after or drain_needed)
         ):
             reset = self.store.checkpoint(
                 "TRUNCATE",
-                drain_readers=bool(checkpoint["reader_drain_pending"])
-                or checkpoint["log_bytes"] >= self.wal_reset_bytes,
+                drain_readers=drain_needed or checkpoint["wal_bytes"] >= 2 * self.wal_reset_bytes,
             )
-            if not reset["busy"]:
-                self._wal_reset_after = now + WAL_RESET_RETRY_S
+            self._wal_reset_after = now + WAL_RESET_RETRY_S
             checkpoint = (
                 {
                     **reset,
@@ -4829,6 +5454,15 @@ class MarketIndexer:
                 if reset["busy"] else reset
             )
             reset_mode = "TRUNCATE"
+        held_since = self._wal_held_since
+        if held_since is not None and checkpoint["wal_bytes"] < self.wal_hold_bytes:
+            self._wal_held_since = None
+            wal_held = False
+            self.store.hold_writers(None)
+            logger.warning(
+                "WAL reset to %d bytes; writers resume after %.0fs held",
+                checkpoint["wal_bytes"], now - held_since,
+            )
 
         free: int | None = None
         disk_error: OSError | None = None
@@ -4904,6 +5538,8 @@ class MarketIndexer:
 
         reader_draining = bool(checkpoint["reader_drain_pending"])
         reasons = []
+        if wal_held:
+            reasons.append("wal_ceiling")
         if wal_paused:
             reasons.append("wal_backlog")
         if reader_draining:
@@ -4920,6 +5556,12 @@ class MarketIndexer:
             self._bulk_paused = paused
 
         details = []
+        if wal_held:
+            details.append(
+                f"WAL {checkpoint['wal_bytes']} bytes at or above the "
+                f"{self.wal_hold_bytes} byte ceiling; every writer waits for a "
+                f"drained reset ({now - (self._wal_held_since or now):.0f}s so far)"
+            )
         if wal_paused:
             if was_wal_paused:
                 details.append(
@@ -4965,12 +5607,16 @@ class MarketIndexer:
             checkpoint_status["passive"] = passive
         self._set_runtime(
             "storage",
-            error=("bulk work paused: " + "; ".join(details)) if paused else None,
+            error=(
+                ("writers held: " if wal_held else "bulk work paused: ")
+                + "; ".join(details)
+            ) if paused else None,
             storage_observed_at=observed_at,
             storage_paused=paused,
             storage_assessment_pending=False,
             storage_pause_reasons=reasons,
             storage_pressure={
+                "wal_ceiling": wal_held,
                 "wal_backlog": wal_paused,
                 "free_space": disk_paused and disk_error is None,
                 "disk_measurement": disk_error is not None,
@@ -4984,6 +5630,11 @@ class MarketIndexer:
             wal_backlog_pause_bytes=self.wal_backlog_pause_bytes,
             wal_backlog_resume_bytes=self.wal_backlog_resume_bytes,
             wal_reset_bytes=self.wal_reset_bytes,
+            wal_hold_bytes=self.wal_hold_bytes,
+            wal_held_seconds=(
+                None if self._wal_held_since is None
+                else round(now - self._wal_held_since, 3)
+            ),
             wal_checkpoint_interval_seconds=self.maintenance_interval_s,
             wal_checkpoint=checkpoint_status,
             bulk_work="paused" if paused else "running",
@@ -5012,14 +5663,16 @@ class MarketIndexer:
                 max(0, head_timestamp - int(cursor_timestamp))
                 if head_timestamp and cursor_timestamp is not None else None
             )
-            # The live worker normally trails a continuously advancing tip and
-            # its adaptive batch shrinks on any store hiccup. Reserve recent-gap
-            # priority for debt that is both several live batches deep and
-            # older than a real wall-clock window, so a one-batch stumble
-            # cannot pre-empt the archive's writer window every interval.
-            pending = lag > RECENT_CATCHUP_YIELD_CHUNKS * self._live_chunk and (
-                lag_seconds is None or lag_seconds > RECENT_CATCHUP_YIELD_SECONDS
-            )
+            # A block threshold tracks adaptive transaction capacity while the
+            # wall-clock threshold catches a large chunk whose block count
+            # would otherwise permit minutes of stale current data.
+            if lag_seconds is None:
+                pending = lag > self._live_chunk
+            else:
+                pending = (
+                    lag > RECENT_CATCHUP_YIELD_CHUNKS * self._live_chunk
+                    or lag_seconds > RECENT_CATCHUP_YIELD_SECONDS
+                )
             self._runtime_status.update({
                 "recent_catchup_priority": pending,
                 "recent_catchup_lag_blocks": lag,
@@ -5033,6 +5686,17 @@ class MarketIndexer:
             return False
         if not self._storage_allows_history():
             return False
+        projection_pending = int(self.store.status().get("pending_reprojection", 0))
+        if (
+            self._history_projection_resume_at is not None
+            and projection_pending > self._history_projection_resume_at
+        ):
+            self._set_runtime(
+                "history", history_wait_reason="projection_backlog",
+                history_projection_resume_at=self._history_projection_resume_at,
+            )
+            return False
+        self._set_runtime("history", history_wait_reason=None)
         started = time.monotonic()
         cursor, cursor_epoch = self.store.cursor_state("history")
         if not cursor or cursor.get("next_to") is None:
@@ -5088,6 +5752,35 @@ class MarketIndexer:
             if exc.range_too_large and self._shrink("history"):
                 return True
             raise
+        fetched_start = start
+        fetched_logs = len(logs)
+        if fetched_logs > HISTORY_MAX_STORE_LOGS:
+            start = max(start, self._store_log_boundary(
+                logs, HISTORY_MAX_STORE_LOGS, newest_first=True,
+            ))
+            logs = [
+                log for log in logs
+                if _hex_int(log.get("blockNumber"), "log block number") >= start
+            ]
+            headers = {
+                number: header for number, header in headers.items()
+                if start <= number <= end
+            }
+            self._history_chunk = max(
+                HISTORY_MIN_CHUNK, min(self._history_chunk, end - start + 1),
+            )
+            if start != fetched_start:
+                # Only the fetched boundaries were confirmed canonical. An
+                # interior event header may be archive-only; it must not
+                # become the history cursor hash that later reorg recovery
+                # trusts as an anchor.
+                canonical_start = self._block("history_header", start)
+                if canonical_start["hash"] != headers[start]["hash"]:
+                    raise RpcError(
+                        f"trimmed history start {start} header "
+                        f"{headers[start]['hash']} disagrees with canonical "
+                        f"header {canonical_start['hash']}"
+                    )
         # The live head can advance while archive RPC work is in flight. Do
         # not take the shared writer after that work creates recent live debt.
         if self._recent_catchup_pending():
@@ -5123,9 +5816,14 @@ class MarketIndexer:
         decode_s = time.monotonic() - decode_started
         complete = start <= target
         store_started = time.monotonic()
-        with self.store.transaction() as connection:
+        with self.store.transaction(priority="background") as connection:
             store_acquired = time.monotonic()
             store_wait_s = store_acquired - store_started
+            # Admission itself may wait behind an in-flight transaction. Do
+            # not publish this prepared archive interval if live debt became
+            # urgent during that wait.
+            if self._recent_catchup_pending():
+                return False
             deferred_identities = self._queue_deferred_pool_identities(
                 connection, logs, events,
             )
@@ -5141,6 +5839,10 @@ class MarketIndexer:
                     "complete": complete,
                     "has_coverage": True,
                 },
+            )
+        if inserted:
+            self._history_projection_resume_at = max(
+                REPROJECT_MAX_BATCH, projection_pending - len(inserted),
             )
         store_s = time.monotonic() - store_acquired
         publish_started = time.monotonic()
@@ -5171,6 +5873,9 @@ class MarketIndexer:
             "to_block": end,
             "blocks": blocks,
             "logs": len(logs),
+            "fetched_from_block": fetched_start,
+            "fetched_logs": fetched_logs,
+            "store_log_cap": HISTORY_MAX_STORE_LOGS,
             "decoded_events": len(events),
             "inserted_events": len(inserted),
             "deferred_pool_identity_transactions": deferred_identities,
@@ -5730,11 +6435,15 @@ class MarketIndexer:
             timeout=0.05,
             return_when=FIRST_COMPLETED,
         )
-        jobs = [
-            self._enrichment_jobs.pop(key)
-            for key, job in tuple(self._enrichment_jobs.items())
-            if job[1].done()
-        ]
+        completed = []
+        remaining = self._enrichment_publication_batch
+        for key, job in self._enrichment_jobs.items():
+            if job[1].done() and len(job[0]) <= remaining:
+                completed.append(key)
+                remaining -= len(job[0])
+                if not remaining:
+                    break
+        jobs = [self._enrichment_jobs.pop(key) for key in completed]
         if not jobs:
             return False
         started = min(job[2] for job in jobs)
@@ -5797,24 +6506,28 @@ class MarketIndexer:
         # provider while completed evidence waits behind live/history commits.
         self._fill_enrichment_jobs(completed_hashes)
         batch_error: Exception | None = None
-        for row, exc in failures:
-            attempts = int(row.get("attempts", 0)) + 1
-            if not self._mark_enrichment_failure(
-                row,
-                exc,
-                delay=(
-                    ENRICHMENT_CAPABILITY_RECHECK_S
-                    if self._trace_capability_error(exc)
-                    else min(300.0, 2.0 ** min(attempts, 8))
-                ),
-            ):
-                continue
-            batch_error = exc
-            self._set_runtime("enrichment", error=exc)
+        if failures:
+            with self.store.transaction():
+                for row, exc in failures:
+                    attempts = int(row.get("attempts", 0)) + 1
+                    if self._mark_enrichment_failure(
+                        row,
+                        exc,
+                        delay=(
+                            ENRICHMENT_CAPABILITY_RECHECK_S
+                            if self._trace_capability_error(exc)
+                            else min(300.0, 2.0 ** min(attempts, 8))
+                        ),
+                    ):
+                        batch_error = exc
+            if batch_error is not None:
+                self._set_runtime("enrichment", error=batch_error)
 
         if transactions:
+            _, enrichment_epoch = self.store.cursor_state("live")
             try:
                 with self.store.transaction() as conn:
+                    acquired = time.monotonic()
                     # Identity replay may have added canonical inputs while
                     # this receipt was in flight. Never clear that newer job.
                     ready = self._current_enrichment_jobs(conn, successful_rows)
@@ -5848,18 +6561,36 @@ class MarketIndexer:
                     supplied_anchor=True,
                 )
             except Exception as exc:
-                for row in successful_rows:
-                    attempts = int(row.get("attempts", 0)) + 1
-                    self._mark_enrichment_failure(
-                        row,
-                        exc,
-                        delay=min(300.0, 2.0 ** min(attempts, 8)),
-                    )
+                with self.store.transaction():
+                    for row in successful_rows:
+                        attempts = int(row.get("attempts", 0)) + 1
+                        self._mark_enrichment_failure(
+                            row,
+                            exc,
+                            delay=min(300.0, 2.0 ** min(attempts, 8)),
+                        )
                 self._set_runtime("enrichment", error=exc)
             else:
-                self._publish_enriched_current_events(
-                    events, source="enrichment",
+                store_seconds = max(time.monotonic() - acquired, 1e-9)
+                current = self._enrichment_publication_batch
+                target = max(
+                    max(ENRICH_BATCH, ENRICH_TRACE_BATCH),
+                    int(len(outcomes) * ENRICH_MAX_STORE_SECONDS / store_seconds)
+                    // max(ENRICH_BATCH, ENRICH_TRACE_BATCH)
+                    * max(ENRICH_BATCH, ENRICH_TRACE_BATCH),
                 )
+                if store_seconds > ENRICH_MAX_STORE_SECONDS:
+                    self._enrichment_publication_batch = min(current, target)
+                elif len(outcomes) >= current:
+                    self._enrichment_publication_batch = min(
+                        ENRICH_MAX_PUBLICATION_BATCH, current * 2, target,
+                    )
+                with self._reorg_lock:
+                    _, publish_epoch = self.store.cursor_state("live")
+                    if publish_epoch == enrichment_epoch:
+                        self._publish_canonical_current_events(
+                            events, source="enrichment",
+                        )
                 if batch_error is None:
                     self._set_runtime(
                         "enrichment",
@@ -5995,7 +6726,7 @@ class MarketIndexer:
                 try:
                     self._publish_token_pools(address, register)
                 except BaseException:
-                    self._publish_after_id = ""
+                    self._publish_after_rowid = 0
                     raise
         self._set_runtime(
             "metadata",
@@ -6089,7 +6820,7 @@ class MarketIndexer:
     def _balances_once(self) -> bool:
         if not self.v3_balances or self._stop.is_set():
             return False
-        pending = self.store.pending_v3_balances(BALANCE_BATCH)
+        pending = self.store.pending_v3_balances(self._balance_batch)
         if not pending:
             return False
         started = time.monotonic()
@@ -6129,13 +6860,22 @@ class MarketIndexer:
                     completed.append((row, balance0, balance1))
         saved = 0
         if completed:
-            outcomes = self.store.save_v3_balances([
-                (
-                    str(row["pool_id"]), int(row["block_number"]),
-                    str(row["block_hash"]), balance0, balance1,
-                )
-                for row, balance0, balance1 in completed
-            ])
+            with self.store.transaction():
+                acquired = time.monotonic()
+                outcomes = self.store.save_v3_balances([
+                    (
+                        str(row["pool_id"]), int(row["block_number"]),
+                        str(row["block_hash"]), balance0, balance1,
+                    )
+                    for row, balance0, balance1 in completed
+                ])
+            store_seconds = max(time.monotonic() - acquired, 1e-9)
+            current = self._balance_batch
+            target = max(1, int(len(completed) * BALANCE_MAX_STORE_SECONDS / store_seconds))
+            if store_seconds > BALANCE_MAX_STORE_SECONDS:
+                self._balance_batch = min(current, target)
+            elif len(completed) >= current:
+                self._balance_batch = min(BALANCE_MAX_BATCH, current * 2, target)
             for (row, _balance0, _balance1), outcome in zip(completed, outcomes):
                 if outcome is None:
                     saved += 1
@@ -6178,9 +6918,11 @@ class MarketIndexer:
                         wal_paused = self._wal_backlog_paused
                         disk_paused = self._disk_free_paused
                     reasons = (
-                        ["assessment_pending", "checkpoint_error"]
-                        if assessment_pending else ["checkpoint_error"]
+                        ["wal_ceiling"] if self._wal_held_since is not None else []
                     )
+                    if assessment_pending:
+                        reasons.append("assessment_pending")
+                    reasons.append("checkpoint_error")
                     self._set_runtime(
                         "storage",
                         error=f"WAL maintenance failed: {exc}",
@@ -6189,6 +6931,7 @@ class MarketIndexer:
                         storage_assessment_pending=assessment_pending,
                         storage_pause_reasons=reasons,
                         storage_pressure={
+                            "wal_ceiling": self._wal_held_since is not None,
                             "wal_backlog": wal_paused,
                             "free_space": disk_paused,
                             "disk_measurement": False,
@@ -6201,6 +6944,11 @@ class MarketIndexer:
                         wal_backlog_pause_bytes=self.wal_backlog_pause_bytes,
                         wal_backlog_resume_bytes=self.wal_backlog_resume_bytes,
                         wal_reset_bytes=self.wal_reset_bytes,
+                        wal_hold_bytes=self.wal_hold_bytes,
+                        wal_held_seconds=(
+                            None if self._wal_held_since is None
+                            else round(time.monotonic() - self._wal_held_since, 3)
+                        ),
                         wal_checkpoint_interval_seconds=self.maintenance_interval_s,
                         bulk_work="paused",
                     )
@@ -6211,6 +6959,9 @@ class MarketIndexer:
                     self._stop.wait(self.maintenance_interval_s)
         finally:
             self.store.cancel_checkpoint_drain()
+            if self._wal_held_since is not None:
+                self._wal_held_since = None
+                self.store.hold_writers(None)
 
     def _balance_run(self) -> None:
         backoff = 0.5
@@ -6301,17 +7052,23 @@ class MarketIndexer:
         backoff = 0.5
         verified = False
         while not self._stop.is_set():
-            if not self._initialized.wait(0.5):
+            # Restoring the stored catalog only reads pools; it must not wait
+            # for RPC bootstrap or a paused bulk lane.
+            try:
+                published = self._publish_stored_pool_page()
+            except Exception as exc:
+                self._set_runtime("metadata", error=exc)
+                self._stop.wait(backoff)
+                backoff = min(30.0, backoff * 2.0)
                 continue
-            if not self._bulk_work_allowed():
-                self._stop.wait(0.5)
+            if not self._initialized.is_set() or not self._bulk_work_allowed():
+                self._stop.wait(0.01 if published else 0.5)
                 continue
             try:
                 if not verified:
                     self._verify_chain("enrichment")
                     verified = True
-                worked = self._publish_stored_pool_page()
-                worked = self._resolve_deferred_pool_identities_once() or worked
+                worked = self._resolve_deferred_pool_identities_once() or published
                 worked = self._metadata_once() or worked
                 worked = self._recover_legacy_v4_pool_page() or worked
             except Exception as exc:
@@ -6404,6 +7161,7 @@ class MarketIndexer:
                     V3_BIRTH_REPAIR_PREFIXES,
                 )
                 worked = self._repair_v4_owners_once() or worked
+                worked = self.store.recover_missing_enrichment() or worked
                 if worked:
                     self._set_runtime("repair", latency=time.monotonic() - started)
             except Exception as exc:
