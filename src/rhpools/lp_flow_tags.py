@@ -253,6 +253,10 @@ def footprint_filters(block: int) -> list[tuple[str, list[Any]]]:
 
 
 def fetch_envelopes(rpc: Rpc, requests: Sequence[tuple[str, int, int]]) -> dict[str, TxEnvelope]:
+    if not requests:
+        return {}
+    head = int(rpc.batch([("eth_blockNumber", [])])[0], 16)
+    requests = [request for request in requests if int(request[1]) <= head]
     times = {tx_hash.lower(): int(block_time) for tx_hash, _block, block_time in requests}
     if not times:
         return {}

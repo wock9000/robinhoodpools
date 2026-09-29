@@ -62,17 +62,22 @@ class FakeRpc:
         self.logs = [log for f in fixtures for log in f["footprint_logs"]]
         self.launches = {f["pool"]["id"]: f["launches_word0_nonzero"] for f in fixtures}
         self.codes = {wallet: code for f in fixtures for wallet, code in f["wallet_codes"].items()}
+        self.head = max((int(f["tx"]["blockNumber"], 16) for f in fixtures), default=0)
         self.calls = []
 
     def batch(self, calls):
         results = []
         for method, params in calls:
             self.calls.append((method, params))
-            if method == "eth_getTransactionByHash":
+            if method == "eth_blockNumber":
+                results.append(hex(self.head))
+            elif method == "eth_getTransactionByHash":
                 results.append(self.transactions.get(params[0].lower()))
             elif method == "eth_getLogs":
                 query = params[0]
                 low, high = int(query["fromBlock"], 16), int(query["toBlock"], 16)
+                if high > self.head:
+                    raise RuntimeError('{"code": -32000, "message": "invalid block range params"}')
                 results.append([
                     log for log in self.logs
                     if low <= int(log["blockNumber"], 16) <= high and log_matches(log, query)
@@ -195,6 +200,16 @@ def test_fetch_envelopes_batches_transactions_and_footprint_logs():
     for data in fixtures:
         assert envelopes[data["tx"]["hash"].lower()] == envelope_of(data), data["name"]
     assert tags.fetch_envelopes(rpc, []) == {}
+
+
+def test_blocks_past_the_node_head_wait_instead_of_failing_the_batch():
+    fixtures = [fixture(name) for name in EXPECTED]
+    rpc = FakeRpc(fixtures)
+    requests = [(f["tx"]["hash"], int(f["tx"]["blockNumber"], 16), f["block_time"]) for f in fixtures]
+    ahead = ("0x" + "ab" * 32, rpc.head + 3, fixtures[0]["block_time"] + 6)
+    envelopes = tags.fetch_envelopes(rpc, [*requests, ahead])
+    assert set(envelopes) == {f["tx"]["hash"].lower() for f in fixtures}
+    assert tags.fetch_envelopes(rpc, [ahead]) == {}
 
 
 def test_pons_registry_reads_the_hook_once_per_pool(tmp_path):

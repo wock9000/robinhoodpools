@@ -39,3 +39,6 @@ ts	phase	decision	why	evidence	result
 2026-09-28T06:48:06Z	C	Grace semantics changed	Grace let one balance keep many wallets entitled	grace only on oracle failure; fresh below-threshold read ends access	owner decision pending
 2026-09-28T06:48:06Z	C	CI golden failure root cause	Server header carried the exact Python version	fixed Server header "rhpools"; comparator ignores it	CI green on 9e8b629
 2026-09-28T06:48:06Z	C	Node log search limited to ~11 days	nitro --execution.rpc.log-history default 9,400,000 blocks	day -10 0.01s, day -14 timeout	needs node restart; owner decision pending
+2026-09-28T17:24:05Z	C	Pools pane 503s	c18eedb/1754f2c/d953076 query rewrite; page sorts fees/flow/created hit 60 s interrupts	reverted; accounting == 1b00978	all four tabs 0.3-0.6 s live
+2026-09-28T17:24:05Z	C	LP WALLETS fees/PnL empty	owner rollup stale 75 h: stale-key scan 44.7 s under 15 s ledger deadline, build discarded every 10 min	ledger read uses rollup deadline; regression test	build 576 published; 24h rows 50/50 with fees
+2026-09-28T17:24:05Z	C	Logo	RH.Pools logo header 14 px, favicon/touch icons, tunnel v10	5b06760	live
