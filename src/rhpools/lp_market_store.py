@@ -964,6 +964,16 @@ class MarketStore:
         return connection is not None and connection.in_transaction
 
     @contextlib.contextmanager
+    def patient_reads(self, seconds: float) -> Iterator[None]:
+        """Give this thread's unbounded snapshots a longer deadline."""
+        previous = getattr(self._local, "patient_seconds", None)
+        self._local.patient_seconds = float(seconds)
+        try:
+            yield
+        finally:
+            self._local.patient_seconds = previous
+
+    @contextlib.contextmanager
     def reader_snapshot(
         self, seconds: float | None = None,
     ) -> Iterator[sqlite3.Connection]:
@@ -988,6 +998,8 @@ class MarketStore:
                 raise MarketStoreError("market store is closed")
             snapshot_drain_generation = self._reader_drain_generation
             self._active_reader_snapshots += 1
+        if seconds is None:
+            seconds = getattr(self._local, "patient_seconds", None)
         deadline = time.monotonic() + (
             _READER_SNAPSHOT_SECONDS
             if seconds is None

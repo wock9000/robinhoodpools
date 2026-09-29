@@ -1137,3 +1137,38 @@ def test_writer_owned_work_does_not_wait_behind_reader_drain(tmp_path):
         if writer.ident is not None:
             writer.join(2)
         store.close()
+
+
+def test_patient_reads_extend_only_this_threads_snapshot_deadline(tmp_path, monkeypatch):
+    store = MarketStore(tmp_path / "market.sqlite")
+    monkeypatch.setattr(market_store_module, "_READER_SNAPSHOT_SECONDS", 0.2)
+    slow = "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<4000000) SELECT count(*) FROM n"
+    try:
+        with pytest.raises((sqlite3.OperationalError, MarketStoreError)):
+            with store.reader_snapshot() as connection:
+                connection.execute(slow).fetchone()
+        store.close_reader()
+        with store.patient_reads(60):
+            with store.reader_snapshot() as connection:
+                assert connection.execute(slow).fetchone()[0] == 4_000_000
+            store.close_reader()
+            others: list[BaseException] = []
+
+            def default_reader():
+                try:
+                    with store.reader_snapshot() as connection:
+                        connection.execute(slow).fetchone()
+                except BaseException as exc:
+                    others.append(exc)
+                finally:
+                    store.close_reader()
+
+            thread = threading.Thread(target=default_reader)
+            thread.start()
+            thread.join()
+            assert others
+        with pytest.raises((sqlite3.OperationalError, MarketStoreError)):
+            with store.reader_snapshot() as connection:
+                connection.execute(slow).fetchone()
+    finally:
+        store.close()
