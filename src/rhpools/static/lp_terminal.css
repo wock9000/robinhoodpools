@@ -453,10 +453,10 @@ select:focus { border-color: var(--text); color: var(--text); }
 .tape-arrivals.is-empty { visibility: hidden; }
 
 #tape-table th:nth-child(1) { width: 6%; }
-#tape-table th:nth-child(2) { width: 8%; }
+#tape-table th:nth-child(2) { width: 11%; }
 #tape-table th:nth-child(3) { width: 18%; }
 #tape-table th:nth-child(4) { width: 13%; }
-#tape-table th:nth-child(5) { width: 28%; }
+#tape-table th:nth-child(5) { width: 25%; }
 #tape-table th:nth-child(6) { width: 8%; }
 #tape-table th:nth-child(7) { width: 10%; }
 #tape-table th:nth-child(8) { width: 9%; }
