@@ -1103,6 +1103,11 @@ class MarketStore:
             "reader_drain_pending": int(reader_drain_pending),
         }
 
+    def reusable_bytes(self) -> int:
+        """Bytes in freed pages, which SQLite reuses before growing the file."""
+        free_pages = self.read().execute("PRAGMA freelist_count").fetchone()[0]
+        return int(free_pages) * self._page_size
+
     def checkpoint(
         self, mode: str = "PASSIVE", *, drain_readers: bool = False,
     ) -> dict[str, int]:

@@ -83,6 +83,12 @@ def copy_kept_rows(db: sqlite3.Connection) -> None:
     )
     set_meta(db, "entities", db.execute("SELECT count(*) FROM side.entities").fetchone()[0])
     set_meta(db, "terms", db.execute("SELECT count(*) FROM side.terms").fetchone()[0])
+    # Rows the live indexer writes after this snapshot are dropped with the
+    # tables; rewinding its cursor here after the reload re-indexes them.
+    cursor = db.execute(
+        "SELECT value FROM main.metadata WHERE key='search_index_cursor'"
+    ).fetchone()
+    set_meta(db, "search_cursor", int(cursor[0]) if cursor else 0)
     set_meta(db, "copied", 1)
     db.execute("COMMIT")
     db.execute("CREATE INDEX IF NOT EXISTS side.terms_order ON terms(term,kind,id)")
@@ -176,11 +182,16 @@ def run() -> None:
     parser.add_argument("database")
     parser.add_argument("side", help="side SQLite file on another disk")
     parser.add_argument("--chunk", type=int, default=2_000_000)
+    parser.add_argument(
+        "--copy-only", action="store_true",
+        help="only take the side copy; safe while the service is running",
+    )
     args = parser.parse_args()
     db = sqlite3.connect(args.database, isolation_level=None, timeout=60)
     db.execute("PRAGMA foreign_keys=OFF")
-    db.execute("PRAGMA main.journal_mode=WAL")
-    checkpoint(db)
+    if not args.copy_only:
+        db.execute("PRAGMA main.journal_mode=WAL")
+        checkpoint(db)
     db.execute("ATTACH ? AS side", (args.side,))
     db.execute("PRAGMA side.journal_mode=OFF")
     db.execute("PRAGMA side.synchronous=OFF")
@@ -198,12 +209,20 @@ def run() -> None:
         log("copying non-transaction search rows to side database")
         copy_kept_rows(db)
     log(f"side copy: {meta(db, 'entities')} entities, {meta(db, 'terms')} terms")
+    if args.copy_only:
+        return
     if meta(db, "dropped") != "1":
         log("dropping search tables")
         drop_main_tables(db)
     log("reloading kept rows")
     reload(db, args.chunk)
     verify(db)
+    db.execute(
+        "UPDATE main.metadata SET value=? WHERE key='search_index_cursor' "
+        "AND CAST(value AS INTEGER)>?",
+        (meta(db, "search_cursor"), int(meta(db, "search_cursor") or 0)),
+    )
+    log(f"search cursor rewound to {meta(db, 'search_cursor')}")
     set_meta(db, "complete", 1)
 
 

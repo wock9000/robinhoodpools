@@ -5465,6 +5465,7 @@ class MarketIndexer:
             )
 
         free: int | None = None
+        reusable = 0
         disk_error: OSError | None = None
         if str(self.store.path) != ":memory:":
             try:
@@ -5473,6 +5474,10 @@ class MarketIndexer:
                 )
             except OSError as exc:
                 disk_error = exc
+            # Inserts reuse freed database pages before the file grows, so
+            # they are headroom the reserve protects just like disk space.
+            reusable = self.store.reusable_bytes()
+        available = None if free is None else free + reusable
         observed_at = time.time()
 
         backlog = checkpoint["backlog_bytes"]
@@ -5532,9 +5537,9 @@ class MarketIndexer:
         elif disk_error is not None:
             disk_paused = True
         elif was_disk_paused:
-            disk_paused = free is None or free < self.storage_resume_bytes
+            disk_paused = available is None or available < self.storage_resume_bytes
         else:
-            disk_paused = free is None or free < self.history_disk_reserve_bytes
+            disk_paused = available is None or available < self.history_disk_reserve_bytes
 
         reader_draining = bool(checkpoint["reader_drain_pending"])
         reasons = []
@@ -5582,12 +5587,14 @@ class MarketIndexer:
         elif disk_paused:
             if was_disk_paused:
                 details.append(
-                    f"{free} free bytes has not recovered to "
+                    f"{available} free bytes ({reusable} reusable in the "
+                    f"database) has not recovered to "
                     f"{self.storage_resume_bytes} bytes"
                 )
             else:
                 details.append(
-                    f"{free} free bytes fell below "
+                    f"{available} free bytes ({reusable} reusable in the "
+                    f"database) fell below "
                     f"{self.history_disk_reserve_bytes} byte reserve"
                 )
         checkpoint_status: dict[str, Any] = {
