@@ -5,6 +5,7 @@
   const MAX_TAPE_ROWS = 150;
   const TABLE_LIMIT = 100;
   const OWNER_STREAM_LIMIT = 200;
+  const AGGREGATE_REFRESH_MS = 1_000;
   const REFRESH_MS = 12_000;
   const HISTORY_REFRESH_MS = 15_000;
   const REQUEST_TIMEOUT_MS = 15_000;
@@ -16,7 +17,7 @@
   const OWNER_SORT_API = { activity: "activity", net_pnl_usd: "net", fees_usd: "fees" };
   const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
   const SEARCH_KINDS = new Set(["pool", "token", "protocol", "owner", "custody", "transaction", "position"]);
-  const LP_EVENT_KINDS = new Set(["add", "remove", "collect", "checkpoint", "donate", "fee"]);
+  const LP_EVENT_KINDS = new Set(["add", "remove", "collect"]);
   const TOUCH_NAVIGATION = window.matchMedia("(hover: none) and (pointer: coarse)");
   const PANE_STORAGE_KEY = "lp-terminal-pane-layout-v1";
   const PANE_LAYOUT_MEDIA = window.matchMedia("(max-width: 520px), (max-height: 520px) and (max-width: 900px)");
@@ -40,7 +41,6 @@
     context: byId("strip-context"),
     liveBlockLink: byId("live-block-link"),
     liveBlockAge: byId("live-block-age"),
-    liveBlockGap: byId("live-block-gap"),
     status: byId("status-readout"),
     indexStatus: byId("index-status"),
     indexStatusShell: byId("index-status-shell"),
@@ -56,9 +56,10 @@
     filterControl: byId("filter-control"),
     ownerSort: byId("owner-sort"),
     ownerScope: byId("owner-scope"),
-    ownersAccountingReadout: byId("owners-accounting-readout"),
     tabs: byId("pool-tabs"),
     poolPanel: byId("pool-panel"),
+    poolsWrap: byId("pools-wrap"),
+    dislocationsWrap: byId("dislocations-wrap"),
     tapeScroll: byId("tape-scroll"),
     tapeArrivals: byId("tape-arrivals"),
     footer: byId("footer-state"),
@@ -82,6 +83,8 @@
     ownerFollow: byId("owner-follow"),
     ownerLiveState: byId("owner-live-state"),
     copyStatus: byId("copy-status"),
+    ownerTrades: byId("owner-trades"),
+    ownerTradesBody: byId("owner-trades-body"),
     terminalMain: byId("terminal-main"),
     poolInspector: byId("pool-inspector"),
     poolInspectorShell: byId("pool-inspector-shell"),
@@ -126,7 +129,6 @@
     ownerViewCache: new Map(),
     poolsEnvelope: null,
     dislocations: null,
-    dislocationsAt: 0,
     dislocationsScope: "",
     dislocationsController: null,
     revision: null,
@@ -834,13 +836,44 @@
   }
 
 
+  const flowTags = new Map();
+  const flowTagsPending = new Set();
+
+  function flowTagsEnabled() {
+    const gate = window.rhpGate && window.rhpGate.snapshot();
+    const me = gate && gate.me;
+    return Boolean(me && me.signed_in && (me.features || []).includes("flags"));
+  }
+
+  function tagsFor(item) {
+    if (!flowTagsEnabled()) return null;
+    const byPool = flowTags.get(String(item.tx_hash || "").toLowerCase());
+    return byPool ? byPool[String(item.pool_id || "").toLowerCase()] || null : null;
+  }
+
+  function setKindCell(cell, kind, tags) {
+    if (!tags || !tags.length) {
+      if (cell.dataset.signature) {
+        delete cell.dataset.signature;
+        delete cell.dataset.value;
+      }
+      return setTextCell(cell, kind, "event-kind");
+    }
+    delete cell.dataset.value;
+    setNodeCell(cell, `${kind}|${tags.join(",")}`, "event-kind", () => [document.createTextNode(kind), ...tags.map((tag) => {
+      const badge = el("span", `badge flow-tag ${tag === "PONS" ? "warn" : "live"}`, tag);
+      badge.title = tag === "PONS" ? "Pons launch: pool registered in the Pons V2 hook" : "FOMO app: Relay-routed trade by a FOMO wallet";
+      return badge;
+    })]);
+  }
+
   function patchTapeRow(row, item) {
     const kind = String(item.kind || "unknown").toLowerCase();
     row.className = `event-${kind}`;
     const cells = row.cells;
     const eventTime = eventTimeLabel(item);
     setTextCell(cells[0], eventTime.text, "dim", eventTime.title);
-    setTextCell(cells[1], kind, "event-kind");
+    setKindCell(cells[1], kind, tagsFor(item));
     const poolId = item.pool_id || "";
     setNodeCell(cells[2], `${poolId}|${pairFor(item)}|${item.protocol}`, "pair-symbol", () => {
       const link = internalPoolLink(poolId, "", `${pairFor(item)} ${String(item.protocol || "").toUpperCase()}`, item.tx_hash);
@@ -973,10 +1006,13 @@
     });
     setTextCell(cells[1], item.protocol || "—", "protocol");
     const fee = finite(item.fee_ppm);
-    setTextCell(cells[2], fee == null ? "—" : `${(fee / 10_000).toFixed(fee % 100 === 0 ? 2 : 4)}%`, "numeric dim");
-    setTextCell(cells[3], formatUsd(item.tvl_usd), `numeric ${item.tvl_usd == null ? "unknown" : ""}`, item.tvl_basis || "");
-    setTextCell(cells[4], formatUsd(item.active_tvl_usd), `numeric desktop-column ${item.active_tvl_usd == null ? "unknown" : ""}`);
-    setTextCell(cells[5], formatUsd(item.observed_active_tvl_usd), `numeric desktop-column ${item.observed_active_tvl_usd == null ? "unknown" : ""}`);
+    setTextCell(cells[2], fee == null ? "—" : `${(fee / 10_000).toFixed(fee % 100 === 0 ? 2 : 4)}%`, "numeric dim", fee == null ? "" : `${fee} ppm; ${item.protocol === "v4" ? "current swap fee" : "pool fee"}`);
+    const inventoryTitle = item.coverage && item.coverage.inventory_complete === false
+      ? "Position inventory incomplete; TVL is unavailable. Observed active is only the indexed portion."
+      : "";
+    setTextCell(cells[3], formatUsd(item.tvl_usd), `numeric ${item.tvl_usd == null ? "unknown" : ""}`, item.tvl_basis || inventoryTitle);
+    setTextCell(cells[4], formatUsd(item.active_tvl_usd), `numeric desktop-column ${item.active_tvl_usd == null ? "unknown" : ""}`, inventoryTitle);
+    setTextCell(cells[5], formatUsd(item.observed_active_tvl_usd), `numeric desktop-column ${item.observed_active_tvl_usd == null ? "unknown" : ""}`, inventoryTitle);
     setTextCell(cells[6], formatUsd(item.volume_usd), `numeric ${item.volume_usd == null ? "unknown" : ""}`);
     setTextCell(cells[7], formatUsd(item.fees_usd), `numeric ${item.fees_usd == null ? "unknown" : "positive"}`);
     setTextCell(cells[8], formatSignedUsd(item.net_deposits_usd), `numeric ${valueClass(item.net_deposits_usd)}`);
@@ -1033,7 +1069,18 @@
     setTextCell(cells[7], valuation, "dim");
     setTextCell(cells[8], item.status || "open", "dim");
     const poolId = item.pool_id || "";
-    setNodeCell(cells[9], `${poolId}|${state.ownerAddress}`, "cyan", () => internalPoolLink(poolId, state.ownerAddress));
+    setNodeCell(cells[9], `${poolId}|${state.ownerAddress}|${item.token_id}|${window.rhpGate?.snapshot().wallet || ""}`, "cyan", () => {
+      const link = internalPoolLink(poolId, state.ownerAddress);
+      const wallet = window.rhpGate?.snapshot().wallet;
+      if (wallet && wallet.toLowerCase() === state.ownerAddress && item.token_id && poolId) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = "manage";
+        button.addEventListener("click", () => window.rhpTrade?.open({ mode: "lp", pool: poolId, tokenId: item.token_id }));
+        link.append(" ", button);
+      }
+      return link;
+    });
   }
 
   function patchOwnerClosedRow(row, item) {
@@ -1161,35 +1208,8 @@
     return output;
   }
 
-  function renderOwnerFreshness() {
-    const envelope = state.ownersEnvelope || {};
-    const current = envelope.current_activity && typeof envelope.current_activity === "object"
-      ? envelope.current_activity : {};
-    const accountingDate = toDate(envelope.accounting_as_of);
-    const accountingAge = accountingDate
-      ? formatAge(Math.max(0, (Date.now() - accountingDate.getTime()) / 1000))
-      : null;
-    const qualification = String(current.qualification || "").replaceAll("_", " ");
-    const label = !state.ownersReady
-      ? "Loading wallet activity…"
-      : `${ownerSourceRows().length} ${state.ownerScope === "wallets" ? "wallets" : "custody rows"} · ${accountingDate ? `accounting ${accountingAge} behind` : "accounting unavailable"} · — = not verified`;
-    if (elements.ownersAccountingReadout.textContent !== label) {
-      elements.ownersAccountingReadout.textContent = label;
-    }
-    elements.ownersAccountingReadout.title = [
-      accountingDate
-        ? `Financial totals are historical accounting as of ${formatStamp(accountingDate)} (${accountingAge} old)`
-        : "Historical accounting timestamp unavailable; financial values are not current-stream values",
-      "Latest activity is a separate wallet freshness indicator, not part of the financial totals",
-      current.head != null ? `Current activity head #${formats.integer.format(current.head)}` : null,
-      current.observed_from != null ? `Current activity observed from block #${formats.integer.format(current.observed_from)}` : null,
-      qualification ? `Current activity qualification: ${qualification}` : null,
-      envelope.coverage ? describeCoverage(envelope.coverage) : null
-    ].filter(Boolean).join("\n");
-  }
 
   function renderOwners() {
-    renderOwnerFreshness();
     if (!state.ownersReady) {
       ownersTable.reconcile([], ownersPanelActive() ? "Loading indexed wallet activity and positions…" : "Wallet activity paused while hidden");
       return;
@@ -1200,10 +1220,6 @@
   }
 
   function renderPools() {
-    if (!state.poolsVisible) {
-      poolsTable.reconcile([], "POOL SUMMARY LOADS WHEN VISIBLE");
-      return;
-    }
     if (!state.poolsEnvelope) {
       const failed = state.health.get("pools")?.ok === false;
       poolsTable.reconcile([], failed ? "POOL DATA UNAVAILABLE · RETRYING" : "POOL SUMMARY SYNCING");
@@ -1232,31 +1248,33 @@
     dislocationsTable.reconcile(rows, `NO PAIR DISLOCATED ≥${DISLOCATION_PARAMS.min_bps}bp WITH ≥${formatUsd(DISLOCATION_PARAMS.min_depth_usd)} DEPTH`);
   }
 
-  async function refreshDislocations() {
-    if (!poolPanelActive() || state.tab !== "disloc") return;
+  async function refreshDislocations(force = false) {
+    if (state.tab !== "disloc" || !poolPanelAvailable() || (!force && !state.poolsVisible)) return;
     const scope = JSON.stringify([state.q, state.protocol]);
     if (scope !== state.dislocationsScope) {
       state.dislocations = null;
-      state.dislocationsAt = 0;
       state.dislocationsScope = scope;
       scheduleRender("dislocations", renderDislocations);
     }
-    if (state.dislocationsController || Date.now() - state.dislocationsAt < REFRESH_MS) return;
+    if (state.dislocationsController) return;
     const controller = new AbortController();
     state.dislocationsController = controller;
     byId("dislocations-table").setAttribute("aria-busy", "true");
     try {
       const payload = await api("/dislocations", { ...DISLOCATION_PARAMS, q: state.q, protocol: state.protocol }, controller.signal);
-      if (controller.signal.aborted || scope !== state.dislocationsScope) return;
+      if (controller.signal.aborted || scope !== state.dislocationsScope || state.tab !== "disloc") return;
       state.dislocations = payload;
-      state.dislocationsAt = Date.now();
-      healthSuccess("dislocations");
+      healthSuccess("dislocations", aggregateHealthTimestamp(payload));
     } catch (error) {
-      if (error.name !== "AbortError" && !controller.signal.aborted) healthFailure("dislocations", error);
+      if (error.name !== "AbortError" && !controller.signal.aborted && scope === state.dislocationsScope && state.tab === "disloc") {
+        healthFailure("dislocations", error);
+      }
     } finally {
-      if (state.dislocationsController === controller) state.dislocationsController = null;
-      byId("dislocations-table").setAttribute("aria-busy", "false");
-      scheduleRender("dislocations", renderDislocations);
+      if (state.dislocationsController === controller) {
+        state.dislocationsController = null;
+        byId("dislocations-table").setAttribute("aria-busy", "false");
+        scheduleRender("dislocations", renderDislocations);
+      }
     }
   }
 
@@ -1282,7 +1300,6 @@
     state.ownersReady = false;
     state.ownerViewCache.clear();
     byId("owners-table").setAttribute("aria-busy", String(ownersPanelActive()));
-    elements.ownersAccountingReadout.title = reason || "Waiting for a fresh wallet summary";
     scheduleRender("owners", renderOwners);
   }
 
@@ -1304,33 +1321,6 @@
     const observed = liveHead != null && indexedHead != null ? Math.max(0, liveHead - indexedHead) : null;
     if (reported == null) return observed;
     return observed == null ? Math.max(0, reported) : Math.max(0, reported, observed);
-  }
-
-  function renderGlobalGap() {
-    const indexGap = currentIndexGap();
-    const feedGap = state.liveBlock && state.liveBlock.gap;
-    const hasIndexGap = indexGap != null && indexGap > 0;
-    const hasFeedGap = feedGap != null && feedGap !== false && feedGap !== 0;
-    const feedGapCount = typeof feedGap === "number"
-      ? feedGap
-      : feedGap && typeof feedGap === "object"
-        ? finite(feedGap.count != null ? feedGap.count : feedGap.missing)
-        : null;
-    elements.liveBlockGap.hidden = !hasIndexGap && !hasFeedGap;
-    if (elements.liveBlockGap.hidden) {
-      elements.liveBlockGap.title = "";
-      return;
-    }
-    if (hasIndexGap) {
-      elements.liveBlockGap.textContent = `INDEX GAP ${formatCount(indexGap)}${hasFeedGap ? " · FEED GAP" : ""}`;
-      elements.liveBlockGap.title = [
-        `Live chain head is ${formats.integer.format(indexGap)} block${indexGap === 1 ? "" : "s"} ahead of the durable index`,
-        hasFeedGap ? `Feed discontinuity: ${typeof feedGap === "object" ? JSON.stringify(feedGap) : String(feedGap)}` : null
-      ].filter(Boolean).join("\n");
-      return;
-    }
-    elements.liveBlockGap.textContent = feedGapCount != null ? `FEED GAP ${formatCount(feedGapCount)}` : "FEED GAP";
-    elements.liveBlockGap.title = typeof feedGap === "object" ? JSON.stringify(feedGap) : String(feedGap);
   }
 
   function pruneConfirmedOrphanRows(block) {
@@ -1445,7 +1435,6 @@
       block.parent_hash ? `parent ${block.parent_hash}` : null,
       block.source ? `source ${block.source}` : null
     ].filter(Boolean).join(" · ");
-    renderGlobalGap();
     renderStatus();
     renderLiveBlockAge();
   }
@@ -1515,32 +1504,18 @@
 
   function renderStatus() {
     const status = state.status;
+    elements.status.textContent = "INDEX STATUS";
+    elements.status.title = "Open index status details";
+    elements.footer.textContent = "INDEX STATUS";
+    elements.footer.removeAttribute("title");
     if (!status) {
-      elements.status.textContent = "CONNECTING";
-      elements.footer.textContent = "INDEX —";
       renderIndexDetails("");
-      renderGlobalGap();
       return;
     }
     const liveHead = finite(state.liveBlock && state.liveBlock.number) ?? finite(status.head);
     const indexedHead = finite(status.indexed_head);
     const gap = currentIndexGap();
     const lag = finite(status.lag_s);
-    const parts = [
-      liveHead != null ? `HEAD #${formats.integer.format(liveHead)}` : "HEAD —",
-      indexedHead != null ? `INDEX #${formats.integer.format(indexedHead)}` : "INDEXING"
-    ];
-    if (gap != null && gap > 0) {
-      parts.push(`CATCH-UP ${formats.integer.format(gap)} BLOCK${gap === 1 ? "" : "S"}`);
-    } else if (lag != null && lag > 2) {
-      parts.push(`CATCH-UP ${formatAge(lag)}`);
-    } else if (gap === 0) {
-      parts.push("INDEX CURRENT");
-    }
-    elements.status.textContent = parts.join(" · ");
-    elements.footer.textContent = gap != null && gap > 0
-      ? `INDEX ${formats.integer.format(gap)} BLOCK${gap === 1 ? "" : "S"} BEHIND${lag != null && lag > 0 ? ` · ${formatAge(lag)}` : ""}`
-      : lag != null && lag > 2 ? `INDEX ${formatAge(lag)} BEHIND` : "INDEX CURRENT";
     const details = [
       liveHead != null ? `Live head #${formats.integer.format(liveHead)}` : null,
       indexedHead != null ? `Durable indexed head #${formats.integer.format(indexedHead)}` : null,
@@ -1548,10 +1523,7 @@
       lag != null ? `Indexed block time lag ${formatAge(lag)}` : null,
       ...reportedErrorDetails(status.errors)
     ].filter(Boolean).join("\n");
-    elements.status.title = `Open index status details\n${details}`;
-    elements.footer.title = details;
     renderIndexDetails(details);
-    renderGlobalGap();
   }
 
   function renderOverview() {
@@ -1578,8 +1550,19 @@
     ].join(" · ");
   }
 
-  function healthSuccess(name) {
-    state.health.set(name, { ok: true, at: Date.now(), error: "" });
+  function aggregateHealthTimestamp(payload) {
+    const coverage = payload && typeof payload.coverage === "object" ? payload.coverage : null;
+    // Indexed coverage can predate completion of an expensive cached frame.
+    for (const value of [coverage && coverage.to, coverage && coverage.history_to, payload && payload.as_of]) {
+      const timestamp = toDate(value);
+      if (timestamp) return timestamp;
+    }
+    return null;
+  }
+
+  function healthSuccess(name, observedAt = null) {
+    const observed = toDate(observedAt);
+    state.health.set(name, { ok: true, at: observed ? observed.getTime() : Date.now(), error: "" });
     renderHealth();
   }
 
@@ -1891,12 +1874,12 @@
     return { window: state.window, q: state.q, protocol: state.protocol, limit, offset: 0 };
   }
 
-  async function loadResource(name, path, params, controller, apply) {
+  async function loadResource(name, path, params, controller, apply, healthTimestamp = null) {
     try {
       const payload = await api(path, params, controller.signal);
       if (controller.signal.aborted) return;
       apply(payload || {});
-      healthSuccess(name);
+      healthSuccess(name, healthTimestamp ? healthTimestamp(payload) : null);
     } catch (error) {
       if (error.name === "AbortError" || controller.signal.aborted) return;
       healthFailure(name, error);
@@ -1918,8 +1901,12 @@
     return !state.hidden && state.ownersVisible && elements.modal.hidden && elements.poolInspector.hidden;
   }
 
+  function poolPanelAvailable() {
+    return !state.hidden && elements.modal.hidden && elements.poolInspector.hidden;
+  }
+
   function poolPanelActive() {
-    return !state.hidden && state.poolsVisible && elements.modal.hidden && elements.poolInspector.hidden;
+    return poolPanelAvailable() && state.poolsVisible;
   }
 
   function syncOwnerProjection(reason) {
@@ -1963,7 +1950,7 @@
       }
       if (ownerVisibilityChanged) syncOwnerProjection("Wallet summary visibility changed");
       if (poolBecameVisible) refreshPools();
-      if (!poolPanelActive()) abortPoolRequests();
+      if (!poolPanelActive()) abortMarketRequests();
     }, { root: elements.terminalMain, threshold: 0.01 });
     state.summaryObserver.observe(ownersSection);
     state.summaryObserver.observe(poolsSection);
@@ -1973,9 +1960,16 @@
     return JSON.stringify([state.window, state.q, state.protocol, sort, order]);
   }
 
-  function abortPoolRequests() {
+  function abortMarketRequests() {
     for (const request of state.poolRequests.values()) request.controller.abort();
     state.poolRequests.clear();
+    if (state.dislocationsController) {
+      const controller = state.dislocationsController;
+      state.dislocationsController = null;
+      controller.abort();
+    }
+    byId("pools-table").setAttribute("aria-busy", "false");
+    byId("dislocations-table").setAttribute("aria-busy", "false");
   }
 
   function activatePoolView() {
@@ -1986,8 +1980,6 @@
 
   function fetchPoolView(sort, order) {
     const key = poolViewKey(sort, order);
-    const cached = state.poolViews.get(key);
-    if (cached && Date.now() - cached.at < REFRESH_MS) return Promise.resolve(cached.payload);
     const pending = state.poolRequests.get(key);
     if (pending) return pending.promise;
     const controller = new AbortController();
@@ -1996,11 +1988,11 @@
       try {
         const payload = await api("/pools", params, controller.signal);
         if (controller.signal.aborted) return;
-        state.poolViews.set(key, { payload, at: Date.now() });
+        state.poolViews.set(key, { payload });
         if (key === poolViewKey()) {
           state.poolsEnvelope = payload;
           scheduleRender("pools", renderPools);
-          healthSuccess("pools");
+          healthSuccess("pools", aggregateHealthTimestamp(payload));
         }
         return payload;
       } catch (error) {
@@ -2017,12 +2009,12 @@
     return promise;
   }
 
-  async function refreshPools() {
-    if (!poolPanelActive()) return;
-    if (state.tab === "disloc") return refreshDislocations();
+  async function refreshPools(force = false) {
+    if (!poolPanelAvailable() || (!force && !state.poolsVisible)) return;
+    if (state.tab === "disloc") return refreshDislocations(force);
     const scope = JSON.stringify([state.window, state.q, state.protocol]);
     if (scope !== state.poolScope) {
-      abortPoolRequests();
+      abortMarketRequests();
       state.poolViews.clear();
       state.poolScope = scope;
     }
@@ -2035,14 +2027,20 @@
     }
   }
 
-  function scheduleAggregateRefresh(delay = REFRESH_MS) {
+  function scheduleAggregateRefresh(delay = AGGREGATE_REFRESH_MS) {
     clearTimeout(state.refreshTimer);
+    state.refreshTimer = null;
     if (state.hidden) return;
-    state.refreshTimer = setTimeout(() => refreshAggregates("timer"), delay);
+    state.refreshTimer = setTimeout(() => {
+      state.refreshTimer = null;
+      refreshAggregates("timer");
+    }, delay);
   }
 
   async function refreshAggregates(reason) {
     if (state.hidden) return;
+    scheduleAggregateRefresh();
+    if (poolPanelActive()) refreshPools();
     if (state.aggregateController) {
       if (reason === "timer") return;
       state.aggregateController.abort();
@@ -2055,16 +2053,17 @@
       requests.push(loadResource("overview", "/overview", { window: state.window }, controller, (payload) => {
         state.overview = payload;
         scheduleRender("overview", renderOverview);
-      }));
+      }, aggregateHealthTimestamp));
     }
-    if (poolPanelActive()) refreshPools();
-    await Promise.all(requests);
-    if (reason === "timer" && !elements.modal.hidden && state.ownerFollow && state.ownerAddress) {
-      loadOwner(state.ownerAddress);
-    }
-    if (generation === state.aggregateGeneration && state.aggregateController === controller) {
-      state.aggregateController = null;
-      scheduleAggregateRefresh();
+    try {
+      await Promise.all(requests);
+      if (reason === "timer" && !elements.modal.hidden && state.ownerFollow && state.ownerAddress && !state.ownerController) {
+        loadOwner(state.ownerAddress);
+      }
+    } finally {
+      if (generation === state.aggregateGeneration && state.aggregateController === controller) {
+        state.aggregateController = null;
+      }
     }
   }
 
@@ -2248,17 +2247,20 @@
 
   function setPoolSort(key, toggle = true) {
     if (!Object.hasOwn(POOL_SORT_FIELDS, key)) return;
-    state.poolOrder = toggle && state.poolSort === key && state.poolOrder === "desc" ? "asc" : "desc";
+    const order = toggle && state.poolSort === key && state.poolOrder === "desc" ? "asc" : "desc";
+    if (state.poolSort !== key || state.poolOrder !== order) abortMarketRequests();
     state.poolSort = key;
-    byId("pools-table").parentElement.scrollTop = 0;
+    state.poolOrder = order;
+    elements.poolsWrap.scrollTop = 0;
     activatePoolView();
     updatePoolSortControls();
-    refreshPools();
+    refreshPools(true);
   }
 
   function setTab(next, focus = false, load = true) {
     if (!Object.prototype.hasOwnProperty.call(POOL_SORT, next)) return;
     const changed = state.tab !== next;
+    if (changed) abortMarketRequests();
     state.tab = next;
     if (changed) [state.poolSort, state.poolOrder] = POOL_SORT[next];
     const tabs = Array.from(elements.tabs.querySelectorAll("[role=tab]"));
@@ -2273,13 +2275,15 @@
     });
     updatePoolSortControls();
     const dislocated = next === "disloc";
-    byId("pools-table").parentElement.hidden = dislocated;
-    byId("dislocations-wrap").hidden = !dislocated;
+    elements.poolsWrap.hidden = dislocated;
+    elements.dislocationsWrap.hidden = !dislocated;
     if (changed) {
-      byId("pools-table").parentElement.scrollTop = 0;
-      activatePoolView();
-      if (load) refreshPools();
+      elements.poolsWrap.scrollTop = 0;
+      elements.dislocationsWrap.scrollTop = 0;
     }
+    if (dislocated) scheduleRender("dislocations", renderDislocations);
+    else activatePoolView();
+    if (load) refreshPools(true);
   }
 
   function refreshNow(reason) {
@@ -2296,7 +2300,7 @@
       state.aggregateController.abort();
       state.aggregateController = null;
     }
-    abortPoolRequests();
+    abortMarketRequests();
     if (state.tapeController) {
       state.tapeGeneration += 1;
       state.tapeController.abort();
@@ -2311,6 +2315,11 @@
   function queueFilterRefresh() {
     clearTimeout(state.filterTimer);
     abortForFilter();
+    if (state.tab === "disloc") {
+      state.dislocations = null;
+      state.dislocationsScope = "";
+      scheduleRender("dislocations", renderDislocations);
+    }
     renderAllTables();
     state.filterTimer = setTimeout(() => refreshNow("filter"), FILTER_DELAY_MS);
   }
@@ -2587,6 +2596,93 @@
     }
   }
 
+  function tradeAmount(leg) {
+    const raw = String(leg.amount || "0");
+    const decimals = Number(leg.decimals || 0);
+    const padded = raw.padStart(decimals + 1, "0");
+    const whole = decimals ? padded.slice(0, -decimals) : padded;
+    const fractional = decimals ? padded.slice(-decimals).replace(/0+$/, "").slice(0, 6) : "";
+    const symbol = leg.symbol || shortIdentifier(leg.token);
+    if (raw !== "0" && whole === "0" && !/[1-9]/.test(fractional)) return `<0.000001 ${symbol}`;
+    return `${whole}${fractional ? "." + fractional : ""} ${symbol}`;
+  }
+
+  async function loadWalletTrades(address, before = null) {
+    const section = elements.ownerTrades;
+    const body = elements.ownerTradesBody;
+    const gate = window.rhpGate?.snapshot();
+    const visible = gate?.me?.signed_in && gate.wallet?.toLowerCase() === address
+      && gate.me.wallet?.toLowerCase() === address;
+    section.hidden = !visible;
+    if (!visible) return;
+    const request = (state.ownerTradesRequest || 0) + 1;
+    state.ownerTradesRequest = request;
+    if (before === null) {
+      body.replaceChildren(el("tr", "", ""));
+      body.firstChild.append(el("td", "dim", "loading trades"));
+      body.firstChild.firstChild.colSpan = 5;
+    } else {
+      body.lastChild?.remove();
+    }
+    try {
+      const url = `/api/tx/history?feature=trade${before === null ? "" : `&before=${before}`}`;
+      const response = await fetch(url, { credentials: "same-origin" });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const payload = await response.json();
+      if (state.ownerTradesRequest !== request || state.ownerAddress !== address || section.hidden) return;
+      const rows = payload.rows || [];
+      const trades = rows.map((trade) => {
+        const row = el("tr");
+        const link = el("a", "cyan", shortIdentifier(trade.hash));
+        link.href = `${ROBINSCAN}/tx/${trade.hash}`;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        const feeLeg = trade.fee && [...trade.sent, ...trade.received].find((leg) => leg.token === trade.fee.currency);
+        const via = trade.fee && feeLeg
+          ? `${trade.via} · fee ${tradeAmount({ ...feeLeg, amount: trade.fee.amount })}`
+          : trade.via;
+        for (const content of [
+          formatAge(Math.max(0, Date.now() / 1000 - trade.timestamp)),
+          trade.sent.map(tradeAmount).join(" + ") || "—",
+          trade.received.map(tradeAmount).join(" + ") || "—",
+          via
+        ]) row.append(el("td", "", content));
+        const tx = el("td");
+        tx.append(link);
+        row.append(tx);
+        return row;
+      });
+      if (before === null) body.replaceChildren(...trades);
+      else body.append(...trades);
+      if (!rows.length && before === null) {
+        const row = el("tr");
+        const cell = el("td", "dim", "no trades");
+        cell.colSpan = 5;
+        row.append(cell);
+        body.append(row);
+      }
+      if (payload.next_before != null) {
+        const row = el("tr");
+        const cell = el("td", "dim");
+        cell.colSpan = 5;
+        const older = el("button", "", "older");
+        older.type = "button";
+        older.addEventListener("click", () => loadWalletTrades(address, payload.next_before), { once: true });
+        cell.append(older);
+        row.append(cell);
+        body.append(row);
+      }
+    } catch (error) {
+      if (state.ownerTradesRequest !== request || state.ownerAddress !== address || section.hidden) return;
+      const row = el("tr");
+      const cell = el("td", "dim", `trades unavailable · ${error.message}`);
+      cell.colSpan = 5;
+      row.append(cell);
+      if (before === null) body.replaceChildren(row);
+      else body.append(row);
+    }
+  }
+
   function openOwner(address, trigger, historyMode = "push") {
     const normalized = String(address || "").trim().toLowerCase();
     if (!ADDRESS_RE.test(normalized)) return;
@@ -2596,7 +2692,7 @@
     state.ownerPaused = false;
     elements.modal.hidden = false;
     syncOwnerProjection("Owner detail opened");
-    abortPoolRequests();
+    abortMarketRequests();
     elements.modalTitle.textContent = "LP DETAIL";
     elements.context.textContent = `LP ${shortIdentifier(normalized, 7, 5)}`;
     elements.context.title = normalized;
@@ -2625,6 +2721,7 @@
     elements.dialog.focus({ preventScroll: true });
     elements.modal.scrollIntoView({ behavior: "auto", block: "start" });
     loadOwner(normalized);
+    loadWalletTrades(normalized);
   }
 
   function closeOwner(historyMode = "push") {
@@ -2704,7 +2801,7 @@
     elements.poolInspectorNewTab.href = urls.external.href;
     elements.poolInspector.hidden = false;
     syncOwnerProjection("Pool inspector opened");
-    abortPoolRequests();
+    abortMarketRequests();
     if (state.aggregateController) state.aggregateController.abort();
     if (elements.poolInspectorFrame.src !== urls.embedded.href) {
       elements.poolInspectorFrame.src = urls.embedded.href;
@@ -2735,6 +2832,46 @@
       }
     });
   }
+
+  async function refreshFlowTags() {
+    if (!flowTagsEnabled() || document.hidden) return;
+    const wanted = [];
+    for (const [, item] of tapeTable.items) {
+      const tx = String(item.tx_hash || "").toLowerCase();
+      if (tx.length === 66 && !flowTags.has(tx) && !flowTagsPending.has(tx) && !wanted.includes(tx)) wanted.push(tx);
+      if (wanted.length >= 100) break;
+    }
+    if (!wanted.length) return;
+    wanted.forEach((tx) => flowTagsPending.add(tx));
+    try {
+      const response = await fetch(`/api/v1/tags?tx=${wanted.join(",")}`, { credentials: "same-origin", headers: { Accept: "application/json" } });
+      if (!response.ok) return;
+      const body = await response.json();
+      for (const tx of wanted) {
+        const byPool = {};
+        for (const [pool, value] of Object.entries((body.tags || {})[tx] || {})) if (value.tags.length) byPool[pool] = value.tags;
+        flowTags.set(tx, byPool);
+      }
+      repatchTapeKinds();
+    } catch (_) {
+      return;
+    } finally {
+      wanted.forEach((tx) => flowTagsPending.delete(tx));
+    }
+  }
+
+  function repatchTapeKinds() {
+    for (const [key, item] of tapeTable.items) {
+      const row = tapeTable.rowFor(key);
+      if (row) setKindCell(row.cells[1], String(item.kind || "unknown").toLowerCase(), tagsFor(item));
+    }
+  }
+
+  setInterval(refreshFlowTags, 2000);
+  document.addEventListener("rhp:gate", () => {
+    repatchTapeKinds();
+    refreshFlowTags();
+  });
 
   function refreshVisibleTapeAges() {
     for (const [key, item] of tapeTable.items) {
@@ -2789,7 +2926,6 @@
     elements.clock.textContent = formatTime(now, true);
     elements.clock.dateTime = now.toISOString();
     renderLiveBlockAge();
-    renderOwnerFreshness();
     const ageTick = Math.floor(now.getTime() / 15_000);
     if (ageTick !== state.lastTapeAgeTick) {
       state.lastTapeAgeTick = ageTick;
@@ -2828,7 +2964,7 @@
         state.statusController.abort();
         state.statusController = null;
       }
-      abortPoolRequests();
+      abortMarketRequests();
       if (state.tapeController) state.tapeController.abort();
       if (state.ownerController) {
         state.ownerController.abort();
@@ -2871,9 +3007,8 @@
   }
 
   function setPaneProperties(layout, sizes) {
-    const unit = layout === "mobile" ? "dvh" : "fr";
     sizes.forEach((size, index) => {
-      document.documentElement.style.setProperty(PANE_PROPERTIES[index], `${size}${unit}`);
+      document.documentElement.style.setProperty(PANE_PROPERTIES[index], layout === "mobile" ? `${size}dvh` : `${size * 100}fr`);
     });
   }
 
@@ -3151,6 +3286,28 @@
   });
   elements.paneReset.addEventListener("click", resetPaneLayouts);
   PANE_LAYOUT_MEDIA.addEventListener("change", applyPaneLayout);
+  const sectionLinks = Array.from(document.querySelectorAll('.section-nav > a[href^="#"]'))
+    .filter((link) => ["#search", "#tape-section", "#owners-section", "#pools-section"].includes(link.getAttribute("href")));
+  function activateSection() {
+    const hash = sectionLinks.some((link) => link.getAttribute("href") === location.hash) ? location.hash : "#tape-section";
+    sectionLinks.forEach((link) => {
+      if (link.getAttribute("href") === hash) link.setAttribute("aria-current", "location");
+      else link.removeAttribute("aria-current");
+    });
+    if (hash === "#search") {
+      elements.lpSearchInput.focus();
+    } else if (!PANE_LAYOUT_MEDIA.matches && location.hash) {
+      const index = ["#tape-section", "#owners-section", "#pools-section"].indexOf(hash);
+      const sizes = [0.12, 0.12, 0.12];
+      sizes[index] = 0.76;
+      setPaneProperties("desktop", sizes);
+      requestAnimationFrame(updatePaneSeparatorValues);
+    }
+  }
+  sectionLinks.forEach((link) => link.addEventListener("click", () => {
+    if (location.hash === link.getAttribute("href")) activateSection();
+  }));
+  window.addEventListener("hashchange", activateSection);
   byId("pools-table").addEventListener("click", (event) => {
     const button = event.target.closest("[data-pool-sort]");
     if (button) setPoolSort(button.dataset.poolSort);
@@ -3182,7 +3339,7 @@
     byId("owners-title").textContent = state.ownerScope === "wallets" ? "LP WALLETS" : "LP CUSTODY";
     byId("owners-table").tHead.rows[0].cells[0].textContent = state.ownerScope === "wallets" ? "LP wallet" : "Custody contract";
     document.querySelector(".wallet-description").textContent = state.ownerScope === "wallets"
-      ? "Who is providing liquidity, and where? Select a wallet for positions and accounting."
+      ? ""
       : "Contracts holding positions for multiple wallets. Custody activity is not one trader’s portfolio.";
     invalidateOwners("Identity scope changed");
     openStream(true);
@@ -3282,6 +3439,7 @@
   setOwnerFollow(true);
   setTab("pools", false, false);
   applyPaneLayout();
+  activateSection();
   renderStatus();
   renderOverview();
   renderAllTables();
@@ -3294,6 +3452,10 @@
   reloadTape("initial");
   const initialOwner = String(initialUrl.searchParams.get("owner") || "").toLowerCase();
   if (ADDRESS_RE.test(initialOwner)) openOwner(initialOwner, null, "replace");
+  window.rhpTerminal = { openOwner: (address, trades = false) => {
+    openOwner(address, document.activeElement);
+    if (trades && !elements.ownerTrades.hidden) elements.ownerTrades.scrollIntoView({ behavior: "auto", block: "start" });
+  } };
   requestAnimationFrame(() => {
     setTimeout(() => {
       startSummaryObservers();

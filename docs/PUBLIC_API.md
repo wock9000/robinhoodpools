@@ -8,15 +8,19 @@ The API exposes four `GET` routes:
 
 | Route | Purpose |
 | --- | --- |
-| `/api/v1/pools` | Every verified known pool containing a token, with current block-pinned state |
+| `/api/v1/pools` | One bounded page of matching known-pool identity candidates, with current block-pinned state for verified rows |
 | `/api/v1/assets` | Unit-safe configuration groups and defensible V2 reserve subtotals |
 | `/api/v1/research/owner` | Bounded, coverage-qualified owner allocation, configuration, and lifecycle research |
 | `/api/v1/fomo/flow` | One bounded, attributed page from a selected anonymous public flow publisher |
 
-No route requires authentication. JSON responses include
-`Access-Control-Allow-Origin: *`; browser clients do not send credentials. The
-routes do not accept RPC URLs, submit transactions, recommend trades, or infer
-private strategies.
+No route requires authentication for its anonymous form. JSON responses include
+`Access-Control-Allow-Origin: *`; anonymous browser clients do not send
+credentials. The routes do not accept RPC URLs, submit transactions, recommend
+trades, or infer private strategies.
+
+Holders of the rhpools token can present an API key (see [API keys](#api-keys))
+to move the same routes into a keyed quota tier and to open the keyed
+`/api/v1/stream`. Anonymous responses are unchanged by the existence of keys.
 
 ## Run an installed local service
 
@@ -49,37 +53,40 @@ curl --fail --get 'https://rhpools.lol/api/v1/assets' \
 ### `GET /api/v1/pools`
 
 A pool matches when the queried address is either `currency0.address` or
-`currency1.address`; `matched_currency` identifies the side. The route returns
-every verified known match. There is no output pagination: supplying `limit` or
-`offset` is a `400` error rather than a silent cap.
+`currency1.address`; `matched_currency` identifies the side. Responses use
+deterministic pool-id order. `limit` defaults to 100 and accepts integers from
+1 through 200; `offset` defaults to 0 and accepts integers from 0 through
+9,223,372,036,854,775,807. Pass `next_offset` as the next request's `offset`
+until it is null. Invalid values return `400`. Pages can change as the catalog
+or chain head changes; an offset is not a stable snapshot cursor.
 
 The response contains:
 
 - `chain_id`, the normalized `token`, `pool_count`, and `pools`;
+- `limit`, `offset`, and nullable `next_offset`;
 - `snapshot`, the exact current block number, hash, timestamp, canonical
   confirmation basis, and state-read transports;
-- `coverage.catalog`, which qualifies the verified known census and any omitted
-  malformed or conflicting catalog records;
+- `coverage.catalog`, which qualifies the known census and malformed,
+  conflicting, or missing identity records found on this page;
 - `coverage.history`, which separately describes indexed canonical event
   history; and
 - `coverage.state`, which counts available and unavailable current liquidity
-  reads, reports the per-request state-read limit, and counts matching pools
-  beyond that limit.
+  reads **on this page**, not across all matching pools.
 
-“Every verified known match” does not mean every pool deployed on-chain.
-`coverage.catalog.complete_for_known_catalog` applies only to supported known
-factories and the indexed V4 PoolManager catalog.
+`pool_count` counts distinct matching identities in the stored-pool and ready
+catalog-search indexes before per-page identity verification. A malformed or
+conflicting candidate can be absent from `pools`; `coverage.catalog.omitted_records`
+and `omission_reasons` describe exclusions on the returned page only. Thus
+`pool_count` is a candidate total, not a guarantee that every page contains
+`limit` verified rows. `coverage.catalog.complete_for_known_catalog` only
+qualifies the returned page within supported known factories and the indexed
+V4 PoolManager catalog. It does not assert full-chain discovery.
 
 Verified pool identities are cached separately from current liquidity snapshots
 and invalidated when pool or token metadata changes. Recovering an omitted V4
 tick spacing reuses candidates from previously verified PoolKeys, but each
-candidate must still reproduce the requested pool hash. Large-token responses
-remain complete rather than silently capped: every matching pool is returned.
-Block-pinned state reads are bounded to the 512 most recently active matching
-pools per request, selected by latest indexed pool activity; `coverage.state`
-reports the bound as `state_read_limit` and the unmatched remainder as
-`pools_over_limit`. Attempted state reads use bounded RPC batches and retain
-the exact-block confirmation described above.
+candidate must still reproduce the requested pool hash. Pages cap state reads
+to at most 200 pools and preserve the exact-block confirmation described above.
 
 ### Pool identity and dynamic fees
 
@@ -119,17 +126,10 @@ A successful zero is `"0"`. A failed, reverted, or malformed contract read has
 Unavailable state is never converted to zero. One unavailable pool does not
 discard successful reads for other pools.
 
-A pool beyond the per-request state-read bound (`coverage.state.pools_over_limit`
-greater than zero) has not been read at all: it keeps its complete catalog row
-but returns `liquidity.status: "unavailable"` with `unavailable_reason:
-"state_read_budget"`, `availability.reasons: ["state_read_budget"]`, and, for
-dynamic V4, `fee.current_status: "unavailable"`. Selection is most
-recently active first; such pools are never dropped, zeroed, or hidden from
-counts.
-
 ### `GET /api/v1/assets`
 
-This route reuses the pools endpoint's canonical snapshot and groups matches by:
+This route groups the entire verified known token catalog at one canonical
+snapshot block by:
 
 1. protocol;
 2. fee mode and exact configured fee field;
@@ -145,6 +145,13 @@ Every term therefore has the same currency and raw unit. `value_raw` is exact;
 `value_decimal` is non-null only when token decimals are consistent and known.
 The subtotal's `coverage` is `partial` if any pool in the group lacks a reserve
 measurement.
+
+`/api/v1/assets` does not paginate: it retains all verified pool identities
+and groups, even for tokens with more than 200 pools. Its block-pinned state
+reads cover at most 512 pools per response. `coverage.state.pools_over_limit`,
+group `state_coverage`, and each V2 subtotal's `coverage` and `pools_missing`
+show which measurements were unavailable; a partial sum is never labelled
+complete. `limit` and `offset` are not accepted on this route.
 
 The route never:
 
@@ -236,21 +243,15 @@ exact same-transaction pool route, so trades are not attributed as LP activity.
 Use `occurred_at` and, when available, `observed_at` as evidence times.
 `read_at` is server read time and is not evidence time.
 
-Pages are cached for 30 seconds per query. When a refresh fails after one
-retry, the last successfully fetched page for that query is served with
-`provenance.stale: true`, `provenance.stale_reason`, and its original
-`provenance.retrieved_at`. After three consecutive failures the publisher's
-upstream is skipped for 60 seconds and `coverage.publisher_circuit` reports
-the open breaker; it is `null` otherwise. A `503` is returned only when no last-good page
-exists for the query.
-
 ## Freshness and completeness
 
 For pool and asset responses, the service obtains the Robinhood Chain head,
 executes contract calls using that exact block number, and confirms the block
-hash again before publication. An otherwise valid response may be briefly
-cached; use `snapshot.block_number`, `snapshot.block_hash`, and
-`snapshot.timestamp`, not HTTP arrival time, as freshness evidence.
+hash again before publication. The in-process response cache lasts 2 seconds.
+HTTP responses use `Cache-Control: public, max-age=2, stale-while-revalidate=10`;
+intermediaries may serve an older response during the 10-second stale window.
+Use `snapshot.block_number`, `snapshot.block_hash`, and `snapshot.timestamp`,
+not HTTP arrival time, as freshness evidence.
 
 Coverage dimensions are independent:
 
@@ -264,65 +265,11 @@ Coverage dimensions are independent:
 
 Preserve nulls and these qualifications in derived data.
 
-### HTTP caching
+### Terminal LP search
 
-Every successful JSON response carries `Cache-Control: public, max-age=N,
-stale-while-revalidate=M`, a weak `ETag`, and `Vary: Accept-Encoding`. `N`
-equals the service's own response cache lifetime for that route, so a shared
-cache in front of the origin never serves data older than the origin itself
-would. A request with a matching `If-None-Match` receives `304 Not Modified`
-with no body.
-
-| Route | `max-age` | `stale-while-revalidate` |
-| --- | ---: | ---: |
-| `/api/lp/status` | 1 | 2 |
-| `/api/lp/overview`, `/api/lp/pools` with `window=1h` or `24h` | 3 | 30 |
-| `/api/lp/overview`, `/api/lp/pools` with `window=7d` | 30 | 120 |
-| `/api/lp/overview`, `/api/lp/pools` with `window=30d` or `all` | 120 | 600 |
-| `/api/lp/tape`, `/api/lp/dislocations` | 2 | 10 |
-| `/api/lp/owners`, `/api/lp/owner`, `/api/v1/research/owner` | 5 | 60 |
-| `/api/lp/search`, `/api/workbench/pools` | 5 | 30 |
-| `/api/lp/closed` | 15 | 60 |
-| `/api/v1/pools`, `/api/v1/assets` | 2 | 10 |
-| `/api/v1/fomo/flow` | 10 | 60 |
-
-Error responses and the `/api/lp/stream` event stream are `no-store`.
-
-### Cross-pool dislocations
-
-`GET /api/lp/dislocations` compares the last indexed price of every pool
-that shares a token pair and returns the pairs whose pools disagree. It is a
-read of indexed state, not an executable quote, and it never submits or
-recommends a trade.
-
-| Parameter | Default | Behavior |
-| --- | --- | --- |
-| `min_bps` | `30` | Minimum `spread_bps` (max pool price over min pool price, in basis points) |
-| `min_depth_usd` | `100` | Minimum `depth_usd`; `0` keeps pairs whose depth cannot be priced |
-| `max_age_s` | `3600` | A pair qualifies when at least one of its pools has indexed state this recent; clamped to 60–86400 |
-| `max_stale_s` | `0` | When positive, drops pairs whose older buy or sell leg exceeds this age |
-| `protocol` | | `v2`, `v3`, or `v4`; compares only pools of that protocol |
-| `token` | | 20-byte address; keeps pairs containing it |
-| `q` | | Substring over pool id, token addresses, and symbols |
-| `sort` | `net` | `net`, `spread`, or `depth`, descending |
-| `limit`, `offset` | `50`, `0` | Page bounds; `limit` is at most 150 |
-
-Each row carries the pair's tokens, `pool_count`, `spread_bps`, `fee_bps`
-(the configured fee of the buy and sell pools, summed; `null` when either fee
-is unknown), `net_bps` (`spread_bps - fee_bps`, ignoring gas and slippage),
-`depth_usd`, a `buy` leg (lowest price of token0 in token1), a `sell` leg
-(highest), and up to 25 `pools` ordered by depth with `pools_omitted`. Every
-leg exposes `id`, `protocol`, `address`, `fee_ppm`, `tick_spacing`, `hook`,
-`price`, `sqrt_price_x96`, `tick`, `liquidity`, V2 `reserve0`/`reserve1`,
-`price0_usd`/`price1_usd`, `depth_usd`, `block_number`, `timestamp`, and
-`age_s` relative to the indexed head.
-
-`depth_usd` is the USDG-quote value required to move a leg to the geometric
-mid of the buy and sell prices assuming no tick crossing (V3/V4) or constant
-product (V2); the row value is the thinner leg. Pools with zero active
-liquidity or reserves, and pools at a tick limit, are excluded before
-comparison. A stale leg (large `age_s`) is the side that has not repriced;
-treat token transfer restrictions, hooks, and pool honesty as unverified.
+The terminal's `/api/lp/search` counts all matching indexed prefix terms in
+`total`. Its top results are ranked only within bounded candidates; `total`
+does not mean every matching result was ranked. Search uses the existing index.
 
 ### Terminal wallet accounting
 
@@ -355,22 +302,147 @@ responses distinguish complete collected-fee totals from partial evidence:
 Fresh canonical activity does not imply complete transaction enrichment or
 historical accounting. Preserve both freshness and completeness qualifications.
 
+## API keys
+
+Access above the anonymous tier is a property of a wallet, not of a key. The
+server reads the wallet's `balanceOf` on the token named in the owner-signed
+gate policy (cached 30 s, at most one read per wallet per 30 s regardless of
+how many keys or streams the wallet holds). A fresh read below the threshold
+removes entitlement at the next recheck, even if `grace_s` has not elapsed.
+Grace applies only while the balance oracle cannot return a fresh reading,
+for at most `grace_s` seconds after the last qualifying observation. Revoking
+one key never changes another key's outcome.
+
+The same policy sets swap fees. `base_fee_bps` defaults to `100`, and
+`fee_tiers` defaults to `[{"min_supply_bps":10,"fee_bps":75},
+{"min_supply_bps":50,"fee_bps":50}]`. Supply bps measure the wallet's share
+of the policy token's on-chain `totalSupply`: 10 bps means 0.10% of supply,
+50 bps means 0.50%. The highest threshold met wins, including at the exact
+boundary. The server caches `totalSupply` per token for 30 s, separate from
+the per-wallet balance cache. If it cannot read supply, the wallet pays the
+base fee. Holding grace never preserves a discounted rate.
+
+An owner can set zero to four tiers in the policy JSON used by the POLICY
+panel or passed to `rhpools-gate policy typed-data` and `rhpools-gate policy apply`.
+Tiers must increase by `min_supply_bps` (0..10000) and decrease strictly by
+`fee_bps` (0..100).
+No tier can exceed `base_fee_bps` (0..100). The EIP-712 domain version is
+`2`; its `GatePolicy` struct signs `baseFeeBps` and a `FeeTier[] feeTiers`
+array. Old policy signatures cannot authorize new policies. Policies already
+stored before this change read with the defaults above until the owner
+signs a replacement version.
+
+Sign in once with an EIP-4361 (SIWE) message. The message's domain must be
+`rhpools.lol`, its chain ID `4663`, and its nonce must come from `/api/gate/nonce`
+(single use, 600 s). The nonce endpoint limits requests per client IP and
+returns `503` rather than evicting unexpired nonces when full. `personal_sign`
+over the message text is enough; no transaction, no fee. Contract wallets
+are verified with ERC-1271; EIP-7702 delegated accounts are verified like
+plain EOAs.
+
+```sh
+NONCE=$(curl -s https://rhpools.lol/api/gate/nonce?wallet=$WALLET)
+# build the SIWE text from the nonce response, sign it with the wallet, then:
+curl -s -c jar -X POST https://rhpools.lol/api/gate/session \
+  -H 'content-type: application/json' \
+  -d '{"message":"<siwe text>","signature":"0x…","label":"research-box"}'
+# mint a long-lived key from the session (cookie plus same-origin header)
+curl -s -b jar -H 'origin: https://rhpools.lol' -X POST https://rhpools.lol/api/gate/keys \
+  -H 'content-type: application/json' -d '{"op":"mint","label":"bot-1","ttl_s":7776000}'
+# → {"key_id":"5c1d9b2e0a7f43aa","secret":"rhp_…","label":"bot-1","expires_at":…}
+curl -s -H 'authorization: Bearer rhp_…' https://rhpools.lol/api/v1/pools?token=0x…
+```
+
+The secret is shown once; only its SHA-256 is stored. `key_id` is the public
+handle. The sign-in session itself is the same kind of credential (a browser
+receives it as the `__Host-rhp_session` cookie; a script may send it as a
+bearer) but keys can only be minted from a browser session, never from a
+bearer. A wallet may hold eight live keys and four concurrent keyed streams.
+
+| Route | Credential | Purpose |
+| --- | --- | --- |
+| `GET /api/gate/nonce?wallet=` | none | Fresh nonce, timestamps, statement, checksummed address |
+| `POST /api/gate/session` | none | `{message, signature, label}` → session cookie plus the `/me` body |
+| `GET /api/gate/me` | optional | Wallet, features, holding (including `total_supply_raw`), `fee_bps`, `tier` (0 = base), grace deadlines, policy; `{"signed_in": false}` otherwise |
+| `GET /api/gate/keys` | required | Live and revoked keys for the wallet (no secrets) |
+| `POST /api/gate/keys` | required | `{"op":"mint","label","ttl_s"}`, `{"op":"revoke","key_id"}`, `{"op":"revoke_all"}` |
+| `POST /api/gate/logout` | cookie | Revokes the session key and clears the cookie |
+| `GET /api/gate/policy` | none | Current owner-signed policy and its EIP-712 typed-data template |
+| `POST /api/gate/policy` | owner signature | `{policy, signature}`; owner-signed refusals and applications are audited; non-owner attempts are counted in memory |
+
+A cookie-authenticated POST must carry a same-origin `Origin`; a bearer POST
+need not. `Authorization: Bearer rhp_…` takes precedence over the cookie. Any
+other `Authorization` scheme is ignored and the request is served anonymously.
+
+### Keyed quota tier
+
+Sending a bearer on any `/api/lp/*`, `/api/v1/*`, or `/api/workbench/*` route
+selects the keyed tier: a per-key token bucket (10 requests per second, burst
+40) on its own capacity lane, `Cache-Control: private, no-store`, no `ETag`, and
+the headers `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`
+(unix seconds until the bucket is full). Exhausting the bucket returns `429`
+with `Retry-After` and `gate.retry_after_ms`.
+
+### Keyed streaming: `GET /api/v1/stream`
+
+The same frames as the terminal's `/api/lp/stream` (`block`, `activity`,
+`owners`, durable frames) with the same query parameters, behind a credential.
+Without `Upgrade: websocket` it is `text/event-stream`; with it, the frames
+arrive as JSON text messages `{"event":…,"id":…,"data":…}` and the server
+never reads client data frames (send only pong or close).
+
+The server re-evaluates the wallet on every loop iteration. When the credential
+is revoked or a fresh balance read falls below the threshold, an SSE client
+receives `event: gate` with the refusal body and the connection ends; a
+WebSocket client receives `{"event":"gate","data":{…}}` and close code `4403`.
+Reconnecting yields the refusal as a normal HTTP error.
+
+## Holder trading and liquidity
+
+These routes need a signed-in wallet entitled to `trade` (swaps) or `lp` (liquidity). The wallet always comes from the credential; a `wallet` field in the body is ignored. Browser sessions must send a same-origin `Origin` on POST.
+
+| Route | Purpose |
+|---|---|
+| `GET /api/tx/status` | `enabled`, `reason`, `base_fee_bps`, `fee_tiers`, `quote_ttl_s` |
+| `POST /api/tx/quote` | `{kind:"swap", side, token, quote_currency, amount_in, slippage_bps}` or `{kind:"lp", op, pool_id, slippage_bps, tick_lower, tick_upper, amount0, amount1, liquidity, token_id}`; amounts are raw integers as strings. Swap quotes carry the wallet's `fee_bps` |
+| `POST /api/tx/prepare` | `{quote_id, permit_signature, batched}`; returns the unsigned transaction after re-simulating its exact bytes with the quote's fee, without recalculating the tier. With `batched: true` on an external-router quote it also returns `calls`: the exact-amount approval and the swap, simulated together, for one `wallet_sendCalls` confirmation |
+| `GET /api/tx/receipt?hash=&feature=` | Fill reconciled from receipt logs: `pending`, `confirmed` with amounts, or `failed` |
+| `GET /api/tx/balances?currencies=&feature=` | Balance, decimals and symbol per currency (up to 8) |
+| `GET /api/tx/pool?pool_id=&ids=&feature=lp` | Pool tokens, tick, spacing, Pons flag and the wallet's positions, each verified on chain; `ids` adds the client's recent mints |
+| `GET /api/tx/history?feature=trade&before=` | The signed-in browser wallet's rhpools swaps and LP fills retained after receipt reconciliation, plus trades found in the chain's most recent 10-day log window. Returns `rows` newest first (up to 50) with `hash`, `block`, `timestamp`, `sent` and `received` raw amounts with token metadata, `via`, and `source` (`rhpools` or `chain`). Stored rows also have `kind` (`swap` or `lp`) and swap `fee` (`currency`, raw `amount`). `next_before` is the exclusive block cursor for older pages, or `null`; pass it as `before`. Older pages outside the node window read the stored record only. Browser session only; API keys are refused |
+
+A swap quote lists `hops` (venue, `dex`, fee tier, Pons hook and creator bps), `legs` (one to three routes with each leg's input and output share of the order), `amounts` (`amount_in`, `net_out`, `min_out`, `hook_fee`, `creator_tax`, `rhpools_fee`, `impact_bps`), `steps` in order (`approve`, `permit` for EIP-712 signing, `send`), and `shortfall` (`{currency, have, need}`) when the wallet holds less than `amount_in`. Such a quote is priced as if funded, and prepare refuses it until the wallet holds the input. A split order runs in one UniversalRouter transaction: the fee is taken once on the whole input, and `min_out` is enforced on the total at the final sweep. Router approvals are exact amounts, and Permit2 signatures expire with the quote. Quotes expire after 60 s. Refusals return 422 with `refusal`: `no_route`, `insufficient_balance`, `impact_over_limit`, `unmodeled_fee`, `unsellable` (a buy whose sell-back simulation fails), `fee_wallet` (the fee recipient cannot trade), `off_market` (the execution price is more than 300 bps worse than the deepest pool), `incomplete_pool`, `unknown_pool`, `unsupported_pool`, `pons_add`, `hook_blocked_add`, `untrusted_hook` (liquidity adds only go to V4 pools without a hook), `not_executable`, `allowlist_mismatch`, `trading_disabled`. Pools charging more than 10% are never routed, and a quote warns (`high_pool_fee`) when a hop charges more than 1%. Quotes are charged against the caller's token bucket (quote 10, prepare 5, pool 5, other reads 1) and each wallet keeps at most 8 live quotes.
+
+LP adds carry no rhpools fee. A swap pays `floor(amount * fee_bps / 10000)`
+to the configured recipient in the same transaction. For an input-leg fee,
+`amount` is the input; for an output-leg fee, it is the gross output before
+the rhpools deduction. The quoted `fee_bps` stays with its plan through
+prepare, even if the wallet balance or policy changes meanwhile.
+
+## Flow tags: `GET /api/v1/tags?tx=`
+
+Up to 100 transaction hashes, comma-separated, for wallets entitled to `flags`. The server resolves each transaction's pools, block and time from its own events and returns `{tags: {tx: {pool: {tags, basis}}}}`. `PONS` means the pool is registered in the Pons V2 hook. `FOMO` means a Relay-routed trade whose counterparty wallet carries FOMO's EIP-7702 delegation. Other wallets delegating to the same implementation cannot be told apart on chain.
+
 ## Errors
 
-All errors use a JSON object with an `error` string.
+All errors use a JSON object with an `error` string. Gate refusals add a `gate`
+object with `state` (`anonymous`, `invalid`, `revoked`, `unset`, `below`,
+`refused`, `forbidden`) and, for `below`, the `feature`, `need` and `have`
+raw-unit amounts.
 
 | HTTP | Meaning |
 | --- | --- |
 | `400` | Missing, malformed, unsupported, or source-incompatible query input |
+| `401` | A credential is required, or an `rhp_` bearer is unknown, expired, or revoked |
+| `403` | Signed in but not entitled (below threshold, policy unset), cross-site cookie POST, key minted from a bearer, or a policy signed by a non-owner |
+| `409` | Policy version does not exceed the current version |
+| `429` | Keyed quota, per-wallet stream limit, or per-client nonce, failed sign-in, or policy rate limit |
 | `503` | Bounded request capacity, required current/indexed service, canonical confirmation, or selected public publisher is unavailable or unusable |
 
 A canonical block changing before publication is `503`; retry the whole request.
 No result from that attempt is published. Individual pool contract-call
 failures remain a `200` response with explicit per-pool nulls and reasons.
-Capacity errors include `Retry-After`. The origin bounds concurrent requests in
-two lanes so a burst of slow owner and research reads cannot starve the
-status, overview, pool, and tape routes. The lane sizes derive from the
-`--api-slots` option (default four per CPU; the slow lane holds half).
+Capacity errors may include `Retry-After`.
 
 Deployment edge limits may additionally return `429`. Clients should honor
 `Retry-After`, use exponential backoff, and avoid aggressive polling.

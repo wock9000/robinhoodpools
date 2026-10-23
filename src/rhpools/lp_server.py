@@ -12,10 +12,19 @@ import sys
 import threading
 import time
 import zlib
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import NamedTuple
 from urllib.parse import parse_qs, urlsplit
+
+from .lp_gate import COOKIE_NAME, Entitlement, Gate, GatePolicy, GateRefusal, Principal
+from .lp_gate_ws import CLOSE_NOT_ENTITLED, WebSocketPush
+from .lp_flow_tags import FlowTagger, PostgresListener, TagStore
+from .tx_core import JsonRpc, TxCore
+from .tx_trade_store import TradeStore
+from .tx_plan import LpIntent, LpOp, Signatures, SwapIntent, TxError, TxPolicy, TxRefusal
+from .tx_routes import RouteBook, Side
 
 STATIC = Path(__file__).resolve().parent / "static"
 MAX_BODY = 16_384
@@ -31,9 +40,13 @@ _ASSETS = {
     "/research": ("lp_research.html", "text/html; charset=utf-8"),
     "/flow": ("lp_flow.html", "text/html; charset=utf-8"),
     "/api/v1/openapi.json": ("openapi.json", "application/json; charset=utf-8"),
+    "/favicon.ico": ("favicon.ico", "image/x-icon"),
+    "/static/rhp_logo.png": ("rhp_logo.png", "image/png"),
+    "/static/rhp_icon_180.png": ("rhp_icon_180.png", "image/png"),
+    "/static/rhp_icon_512.png": ("rhp_icon_512.png", "image/png"),
 }
 for _name in (
-    "lp_theme.css", "lp_terminal.css", "lp_terminal.js", "lp_panes_boot.js",
+    "lp_theme.css", "lp_terminal.css", "lp_terminal.js", "lp_panes_boot.js", "lp_gate.css", "lp_gate.js", "lp_trade.css", "lp_trade.js",
     "workbench.css", "workbench.js", "lp_guide.css",
     "lp_research.css", "lp_research.js", "lp_flow.css", "lp_flow.js",
 ):
@@ -50,9 +63,9 @@ class Route(NamedTuple):
     freshness: tuple[int, int] | dict[str, tuple[int, int]]
 
 
-# (max-age, stale-while-revalidate) seconds. Window entries mirror
-# lp_market_service.WINDOW_CACHE_TTL so the edge never outlives the service cache.
-_WINDOW_FRESHNESS = {"1h": (3, 30), "24h": (3, 30), "7d": (30, 120), "30d": (120, 600), "all": (120, 600)}
+# The service coalesces summary refreshes. Downstream caches must revalidate,
+# rather than adding another freshness window to an already retained snapshot.
+_WINDOW_FRESHNESS = dict.fromkeys(("1h", "24h", "7d", "30d", "all"), (0, 0))
 _ROUTES = {
     "/api/lp/status": Route("lp", "status", "fast", (1, 2)),
     "/api/lp/search": Route("lp", "search", "fast", (5, 30)),
@@ -70,7 +83,15 @@ _ROUTES = {
     "/api/workbench/pools": Route("market", "catalog", "fast", (5, 30)),
     "/api/workbench/pool": Route(None, "_workbench_detail", "slow", (2, 10)),
 }
-_LANE_SHARE = {"fast": 1.0, "slow": 0.5}
+_LANE_SHARE = {"fast": 1.0, "slow": 0.5, "keyed": 0.5}
+_GATE_GET = {"/api/gate/nonce", "/api/gate/me", "/api/gate/keys", "/api/gate/policy"}
+_GATE_POST = {"/api/gate/session", "/api/gate/keys", "/api/gate/logout", "/api/gate/policy"}
+KEYED_STREAM = "/api/v1/stream"
+_TX_GET = {"/api/tx/status", "/api/tx/receipt", "/api/tx/balances", "/api/tx/pool", "/api/tx/history"}
+_TX_POST = {"/api/tx/quote", "/api/tx/prepare"}
+TAGS_PATH = "/api/v1/tags"
+TAGS_MAX_TX = 100
+_MINT_TTL_DEFAULT_S = 90 * 86400
 DEFAULT_API_SLOTS = 4 * (getattr(os, "process_cpu_count", os.cpu_count)() or 1)
 
 
@@ -163,8 +184,67 @@ def _load_assets():
     return assets
 
 
+def _startup_activity(tid: int) -> dict[str, int] | None:
+    """Work counters that grow only while initialization really advances.
+
+    CPU is the initializing thread's own, so serving probes never masquerades
+    as progress; storage bytes are process-wide because SQLite performs the
+    reads of a long WAL recovery from whichever thread the store chooses.
+    """
+    try:
+        with open(f"/proc/self/task/{tid}/stat", "rb") as handle:
+            stat = handle.read()
+        with open("/proc/self/io", "rb") as handle:
+            io = handle.read()
+        fields = stat[stat.rindex(b")") + 2:].split()
+        ticks = int(fields[11]) + int(fields[12])
+        counters = dict(line.split(b":", 1) for line in io.splitlines() if b":" in line)
+        return {
+            "cpu_ms": ticks * 1000 // os.sysconf("SC_CLK_TCK"),
+            "read_bytes": int(counters[b"read_bytes"]),
+            "write_bytes": int(counters[b"write_bytes"]),
+        }
+    except (OSError, ValueError, IndexError, KeyError):
+        return None
+
+
+class Startup:
+    """What the process can say for itself before the runtime exists.
+
+    Opening a large store is a single blocking call that can run for hours,
+    so the socket is served from the start and every request that needs
+    data gets this record instead of a queued connection that times out.
+    """
+
+    def __init__(self, assets: dict) -> None:
+        self.assets = assets
+        self.started_at = time.time()
+        self.tid = threading.get_native_id()
+        self._clock = time.monotonic()
+        self._phase = "starting"
+
+    def phase(self, name: str) -> None:
+        self._phase = name
+        print(f"RobinhoodPools startup: {name}", flush=True)
+
+    def snapshot(self) -> dict:
+        elapsed = int(time.monotonic() - self._clock)
+        return {
+            "chain_id": 4663,
+            "state": "starting",
+            "error": f"Service is starting: {self._phase} ({elapsed}s elapsed)",
+            "startup": {
+                "started_at": self.started_at,
+                "phase": self._phase,
+                "elapsed_s": elapsed,
+                "activity": _startup_activity(self.tid),
+            },
+            "as_of": time.time(),
+        }
+
+
 class Runtime:
-    def __init__(self, args: argparse.Namespace) -> None:
+    def __init__(self, args: argparse.Namespace, startup: Startup) -> None:
         from .lp_market_service import LPMarketService
         from .lp_public_api import PublicMarketAPI
         from .lp_research import LPResearchService
@@ -175,20 +255,23 @@ class Runtime:
         self.stopping = threading.Event()
         self.origins = frozenset(args.public_origin)
         self.enable_prepare = args.enable_transaction_prepare
-        self.assets = _load_assets()
+        self.assets = startup.assets
         self._resources = ExitStack()
         self._close_lock = threading.Lock()
         try:
+            startup.phase("market")
             self.market = MarketService(
                 args.rpc_url, data_dir=args.data_dir, external_index=True,
             )
             self._resources.callback(self.market.close)
+            startup.phase("store")
             self.lp = LPMarketService(
                 self.market, args.rpc_url, args.database,
                 history_days=args.history_days,
                 history_disk_reserve_bytes=int(args.disk_reserve_gib * 1024**3),
             )
             self._resources.callback(self.lp.close)
+            startup.phase("services")
             self.actions = ActionService(self.market.rpc)
             self._resources.callback(self.actions.close)
             self.public = PublicMarketAPI(self.lp)
@@ -196,6 +279,38 @@ class Runtime:
             self.research = LPResearchService(self.lp)
             self.flow = FomoFlowService()
             self._resources.callback(self.flow.close)
+            startup.phase("gate")
+            self.gate = Gate(
+                args.gate_db, owner=args.gate_owner, rpc_url=args.gate_rpc_url,
+                hosts=frozenset(urlsplit(origin).netloc for origin in self.origins),
+            )
+            self._resources.callback(self.gate.close)
+            startup.phase("tx")
+            self.tx, self.tx_unavailable = None, "fee recipient not configured"
+            if args.tx_fee_recipient:
+                try:
+                    rpc = JsonRpc(args.gate_rpc_url)
+                    self.tx = TxCore(
+                        rpc, RouteBook(self.lp.store.reader_snapshot, rpc),
+                        TxPolicy(100, str(args.tx_fee_recipient).lower()),
+                        trade_store=TradeStore(args.gate_db.parent / "trades.sqlite"),
+                    )
+                    self.tx_unavailable = None
+                except Exception as exc:
+                    self.tx_unavailable = "transaction core failed to start: " + " ".join(str(exc).split())[:160]
+                if self.tx is not None and not self.tx.enabled:
+                    self.tx_unavailable = "pinned contract code changed; trading disabled"
+            startup.phase("tags")
+            listener = None
+            if os.environ.get("RHP_LISTENER_DSN"):
+                try:
+                    listener = PostgresListener(os.environ["RHP_LISTENER_DSN"])
+                except Exception:
+                    listener = None
+            self.tags = FlowTagger(
+                JsonRpc(args.gate_rpc_url, timeout=15), TagStore(str(args.data_dir / "tags.sqlite")),
+                _pool_identity_reader(self.lp.store), listener,
+            )
         except BaseException:
             self._resources.close()
             raise
@@ -206,6 +321,14 @@ class Runtime:
             self._resources.close()
 
 
+def _pool_identity_reader(store):
+    def lookup(pool_id: str):
+        with store.reader_snapshot() as connection:
+            row = connection.execute("SELECT id,protocol,hook FROM pools WHERE id=?", (pool_id,)).fetchone()
+        return None if row is None else {"id": row[0], "protocol": row[1], "hook": row[2]}
+    return lookup
+
+
 class LPHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -214,8 +337,132 @@ class LPHTTPServer(ThreadingHTTPServer):
     request_queue_size = 1024
 
 
+def _tx_uint(payload: dict, name: str, default: str | None = None) -> int:
+    value = payload.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, (int, str)) or not str(value).isdigit():
+        raise ValueError(f"{name} must be a non-negative integer in raw units")
+    return int(value)
+
+
+def _tx_int(payload: dict, name: str) -> int:
+    value = payload.get(name, 0)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer")
+    return value
+
+
+def _tx_intent(payload: dict, wallet: str) -> SwapIntent | LpIntent:
+    """The wallet always comes from the credential, never from the request body."""
+    slippage = _tx_uint(payload, "slippage_bps")
+    if not 1 <= slippage <= 5000:
+        raise ValueError("slippage_bps must be between 1 and 5000")
+    if payload["kind"] == "swap":
+        return SwapIntent(
+            wallet.lower(), Side(str(payload.get("side"))), str(payload.get("token") or "").lower(),
+            str(payload.get("quote_currency") or "").lower(), _tx_uint(payload, "amount_in"), slippage,
+        )
+    token_id = payload.get("token_id")
+    return LpIntent(
+        wallet.lower(), LpOp(str(payload.get("op"))), str(payload.get("pool_id") or "").lower(), slippage,
+        tick_lower=_tx_int(payload, "tick_lower"), tick_upper=_tx_int(payload, "tick_upper"),
+        amount0=_tx_uint(payload, "amount0", "0"), amount1=_tx_uint(payload, "amount1", "0"),
+        liquidity=_tx_uint(payload, "liquidity", "0"),
+        token_id=None if token_id is None else _tx_uint(payload, "token_id"),
+    )
+
+
+def _quota_headers(quota) -> tuple[tuple[str, str], ...]:
+    return (
+        ("X-RateLimit-Limit", str(quota.limit)), ("X-RateLimit-Remaining", str(quota.remaining)),
+        ("X-RateLimit-Reset", str(int(quota.reset_at))),
+    )
+
+
+class _StreamClosed(Exception):
+    pass
+
+
+class _SseSink:
+    def __init__(self, handler: "Handler") -> None:
+        self.handler = handler
+        self.recheck = None
+        self.opened = False
+
+    def open(self) -> None:
+        self.write = self.handler._start_event_stream()
+        self.opened = True
+
+    def tick(self) -> None:
+        if self.recheck is not None:
+            try:
+                self.recheck()
+            except GateRefusal as refusal:
+                self.gate(refusal.payload)
+                raise _StreamClosed from None
+
+    def event(self, id_: str, name: str | None, body: bytes) -> None:
+        head = f"id: {id_}\n" + (f"event: {name}\n" if name else "")
+        self.write(head.encode() + b"data: " + body + b"\n\n")
+
+    def heartbeat(self) -> None:
+        self.write(b": heartbeat\n\n")
+
+    def gate(self, payload: dict) -> None:
+        self.write(b"event: gate\ndata: " + _json_bytes(payload) + b"\n\n")
+
+    def error(self, message: str) -> None:
+        try:
+            self.write(b"event: error\ndata: " + _json_bytes({"error": message}) + b"\n\n")
+        except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+            pass
+
+    def finish(self) -> None:
+        pass
+
+
+class _WsSink(_SseSink):
+    def open(self) -> None:
+        self.push = WebSocketPush(self.handler)
+        if self.push.accept() != 101:
+            raise _StreamClosed
+        self.opened = True
+
+    def tick(self) -> None:
+        if not self.push.poll():
+            raise _StreamClosed
+        super().tick()
+
+    def event(self, id_: str, name: str | None, body: bytes) -> None:
+        self.push.send_text('{"event":"%s","id":"%s","data":%s}' % (name or "message", id_, body.decode()))
+
+    def heartbeat(self) -> None:
+        self.push.ping()
+
+    def gate(self, payload: dict) -> None:
+        self.push.send_text(_json_bytes({"event": "gate", "data": payload}).decode())
+        self.push.close(CLOSE_NOT_ENTITLED, "not entitled")
+
+    def error(self, message: str) -> None:
+        try:
+            self.push.close(1011, message[:100])
+        except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+            pass
+
+    def finish(self) -> None:
+        if self.opened and self.push.open:
+            try:
+                self.push.close(1000, "bye")
+            except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+                pass
+
+
 class Handler(BaseHTTPRequestHandler):
-    runtime: Runtime
+    # `runtime` stays None until initialization finishes; `startup` answers
+    # for it meanwhile. Data routes report 503 "starting", never a hang.
+    runtime: Runtime | None = None
+    startup: Startup | None = None
+    server_version = "rhpools"
+    sys_version = ""
     # Keep-alive lets cloudflared reuse origin connections instead of paying a
     # handshake and a new thread per poll. Every response carries Content-Length
     # or closes the connection.
@@ -223,6 +470,7 @@ class Handler(BaseHTTPRequestHandler):
     api_slots = lane_slots(DEFAULT_API_SLOTS)
     lp_streams = threading.BoundedSemaphore(512)
     workbench_streams = threading.BoundedSemaphore(128)
+    keyed_streams = threading.BoundedSemaphore(128)
 
     def setup(self) -> None:
         self.request.settimeout(20)
@@ -243,6 +491,7 @@ class Handler(BaseHTTPRequestHandler):
     def _json(
             self, status: int, payload: object, *,
             retry: int | None = None, key=None, fresh: tuple[int, int] | None = None,
+            private: bool = False, headers: tuple[tuple[str, str], ...] = (),
     ) -> None:
         body = _json_bytes(payload, key)
         etag = _etag(key, body) if status == 200 and fresh is not None else None
@@ -254,13 +503,17 @@ class Handler(BaseHTTPRequestHandler):
             body = build() if key is None else _memoized_body(("gzip", *key), build)
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
-        if etag is None:
+        if private:
+            self.send_header("Cache-Control", "private, no-store")
+        elif etag is None:
             self.send_header("Cache-Control", "no-store")
         else:
             self.send_header("Cache-Control", f"public, max-age={fresh[0]}, stale-while-revalidate={fresh[1]}")
             self.send_header("ETag", etag)
         self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Vary", "Accept-Encoding")
+        self.send_header("Vary", "Accept-Encoding, Authorization, Cookie" if private else "Accept-Encoding")
+        for name, value in headers:
+            self.send_header(name, value)
         self.send_header("Access-Control-Allow-Origin", "*")
         if compressed:
             self.send_header("Content-Encoding", "gzip")
@@ -278,7 +531,8 @@ class Handler(BaseHTTPRequestHandler):
         return {tag.strip() for tag in str(self.headers.get("If-None-Match") or "").split(",")}
 
     def _asset(self, path: str, head: bool = False) -> bool:
-        item = self.runtime.assets.get(path)
+        owner = self.runtime if self.runtime is not None else self.startup
+        item = owner.assets.get(path)
         if item is None:
             return False
         raw, content_type, etag, zipped = item
@@ -319,8 +573,18 @@ class Handler(BaseHTTPRequestHandler):
             for key, values in parse_qs(parsed.query, max_num_fields=64).items()
         }
 
+    def _starting(self) -> None:
+        self._json(503, self.startup.snapshot(), retry=15)
+
     def _bounded(self, route: Route, path: str, query: dict[str, str]) -> None:
-        slots = self.api_slots[route.lane]
+        keyed = self.headers.get("Authorization", "")[:11].lower() == "bearer rhp_"
+        if keyed:
+            try:
+                principal, _ = self.runtime.gate.require(self.headers, "api")
+                quota = self.runtime.gate.admit(principal)
+            except GateRefusal as refusal:
+                return self._refuse(refusal)
+        slots = self.api_slots["keyed" if keyed else route.lane]
         if not slots.acquire(False):
             self._json(503, {"error": "API request capacity reached"}, retry=1)
             return
@@ -331,6 +595,8 @@ class Handler(BaseHTTPRequestHandler):
                 payload = method() if path == "/api/lp/status" else method(query)
             finally:
                 self.runtime.lp.store.close_reader()
+            if keyed:
+                return self._json(200, payload, private=True, headers=_quota_headers(quota))
             key = _publication_key(path, query, payload) if isinstance(payload, dict) else None
             self._json(200, payload, key=key, fresh=freshness(route, query))
         finally:
@@ -397,7 +663,7 @@ class Handler(BaseHTTPRequestHandler):
             key = _publication_key("workbench-stream", query, detail)
             write(b"data: " + _json_bytes({"type": "pool", "data": detail}, key) + b"\n\n")
 
-    def _lp_stream(self, query):
+    def _lp_stream(self, query, sink):
         lp = self.runtime.lp
         after = max(0, int(query.get("after") or 0))
         block_after = max(0, int(query.get("block_after") or 0))
@@ -426,7 +692,7 @@ class Handler(BaseHTTPRequestHandler):
             feed = lp.stream_updates(query, block_after, feed_epoch)
         finally:
             lp.store.close_reader()
-        write = self._start_event_stream()
+        sink.open()
         frame = None
         last_write = time.monotonic()
         next_durable = float("inf") if current_only or terminal else 0.0
@@ -434,6 +700,11 @@ class Handler(BaseHTTPRequestHandler):
         owner_revision = None
         seen_rows = {}
         while not self.runtime.stopping.is_set():
+            sink.tick()
+            if feed["reset"]:
+                # Sequence numbers belong to one feed epoch. Keeping a retired
+                # high cursor would force snapshot-only replay after a restart.
+                block_after = 0
             for item in feed["events"]:
                 block_after = max(block_after, int(item["sequence"]))
                 feed_epoch = feed["feed_epoch"]
@@ -441,7 +712,7 @@ class Handler(BaseHTTPRequestHandler):
                     continue
                 key = ("lp-feed", feed_epoch, int(item["sequence"]), item["event"], () if item["event"] == "block" else view_key)
                 body = _json_bytes(item["data"], key)
-                write(f"id: {after}:{feed_epoch}:{block_after}\nevent: {item['event']}\n".encode() + b"data: " + body + b"\n\n")
+                sink.event(f"{after}:{feed_epoch}:{block_after}", item["event"], body)
                 last_write = time.monotonic()
             if frame is not None:
                 current_rows = {str(row["id"]): row for row in frame["rows"]}
@@ -450,7 +721,7 @@ class Handler(BaseHTTPRequestHandler):
                 frame["rows"] = [row for key, row in current_rows.items() if row != seen_rows.get(key)]
                 seen_rows = current_rows
                 after, epoch = frame["revision"], frame["epoch"]
-                write(f"id: {after}:{feed_epoch or feed['feed_epoch']}:{block_after}\n".encode() + b"data: " + _json_bytes(frame) + b"\n\n")
+                sink.event(f"{after}:{feed_epoch or feed['feed_epoch']}:{block_after}", None, _json_bytes(frame))
                 frame = None
                 last_write = time.monotonic()
             now = time.monotonic()
@@ -463,7 +734,7 @@ class Handler(BaseHTTPRequestHandler):
                 if owners is not None:
                     owner_revision = (int(owners["revision"]), int((owners.get("current_activity") or {}).get("epoch") or 0))
                     body = _json_bytes(owners, ("lp-owners", view_key, *owner_revision))
-                    write(f"id: {after}:{feed_epoch or feed['feed_epoch']}:{block_after}\nevent: owners\n".encode() + b"data: " + body + b"\n\n")
+                    sink.event(f"{after}:{feed_epoch or feed['feed_epoch']}:{block_after}", "owners", body)
                     last_write = time.monotonic()
             block_after = max(block_after, int(feed["sequence"]))
             feed_epoch = feed["feed_epoch"]
@@ -478,7 +749,7 @@ class Handler(BaseHTTPRequestHandler):
                 if frame is not None:
                     continue
             if now - last_write >= 10:
-                write(b": heartbeat\n\n")
+                sink.heartbeat()
                 last_write = now
             lp.wait_stream(block_after, min(0.5, max(0.01, min(next_durable, next_owner) - now)))
             try:
@@ -496,7 +767,7 @@ class Handler(BaseHTTPRequestHandler):
             if workbench:
                 self._workbench_stream(query)
             else:
-                self._lp_stream(query)
+                self._lp_stream(query, _SseSink(self))
         except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
             pass
         except Exception:
@@ -510,6 +781,81 @@ class Handler(BaseHTTPRequestHandler):
             self.runtime.lp.store.close_reader()
             slots.release()
 
+    def _refuse(self, refusal: GateRefusal) -> None:
+        self._json(refusal.status, refusal.payload, retry=refusal.retry_after, private=True)
+
+    def _client_ip(self) -> str:
+        address = self.client_address[0]
+        if address in {"127.0.0.1", "::1"}:
+            return str(self.headers.get("CF-Connecting-IP") or address)
+        return address
+
+    def _me(self, principal: Principal | None) -> dict:
+        gate = self.runtime.gate
+        policy = gate.policy()
+        if principal is None:
+            return {"signed_in": False, "policy": policy.public()}
+        ent = gate.entitlement(principal.wallet)
+        return {
+            "signed_in": True, "wallet": principal.wallet, "key_id": principal.key_id, "kind": principal.kind,
+            "via": principal.via, "expires_at": principal.expires_at, "state": ent.state(policy),
+            **ent.public(), "policy": policy.public(), "owner": gate.is_owner(principal.wallet),
+        }
+
+    def _gate_get(self, path: str, query: dict[str, str]) -> None:
+        gate = self.runtime.gate
+        try:
+            if path == "/api/gate/nonce":
+                return self._json(200, gate.nonce(query.get("wallet"), client_ip=self._client_ip()), private=True)
+            if path == "/api/gate/policy":
+                return self._json(200, gate.status(), private=True)
+            principal = gate.resolve(self.headers)
+            if path == "/api/gate/me":
+                return self._json(200, self._me(principal), private=True)
+            if principal is None:
+                raise GateRefusal(401, "credential required", state="anonymous")
+            return self._json(200, {"wallet": principal.wallet, "keys": [record.public() for record in gate.keys(principal.wallet)]}, private=True)
+        except GateRefusal as refusal:
+            self._refuse(refusal)
+
+    def _keyed_stream(self, query: dict[str, str]) -> None:
+        if self.command == "HEAD":
+            return self._json(405, {"error": "Use GET for event streams"})
+        gate = self.runtime.gate
+        try:
+            principal, _ = gate.require(self.headers, "api")
+        except GateRefusal as refusal:
+            return self._refuse(refusal)
+        if not self.keyed_streams.acquire(False):
+            return self._json(503, {"error": "Live stream capacity reached"}, retry=2)
+        websocket = str(self.headers.get("Upgrade") or "").lower() == "websocket"
+        sink = None
+        try:
+            with gate.stream_slot(principal):
+                sink = _WsSink(self) if websocket else _SseSink(self)
+                sink.recheck = lambda: gate.recheck(principal, "api")
+                self._lp_stream(query, sink)
+        except GateRefusal as refusal:
+            self._refuse(refusal)
+        except _StreamClosed:
+            pass
+        except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+            pass
+        except ValueError as exc:
+            if sink is None or not sink.opened:
+                raise
+            sink.error(str(exc))
+        except Exception:
+            if sink is None or not sink.opened:
+                raise
+            sink.error("Live data is temporarily unavailable")
+        finally:
+            if sink is not None:
+                sink.finish()
+            self.runtime.lp.store.close_reader()
+            self.keyed_streams.release()
+            self.close_connection = True
+
     def do_GET(self) -> None:
         try:
             path, query = self._query()
@@ -519,6 +865,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             route = _ROUTES.get(path)
+            if route is None and path not in {"/api/workbench/capabilities", "/api/lp/stream", "/api/workbench/stream"} and path not in _GATE_GET and path != KEYED_STREAM and path not in _TX_GET and path != TAGS_PATH:
+                return self._json(404, {"error": "Not found"})
+            if self.runtime is None:
+                return self._starting()
             if route is not None:
                 return self._bounded(route, path, query)
             if path == "/api/workbench/capabilities":
@@ -526,9 +876,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"allocation_preview": True, "simulate": local, "prepare": local and self.runtime.enable_prepare, "broadcast": False, "server_signing": False})
             if path == "/api/lp/stream":
                 return self._sse(False, query)
-            if path == "/api/workbench/stream":
-                return self._sse(True, query)
-            self._json(404, {"error": "Not found"})
+            if path in _GATE_GET:
+                return self._gate_get(path, query)
+            if path in _TX_GET:
+                return self._tx_get(path, query)
+            if path == TAGS_PATH:
+                return self._tags(query)
+            if path == KEYED_STREAM:
+                return self._keyed_stream(query)
+            return self._sse(True, query)
         except ValueError as exc:
             self._json(400, {"error": str(exc)})
         except (BrokenPipeError, ConnectionResetError, TimeoutError):
@@ -541,6 +897,13 @@ class Handler(BaseHTTPRequestHandler):
             path, _query = self._query()
         except ValueError as exc:
             return self._json(400, {"error": str(exc)})
+        if path in _GATE_GET or path in _GATE_POST or path == KEYED_STREAM or path in _TX_GET or path in _TX_POST or path == TAGS_PATH:
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Accept, Content-Type, Authorization")
+            self.send_header("Content-Length", "0")
+            return self.end_headers()
         if path not in _ROUTES and path not in {"/api/v1/openapi.json", "/api/workbench/capabilities"}:
             return self._json(404, {"error": "Not found"})
         self.send_response(204)
@@ -563,6 +926,203 @@ class Handler(BaseHTTPRequestHandler):
             return origin == "http://" + host
         return origin in self.runtime.origins and urlsplit(origin).netloc == host
 
+    def _json_body(self) -> dict:
+        if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
+            raise GateRefusal(415, "Expected application/json")
+        size = int(self.headers.get("Content-Length", "0"))
+        if not 0 < size <= MAX_BODY:
+            raise GateRefusal(413, "Request must be between 1 and 16384 bytes")
+        payload = json.loads(self.rfile.read(size))
+        if not isinstance(payload, dict):
+            raise ValueError("Expected a JSON object")
+        return payload
+
+    def _cookie(self, secret: str, max_age: int) -> tuple[str, str]:
+        return ("Set-Cookie", f"{COOKIE_NAME}={secret}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age={max_age}")
+
+    def _tags(self, query: dict[str, str]) -> None:
+        try:
+            principal, _ = self.runtime.gate.require(self.headers, "flags")
+        except GateRefusal as refusal:
+            return self._refuse(refusal)
+        hashes = list(dict.fromkeys(h.strip().lower() for h in str(query.get("tx") or "").split(",") if h.strip()))
+        if not hashes or len(hashes) > TAGS_MAX_TX or any(len(h) != 66 or not h.startswith("0x") for h in hashes):
+            return self._json(400, {"error": f"tx must list 1 to {TAGS_MAX_TX} transaction hashes"}, private=True)
+        try:
+            quota = self.runtime.gate.admit(principal, cost=len(hashes) // 10 + 1)
+        except GateRefusal as refusal:
+            return self._refuse(refusal)
+        slots = self.api_slots["keyed"]
+        if not slots.acquire(False):
+            return self._json(503, {"error": "API request capacity reached"}, retry=1)
+        try:
+            marks = ",".join("?" for _ in hashes)
+            with self.runtime.lp.store.reader_snapshot() as connection:
+                rows = [
+                    {"tx_hash": row[0], "pool_id": row[1], "block_number": row[2], "timestamp": row[3]}
+                    for row in connection.execute(
+                        "SELECT DISTINCT tx_hash,pool_id,block_number,timestamp FROM events INDEXED BY events_tx_log_idx "
+                        f"WHERE tx_hash IN ({marks}) AND pool_id IS NOT NULL", hashes,
+                    )
+                ]
+            tagged: dict[str, dict[str, dict]] = {h: {} for h in hashes}
+            for tag in self.runtime.tags.tag(rows):
+                tagged.setdefault(tag.tx_hash, {})[tag.pool_id] = {"tags": sorted(tag.tags), "basis": sorted(tag.basis)}
+            return self._json(200, {"tags": tagged}, private=True, headers=_quota_headers(quota))
+        finally:
+            slots.release()
+
+    def _tx_principal(self, feature: str, cost: int = 1) -> tuple[Principal, Entitlement]:
+        principal, entitlement = self.runtime.gate.require(self.headers, feature)
+        if principal.via == "cookie" and self.command == "POST" and not self._same_origin():
+            raise GateRefusal(403, "Configured same-origin request required")
+        self.runtime.gate.admit(principal, cost=cost)
+        return principal, entitlement
+
+    def _tx_core(self) -> TxCore:
+        if self.runtime.tx is None:
+            raise TxRefusal("trading_disabled", self.runtime.tx_unavailable or "")
+        return self.runtime.tx
+
+    def _tx_failure(self, exc: TxError) -> None:
+        if isinstance(exc, TxRefusal):
+            return self._json(422, {"refusal": exc.code, "detail": exc.detail}, private=True)
+        if exc.code == "rpc":
+            return self._json(503, {"error": "chain node unavailable", "code": exc.code}, retry=2, private=True)
+        self._json(400, {"error": exc.detail or exc.code, "code": exc.code}, private=True)
+
+    def _tx_get(self, path: str, query: dict[str, str]) -> None:
+        tx = self.runtime.tx
+        if path == "/api/tx/status":
+            policy = self.runtime.gate.policy()
+            return self._json(200, {
+                "enabled": tx is not None and tx.enabled, "reason": self.runtime.tx_unavailable,
+                "base_fee_bps": policy.base_fee_bps,
+                "fee_tiers": [tier.public() for tier in policy.fee_tiers],
+                "quote_ttl_s": tx.ttl_s if tx is not None else None,
+            }, private=True)
+        if path == "/api/tx/history" and query.get("feature") != "trade":
+            return self._json(400, {"error": "feature must be trade"}, private=True)
+        if not self.api_slots["keyed"].acquire(False):
+            return self._json(503, {"error": "API request capacity reached"}, retry=1)
+        try:
+            principal, _ = self._tx_principal("lp" if query.get("feature") == "lp" else "trade", cost=5 if path == "/api/tx/pool" else 1)
+            if path == "/api/tx/history" and (principal.kind != "session" or principal.via != "cookie"):
+                raise GateRefusal(403, "browser session required", state="forbidden")
+            core = self._tx_core()
+            if path == "/api/tx/history":
+                before = query.get("before")
+                if before is not None and (not before.isdecimal() or int(before) <= 0):
+                    raise TxError("invalid_intent", "before must be a positive block number")
+                return self._json(200, core.history(principal.wallet, int(before) if before else None), private=True)
+            if path == "/api/tx/balances":
+                currencies = [c for c in str(query.get("currencies") or "").split(",") if c]
+                return self._json(200, {"wallet": principal.wallet, "balances": core.balances(principal.wallet, currencies)}, private=True)
+            if path == "/api/tx/pool":
+                known = tuple(int(i) for i in str(query.get("ids") or "").split(",") if i.isdigit())
+                return self._json(200, core.pool_view(str(query.get("pool_id") or ""), principal.wallet, known), private=True)
+            return self._json(200, core.receipt(str(query.get("hash") or ""), principal.wallet).to_json(), private=True)
+        except GateRefusal as refusal:
+            self._refuse(refusal)
+        except TxError as exc:
+            self._tx_failure(exc)
+        finally:
+            self.api_slots["keyed"].release()
+
+    def _tx_post(self, path: str) -> None:
+        if not self.api_slots["keyed"].acquire(False):
+            return self._json(503, {"error": "API request capacity reached"}, retry=1)
+        try:
+            payload = self._json_body()
+            if path == "/api/tx/quote":
+                kind = payload.get("kind")
+                if kind not in ("swap", "lp"):
+                    raise ValueError("kind must be swap or lp")
+                principal, entitlement = self._tx_principal("trade" if kind == "swap" else "lp", cost=10)
+                core = self._tx_core()
+                request_policy = replace(core.policy, fee_bps=entitlement.fee_bps)
+                return self._json(200, core.quote(_tx_intent(payload, principal.wallet), policy=request_policy).to_json(), private=True)
+            core = self._tx_core()
+            quote_id = str(payload.get("quote_id") or "")
+            principal, _ = self._tx_principal("lp" if core.kind_of(quote_id) == "lp" else "trade", cost=5)
+            signature = str(payload.get("permit_signature") or "")
+            sigs = Signatures(permit=bytes.fromhex(signature[2:]) if signature.startswith("0x") else None)
+            return self._json(200, core.prepare(quote_id, principal.wallet, sigs, batched=payload.get("batched") is True).to_json(), private=True)
+        except GateRefusal as refusal:
+            self._refuse(refusal)
+        except TxError as exc:
+            self._tx_failure(exc)
+        except (ValueError, KeyError, TypeError) as exc:
+            self._json(400, {"error": str(exc)}, private=True)
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            return
+        except Exception:
+            self._json(503, {"error": "Upstream data is temporarily unavailable"}, retry=2, private=True)
+        finally:
+            self.api_slots["keyed"].release()
+
+    def _gate_post(self, path: str) -> None:
+        gate = self.runtime.gate
+        policy_post = path == "/api/gate/policy"
+        slot = gate._policy_slots if policy_post else self.api_slots["keyed"]
+        try:
+            if policy_post:
+                gate.policy_admit(self._client_ip())
+                if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
+                    raise GateRefusal(415, "Expected application/json")
+                size = int(self.headers.get("Content-Length", "0"))
+                if not 0 < size <= 2048:
+                    raise GateRefusal(413, "Policy request must be between 1 and 2048 bytes")
+            if path == "/api/gate/session" and self.headers.get("Origin") is not None and not self._same_origin():
+                raise GateRefusal(403, "Configured same-origin request required")
+        except GateRefusal as refusal:
+            return self._refuse(refusal)
+        except (ValueError, KeyError, TypeError) as exc:
+            return self._json(400, {"error": str(exc)}, private=True)
+        if not slot.acquire(False):
+            return self._json(503, {"error": "API request capacity reached"}, retry=1)
+        try:
+            payload = self._json_body()
+            if policy_post:
+                applied = gate.apply_policy(GatePolicy.parse(payload.get("policy")), str(payload.get("signature") or ""), via="web")
+                return self._json(200, {"applied": applied.public(), **gate.status()}, private=True)
+            if path == "/api/gate/session":
+                principal, secret = gate.sign_in(
+                    str(payload.get("message") or ""), str(payload.get("signature") or ""),
+                    label=str(payload.get("label") or "browser"), client_ip=self._client_ip(),
+                    host=str(self.headers.get("Host") or "") if self._loopback() else None,
+                )
+                return self._json(200, self._me(principal), private=True, headers=(self._cookie(secret, gate.limits.session_ttl_s),))
+            principal = gate.resolve(self.headers)
+            if principal is None:
+                raise GateRefusal(401, "credential required", state="anonymous")
+            if principal.via == "cookie" and not self._same_origin():
+                raise GateRefusal(403, "Configured same-origin request required")
+            if path == "/api/gate/logout":
+                gate.revoke(principal.key_id, wallet=principal.wallet)
+                return self._json(200, {"signed_in": False}, private=True, headers=(self._cookie("", 0),))
+            op = payload.get("op")
+            if op == "mint":
+                minted, secret = gate.mint_key(
+                    principal, label=str(payload.get("label") or "key"), ttl_s=int(payload.get("ttl_s") or _MINT_TTL_DEFAULT_S),
+                )
+                return self._json(200, {"key_id": minted.key_id, "secret": secret, "label": minted.label, "expires_at": minted.expires_at}, private=True)
+            if op == "revoke":
+                return self._json(200, {"revoked": gate.revoke(str(payload.get("key_id") or ""), wallet=principal.wallet)}, private=True)
+            if op == "revoke_all":
+                return self._json(200, {"revoked": gate.revoke_all(principal.wallet)}, private=True)
+            raise ValueError("op must be mint, revoke or revoke_all")
+        except GateRefusal as refusal:
+            self._refuse(refusal)
+        except (ValueError, KeyError, TypeError) as exc:
+            self._json(400, {"error": str(exc)}, private=True)
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            return
+        except Exception:
+            self._json(503, {"error": "Upstream data is temporarily unavailable"}, retry=2, private=True)
+        finally:
+            slot.release()
+
     def do_POST(self) -> None:
         # A rejected POST leaves its body unread; closing keeps it out of the next request.
         self.close_connection = True
@@ -570,8 +1130,18 @@ class Handler(BaseHTTPRequestHandler):
             path, _query = self._query()
         except ValueError as exc:
             return self._json(400, {"error": str(exc)})
+        if path in _GATE_POST:
+            if self.runtime is None:
+                return self._starting()
+            return self._gate_post(path)
+        if path in _TX_POST:
+            if self.runtime is None:
+                return self._starting()
+            return self._tx_post(path)
         if path not in {"/api/lp/allocation", "/api/workbench/simulate", "/api/workbench/prepare"}:
             return self._json(404, {"error": "Not found"})
+        if self.runtime is None:
+            return self._starting()
         if not self._same_origin():
             return self._json(403, {"error": "Configured same-origin request required"})
         if path != "/api/lp/allocation" and not self._loopback():
@@ -615,7 +1185,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             super().finish()
         finally:
-            if hasattr(self, "runtime"):
+            if self.runtime is not None:
                 self.runtime.lp.store.close_reader()
 
 
@@ -631,6 +1201,10 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--public-origin", action="append", default=[])
     ap.add_argument("--enable-transaction-prepare", action="store_true")
     ap.add_argument("--api-slots", type=int, default=int(os.environ.get("RHP_API_SLOTS", DEFAULT_API_SLOTS)))
+    ap.add_argument("--gate-owner", default=os.environ.get("RHP_GATE_OWNER") or None)
+    ap.add_argument("--gate-db", default=os.environ.get("RHP_GATE_DB"))
+    ap.add_argument("--gate-rpc-url", default=os.environ.get("RHP_GATE_RPC_URL", "http://127.0.0.1:8547"))
+    ap.add_argument("--tx-fee-recipient", default=os.environ.get("RHP_TX_FEE_RECIPIENT") or None)
     return ap
 
 
@@ -642,25 +1216,36 @@ def main() -> None:
     data_dir.mkdir(parents=True, exist_ok=True)
     args.data_dir = data_dir
     args.database = Path(args.database).expanduser() if args.database else data_dir / "lp_market.sqlite"
-    server = LPHTTPServer((args.host, args.port), Handler)
-    try:
-        runtime = Runtime(args)
-    except BaseException:
-        server.server_close()
-        raise
-    Handler.runtime = runtime
+    args.gate_db = Path(args.gate_db).expanduser() if args.gate_db else data_dir / "gate.sqlite"
+    startup = Startup(_load_assets())
+    Handler.startup = startup
     Handler.api_slots = lane_slots(args.api_slots)
+    server = LPHTTPServer((args.host, args.port), Handler)
+    stopping = threading.Event()
+
     def halt(_signum=None, _frame=None):
-        runtime.stopping.set()
-        threading.Thread(target=server.shutdown, daemon=True).start()
+        stopping.set()
     signal.signal(signal.SIGINT, halt)
     signal.signal(signal.SIGTERM, halt)
-    print(f"RobinhoodPools listening on http://{args.host}:{args.port}", flush=True)
+    # The socket is served from the first moment so probes learn "starting"
+    # instead of queueing in the backlog; initialization keeps the main
+    # thread, where a stop signal lands as soon as the store returns.
+    threading.Thread(target=server.serve_forever, name="lp-http", daemon=True).start()
+    print(f"RobinhoodPools listening on http://{args.host}:{args.port} (starting)", flush=True)
+    runtime = None
     try:
-        server.serve_forever()
+        runtime = Runtime(args, startup)
+        if not stopping.is_set():
+            Handler.runtime = runtime
+            startup.phase("ready")
+            stopping.wait()
     finally:
+        if runtime is not None:
+            runtime.stopping.set()
+        server.shutdown()
         server.server_close()
-        runtime.close()
+        if runtime is not None:
+            runtime.close()
 
 
 if __name__ == "__main__":

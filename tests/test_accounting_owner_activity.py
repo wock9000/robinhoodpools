@@ -192,3 +192,30 @@ def test_rows_that_aged_out_since_the_build_are_not_served(ledger, monkeypatch):
     assert later is not None
     assert later["total"] < fresh["total"]
     assert later["valid_until"] is None or later["valid_until"] > fresh["valid_until"]
+
+
+def test_replica_build_survives_a_ledger_scan_longer_than_a_default_read(ledger, tmp_path, monkeypatch):
+    import rhpools.lp_market_store as market_store
+    from rhpools.lp_owner_rollup import RollupReplica
+
+    store, book = ledger
+    monkeypatch.setattr(market_store, "_READER_SNAPSHOT_SECONDS", 0.2)
+    slow_scan = (
+        "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<4000000) "
+        "SELECT NULL FROM n WHERE x<0"
+    )
+    started = time.monotonic()
+    store.read().execute(slow_scan).fetchall()
+    assert time.monotonic() - started > 0.2
+    monkeypatch.setattr(
+        AccountBook, "_stale_position_keys",
+        staticmethod(lambda conn: [str(row[0]) for row in conn.execute(slow_scan)]),
+    )
+    replica = RollupReplica(tmp_path, reserve_bytes=0)
+    try:
+        replica.synchronize(book)
+        snapshot = book._owner_activity_snapshot(replica.built_at, replica=replica)
+    finally:
+        replica.close()
+    assert book._publish_owner_activity(snapshot)
+    assert book.owner_activity("24h")["rows"]

@@ -6,8 +6,6 @@ RPC configuration belongs to the indexer operator, not to an arbitrary browser r
 
 Use `LP_RPC_HEAD_URL_FILES`, `LP_RPC_STATE_URL_FILES`, `LP_RPC_HISTORY_STATE_URL_FILES`, `LP_RPC_LOG_URL_FILES`, `LP_RPC_RECEIPT_URL_FILES`, or `LP_RPC_TRACE_URL_FILES`. Each variable contains comma-separated local filenames. Each file contains HTTP(S) endpoints, one per line, is owned by the service user, and has mode `0600` (or stricter). Files larger than 8 KiB, non-regular files, invalid URLs, and group/world-readable files fail startup without printing their contents.
 
-`LP_RPC_HEAD_WSS_URL_FILES` uses the same ownership, permission, and size checks for files containing WebSocket URLs. Only `ws://` and `wss://` URLs are accepted. Explicit `LP_RPC_HEAD_WSS_URLS` entries precede file-loaded endpoints, followed by `RHP_RPC_WSS` and existing provider fallbacks. `LP_RPC_DISABLE_LOCAL_FALLBACK=1` still excludes local WebSocket endpoints.
-
 Store files outside the checkout. Do not paste a keyed URL into a unit's command line, public example, browser setting, issue, or status report. The file path can safely appear in a systemd drop-in:
 
 ```ini
@@ -38,35 +36,6 @@ catch-up shared the endpoint; with Goldsky first, a 66-block scan spent 0.100 s
 on boundary headers and 0.053 s on event headers. Single-scan samples under
 live contention, not percentiles.
 
-### Archive source for the history lane
-
-`LP_RPC_ARCHIVE_URLS` and `LP_RPC_ARCHIVE_URL_FILES` name log and header sources
-for the history (archive backfill) lane only. The list is opt-in: no public
-provider joins it, `RHP_RPC_URLS` does not feed it, and without it the history
-lane keeps the provider log sources above. The intended entry is the local Nitro
-node, which answers `eth_getLogs` for any archive range without a quota:
-
-```
-[Service]
-Environment=LP_RPC_ARCHIVE_URLS=http://127.0.0.1:8547
-```
-
-With an archive source the lane fetches each interval as concurrent pages sized
-from the observed log density (eight workers against a local host; a page that
-reaches the 10k-log safety cap splits in half and retries). Live ingest still
-uses the provider sources, and canonical safety holds: interval boundary
-headers and the post-log end re-read come from the provider header source,
-the archive's own headers for both boundaries must match them, and every log's
-block hash must match its event header. A local node whose head is behind the
-requested range is skipped for that page rather than trusted.
-
-Archive chunks are sized by events per transaction (10k), not by the 10k-log page:
-raw history inserts cost per event, and a transaction that outgrows the writer
-page cache spills and slows down. `history_scan.source` reports
-`archive` or `provider`; `recent_catchup_lag_seconds` joins the existing lag
-fields. The lane yields the writer to live catch-up only when live debt is
-deeper than four live batches and older than thirty seconds.
-
 For routed HTTP `eth_call` and `eth_estimateGas`, an EVM execution revert is a
 contract outcome, not a provider outage. The caller receives the RPC error and
 the provider remains available for other calls. Transport failures, malformed
@@ -83,46 +52,6 @@ they do not repeat the batch serially. A verified same-receipt mint proves the
 parent-block position absent, but the current-block position read remains
 required. V3 receipts do not wait for trace capability. Successful receipts
 containing V4 PoolManager liquidity modifications still require `callTracer`.
-
-## Quicknode sponsorship
-
-Quicknode supports Robinhood mainnet, chain ID `4663`, over HTTPS and WSS. Keep separate owner-only files for the two endpoint URLs. The token is an endpoint credential, not a platform API key.
-
-```ini
-[Service]
-Environment=LP_RPC_STATE_URL_FILES=%h/.config/robinhoodpools/quicknode-http.urls,%h/.config/robinhoodpools/goldsky.url
-Environment=LP_RPC_HISTORY_STATE_URL_FILES=%h/.config/robinhoodpools/quicknode-http.urls,%h/.config/robinhoodpools/goldsky.url
-Environment=LP_RPC_TRACE_URL_FILES=%h/.config/robinhoodpools/quicknode-http.urls,%h/.config/robinhoodpools/goldsky.url
-Environment=LP_RPC_HEAD_WSS_URLS=
-Environment=LP_RPC_HEAD_WSS_URL_FILES=%h/.config/robinhoodpools/quicknode-wss.urls
-Environment=LP_RPC_DISABLE_TRACE=0
-```
-
-This example retains an existing Goldsky fallback. Omit that filename if it is not configured. Keep working local header, log, and receipt sources ahead of remote fallbacks. Add the HTTPS file to the corresponding `LP_RPC_HEAD_URL_FILES`, `LP_RPC_LOG_URL_FILES`, and `LP_RPC_RECEIPT_URL_FILES` lists when needed.
-
-`deploy/robinhoodpools-quicknode.conf` also replaces stale explicit head, log, and receipt primaries. Install it as a later service drop-in only after confirming the existing node is unsuitable. A deployment probe found the local node behind the durable cursor, so a successful `eth_chainId` alone was not enough to retain that node as primary.
-
-Before switching, verify chain identity, a pinned historical contract read, receipts, filtered logs, a JSON-RPC batch, and `debug_traceTransaction` with `callTracer`. Verify WSS `newHeads` and log subscriptions separately. A successful head read does not prove archive or trace access.
-
-The sponsored endpoint passed archive USDG `decimals()` at block `30,000,000`, pool state ten million blocks behind the observed head, transaction and call tracing, block receipts, filtered logs, gas estimation, fee history, and `eth_simulateV1`. Simulation does not sign or broadcast transactions. These observations do not establish unlimited retention, a rate allowance, or an SLA.
-
-The router paces unrecognized HTTPS hosts, including Quicknode, at 10 JSON-RPC items per second on average per endpoint with four concurrent requests. Batch envelopes are bounded by one second of the source's admission budget: 10 items for Quicknode, 80 for Goldsky, and up to 100 for unpaced local sources. Successful chunks and valid siblings survive failover. Production Quicknode responses reported a 50-request/second limit; counting HTTP envelopes instead of their RPC items exceeded it. Do not raise admission rates without the account's allowance and a measured workload. WSS traffic is separate and is not included in the HTTP traffic counters.
-
-The [Robinhood credit table](https://www.quicknode.com/api-credits/robinhood) lists 20 credits for ordinary reads and 40 for transaction/call tracing. At a sustained 10 ordinary reads per second, HTTP alone would consume 518.4 million credits in 30 days. This is a workload calculation, not a billing cap or the sponsorship allowance. Streams charge for processed blocks even when filters discard the output.
-
-Back up the affected source files and service drop-ins before deployment. Preserve local-only safety changes, the database path, storage guards, and transaction-preparation settings. Never replace the whole installed directory with an upstream checkout without checking for drift. If the process is recovering a large SQLite WAL, let recovery finish before restarting it for an RPC change.
-
-After deployment, check both loopback and public `/api/lp/status`, all required workers, observed and indexed heads, provider failures, and source traffic. Compare cursor and chain gains over the same interval. Roll back only the changed source files and drop-in if the integration fails. Never delete the database or WAL to recover a provider change.
-
-Quicknode's Robinhood documentation lists no endpoint add-ons. Streams and Webhooks require separate product configuration and platform credentials. The Robinhood endpoint cannot serve Apollo's Solana or Base reads. MEV redistribution is not enabled by this integration.
-
-References:
-
-- <https://www.quicknode.com/docs/robinhood/llms.txt>
-- <https://www.quicknode.com/docs/robinhood/endpoint-security>
-- <https://www.quicknode.com/docs/robinhood/add-ons>
-- <https://www.quicknode.com/docs/streams/rest-api>
-- <https://www.quicknode.com/brand>
 
 ## Goldsky measurements and limits
 
@@ -143,7 +72,7 @@ background accounting's shared endpoint quota. A 256-block comparison returned
 on Quicknode and 0.403 s on Goldsky. These isolated timings do not include
 contention with the running service.
 
-The donated allowance is 6,000 requests/minute. This process paces Goldsky at at most 80 JSON-RPC items/second on average per endpoint, counting batch elements conservatively, with four concurrent HTTP requests. Bursts are bounded by 80-item envelopes. This leaves nominal headroom under 100/s but does not account for other applications sharing the key. Provider billing/rate accounting remains authoritative.
+The donated allowance is 6,000 requests/minute. This process paces Goldsky at at most 80 JSON-RPC items/second on average per endpoint, counting batch elements conservatively, with four concurrent HTTP requests. Bursts are bounded by the batch size (100). This leaves nominal headroom under 100/s but does not account for other applications sharing the key. Provider billing/rate accounting remains authoritative.
 
 `/api/lp/status` includes per-source `traffic`: total HTTP attempts, total JSON-RPC items, and rolling approximately 60-second rates. Failed attempts and chain verification count. Traffic is endpoint-wide and repeated under capabilities using that endpoint: **do not sum repeated capability rows**. WSS messages and explorer fallback GETs are not included in these HTTP JSON-RPC counters.
 
@@ -344,6 +273,18 @@ still apply.
 Metadata, identity replay, and bounded source repairs run separately from receipt
 scheduling. Follow `pending_accounting` as well as enrichment and repricing queues;
 a small block gap does not prove those queues are complete.
+
+After deployment, the metadata worker revisits V4 pools with missing
+`tick_spacing` in four-row pages. It derives the spacing only when the full
+PoolKey hash matches the stored pool ID, then commits the repaired row through
+the service's normal writer and publishes it. At the end of a pass it waits
+five minutes before starting another pass, so incomplete rows added after
+startup are eventually considered. The worker pauses with bulk work under WAL
+backpressure. No direct database edit or standalone repair command is needed.
+Until a row is repaired, LP requests return `incomplete_pool` with the missing
+identity field rather than treating the pool as unknown. Dynamic-fee V4 routes
+use `metadata_json.configured_fee` (`0x800000`) for PoolKey verification instead
+of the nullable effective `fee_ppm` column.
 
 Metadata RPC fetches remain bounded and commit one batch.
 V3 balances have an independent worker rather than waiting behind repricing or

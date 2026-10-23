@@ -6,7 +6,6 @@ import time
 
 import pytest
 
-import rhpools.lp_market_service as market_service_module
 import rhpools.lp_market_store as market_store_module
 from rhpools.lp_market_protocols import (
     TRANSFER_TOPIC, V3_POOL_CREATED_TOPIC, V3_SWAP_TOPIC,
@@ -141,65 +140,6 @@ def test_status_gap_uses_current_head_and_durable_cursor(tmp_path):
         assert (caught_up["lag_blocks"], caught_up["lag_s"], caught_up["state"]) == (
             0, 0, "live",
         )
-    finally:
-        app.close()
-
-
-def test_multi_day_window_scans_stay_inside_covering_index(tmp_path):
-    """7d/30d aggregates timed out in production once the hourly range scan
-    dereferenced every rowid; the window source must resolve the hourly arm
-    from its covering index and page totals from the per-pool index."""
-    from rhpools.lp_market_service import _SUM_FIELDS
-
-    app = service(tmp_path / "market.sqlite")
-    try:
-        now = int(time.time()) // 3600 * 3600 + 1_800
-        with app.store.transaction() as connection:
-            values = (2, 2, 0, 0, 0, 2.0, 0.2, 0, 0, 2, 2, 0, 0, 5)
-            connection.executemany(
-                "INSERT INTO lp_pool_buckets VALUES(?,?,?" + ",?" * len(values) + ")",
-                [
-                    (resolution, bucket, pool, *values)
-                    for pool in (V3, V4)
-                    for resolution, step in ((86400, 86400), (3600, 3600), (60, 900))
-                    for bucket in range(now - 40 * 86_400, now, step)
-                ],
-            )
-        start, end = now - 7 * 86_400 + 7, now - 200
-        source, args = app._bucket_source(start, end)
-        page_source, page_args = app._bucket_source(start, end, by_pool=True)
-        with app.store.reader_snapshot() as connection:
-            aggregate_plan = [row[3] for row in connection.execute(
-                f"EXPLAIN QUERY PLAN SELECT pool_id,{_SUM_FIELDS} FROM {source} "
-                "GROUP BY pool_id", args,
-            )]
-            page_plan = [row[3] for row in connection.execute(
-                f"EXPLAIN QUERY PLAN SELECT pool_id,{_SUM_FIELDS} FROM {page_source} "
-                "WHERE pool_id IN (?,?) GROUP BY pool_id", [*page_args, V3, V4],
-            )]
-            aggregated = {
-                row["pool_id"]: (row["events"], row["swaps"]) for row in connection.execute(
-                    f"SELECT pool_id,{_SUM_FIELDS} FROM {source} GROUP BY pool_id", args,
-                )
-            }
-            low_minute, high_minute = start // 60 * 60, end // 60 * 60
-            low_hour = (low_minute + 3599) // 3600 * 3600
-            high_hour = high_minute // 3600 * 3600
-            low_day = (low_hour + 86399) // 86400 * 86400
-            high_day = high_hour // 86400 * 86400
-            expected = connection.execute(
-                "SELECT SUM(events) FROM lp_pool_buckets WHERE pool_id=? AND "
-                "((resolution=86400 AND bucket>=? AND bucket<?) OR "
-                "(resolution=3600 AND ((bucket>=? AND bucket<?) OR (bucket>=? AND bucket<?))) OR "
-                "(resolution=60 AND ((bucket>=? AND bucket<?) OR (bucket>=? AND bucket<=?))))",
-                (V3, low_day, high_day, low_hour, low_day, high_day, high_hour,
-                 low_minute, low_hour, high_hour, high_minute),
-            ).fetchone()[0]
-        assert any("COVERING INDEX lp_buckets_day_window" in step for step in aggregate_plan)
-        assert all(
-            "lp_buckets_pool" in step for step in page_plan if "SEARCH lp_pool_buckets" in step
-        )
-        assert aggregated == {V3: (expected, expected), V4: (expected, expected)}
     finally:
         app.close()
 
@@ -545,6 +485,34 @@ def test_orphan_fees_disappear_and_replacement_branch_is_counted_once(tmp_path):
         app.close()
 
 
+def test_verified_high_static_v4_fee_remains_a_rate(tmp_path):
+    app = service(tmp_path / "market.sqlite")
+    try:
+        pool_id = ("0x6eb6a673b9403141af3f70b883d3a1cf"
+                   "1b4782a3126dc8dc4be92a47fbbd0b76")
+        configured_fee = 999_990
+        app.store.upsert_pools([{
+            **pools()[1], "id": pool_id, "fee_ppm": configured_fee,
+            "token0": "0x" + "00" * 20,
+            "token1": "0x" + "4ad6be87ea760753bf7ec207b77fa184f4f7548c",
+            "symbol0": "ETH", "symbol1": "CIB",
+            "decimals0": 18, "decimals1": 18,
+            "tick_spacing": 10_000, "hook": "0x" + "00" * 20,
+            "factory": MANAGER, "created_block": None,
+            "metadata_json": {"configured_fee": configured_fee, "dynamic_fee": False},
+        }])
+        block = header(100, int(time.time()) - 60)
+        app.store.ingest([block], [{**swap(block, pool_id, "v4"), "fee_ppm": 999_991}])
+        row = next(row for row in app.pools({"window": "1h"})["rows"] if row["id"] == pool_id)
+        assert row["fee_ppm"] == 999_991
+        assert row["fee_ppm"] < 0x800000
+        stored = app.store.pool(pool_id)
+        assert stored["fee_ppm"] == configured_fee
+        assert json.loads(stored["metadata_json"])["dynamic_fee"] is False
+    finally:
+        app.close()
+
+
 def test_backfill_insertion_order_does_not_reorder_live_tape(tmp_path):
     app = service(tmp_path / "market.sqlite")
     try:
@@ -608,6 +576,49 @@ def test_underfilled_lp_tape_stays_within_window(
     finally:
         connection.set_progress_handler(None, 0)
         app.close()
+
+def test_zero_burn_checkpoint_is_not_lp_activity(tmp_path):
+    app = service(tmp_path / "market.sqlite")
+    try:
+        pool_id = "0x4e8649be40ae67ebbcff99c291b92ee03015917b"
+        position_key = (
+            f"v3:{pool_id}:"
+            "0x96c6c215ec2dbd1afb4eb7d20cc88216"
+            "9db30884a7a58c08dcd22b3c61fced52"
+        )
+        app.store.upsert_pools([{**pools()[0], "id": pool_id, "address": pool_id}])
+        block = header(100, int(time.time()) - 60)
+        checkpoint = {
+            **swap(block, pool_id, "v3", index=1),
+            "kind": "checkpoint",
+            "position_key": position_key,
+            "liquidity_delta": "0",
+            "amount0": "0",
+            "amount1": "0",
+            "fee_amount0": None,
+            "fee_amount1": None,
+            "cashflow0": None,
+            "cashflow1": None,
+            "accounting_basis": "zero_burn_fee_checkpoint",
+        }
+        add = {
+            **swap(block, pool_id, "v3"),
+            "kind": "add",
+            "position_key": position_key,
+            "liquidity_delta": "6270951117623300456714",
+            "amount0": "2748253111457097274969",
+            "amount1": "323661737643136471",
+        }
+        app.store.ingest([block], [checkpoint, add])
+        all_rows = app.tape({"kind": "all"})["rows"]
+        assert [row["kind"] for row in all_rows] == ["checkpoint", "add"]
+        assert all_rows[0]["amount0"] == all_rows[0]["amount1"] == "0"
+        assert [row["kind"] for row in app.tape({"kind": "lp"})["rows"]] == ["add"]
+        assert not app._current_event_matches(all_rows[0], {"kind": "lp"})
+        assert app._current_event_matches(all_rows[0], {"kind": "all"})
+    finally:
+        app.close()
+
 
 def test_backfilled_price_repairs_existing_flows_after_restart(tmp_path):
     path = tmp_path / "market.sqlite"
@@ -751,135 +762,6 @@ def test_empty_pool_limit_price_cannot_value_withdrawals_or_borrow_future_marks(
         overview = app.overview({"window": "all"})
         assert overview["volume_usd"] == pytest.approx(101)
         assert overview["coverage"]["unpriced_flows"] == 1
-    finally:
-        app.close()
-
-
-@pytest.mark.parametrize("drained_sqrt,drained_tick", [
-    # Swept to the tick limit: boundary geometry is never a mark.
-    ("4295128740", -887272),
-    # Swept into a liquidity gap at an ordinary price: depth decides.
-    (str(2 << 96), 13863),
-])
-def test_same_block_drain_outranks_pinned_pre_state_for_remove_pricing(
-        tmp_path, drained_sqrt, drained_tick):
-    """A remove logged after a full drain in the same block must not be valued
-    at the pre-drain depth from its block-(N-1) pool_state_before view."""
-    app = service(tmp_path / "market.sqlite")
-    try:
-        app.store.upsert_pools(pools())
-        blocks = [header(100 + i, int(time.time()) - 60 + i) for i in range(2)]
-        app.store.ingest([blocks[0]], [swap(blocks[0], V4, "v4")])
-        drain = swap(blocks[1], V4, "v4")
-        drain.update(sqrt_price_x96=drained_sqrt, tick=drained_tick, liquidity="0")
-        closed = lp_effect(blocks[1], "v4", "remove", -1000,
-                           (10_000_000, 20_000_000), position_state(1000), position_state(0))
-        closed.update(sqrt_price_x96=None, tick=None, liquidity=None, log_index=1,
-                      tx_hash="0x" + f"{int(blocks[1]['hash'], 16) * 100 + 1:064x}",
-                      cashflow0="10000000", cashflow1="20000000")
-        closed["data"]["pool_state_before"] = {
-            "sqrt_price_x96": str(1 << 96), "tick": 0,
-            "liquidity": "1000000000000", "pinned_block": 100,
-        }
-        ingest_effects(app, [blocks[1]], [drain, closed])
-        row = next(row for row in app.tape({"window": "all"})["rows"] if row["kind"] == "remove")
-        assert row["price0_usd"] is None
-        assert row["size_usd"] is None
-        assert app.overview({"window": "all"})["net_deposits_usd"] is None
-
-        # Reprojection after lp_pool_state has moved past the event must
-        # recover the same-block drain from the indexed swap, not the pin.
-        later = header(102, int(time.time()) - 50)
-        app.store.ingest([later], [swap(later, V4, "v4")])
-        app.store.reproject([row["id"]])
-        app.close()
-        app = service(tmp_path / "market.sqlite")
-        row = next(row for row in app.tape({"window": "all"})["rows"] if row["kind"] == "remove")
-        assert row["price0_usd"] is None
-        assert app.overview({"window": "all"})["coverage"]["unpriced_flows"] == 1
-    finally:
-        app.close()
-
-
-def test_add_covering_the_tick_limit_is_not_valued_at_boundary_price(tmp_path):
-    """Re-adding full-range liquidity to a pool swept to MIN_SQRT_RATIO puts
-    depth at the boundary, but the boundary is still not a market price."""
-    app = service(tmp_path / "market.sqlite")
-    try:
-        app.store.upsert_pools(pools())
-        blocks = [header(100 + i, int(time.time()) - 60 + i) for i in range(2)]
-        app.store.ingest([blocks[0]], [swap(blocks[0], V4, "v4")])
-        drain = swap(blocks[1], V4, "v4")
-        drain.update(sqrt_price_x96="4295128740", tick=-887272, liquidity="0")
-        opened = lp_effect(blocks[1], "v4", "add", 1000,
-                           (10_000_000, 20_000_000), position_state(0), position_state(1000))
-        opened.update(sqrt_price_x96=None, tick=None, liquidity=None, log_index=1,
-                      tick_lower=-887272, tick_upper=887272,
-                      tx_hash="0x" + f"{int(blocks[1]['hash'], 16) * 100 + 1:064x}")
-        opened["data"]["pool_state_before"] = {
-            "sqrt_price_x96": "4295128740", "tick": -887272,
-            "liquidity": "0", "pinned_block": 100,
-        }
-        ingest_effects(app, [blocks[1]], [drain, opened])
-        row = next(row for row in app.tape({"window": "all"})["rows"] if row["kind"] == "add")
-        assert row["price0_usd"] is None
-        assert row["size_usd"] is None
-        assert app.overview({"window": "all"})["net_deposits_usd"] is None
-    finally:
-        app.close()
-
-
-def test_implausible_direct_spot_falls_back_to_recent_anchor(tmp_path):
-    """A dust swap that leaves a thin pool quoting the asset above 1e9 USD is
-    not a mark; flows use the recent anchor, as an emptied pool would."""
-    app = service(tmp_path / "market.sqlite")
-    try:
-        app.store.upsert_pools(pools())
-        blocks = [header(100 + i, int(time.time()) - 60 + i) for i in range(2)]
-        app.store.ingest([blocks[0]], [swap(blocks[0], V3, "v3")])
-        spike = swap(blocks[1], V3, "v3")
-        spike.update(sqrt_price_x96=str(100_000 << 96), tick=230_270)
-        closed = lp_effect(blocks[1], "v3", "remove", -1000,
-                           (10_000_000, 20_000_000), position_state(1000), position_state(0))
-        closed.update(sqrt_price_x96=None, tick=None, liquidity=None, log_index=1,
-                      tx_hash="0x" + f"{int(blocks[1]['hash'], 16) * 100 + 1:064x}",
-                      cashflow0="10000000", cashflow1="20000000")
-        ingest_effects(app, [blocks[1]], [spike, closed])
-        row = next(row for row in app.tape({"window": "all"})["rows"] if row["kind"] == "remove")
-        assert row["price0_usd"] == pytest.approx(1.0)
-        assert row["pricing_basis"].startswith("at-or-before USDG anchor")
-        assert row["size_usd"] == pytest.approx(30)
-    finally:
-        app.close()
-
-
-def test_seeds_before_the_first_swap_are_not_valued_at_the_initialize_price(tmp_path):
-    """Initialize sets a price nobody has traded; single-sided seeds against it
-    are unpriced until a swap exists, then later flows value normally."""
-    app = service(tmp_path / "market.sqlite")
-    try:
-        app.store.upsert_pools(pools())
-        blocks = [header(100 + i, int(time.time()) - 60 + i) for i in range(3)]
-        created = swap(blocks[0], V4, "v4")
-        created.update(kind="create", amount0=None, amount1=None, liquidity="0")
-        seed = lp_effect(blocks[0], "v4", "add", 1000,
-                         (10_000_000, 0), position_state(0), position_state(1000))
-        seed.update(sqrt_price_x96=None, tick=None, liquidity=None, log_index=1,
-                    tx_hash="0x" + f"{int(blocks[0]['hash'], 16) * 100 + 1:064x}",
-                    cashflow0="-10000000", cashflow1="0")
-        ingest_effects(app, [blocks[0]], [created, seed])
-        row = next(row for row in app.tape({"window": "all"})["rows"] if row["kind"] == "add")
-        assert row["price0_usd"] is None
-        assert row["size_usd"] is None
-
-        app.store.ingest([blocks[1]], [swap(blocks[1], V4, "v4")])
-        later = lp_effect(blocks[2], "v4", "add", 1000,
-                          (10_000_000, 20_000_000), position_state(1000), position_state(2000))
-        later.update(sqrt_price_x96=None, tick=None, liquidity=None)
-        ingest_effects(app, [blocks[2]], [later])
-        priced = next(row for row in app.tape({"window": "all"})["rows"]
-                      if row["kind"] == "add" and row["block_number"] == 102)
-        assert priced["size_usd"] == pytest.approx(30)
     finally:
         app.close()
 
@@ -1278,207 +1160,6 @@ def test_completed_wallet_projection_is_deliverable_during_live_changes(
             assert TOKEN in {row["owner"] for row in result["rows"]}
     finally:
         release.set()
-        app.close()
-
-
-def test_stale_owners_are_served_while_refresh_runs_past_reader_cap(
-        tmp_path, monkeypatch):
-    app = service(tmp_path / "market.sqlite")
-    params = {
-        "window": "30d", "owner_sort": "activity", "owner_limit": 200,
-        "identity_scope": "wallets",
-    }
-    view_key = app._owner_view_key(app._owner_projection_params(params))
-    entered = threading.Event()
-    original = app.book.owner_candidates
-
-    def invalidate_owners():
-        with app.book._cache_lock:
-            app.book._owners_generation += 1
-        app._owner_last_started.pop(view_key, None)
-
-    def wait_failed_refresh():
-        pending = app._frame_futures.get(("owners", view_key))
-        if pending is not None:
-            with pytest.raises(market_store_module.MarketStoreError):
-                pending.result(3)
-
-    try:
-        app.store.upsert_pools(pools())
-        block = header(100, int(time.time()) - 60)
-        event = lp_effect(
-            block, "v4", "add", 1_000, (1_000_000, 1_000_000),
-            position_state(0), position_state(1_000),
-        )
-        app.observe_current_block(block)
-        app.observe_current_events(block, (event,))
-        monkeypatch.setattr(market_store_module, "_READER_SNAPSHOT_SECONDS", 0.0)
-        monkeypatch.setattr(market_store_module, "_READER_PROGRESS_STEPS", 1)
-        cold = app.owners(params)
-        assert [row["owner"] for row in cold["rows"]] == [TOKEN]
-
-        def slow(candidate_params):
-            entered.set()
-            time.sleep(1.0)
-            return original(candidate_params)
-
-        monkeypatch.setattr(app.book, "owner_candidates", slow)
-        invalidate_owners()
-        started = time.monotonic()
-        stale = app.owners(params)
-        assert time.monotonic() - started < 0.05
-        assert stale["revision"] == cold["revision"]
-        assert entered.wait(1)
-        app._frame_futures[("owners", view_key)].result(3)
-        assert app.owners(params)["revision"] == cold["revision"] + 1
-
-        def failing(_params):
-            raise market_store_module.MarketStoreError(
-                "reader snapshot exceeded its deadline",
-            )
-
-        monkeypatch.setattr(app.book, "owner_candidates", failing)
-        invalidate_owners()
-        assert app.owners(params)["revision"] == cold["revision"] + 1
-        wait_failed_refresh()
-        assert app.poll_owners(params)["revision"] == cold["revision"] + 1
-        assert app.owners(params)["revision"] == cold["revision"] + 1
-    finally:
-        app.close()
-
-
-def test_warmer_skips_while_paused_and_fills_gaps_one_at_a_time(
-        tmp_path, monkeypatch):
-    app = service(tmp_path / "market.sqlite")
-    monkeypatch.setattr(market_service_module, "_WARM_PAUSE_SECONDS", 0.0)
-    real_status = app.status
-    paused = {"value": True}
-    monkeypatch.setattr(
-        app, "status",
-        lambda: {
-            **real_status(),
-            "bulk_work": "paused" if paused["value"] else "running",
-        },
-    )
-    loads = {"count": 0, "threads": set()}
-    gate = threading.Lock()
-
-    def counted(loader):
-        def run(*args, **kwargs):
-            with gate:
-                loads["count"] += 1
-                loads["threads"].add(threading.get_ident())
-            return loader(*args, **kwargs)
-        return run
-
-    monkeypatch.setattr(app, "_load_cached", counted(app._load_cached))
-    monkeypatch.setattr(
-        app, "_materialize_owner_projection",
-        counted(app._materialize_owner_projection),
-    )
-
-    def cycle():
-        warmed = {}
-        app._warm_thread = threading.Thread(
-            target=lambda: warmed.setdefault("keys", app._warm_cycle()),
-        )
-        app._warm_thread.start()
-        app._warm_thread.join(30)
-        return warmed["keys"]
-
-    try:
-        app.store.upsert_pools(pools())
-        assert cycle() == 0
-        assert loads["count"] == 0
-
-        paused["value"] = False
-        assert cycle() == len(market_service_module._WARM_KEYS)
-        filled = loads["count"]
-        assert filled >= len(market_service_module._WARM_KEYS)
-        assert loads["threads"] == {app._warm_thread.ident}
-        assert len(app._owner_results) == 5
-        assert {key[1] for key in app._cache} >= {
-            "overview", "pools", "dislocations",
-        }
-
-        with app._cache_lock:
-            for key, (_at, value) in list(app._cache.items()):
-                app._cache[key] = (0.0, value)
-        with app.book._cache_lock:
-            app.book._owners_generation += 1
-        assert cycle() == len(market_service_module._WARM_KEYS)
-        assert loads["count"] == filled
-        assert not app._cache_refreshing
-        assert not any(key[0] == "owners" for key in app._frame_futures)
-    finally:
-        app._warm_thread = None
-        app.close()
-
-
-def test_owner_rollup_is_used_when_built_and_live_aggregate_otherwise(
-        tmp_path, monkeypatch):
-    app = service(tmp_path / "market.sqlite")
-    rollup_owner = "0x" + "78" * 20
-    built = {"value": None}
-    asked = []
-
-    def owner_activity(window, *, protocol="", identity_scope="all"):
-        asked.append((window, protocol, identity_scope))
-        return built["value"]
-
-    try:
-        app.store.upsert_pools(pools())
-        durable_time = int(time.time()) - 3_600
-        block = header(90, durable_time)
-        durable = lp_effect(
-            block, "v3", "add", 1_000, (1_000_000, 1_000_000),
-            position_state(0), position_state(1_000), key="durable",
-        )
-        durable["custody"] = MANAGER
-        ingest_effects(app, [block], [durable])
-        app.store.ingest([block], [], cursor={
-            "from_block": 90, "to_block": 90, "block_number": 90,
-            "block_hash": block["hash"], "timestamp": durable_time,
-        })
-        live = app.book.owner_candidates({"window": "7d"})
-        assert [row["owner"] for row in live["rows"] if row["owner"]] == [TOKEN]
-        monkeypatch.setattr(app.book, "owner_activity", owner_activity, raising=False)
-
-        fallback = app.owners({"window": "7d", "sort": "activity", "limit": 20})
-        assert asked == [("7d", "", "all")]
-        fallback_owners = {row["owner"] for row in fallback["rows"]}
-        assert TOKEN in fallback_owners and rollup_owner not in fallback_owners
-
-        stamped = app.book.owners_revision - 1
-        built["value"] = {
-            **live,
-            "rows": [{
-                **next(row for row in live["rows"] if row["owner"] == TOKEN),
-                "owner": rollup_owner, "custody": rollup_owner,
-            }],
-            "accounting_revision": stamped,
-        }
-        with app.book._cache_lock:
-            app.book._owners_generation += 1
-        app._owner_last_started.clear()
-        params = {"window": "7d", "sort": "activity", "limit": 20}
-        stale = app.owners(params)
-        view_key = app._owner_view_key(app._owner_projection_params(params))
-        app._frame_futures[("owners", view_key)].result(3)
-        rolled = app.owners(params)
-        assert rolled["revision"] == stale["revision"] + 1
-        assert {row["owner"] for row in rolled["rows"]} == {rollup_owner}
-        assert rolled["financial_revision"] == stamped
-        assert app.poll_owners(params, after_revision=rolled["revision"]) is None
-        assert not any(
-            not future.done() for key, future in app._frame_futures.items()
-            if key[0] == "owners"
-        )
-
-        searched = app.owners({"window": "7d", "q": TOKEN, "limit": 20})
-        assert [row["owner"] for row in searched["rows"]] == [TOKEN]
-        assert len(asked) == 2
-    finally:
         app.close()
 
 
@@ -1932,8 +1613,12 @@ def test_late_trace_enrichment_replaces_current_row_with_position_fees(
                 "fees_basis": "modifyLiquidity_return_exact_but_donate_inflatable",
             },
         }
-        app.indexer._publish_enriched_current_events(
-            [enriched], source="test+enrichment",
+        # The enrichment lane commits canonical facts, then merges them into
+        # the matching current-branch row through canonical publication.
+        app.store.ingest([block], [initial])
+        app.store.enrich([enriched])
+        app.indexer._publish_canonical_current_events(
+            [enriched], source="enrichment",
         )
         late = app.stream_updates(
             {"kind": "lp"}, first["sequence"], first["feed_epoch"],

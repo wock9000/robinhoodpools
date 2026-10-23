@@ -18,13 +18,14 @@ from rhpools.lp_market_protocols import (
     V3_FACTORIES,
 )
 from rhpools.lp_market_store import MarketStore
-from rhpools.lp_public_api import PublicAPIReorg, PublicMarketAPI, _STATE_READ_BUDGET
+from rhpools.lp_public_api import PublicAPIReorg, PublicMarketAPI
 from rhpools.workbench_market import (
     LIQUIDITY_SELECTOR,
     NATIVE,
     RESERVES_SELECTOR,
     SV_LIQUIDITY_SELECTOR,
     SV_SLOT0_SELECTOR,
+    _PoolCatalog,
 )
 
 TOKEN = "0x" + "22" * 20
@@ -87,25 +88,6 @@ def _pool(
 def _insert(store: MarketStore, rows: list[dict]) -> None:
     with store.transaction() as connection:
         store._upsert_pools(connection, rows)
-
-def _record_activity(store: MarketStore, rows: list[tuple[str, int]]) -> None:
-    with store.transaction() as connection:
-        connection.execute(
-            "CREATE TABLE IF NOT EXISTS lp_pool_state ("
-            "pool_id TEXT PRIMARY KEY, block_number INTEGER NOT NULL, tx_index INTEGER NOT NULL,"
-            " log_index INTEGER NOT NULL, timestamp INTEGER NOT NULL, sqrt_price_x96 TEXT,"
-            " tick INTEGER, liquidity TEXT, price0_usd REAL, price1_usd REAL, price REAL,"
-            " fee_ppm INTEGER, pricing_basis TEXT)"
-        )
-        connection.execute(
-            "CREATE INDEX IF NOT EXISTS lp_state_order"
-            " ON lp_pool_state(block_number,tx_index,log_index)"
-        )
-        connection.executemany(
-            "INSERT INTO lp_pool_state(pool_id, block_number, tx_index, log_index, timestamp)"
-            " VALUES (?,?,?,?,1)",
-            [(pool_id, block, 0, 0) for pool_id, block in rows],
-        )
 
 
 class SnapshotRpc:
@@ -194,7 +176,7 @@ class Service:
         self.market = SimpleNamespace(
             rpc=rpc,
             universe=universe,
-            _discovered={},
+            _discovered=_PoolCatalog(),
             _lock=RLock(),
             catalog=lambda _params: {
                 "counts": {
@@ -261,6 +243,7 @@ def test_lookup_matches_both_currency_sides_and_recovers_canonical_dynamic_v4_ke
     try:
         result = api.pools({"token": TOKEN.upper().replace("0X", "0x")})
         assert result["pool_count"] == 3
+        assert [row["pool_id"] for row in result["pools"]] == sorted((v2, v3, v4))
         assert {row["matched_currency"] for row in result["pools"]} == {
             "currency0", "currency1",
         }
@@ -362,21 +345,24 @@ def test_large_token_snapshot_batches_multicalls_without_hiding_pool_failures():
     rpc = SnapshotRpc(responses)
     api = PublicMarketAPI(Service(store, rpc), cache_ttl=0)
     try:
-        result = api.pools({"token": TOKEN})
-        assert result["pool_count"] == pool_count
-        assert result["coverage"]["state"] == {
-            "requested_pools": pool_count,
-            "state_read_limit": _STATE_READ_BUDGET,
-            "pools_over_limit": 0,
-            "available_pools": pool_count - 1,
-            "unavailable_pools": 1,
-        }
+        first = api.pools({"token": TOKEN, "limit": "200"})
+        assert first["pool_count"] == pool_count
+        assert first["next_offset"] == 200
+        assert first["coverage"]["state"]["requested_pools"] == 200
+        assert first["coverage"]["state"]["available_pools"] == 200
+        assert rpc.multicalls == 1
+        result = api.pools({"token": TOKEN, "limit": "200", "offset": "200"})
+        coverage = result["coverage"]["state"]
+        assert result["next_offset"] is None
+        assert coverage["requested_pools"] == pool_count - 200
+        assert coverage["available_pools"] == pool_count - 201
+        assert coverage["unavailable_pools"] == 1
         missing = next(row for row in result["pools"] if row["pool_id"] == pool_ids[-1])
         assert missing["liquidity"]["unavailable_reason"] == (
             "contract_call_reverted_or_unavailable"
         )
         assert rpc.multicalls == 2
-        assert rpc.multicall_http_batches == 1
+        assert rpc.multicall_http_batches == 2
         assert rpc.direct_state_batches == 0
         assert rpc.state_block_tags == {hex(rpc.number)}
     finally:
@@ -384,88 +370,152 @@ def test_large_token_snapshot_batches_multicalls_without_hiding_pool_failures():
         store.close()
 
 
-def test_state_read_budget_marks_only_least_recently_active_pools_unavailable():
-    budget = _STATE_READ_BUDGET
-    dynamic_fee = 0x800000
-    spacing = 60
-    oldest = _v4_id(TOKEN, HIGH, dynamic_fee, spacing, NATIVE)
-    v3_ids = [f"0x{index + 1:040x}" for index in range(budget)]
+def test_token_pages_include_all_matches_without_fetching_other_pages():
+    pool_ids = [f"0x{index + 1:040x}" for index in range(205)]
     store = MarketStore(":memory:")
     _insert(store, [
-        _pool(
-            oldest, "v4", TOKEN, HIGH, spacing=spacing, hooks=NATIVE,
-            configured_fee=dynamic_fee,
-        ),
-        *(
-            _pool(pool_id, "v3", TOKEN, HIGH, fee=500, spacing=10)
-            for pool_id in v3_ids
-        ),
+        _pool(pool_id, "v3", TOKEN, HIGH, fee=500, spacing=10)
+        for pool_id in pool_ids
     ])
-    _record_activity(
-        store,
-        [(oldest, 1)]
-        + [(pool_id, index + 2) for index, pool_id in enumerate(v3_ids)],
-    )
-    responses = {
-        (pool_id, LIQUIDITY_SELECTOR): abi_encode(["uint128"], [7])
-        for pool_id in v3_ids
-    }
-    rpc = SnapshotRpc(responses)
+    rpc = SnapshotRpc({
+        (pool_id, LIQUIDITY_SELECTOR): abi_encode(["uint128"], [index + 1])
+        for index, pool_id in enumerate(pool_ids)
+    })
     api = PublicMarketAPI(Service(store, rpc), cache_ttl=0)
     try:
-        result = api.pools({"token": TOKEN})
-        assert result["pool_count"] == budget + 1
-        assert result["coverage"]["state"] == {
-            "requested_pools": budget + 1,
-            "state_read_limit": budget,
-            "pools_over_limit": 1,
-            "available_pools": budget,
-            "unavailable_pools": 1,
-        }
-        over = next(row for row in result["pools"] if row["protocol"] == "v4")
-        assert over["pool_id"] == oldest
-        assert over["liquidity"]["status"] == "unavailable"
-        assert over["liquidity"]["unavailable_reason"] == "state_read_budget"
-        assert over["availability"] == {
-            "state": "unavailable", "reasons": ["state_read_budget"],
-        }
-        assert over["fee"]["current_status"] == "unavailable"
-        assert all(
-            row["liquidity"]["active_liquidity_raw"] == "7"
-            for row in result["pools"]
-            if row["protocol"] == "v3"
-        )
+        first = api.pools({"token": TOKEN, "limit": "50"})
+        assert first["pool_count"] == 205
+        assert first["limit"] == 50
+        assert first["offset"] == 0
+        assert first["next_offset"] == 50
+        assert [row["pool_id"] for row in first["pools"]] == pool_ids[:50]
+        assert rpc.multicalls == 1
+        second = api.pools({"token": TOKEN, "limit": "50", "offset": "200"})
+        assert second["pool_count"] == 205
+        assert second["next_offset"] is None
+        assert [row["pool_id"] for row in second["pools"]] == pool_ids[200:]
+        assert second["coverage"]["state"]["requested_pools"] == 5
+        assert rpc.multicalls == 2
+        assert api.pools({"token": TOKEN, "limit": "50", "offset": "205"})["pools"] == []
+        default = api.pools({"token": TOKEN})
+        assert default["limit"] == 100
+        assert default["next_offset"] == 100
+        assert [row["pool_id"] for row in default["pools"]] == pool_ids[:100]
         assert rpc.multicalls == 3
+        with pytest.raises(ValueError, match="limit"):
+            api.pools({"token": TOKEN, "limit": "201"})
+        with pytest.raises(ValueError, match="offset"):
+            api.pools({"token": TOKEN, "offset": "-1"})
+        with pytest.raises(ValueError, match="offset"):
+            api.pools({"token": TOKEN, "offset": str(1 << 63)})
+        assets = api.assets({"token": TOKEN})
+        assert assets["pool_count"] == 205
+        assert assets["groups"][0]["pool_count"] == 205
+        assert assets["groups"][0]["state_coverage"]["measured_pools"] == 205
+        assert assets["coverage"]["state"]["requested_pools"] == 205
+        assert rpc.multicalls == 4
     finally:
         api.close()
         store.close()
 
-    exact_store = MarketStore(":memory:")
-    _insert(exact_store, [
-        _pool(pool_id, "v3", TOKEN, HIGH, fee=500, spacing=10)
-        for pool_id in v3_ids
-    ])
-    _record_activity(
-        exact_store,
-        [(pool_id, index + 1) for index, pool_id in enumerate(v3_ids)],
-    )
-    exact_rpc = SnapshotRpc({
-        (pool_id, LIQUIDITY_SELECTOR): abi_encode(["uint128"], [9])
-        for pool_id in v3_ids
+
+def test_indexed_pool_pages_include_newly_discovered_unindexed_pools():
+    indexed = "0x" + "a1" * 20
+    discovered = "0x" + "b2" * 20
+    store = MarketStore(":memory:")
+    _insert(store, [_pool(indexed, "v3", TOKEN, HIGH, fee=500, spacing=10)])
+    with store.transaction() as connection:
+        store._set_metadata(connection, "catalog_search_signature", "ready")
+    rpc = SnapshotRpc({
+        (pool_id, LIQUIDITY_SELECTOR): abi_encode(["uint128"], [1])
+        for pool_id in (indexed, discovered)
     })
-    exact_api = PublicMarketAPI(Service(exact_store, exact_rpc), cache_ttl=0)
+    service = Service(store, rpc)
+    api = PublicMarketAPI(service, cache_ttl=0)
     try:
-        exact = exact_api.pools({"token": TOKEN})
-        assert exact["coverage"]["state"] == {
-            "requested_pools": budget,
-            "state_read_limit": budget,
-            "pools_over_limit": 0,
-            "available_pools": budget,
-            "unavailable_pools": 0,
-        }
+        assert api.pools({"token": TOKEN, "limit": "1"})["pool_count"] == 1
+        service.market._discovered[discovered] = SimpleNamespace(
+            id=discovered, address=discovered, kind="v3",
+            token0=TOKEN, token1=HIGH, fee_ppm=500, tick_spacing=10,
+            factory=V3_FACTORY, source="factory event",
+        )
+        first = api.pools({"token": TOKEN, "limit": "1"})
+        second = api.pools({"token": TOKEN, "limit": "1", "offset": "1"})
+        assert first["pool_count"] == second["pool_count"] == 2
+        assert [row["pool_id"] for row in first["pools"] + second["pools"]] == [
+            indexed, discovered,
+        ]
     finally:
-        exact_api.close()
-        exact_store.close()
+        api.close()
+        store.close()
+
+def test_indexed_pool_page_merges_both_currency_sides_catalog_and_pending_ids():
+    pool_ids = [f"0x{index:040x}" for index in range(1, 6)]
+    store = MarketStore(":memory:")
+    _insert(store, [
+        _pool(pool_ids[0], "v3", TOKEN, HIGH, fee=500, spacing=10),
+        _pool(pool_ids[1], "v3", LOW, TOKEN, fee=500, spacing=10),
+        _pool(pool_ids[2], "v3", TOKEN, TOKEN, fee=500, spacing=10),
+        _pool(pool_ids[3], "v3", LOW, HIGH, fee=500, spacing=10),
+    ])
+    with store.transaction() as connection:
+        connection.executemany(
+            "INSERT INTO lp_catalog_search"
+            "(id,protocol,token0,token1,label,subtitle,href) "
+            "VALUES (?,'v3',?,?,'pool','pool','/pool')",
+            [
+                (pool_ids[1], LOW, TOKEN),
+                (pool_ids[2], TOKEN, TOKEN),
+                (pool_ids[4], TOKEN.upper(), HIGH),
+            ],
+        )
+    api = PublicMarketAPI(Service(store, SnapshotRpc({})))
+    try:
+        expected = [pool_ids[0], pool_ids[1], pool_ids[2], pool_ids[4]]
+        first, first_ids, total = api._stored_matches(
+            TOKEN, 2, 0, [pool_ids[4]], indexed=True,
+        )
+        second, second_ids, second_total = api._stored_matches(
+            TOKEN, 2, 2, [pool_ids[4]], indexed=True,
+        )
+        assert first_ids + second_ids == expected
+        assert total == second_total == len(expected)
+        assert {row["id"] for row in first} == set(first_ids)
+        assert {row["id"] for row in second} == {pool_ids[2]}
+    finally:
+        api.close()
+        store.close()
+
+
+def test_assets_keep_all_pool_identities_and_qualify_reserve_sum_beyond_state_budget():
+    pool_ids = [f"0x{index + 1:040x}" for index in range(513)]
+    store = MarketStore(":memory:")
+    _insert(store, [_pool(pool_id, "v2", TOKEN, HIGH) for pool_id in pool_ids])
+    rpc = SnapshotRpc({
+        (pool_id, RESERVES_SELECTOR): abi_encode(
+            ["uint112", "uint112", "uint32"], [1, 10, 0],
+        )
+        for pool_id in pool_ids
+    })
+    api = PublicMarketAPI(Service(store, rpc), cache_ttl=0)
+    try:
+        result = api.assets({"token": TOKEN})
+        assert result["pool_count"] == 513
+        assert result["snapshot"]["canonical"] is True
+        assert result["coverage"]["state"]["pools_over_limit"] == 1
+        group = result["groups"][0]
+        assert group["pool_ids"] == pool_ids
+        assert group["state_coverage"] == {
+            "state": "partial", "measured_pools": 512, "missing_pools": 1,
+        }
+        subtotal = group["subtotals"][0]
+        assert subtotal["value_raw"] == "512"
+        assert subtotal["pools_measured"] == 512
+        assert subtotal["pools_missing"] == 1
+        assert subtotal["coverage"] == "partial"
+    finally:
+        api.close()
+        store.close()
 
 
 def test_native_catalog_recovers_shared_legacy_v4_configurations_completely():
@@ -515,7 +565,7 @@ def test_native_catalog_recovers_shared_legacy_v4_configurations_completely():
     api = PublicMarketAPI(Service(store, SnapshotRpc(responses)), cache_ttl=0)
     try:
         result = api.pools({"token": NATIVE})
-        assert result["pool_count"] == len(expected)
+        assert result["pool_count"] == len(expected) + 1
         assert {
             row["pool_id"]: int(row["pool_key"]["tick_spacing"])
             for row in result["pools"]

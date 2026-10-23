@@ -26,6 +26,10 @@ MAX_SOURCE_CONCURRENCY = 4
 # A local node has no provider quota; the archive lane fans log pages out to it.
 LOCAL_SOURCE_CONCURRENCY = 16
 CAPABILITIES = ("head", "state", "history_state", "logs", "receipts", "trace", "archive")
+HASH_LOOKUP_METHODS = frozenset({
+    "eth_getTransactionByHash",
+    "eth_getTransactionReceipt",
+})
 _PUBLIC = "https://rpc.mainnet.chain.robinhood.com"
 _PUBLICNODE = "https://robinhood-rpc.publicnode.com"
 _ARROW = "https://rpc.arrowrpc.com"
@@ -1039,6 +1043,7 @@ class RoutedRpc:
                 f"configure LP_RPC_{capability.upper()}_URLS"
             )
         failures: list[str] = []
+        valid_null = False
         for source in sources:
             if not self._registry.can_try(source, capability):
                 continue
@@ -1067,6 +1072,13 @@ class RoutedRpc:
                     raise self._error(
                         f"{source.name} changed chain identity"
                     )
+                if method in HASH_LOOKUP_METHODS and result is None:
+                    self._registry.success(
+                        source, capability, method,
+                        time.monotonic() - started,
+                    )
+                    valid_null = True
+                    continue
             except _ExecutionReverted as exc:
                 self._registry.success(
                     source, capability, exc.method,
@@ -1101,6 +1113,8 @@ class RoutedRpc:
                     time.monotonic() - started,
                 )
                 return result
+        if valid_null and not failures:
+            return None
         if not failures:
             raise self._error(
                 f"{capability} RPC deferred during provider cooldown"
@@ -1198,6 +1212,7 @@ class RoutedRpc:
             index: [] for index in range(len(specifications))
         }
         failure_codes: dict[int, int] = {}
+        valid_nulls: set[int] = set()
 
         def remember(
             attempted: Iterable[
@@ -1236,6 +1251,9 @@ class RoutedRpc:
                 (remaining[offset:offset + batch_limit], False)
                 for offset in range(0, len(remaining), batch_limit)
             ]
+            null_pending: list[
+                tuple[int, tuple[str, list[Any]]]
+            ] = []
             while chunks:
                 attempted, split = chunks.pop(0)
                 started = time.monotonic()
@@ -1252,7 +1270,8 @@ class RoutedRpc:
                     ):
                         chunks.insert(0, (attempted, split))
                         pending = [
-                            item for chunk, _split in chunks for item in chunk
+                            *null_pending,
+                            *(item for chunk, _split in chunks for item in chunk),
                         ]
                         break
                     request_ids = self._reserve_ids(len(attempted))
@@ -1279,7 +1298,8 @@ class RoutedRpc:
                     remember(attempted, source, exc)
                     chunks.insert(0, (attempted, split))
                     pending = [
-                        item for chunk, _split in chunks for item in chunk
+                        *null_pending,
+                        *(item for chunk, _split in chunks for item in chunk),
                     ]
                     break
 
@@ -1292,10 +1312,15 @@ class RoutedRpc:
                     index, (method, params)
                 ) in zip(request_ids, attempted):
                     try:
-                        output[index] = self._validate_item(
+                        result = self._validate_item(
                             source, by_id.get(request_id), request_id, method,
                             allow_revert=allow_reverts,
                         )
+                        if method in HASH_LOOKUP_METHODS and result is None:
+                            valid_nulls.add(index)
+                            null_pending.append((index, (method, params)))
+                        else:
+                            output[index] = result
                     except _ExecutionReverted as exc:
                         output[index] = exc.error
                     except Exception as exc:
@@ -1323,6 +1348,7 @@ class RoutedRpc:
                     unresolved.extend(
                         item for chunk, _split in chunks for item in chunk
                     )
+                    unresolved.extend(null_pending)
                     pending = unresolved
                     break
                 for _index, (method, _params) in attempted:
@@ -1330,10 +1356,14 @@ class RoutedRpc:
                         source, capability, method,
                         time.monotonic() - started,
                     )
+            if not pending:
+                pending = null_pending
 
         for index, _specification in pending:
             messages = failure_messages[index]
-            if messages:
+            if index in valid_nulls and not messages:
+                output[index] = None
+            elif messages:
                 output[index] = self._error(
                     f"{capability} RPC exhausted: " + "; ".join(messages),
                     code=failure_codes.get(index),

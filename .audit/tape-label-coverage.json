@@ -1,0 +1,11 @@
+{
+ "lp_rows": 700,
+ "hours_covered": 0.01,
+ "by_protocol": {
+  "v4": 570,
+  "v3": 105,
+  "v2": 25
+ },
+ "rows_in_pons_pools": 0,
+ "rows_from_fomo_router_or_4337": 140
+}
