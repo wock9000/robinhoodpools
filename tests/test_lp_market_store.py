@@ -786,6 +786,34 @@ def test_repeated_search_entities_do_not_duplicate_search_results():
         store.close()
 
 
+def test_transactions_are_searched_from_events_without_search_rows():
+    store = MarketStore(":memory:")
+    block = header(10)
+    try:
+        store.ingest([block], [event(block, offset) for offset in range(3)])
+        store.build_search_index(threading.Event())
+        stored = store.read().execute(
+            "SELECT count(*) FROM lp_search_entities WHERE kind='transaction'"
+        ).fetchone()[0]
+        assert stored == 0
+        tx_hash = "0x" + "ab" * 32
+        expected = {
+            "kind": "transaction",
+            "id": tx_hash,
+            "label": tx_hash,
+            "subtitle": "TRANSACTION · BLOCK 10",
+            "href": f"https://robinscan.io/tx/{tx_hash}",
+        }
+        for query in (tx_hash, tx_hash[:10].upper(), "10"):
+            rows, total = store.search(query)
+            assert expected in rows, query
+            assert total >= 1, query
+        assert store.search(tx_hash)[0][0] == expected
+        assert store.search("0x" + "cd" * 32) == ([], 0)
+    finally:
+        store.close()
+
+
 def test_broad_search_ranks_a_bounded_candidate_set_and_keeps_exact_tokens():
     store = MarketStore(":memory:")
     try:
