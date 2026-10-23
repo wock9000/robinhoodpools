@@ -95,6 +95,8 @@ SEARCH_KINDS = frozenset({
     "pool", "token", "protocol", "owner", "custody", "transaction", "position",
 })
 _SEARCH_WORD_RE = re.compile(r"[a-z0-9]+")
+_TRANSACTION_PREFIX_RE = re.compile(r"0x[0-9a-f]{0,64}")
+_TRANSACTION_COUNT_CAP = 10_000
 _CORE_POSITION_REPAIR_CHECKPOINT = "core_position_key_source_repair_v1"
 _CORE_POSITION_KEY_START = "0x"
 _CORE_POSITION_KEY_END = "0y"
@@ -964,6 +966,16 @@ class MarketStore:
         return connection is not None and connection.in_transaction
 
     @contextlib.contextmanager
+    def patient_reads(self, seconds: float) -> Iterator[None]:
+        """Give this thread's unbounded snapshots a longer deadline."""
+        previous = getattr(self._local, "patient_seconds", None)
+        self._local.patient_seconds = float(seconds)
+        try:
+            yield
+        finally:
+            self._local.patient_seconds = previous
+
+    @contextlib.contextmanager
     def reader_snapshot(
         self, seconds: float | None = None,
     ) -> Iterator[sqlite3.Connection]:
@@ -988,6 +1000,8 @@ class MarketStore:
                 raise MarketStoreError("market store is closed")
             snapshot_drain_generation = self._reader_drain_generation
             self._active_reader_snapshots += 1
+        if seconds is None:
+            seconds = getattr(self._local, "patient_seconds", None)
         deadline = time.monotonic() + (
             _READER_SNAPSHOT_SECONDS
             if seconds is None
@@ -1088,6 +1102,11 @@ class MarketStore:
             "active_reader_snapshots": int(active_reader_snapshots),
             "reader_drain_pending": int(reader_drain_pending),
         }
+
+    def reusable_bytes(self) -> int:
+        """Bytes in freed pages, which SQLite reuses before growing the file."""
+        free_pages = self.read().execute("PRAGMA freelist_count").fetchone()[0]
+        return int(free_pages) * self._page_size
 
     def checkpoint(
         self, mode: str = "PASSIVE", *, drain_readers: bool = False,
@@ -1588,13 +1607,6 @@ class MarketStore:
     def _event_search_entities(
         cls, row: Mapping[str, Any],
     ) -> Iterator[tuple[str, str, str, str, str, int, Iterable[Any]]]:
-        tx_hash = str(row.get("tx_hash") or "").lower()
-        if tx_hash:
-            yield (
-                "transaction", tx_hash, tx_hash,
-                f"TRANSACTION · BLOCK {int(row.get('block_number') or 0)}",
-                f"https://robinscan.io/tx/{tx_hash}", 0, (tx_hash,),
-            )
         for kind, value, rank in (
             ("owner", row.get("owner"), 4),
             ("custody", row.get("custody"), 5),
@@ -1632,15 +1644,6 @@ class MarketStore:
     ) -> None:
         entities: dict[tuple[str, str], dict[str, Any]] = {}
         for row in rows:
-            tx_hash = str(row.get("tx_hash") or "").lower()
-            if tx_hash:
-                entities.setdefault(
-                    ("transaction", tx_hash),
-                    {
-                        "tx_hash": tx_hash,
-                        "block_number": row.get("block_number"),
-                    },
-                )
             for kind in ("owner", "custody"):
                 address = str(row.get(kind) or "").lower()
                 if address:
@@ -2105,10 +2108,11 @@ class MarketStore:
             )
         base = " FROM " + " ".join(matches)
         connection = self.read()
+        transactions, transaction_total = self._transaction_search(connection, raw, tokens)
         total = int(connection.execute("SELECT COUNT(*)" + base, args).fetchone()[0])
         bounded = max(1, min(int(limit), 30))
         if total == 0:
-            return [], 0
+            return transactions[:bounded], transaction_total
         candidates = [
             (str(row["kind"]), str(row["id"]))
             for row in connection.execute(
@@ -2148,7 +2152,54 @@ class MarketStore:
             [*(value for candidate in candidates for value in candidate),
              exact_shape, label_shape, *args, bounded],
         ).fetchall()
-        return [dict(row) for row in rows], total
+        merged = sorted(
+            [*transactions, *(dict(row) for row in rows)],
+            key=lambda row: row["id"] != exact_shape,
+        )
+        return merged[:bounded], total + transaction_total
+
+    @staticmethod
+    def _transaction_search(
+        connection: sqlite3.Connection, raw: str, tokens: list[str],
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Answer a hash prefix or exact block number from canonical events.
+
+        Transactions are not catalog entities: one per indexed transaction made
+        the search tables the second-largest object in the database, while
+        events_tx_log_idx and events_block_idx already order the same keys."""
+        if len(tokens) != 1:
+            return [], 0
+        token = tokens[0]
+        if raw.startswith("0x") and _TRANSACTION_PREFIX_RE.fullmatch(token):
+            source = "events INDEXED BY events_tx_log_idx"
+            where, args = "tx_hash>=? AND tx_hash<?", (token, token + "\U0010ffff")
+        elif token.isdigit() and len(token) <= 18:
+            source = "events INDEXED BY events_block_idx"
+            where, args = "block_number=?", (int(token),)
+        else:
+            return [], 0
+        rows = connection.execute(
+            f"SELECT tx_hash,MIN(block_number) AS block_number FROM {source} "
+            f"WHERE {where} GROUP BY tx_hash ORDER BY tx_hash LIMIT 30",
+            args,
+        ).fetchall()
+        if not rows:
+            return [], 0
+        total = int(connection.execute(
+            f"SELECT COUNT(*) FROM (SELECT DISTINCT tx_hash FROM {source} "
+            f"WHERE {where} LIMIT {_TRANSACTION_COUNT_CAP})",
+            args,
+        ).fetchone()[0])
+        return [
+            {
+                "kind": "transaction",
+                "id": str(row["tx_hash"]),
+                "label": str(row["tx_hash"]),
+                "subtitle": f"TRANSACTION · BLOCK {int(row['block_number'] or 0)}",
+                "href": f"https://robinscan.io/tx/{row['tx_hash']}",
+            }
+            for row in rows
+        ], total
 
     def update_status(self, **values: Any) -> None:
         """Atomically merge inexpensive runtime status maintained by the indexer."""

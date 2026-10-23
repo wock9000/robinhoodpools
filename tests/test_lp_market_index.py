@@ -1114,6 +1114,45 @@ def test_storage_pressure_hysteresis_pauses_and_resumes_history(
         store.close()
 
 
+def test_storage_reserve_counts_database_pages_freed_for_reuse(tmp_path, monkeypatch):
+    store = MarketStore(tmp_path / "market.sqlite")
+    with store.transaction() as connection:
+        connection.execute("CREATE TABLE scratch(value BLOB)")
+        connection.executemany(
+            "INSERT INTO scratch VALUES(?)", [(b"x" * 3000,) for _ in range(200)],
+        )
+    with store.transaction() as connection:
+        connection.execute("DROP TABLE scratch")
+    store.checkpoint("TRUNCATE")
+    reusable = store.reusable_bytes()
+    assert reusable >= 200 * 3000
+    reserve = reusable // 2
+    scanner = MarketIndexer(
+        store,
+        Market(),
+        "http://unused.invalid",
+        rpc=StaticRpc(),
+        history_disk_reserve_bytes=reserve,
+        storage_resume_bytes=reserve,
+    )
+    monkeypatch.setattr(
+        "rhpools.lp_market_index.shutil.disk_usage",
+        lambda _path: SimpleNamespace(free=reserve - 1),
+    )
+    try:
+        scanner._storage_maintenance_once()
+        status = scanner.runtime_status()
+        assert status["storage_pressure"]["free_space"] is False
+        assert status["storage_free_bytes"] == reserve - 1
+
+        monkeypatch.setattr(store, "reusable_bytes", lambda: 0)
+        scanner._storage_maintenance_once()
+        assert scanner.runtime_status()["storage_pressure"]["free_space"] is True
+    finally:
+        scanner.close()
+        store.close()
+
+
 def test_history_cap_rejects_trimmed_start_that_is_not_canonical(monkeypatch):
     store = MarketStore(":memory:")
     scanner = indexer(store, StaticRpc(300))

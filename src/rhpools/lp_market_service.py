@@ -63,6 +63,10 @@ _OWNER_SNAPSHOT_SECONDS = 900.0
 _WARM_PAUSE_SECONDS = 3.0
 _WARM_IDLE_SECONDS = 5.0
 _WARM_ACCOUNTING_LATENCY_LIMIT_SECONDS = 30.0
+# A restart under disk contention can need longer than one request's read
+# deadline to build the terminal's first views; build them once, patiently.
+_STARTUP_WARM_READ_SECONDS = 120.0
+_STARTUP_WARM_BUDGET_SECONDS = 900.0
 # Synchronous catalog restore in __init__ blocks HTTP and every maintenance
 # thread; a multi-hundred-GiB pools table finishes on the metadata lane.
 _STORED_POOL_RESTORE_SECONDS = 5.0
@@ -1854,7 +1858,23 @@ class LPMarketService:
             )
         return warmed
 
+    def _warm_startup(self) -> None:
+        pending = [key for key in _WARM_KEYS if key[1].get("window", "24h") == "24h"]
+        give_up = time.monotonic() + _STARTUP_WARM_BUDGET_SECONDS
+        while pending and not self._warm_stop.is_set() and time.monotonic() < give_up:
+            route, params = pending.pop(0)
+            try:
+                with self.store.patient_reads(_STARTUP_WARM_READ_SECONDS):
+                    getattr(self, route)(dict(params))
+            except Exception as exc:
+                self._warm_error = str(exc)[:500]
+                pending.append((route, params))
+                self._warm_stop.wait(_WARM_PAUSE_SECONDS)
+            finally:
+                self.store.close_reader()
+
     def _warm_run(self):
+        self._warm_startup()
         while not self._warm_stop.is_set():
             try:
                 self._warm_cycle()

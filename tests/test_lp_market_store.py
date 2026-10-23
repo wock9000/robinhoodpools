@@ -786,6 +786,34 @@ def test_repeated_search_entities_do_not_duplicate_search_results():
         store.close()
 
 
+def test_transactions_are_searched_from_events_without_search_rows():
+    store = MarketStore(":memory:")
+    block = header(10)
+    try:
+        store.ingest([block], [event(block, offset) for offset in range(3)])
+        store.build_search_index(threading.Event())
+        stored = store.read().execute(
+            "SELECT count(*) FROM lp_search_entities WHERE kind='transaction'"
+        ).fetchone()[0]
+        assert stored == 0
+        tx_hash = "0x" + "ab" * 32
+        expected = {
+            "kind": "transaction",
+            "id": tx_hash,
+            "label": tx_hash,
+            "subtitle": "TRANSACTION · BLOCK 10",
+            "href": f"https://robinscan.io/tx/{tx_hash}",
+        }
+        for query in (tx_hash, tx_hash[:10].upper(), "10"):
+            rows, total = store.search(query)
+            assert expected in rows, query
+            assert total >= 1, query
+        assert store.search(tx_hash)[0][0] == expected
+        assert store.search("0x" + "cd" * 32) == ([], 0)
+    finally:
+        store.close()
+
+
 def test_broad_search_ranks_a_bounded_candidate_set_and_keeps_exact_tokens():
     store = MarketStore(":memory:")
     try:
@@ -1136,4 +1164,39 @@ def test_writer_owned_work_does_not_wait_behind_reader_drain(tmp_path):
         reader.rollback()
         if writer.ident is not None:
             writer.join(2)
+        store.close()
+
+
+def test_patient_reads_extend_only_this_threads_snapshot_deadline(tmp_path, monkeypatch):
+    store = MarketStore(tmp_path / "market.sqlite")
+    monkeypatch.setattr(market_store_module, "_READER_SNAPSHOT_SECONDS", 0.2)
+    slow = "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<4000000) SELECT count(*) FROM n"
+    try:
+        with pytest.raises((sqlite3.OperationalError, MarketStoreError)):
+            with store.reader_snapshot() as connection:
+                connection.execute(slow).fetchone()
+        store.close_reader()
+        with store.patient_reads(60):
+            with store.reader_snapshot() as connection:
+                assert connection.execute(slow).fetchone()[0] == 4_000_000
+            store.close_reader()
+            others: list[BaseException] = []
+
+            def default_reader():
+                try:
+                    with store.reader_snapshot() as connection:
+                        connection.execute(slow).fetchone()
+                except BaseException as exc:
+                    others.append(exc)
+                finally:
+                    store.close_reader()
+
+            thread = threading.Thread(target=default_reader)
+            thread.start()
+            thread.join()
+            assert others
+        with pytest.raises((sqlite3.OperationalError, MarketStoreError)):
+            with store.reader_snapshot() as connection:
+                connection.execute(slow).fetchone()
+    finally:
         store.close()
