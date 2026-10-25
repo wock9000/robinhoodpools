@@ -16,6 +16,7 @@ from contextlib import contextmanager
 from functools import lru_cache
 from itertools import groupby, islice
 import json
+import logging
 import math
 import multiprocessing
 from multiprocessing.synchronize import Event
@@ -28,7 +29,12 @@ from typing import Any, Iterable, NamedTuple, Sequence
 from .lp_math import principal_raw
 from .lp_market_protocols import core_position_key
 from .lp_market_store import _insert_rows
-from .lp_owner_rollup import DEFAULT_RESERVE_BYTES, RollupReplica, install_journal, prune_journal
+from .lp_owner_rollup import (
+    DEFAULT_RESERVE_BYTES, RollupReplica, install_journal, prune_journal, release_journal,
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 _ZERO_ADDRESS = "0x" + "0" * 40
@@ -1179,6 +1185,10 @@ class AccountBook:
         self._rollup_future: Future[dict[str, Any]] | None = None
         self._rollup_started = -math.inf
         self._rollup_generation = -1
+        # Whether the rollup worker may still hold a replica that has not
+        # replayed the journal past ``owner_rollup_ack``. Without one, no
+        # reader needs any journalled change: a new replica starts at the head.
+        self._rollup_replica_live = False
         self._rollup_partials: dict[
             tuple[str, str, str, int], list[Any]
         ] | None = None
@@ -5747,14 +5757,19 @@ class AccountBook:
             try:
                 snapshot = future.result()
             except BrokenProcessPool:
+                self._rollup_replica_live = False
                 if self._rollup_pool is not None:
                     self._rollup_pool.shutdown(wait=False, cancel_futures=True)
                     self._rollup_pool = None
                 return False
             except Exception as exc:
-                if not _snapshot_deadline_error(exc):
+                # The worker keeps its replica only across deadline errors.
+                self._rollup_replica_live = _snapshot_deadline_error(exc)
+                if not self._rollup_replica_live:
+                    logger.warning("owner-activity rollup build failed: %s", exc)
                     raise
                 return False
+            self._rollup_replica_live = True
             return self._publish_owner_activity(snapshot)
         now = time.monotonic()
         if (
@@ -5763,6 +5778,11 @@ class AccountBook:
         ):
             return False
         self._rollup_started = now
+        if not self._rollup_replica_live:
+            # Ack before submitting, so the replica the worker is about to
+            # build starts at or past it and prune can drain the backlog.
+            with self.store.transaction() as conn:
+                release_journal(conn)
         if self._rollup_pool is None:
             self._rollup_pool = self._create_preparation_pool(1)
         self._rollup_future = self._rollup_pool.submit(

@@ -219,3 +219,146 @@ def test_replica_build_survives_a_ledger_scan_longer_than_a_default_read(ledger,
         replica.close()
     assert book._publish_owner_activity(snapshot)
     assert book.owner_activity("24h")["rows"]
+
+
+class _DeferredPool:
+    """Runs a submitted build only when its future is first polled, so the
+    accounting loop's prune can run in between, as with a real worker."""
+
+    class _Future:
+        def __init__(self, fn, args):
+            self._call = (fn, args)
+            self._outcome = None
+
+        def done(self):
+            if self._outcome is None:
+                fn, args = self._call
+                try:
+                    self._outcome = (fn(*args), None)
+                except Exception as exc:
+                    self._outcome = (None, exc)
+            return True
+
+        def result(self):
+            self.done()
+            value, error = self._outcome
+            if error is not None:
+                raise error
+            return value
+
+    def submit(self, fn, *args):
+        return self._Future(fn, args)
+
+    def shutdown(self, **_kwargs):
+        pass
+
+
+@pytest.fixture
+def rollup_worker(ledger, monkeypatch):
+    import rhpools.lp_market_accounting as accounting
+
+    store, book = ledger
+    monkeypatch.setattr(store, "_stop", None, raising=False)
+    monkeypatch.setattr(accounting, "_preparation_book", book)
+    monkeypatch.setattr(accounting, "_rollup_replica", None)
+    monkeypatch.setattr(accounting, "_OWNER_ACTIVITY_INTERVAL_SECONDS", 0.0)
+    monkeypatch.setattr(book, "_create_preparation_pool", lambda _workers: _DeferredPool())
+    book._storage_reserve_bytes = 1
+    try:
+        yield store, book
+    finally:
+        if accounting._rollup_replica is not None:
+            accounting._rollup_replica.close()
+
+
+def _journal(store):
+    connection = store.read()
+    rows, = connection.execute("SELECT COUNT(*) FROM lp_owner_rollup_journal").fetchone()
+    ack = connection.execute(
+        "SELECT value FROM lp_accounting_meta WHERE key='owner_rollup_ack'",
+    ).fetchone()
+    head, = connection.execute(
+        "SELECT seq FROM sqlite_sequence WHERE name='lp_owner_rollup_journal'",
+    ).fetchone()
+    return rows, None if ack is None else int(ack[0]), int(head)
+
+
+def _churn(store):
+    with store.transaction() as connection:
+        connection.execute(
+            "UPDATE lp_accounting_episodes SET gross_pnl_usd=COALESCE(gross_pnl_usd,0)+1",
+        )
+
+
+def _prune(store):
+    from rhpools.lp_owner_rollup import prune_journal
+
+    while True:
+        with store.transaction() as connection:
+            if not prune_journal(connection, limit=64):
+                return
+
+
+def _build(store, book):
+    """One accounting-loop rollup cycle: submit, prune while it runs, collect."""
+    book._rollup_generation = -1
+    assert book._advance_rollup() is False
+    _prune(store)
+    published = book._advance_rollup()
+    _prune(store)
+    return published
+
+
+def test_failed_replica_builds_do_not_freeze_the_journal(rollup_worker, monkeypatch):
+    from types import SimpleNamespace
+
+    from rhpools.lp_owner_rollup import ReplicaSpaceError
+    import rhpools.lp_market_accounting as accounting
+
+    store, book = rollup_worker
+    assert _build(store, book)
+    rows, ack, head = _journal(store)
+    assert (rows, ack) == (0, head)
+    with monkeypatch.context() as full_disk:
+        # Production: the replica's free-space check trips on every attempt,
+        # so no build publishes and owner_rollup_ack stops moving.
+        full_disk.setattr(
+            "rhpools.lp_owner_rollup.shutil.disk_usage",
+            lambda _path: SimpleNamespace(free=0),
+        )
+        accounting._rollup_replica._next_space_check = 0.0
+        for _ in range(3):
+            _churn(store)
+            with pytest.raises(ReplicaSpaceError):
+                _build(store, book)
+        rows, ack, head = _journal(store)
+        assert ack == head
+        assert rows == 0
+    _churn(store)
+    assert _build(store, book)
+    rows, ack, head = _journal(store)
+    assert (rows, ack) == (0, head)
+    served = _comparable(book.owner_activity("all"))
+    assert book._publish_owner_activity(book._owner_activity_snapshot(int(time.time())))
+    assert served == _comparable(book.owner_activity("all"))
+
+
+def test_a_replica_kept_across_a_deadline_still_finds_its_journal(rollup_worker, monkeypatch):
+    from rhpools.lp_market_accounting import PreparationDeadlineError
+
+    store, book = rollup_worker
+    assert _build(store, book)
+
+    def deadline(*_args, **_kwargs):
+        raise PreparationDeadlineError("owner activity snapshot exceeded its deadline")
+
+    with monkeypatch.context() as slow:
+        slow.setattr(book, "_owner_activity_snapshot", deadline)
+        _churn(store)
+        assert _build(store, book) is False
+    _churn(store)
+    _, before, head = _journal(store)
+    assert before < head
+    assert _build(store, book)
+    rows, ack, head = _journal(store)
+    assert (rows, ack) == (0, head)
