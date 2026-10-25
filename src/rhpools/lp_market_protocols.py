@@ -910,9 +910,6 @@ def _decode_event(
                 "recipient": _topic_address(topics[2], "V2 Swap recipient"),
                 "input0": str(values[0]),
                 "input1": str(values[1]),
-                "output0": str(values[2]),
-                "output1": str(values[3]),
-                "swap_fee_ppm": row["fee_ppm"],
                 "fees_basis": "gross_swap_fee_estimate" if row["fee_ppm"] is not None else "unknown_pair_fee",
             }
         elif topic0 == V2_MINT_TOPIC:
@@ -971,9 +968,6 @@ def _decode_event(
                 "recipient": _topic_address(topics[2], "V3 Swap recipient"),
                 "input0": str(max(amount0, 0)),
                 "input1": str(max(amount1, 0)),
-                "output0": str(max(-amount0, 0)),
-                "output1": str(max(-amount1, 0)),
-                "swap_fee_ppm": row["fee_ppm"],
                 "fees_basis": "gross_swap_fee_estimate" if row["fee_ppm"] is not None else "unknown_pool_fee",
             }
             if count == 7:
@@ -1076,7 +1070,6 @@ def _decode_event(
             row["data"] = {
                 "sender": _topic_address(topics[1], "V3 Flash sender"),
                 "recipient": _topic_address(topics[2], "V3 Flash recipient"),
-                "paid0": str(paid0), "paid1": str(paid1),
                 "fees_basis": "gross_pool_flash_paid_exact",
             }
         elif topic0 in {
@@ -1163,8 +1156,6 @@ def _decode_event(
                 "sender": _topic_address(topics[2], "V4 Swap sender"),
                 # V4 emits the caller BalanceDelta: debt/input is negative.
                 "input0": str(max(-amount0, 0)), "input1": str(max(-amount1, 0)),
-                "output0": str(max(amount0, 0)), "output1": str(max(amount1, 0)),
-                "swap_fee_ppm": swap_fee,
                 "fees_basis": "gross_combined_swap_fee_event",
             }
         elif topic0 == V4_MODIFY_LIQUIDITY_TOPIC:
@@ -1195,8 +1186,6 @@ def _decode_event(
                 "trace_complete": False,
                 "cashflow_basis": "pending_trace",
             }
-            if token_id is not None:
-                row["data"]["nft_position_key"] = position_key
         elif topic0 == V4_DONATE_TOPIC:
             if len(topics) != 3:
                 raise ProtocolDecodeError("malformed V4 Donate topics")
@@ -1521,7 +1510,6 @@ def _correlate_manager_events(
                     core_position_key=core_key,
                     nft_manager=aux["manager"],
                     nft_event_log_index=aux["log_index"],
-                    nft_position_key=row["position_key"],
                     identity_basis=row["identity_basis"],
                 )
                 if aux["recipient"] is not None:
@@ -1826,7 +1814,6 @@ def _enrich_v4_traces(
                 fees_accrued_exact=True,
                 fees_basis="modifyLiquidity_return_exact_but_donate_inflatable",
                 input0=str(max(-caller0, 0)), input1=str(max(-caller1, 0)),
-                output0=str(max(caller0, 0)), output1=str(max(caller1, 0)),
                 cashflow_basis="v4_modifyLiquidity_return",
                 configured_fee=decoded["configured_fee"], tick_spacing=decoded["tick_spacing"],
                 hook=hook,

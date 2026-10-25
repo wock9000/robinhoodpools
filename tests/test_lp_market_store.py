@@ -1,5 +1,6 @@
 """Focused durable-store batching and canonical-safety regressions."""
 from __future__ import annotations
+import fcntl
 import sqlite3
 import threading
 from types import SimpleNamespace
@@ -8,9 +9,12 @@ import pytest
 
 import rhpools.lp_market_store as market_store_module
 from rhpools.lp_market_store import (
+    LEGACY_INDEXES,
     CanonicalConflict,
     MarketStore,
     MarketStoreError,
+    drop_legacy_indexes,
+    state_json_digest,
 )
 from rhpools.lp_market_accounting import AccountBook
 
@@ -635,6 +639,75 @@ def test_schema18_replaces_token_indexes_and_keeps_pool_pages_ordered(tmp_path):
             assert all("TEMP B-TREE" not in step for step in plan)
 
 
+def test_schema19_digests_claim_state_and_drops_legacy_indexes_offline(tmp_path):
+    path = tmp_path / "market.sqlite"
+    state = '{"episode_ordinal":1,"tokens_owed0":"5"}'
+    legacy = {
+        "events_owner_time_idx":
+            "ON events(owner,timestamp DESC,id DESC) WHERE owner IS NOT NULL",
+        "events_custody_time_idx":
+            "ON events(custody,timestamp DESC,id DESC) WHERE custody IS NOT NULL",
+        "lp_accounting_effects_position_tx":
+            "ON lp_accounting_effects(position_key,tx_hash)",
+        "lp_accounting_episodes_owner_count_window":
+            "ON lp_accounting_episodes(last_timestamp,owner,custody)",
+    }
+    assert tuple(legacy) == LEGACY_INDEXES
+
+    def present(connection):
+        return {
+            str(row[0]) for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            )
+        } & set(LEGACY_INDEXES)
+
+    with MarketStore(path) as store:
+        AccountBook(store).install()
+        with store.transaction() as connection:
+            # A schema-18 store: claims hold a verbatim copy of state_json and
+            # the legacy indexes are still maintained.
+            connection.execute(
+                "ALTER TABLE lp_accounting_claims RENAME COLUMN "
+                "position_state_digest TO position_state_json"
+            )
+            connection.executemany(
+                "INSERT INTO lp_accounting_claims(position_key,epoch,block_number,"
+                "block_hash,timestamp,position_last_block,position_last_tx_index,"
+                "position_last_log_index,liquidity,sqrt_price_x96,tick,claim0,claim1,"
+                "position_state_json) VALUES(?,0,1,'0x',1,1,0,0,'1','1',0,'0','0',?)",
+                [("stated", state), ("unstated", "")],
+            )
+            for name, definition in legacy.items():
+                connection.execute(f"CREATE INDEX {name} {definition}")
+            connection.execute("PRAGMA user_version=18")
+    with pytest.raises(MarketStoreError, match="schema 18"):
+        drop_legacy_indexes(path)
+
+    with MarketStore(path) as store:
+        connection = store.read()
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 19
+        assert dict(connection.execute(
+            "SELECT position_key,position_state_digest FROM lp_accounting_claims"
+        ).fetchall()) == {"stated": state_json_digest(state), "unstated": ""}
+        assert connection.execute(
+            "SELECT state_json_digest(?)", (state,),
+        ).fetchone()[0] == state_json_digest(state)
+        # Startup never pays for walking the legacy index pages.
+        assert present(connection) == set(LEGACY_INDEXES)
+
+    with open(f"{path.resolve()}.indexer.lock", "a+") as held:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(MarketStoreError, match="stop the service"):
+            drop_legacy_indexes(path)
+
+    started = []
+    dropped = drop_legacy_indexes(path, started.append)
+    assert [name for name, _seconds in dropped] == started == list(LEGACY_INDEXES)
+    assert drop_legacy_indexes(path) == []
+    with MarketStore(path) as store:
+        assert present(store.read()) == set()
+
+
 def test_schema16_baselines_completed_synchronous_search_index_only(tmp_path):
     path = tmp_path / "market.sqlite"
     store = MarketStore(path)
@@ -888,6 +961,61 @@ def test_search_batch_skips_noop_updates_and_keeps_late_enrichment():
             "subtitle": "V3 POSITION · late-position",
             "href": "/lp?q=late-position",
         }]
+    finally:
+        store.close()
+
+
+def test_reorg_search_repair_uses_order_indexes_and_restores_identities():
+    store = MarketStore(":memory:")
+    kept, orphan = "0x" + "11" * 20, "0x" + "33" * 20
+    kept_custody, orphan_custody = "0x" + "22" * 20, "0x" + "44" * 20
+    tables = ("lp_search_entities", "lp_search_terms")
+
+    def snapshot():
+        return {
+            table: sorted(tuple(row) for row in store.read().execute(f"SELECT * FROM {table}"))
+            for table in tables
+        }
+
+    try:
+        indexes = {
+            str(row[0]) for row in store.read().execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='events'"
+            )
+        }
+        assert {"events_owner_order_idx", "events_custody_order_idx"} <= indexes
+        assert not {"events_owner_time_idx", "events_custody_time_idx"} & indexes
+
+        first = header(10)
+        store.ingest([first], [event(first, 0)])
+        store.build_search_index(threading.Event())
+        before = snapshot()
+        assert store.search(kept)[1] == 1
+
+        second = header(11)
+        orphaned = [
+            {**event(second, 0), "tx_hash": "0x" + "cd" * 32},
+            {
+                **event(second, 1), "tx_hash": "0x" + "cd" * 32,
+                "owner": orphan, "custody": orphan_custody,
+                "position_key": "orphan-position",
+            },
+        ]
+        store.ingest([second], orphaned)
+        store.build_search_index(threading.Event())
+        assert store.search(orphan)[1] == 1
+        assert store.search(orphan_custody)[1] == 1
+
+        store.rollback(10)
+
+        # Identities first seen in the orphan disappear; identities that also
+        # appear in canonical history are rebuilt exactly as before the fork.
+        assert snapshot() == before
+        assert store.search(orphan) == ([], 0)
+        assert store.search(orphan_custody) == ([], 0)
+        assert store.search("orphan-position") == ([], 0)
+        assert store.search(kept)[1] == 1
+        assert store.search(kept_custody)[1] == 1
     finally:
         store.close()
 

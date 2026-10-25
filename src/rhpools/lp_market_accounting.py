@@ -27,7 +27,7 @@ from typing import Any, Iterable, NamedTuple, Sequence
 
 from .lp_math import principal_raw
 from .lp_market_protocols import core_position_key
-from .lp_market_store import _insert_rows
+from .lp_market_store import _insert_rows, state_json_digest
 from .lp_owner_rollup import DEFAULT_RESERVE_BYTES, RollupReplica, install_journal, prune_journal
 
 
@@ -387,7 +387,7 @@ CREATE TABLE IF NOT EXISTS lp_accounting_claims (
     price1_usd REAL,
     claim0 TEXT NOT NULL,
     claim1 TEXT NOT NULL,
-    position_state_json TEXT NOT NULL DEFAULT ''
+    position_state_digest TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS lp_accounting_claims_block
     ON lp_accounting_claims(block_number);
@@ -874,6 +874,9 @@ class _PreparationReader:
         )
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA query_only=ON")
+        self._connection.create_function(
+            "state_json_digest", 1, state_json_digest, deterministic=True,
+        )
         # Position replays sort 50k-115k events; the default 2 MiB cache
         # spilled every one of them and re-read pages without the mmap.
         self._connection.execute("PRAGMA cache_size=-262144")
@@ -1415,10 +1418,10 @@ class AccountBook:
                     "PRAGMA table_info(lp_accounting_claims)"
                 )
             }
-            if "position_state_json" not in claim_columns:
+            if "position_state_digest" not in claim_columns:
                 self.store.connection.execute(
                     "ALTER TABLE lp_accounting_claims ADD COLUMN "
-                    "position_state_json TEXT NOT NULL DEFAULT ''"
+                    "position_state_digest TEXT NOT NULL DEFAULT ''"
                 )
             with self.store.transaction() as conn:
                 install_journal(conn)
@@ -2580,7 +2583,7 @@ class AccountBook:
                 "position_last_tx_index", "position_last_log_index",
                 "liquidity", "sqrt_price_x96", "tick",
                 "price0_usd", "price1_usd", "claim0", "claim1",
-                "position_state_json",
+                "position_state_digest",
             )
             for position_key, candidate in candidates.items():
                 position = positions.get(position_key)
@@ -2612,6 +2615,7 @@ class AccountBook:
                     or _raw_int(block.get("timestamp")) != int(candidate[4])
                 ):
                     continue
+                stored = candidate[:15] + (state_json_digest(candidate[18]),)
                 existing = existing_claims.get(position_key)
                 if existing is not None:
                     if (
@@ -2622,9 +2626,9 @@ class AccountBook:
                         continue
                     if tuple(
                         existing.get(column) for column in claim_columns
-                    ) == candidate[:15] + candidate[18:]:
+                    ) == stored:
                         continue
-                accepted.append(candidate[:15] + candidate[18:])
+                accepted.append(stored)
                 pool_id = position.get("pool_id")
                 if pool_id:
                     affected_pools.add(str(pool_id).lower())
@@ -4321,7 +4325,7 @@ class AccountBook:
             "AND c.position_last_tx_index=p.last_tx_index "
             "AND c.position_last_log_index=p.last_log_index "
             "AND c.liquidity=p.liquidity "
-            "AND c.position_state_json=p.state_json "
+            "AND c.position_state_digest=state_json_digest(p.state_json) "
             "LEFT JOIN pools m ON m.id=p.pool_id WHERE " + " AND ".join(clauses), args))
         values: dict[str, dict[str, Any]] = {}
         for row in rows:
