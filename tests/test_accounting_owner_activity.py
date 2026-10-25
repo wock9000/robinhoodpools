@@ -364,61 +364,129 @@ def test_a_replica_kept_across_a_deadline_still_finds_its_journal(rollup_worker,
     assert (rows, ack) == (0, head)
 
 
-def test_only_the_rollup_pool_moves_to_the_configured_replica_directory(ledger, tmp_path, monkeypatch):
+class _PoolRecorder:
+    """Stands in for ProcessPoolExecutor and keeps each pool's worker setup."""
+
+    created: list[tuple] = []
+
+    def __init__(self, **kwargs):
+        self.created.append(kwargs["initargs"])
+
+    def submit(self, *_args):
+        return None
+
+
+def _pool_setups(store, monkeypatch, **options):
+    """Worker initargs for the (rollup, preparation) pools of one book."""
     import rhpools.lp_market_accounting as accounting
 
+    monkeypatch.setattr(accounting, "ProcessPoolExecutor", _PoolRecorder)
+    _PoolRecorder.created = []
+    book = AccountBook(store, deferred=True, preparation_workers=3, **options)
+    book._advance_rollup()
+    book._create_preparation_pool(3)
+    rollup, preparation = _PoolRecorder.created
+    return rollup, preparation
+
+
+def test_only_the_rollup_pool_takes_the_replica_directory_and_reserve(ledger, tmp_path, monkeypatch):
     store, _book = ledger
     replica_dir = tmp_path / "replica"
     replica_dir.mkdir()
-    pools = []
-
-    class _Recorder:
-        def __init__(self, **kwargs):
-            pools.append(kwargs["initargs"])
-
-        def submit(self, *_args):
-            return None
-
-    monkeypatch.setattr(accounting, "ProcessPoolExecutor", _Recorder)
     database_dir = str(store.path.resolve().parent)
-    for configured, expected in ((None, database_dir), (replica_dir, str(replica_dir.resolve()))):
-        pools.clear()
-        book = AccountBook(
-            store, deferred=True, preparation_workers=3, rollup_replica_dir=configured,
-        )
-        book._advance_rollup()
-        book._create_preparation_pool(3)
-        assert [args[3] for args in pools] == [expected, database_dir]
+    rollup, preparation = _pool_setups(store, monkeypatch, storage_reserve_bytes=160)
+    assert rollup[2:] == preparation[2:] == (160, database_dir)
+    rollup, preparation = _pool_setups(
+        store, monkeypatch, storage_reserve_bytes=160,
+        rollup_replica_dir=replica_dir, rollup_replica_reserve_bytes=20,
+    )
+    assert rollup[2:] == (20, str(replica_dir.resolve()))
+    assert preparation[2:] == (160, database_dir)
     with pytest.raises(ValueError):
         AccountBook(store, rollup_replica_dir=tmp_path / "missing")
 
 
-def test_rollup_worker_builds_and_measures_space_in_the_replica_directory(ledger, tmp_path, monkeypatch):
+def test_the_writer_reserve_does_not_follow_the_replica_reserve(tmp_path):
+    from rhpools.lp_market_service import LPMarketService
+
+    replica_dir = tmp_path / "replica"
+    replica_dir.mkdir()
+    app = LPMarketService(
+        None, "http://127.0.0.1:1", tmp_path / "market.sqlite", start=False,
+        history_disk_reserve_bytes=160, rollup_replica_dir=replica_dir,
+        rollup_replica_reserve_bytes=20,
+    )
+    try:
+        assert app.indexer.history_disk_reserve_bytes == 160
+        assert app.book._storage_reserve_bytes == 160
+        assert app.book._rollup_reserve_bytes == 20
+    finally:
+        app.close()
+
+
+def test_replica_settings_default_to_the_database_directory_and_disk_reserve(monkeypatch):
+    from rhpools.lp_server import parser
+
+    monkeypatch.delenv("LP_ROLLUP_REPLICA_DIR", raising=False)
+    monkeypatch.delenv("LP_ROLLUP_REPLICA_RESERVE_GIB", raising=False)
+    monkeypatch.setenv("LP_DISK_RESERVE_GIB", "160")
+    args = parser().parse_args([])
+    assert (args.disk_reserve_gib, args.rollup_replica_dir, args.rollup_replica_reserve_gib) == (
+        160.0, None, None,
+    )
+    monkeypatch.setenv("LP_ROLLUP_REPLICA_DIR", "/data/disk1/rhpools-rollup")
+    monkeypatch.setenv("LP_ROLLUP_REPLICA_RESERVE_GIB", "20")
+    args = parser().parse_args([])
+    assert (args.disk_reserve_gib, args.rollup_replica_dir, args.rollup_replica_reserve_gib) == (
+        160.0, "/data/disk1/rhpools-rollup", 20.0,
+    )
+
+
+@pytest.mark.parametrize("fits", [True, False])
+def test_rollup_worker_builds_in_and_reserves_space_on_the_replica_directory(
+    ledger, tmp_path, monkeypatch, fits,
+):
     import os
     import shutil
-    import threading
+    from types import SimpleNamespace
 
     import rhpools.lp_market_accounting as accounting
+    from rhpools.lp_owner_rollup import ReplicaSpaceError
 
     store, _book = ledger
     replica_dir = (tmp_path / "replica").resolve()
     replica_dir.mkdir()
+    free = 50 * 1024**3
+    # Exactly one of the two reserves exceeds the replica filesystem's free
+    # space; the build must follow the replica reserve.
+    writer_reserve, replica_reserve = (
+        (free + 1, free - 1) if fits else (free - 1, free + 1)
+    )
+    rollup_setup, _preparation = _pool_setups(
+        store, monkeypatch, storage_reserve_bytes=writer_reserve,
+        rollup_replica_dir=replica_dir, rollup_replica_reserve_bytes=replica_reserve,
+    )
     monkeypatch.setattr(accounting, "_preparation_book", None)
     monkeypatch.setattr(accounting, "_rollup_replica", None)
     monkeypatch.setattr(accounting, "_worker_temp_directory", None)
     measured = []
     disk_usage = shutil.disk_usage
 
-    def recording_disk_usage(path):
+    def measured_disk_usage(path):
         measured.append(os.fspath(path))
+        if os.fspath(path) == str(replica_dir):
+            return SimpleNamespace(free=free)
         return disk_usage(path)
 
-    monkeypatch.setattr("rhpools.lp_owner_rollup.shutil.disk_usage", recording_disk_usage)
-    accounting._initialize_preparation_worker(
-        str(store.path), threading.Event(), 1, str(replica_dir),
-    )
+    monkeypatch.setattr("rhpools.lp_owner_rollup.shutil.disk_usage", measured_disk_usage)
+    accounting._initialize_preparation_worker(*rollup_setup)
     reader = accounting._preparation_book.store.read()
     try:
+        if not fits:
+            with pytest.raises(ReplicaSpaceError):
+                accounting._owner_activity_in_worker(0)
+            assert set(measured) == {str(replica_dir)}
+            return
         snapshot = accounting._owner_activity_in_worker(0)
         assert snapshot["rows"] and snapshot["journal_through"] > 0
         assert measured and set(measured) == {str(replica_dir)}

@@ -270,6 +270,10 @@ class Runtime:
                 history_days=args.history_days,
                 history_disk_reserve_bytes=int(args.disk_reserve_gib * 1024**3),
                 rollup_replica_dir=args.rollup_replica_dir,
+                rollup_replica_reserve_bytes=(
+                    None if args.rollup_replica_reserve_gib is None
+                    else int(args.rollup_replica_reserve_gib * 1024**3)
+                ),
             )
             self._resources.callback(self.lp.close)
             startup.phase("services")
@@ -1202,6 +1206,12 @@ def parser() -> argparse.ArgumentParser:
     # The owner-activity replica is a full temporary copy of the accounting
     # inputs; this puts it (and its reserve check) on another filesystem.
     ap.add_argument("--rollup-replica-dir", default=os.environ.get("LP_ROLLUP_REPLICA_DIR") or None)
+    # Free space the replica must leave on its directory's filesystem;
+    # defaults to --disk-reserve-gib, which still gates the writer.
+    ap.add_argument(
+        "--rollup-replica-reserve-gib", type=float,
+        default=os.environ.get("LP_ROLLUP_REPLICA_RESERVE_GIB") or None,
+    )
     ap.add_argument("--public-origin", action="append", default=[])
     ap.add_argument("--enable-transaction-prepare", action="store_true")
     ap.add_argument("--api-slots", type=int, default=int(os.environ.get("RHP_API_SLOTS", DEFAULT_API_SLOTS)))

@@ -1157,6 +1157,7 @@ class AccountBook:
         preparation_workers: int = 0,
         storage_reserve_bytes: int = DEFAULT_RESERVE_BYTES,
         rollup_replica_dir: str | Path | None = None,
+        rollup_replica_reserve_bytes: int | None = None,
     ):
         self.store = store
         self.deferred = bool(deferred)
@@ -1168,6 +1169,14 @@ class AccountBook:
         self._rollup_replica_dir = (
             None if rollup_replica_dir is None else str(Path(rollup_replica_dir).resolve())
         )
+        # Free space the replica leaves on its directory's filesystem.
+        self._rollup_reserve_bytes = (
+            storage_reserve_bytes
+            if rollup_replica_reserve_bytes is None
+            else int(rollup_replica_reserve_bytes)
+        )
+        if self._rollup_reserve_bytes < 0:
+            raise ValueError("rollup_replica_reserve_bytes must be nonnegative")
         self._preparation_pool: ProcessPoolExecutor | None = None
         self._worker_stop: Event | None = None
         self._closing = False
@@ -1215,6 +1224,7 @@ class AccountBook:
 
     def _create_preparation_pool(
         self, workers: int, temp_directory: str | None = None,
+        reserve_bytes: int | None = None,
     ) -> ProcessPoolExecutor:
         context = multiprocessing.get_context("spawn")
         if self._worker_stop is None:
@@ -1225,7 +1235,8 @@ class AccountBook:
             max_workers=workers, mp_context=context,
             initializer=_initialize_preparation_worker,
             initargs=(
-                str(self.store.path), self._worker_stop, self._storage_reserve_bytes,
+                str(self.store.path), self._worker_stop,
+                self._storage_reserve_bytes if reserve_bytes is None else reserve_bytes,
                 temp_directory or str(self.store.path.resolve().parent),
             ),
         )
@@ -5802,7 +5813,9 @@ class AccountBook:
             with self.store.transaction() as conn:
                 release_journal(conn)
         if self._rollup_pool is None:
-            self._rollup_pool = self._create_preparation_pool(1, self._rollup_replica_dir)
+            self._rollup_pool = self._create_preparation_pool(
+                1, self._rollup_replica_dir, self._rollup_reserve_bytes,
+            )
         self._rollup_future = self._rollup_pool.submit(
             _owner_activity_in_worker, self.owners_revision,
         )
