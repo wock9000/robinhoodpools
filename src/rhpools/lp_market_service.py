@@ -795,9 +795,9 @@ class PriceProjection:
         return state
 
     @staticmethod
-    def _restore_old_rollups(conn, pool_id, minute, ancestor=None):
+    def _restore_old_rollups(conn, pool_id, minute, ancestor=None, resolutions=(3600, 86400)):
         columns = ",".join("?" for _ in range(len(BUCKET_FIELDS) + 4))
-        for resolution in (3600, 86400):
+        for resolution in resolutions:
             bucket = minute // resolution * resolution
             row = conn.execute(
                 f"SELECT {_BUCKET_EVENT_SUMS} FROM events e INDEXED BY events_pool_time_idx "
@@ -960,12 +960,16 @@ class PriceProjection:
         ).fetchone()
         prune_before = json.loads(prune_row[0]) if prune_row else 0
         if prune_before:
-            affected = {
-                (pool_id, minute // 3600 * 3600)
-                for pool_id, minute in ordered if minute < prune_before
-            }
-            for pool_id, hour in sorted(affected):
-                PriceProjection._restore_old_rollups(conn, pool_id, hour)
+            # Recompute each pruned hour and day once per batch, not per minute.
+            for resolution in (3600, 86400):
+                affected = {
+                    (pool_id, minute // resolution * resolution)
+                    for pool_id, minute in ordered if minute < prune_before
+                }
+                for pool_id, bucket in sorted(affected):
+                    PriceProjection._restore_old_rollups(
+                        conn, pool_id, bucket, resolutions=(resolution,),
+                    )
 
     def _queue_successors(self, conn, sources, revision):
         """Repair old consumers, never rows just priced in this delivery."""

@@ -538,6 +538,7 @@ class MarketIndexer:
         self._bulk_paused = False
         self._wal_backlog_paused = False
         self._disk_free_paused = False
+        self._storage_pause_reasons: tuple[str, ...] = ()
         self._storage_assessment_pending = False
         self._wal_previous_backlog_bytes: int | None = None
         self._wal_previous_log_frames: int | None = None
@@ -5361,6 +5362,18 @@ class MarketIndexer:
         with self._status_lock:
             return not self._bulk_paused
 
+    def _bucket_prune_allowed(self) -> bool:
+        # Pruning moves bucket pages to the freelist, which the reserve counts
+        # as headroom, so a pause caused only by low free space must not stop it.
+        with self._status_lock:
+            return not self._storage_assessment_pending and (
+                not self._bulk_paused
+                or (
+                    self._storage_pause_reasons == ("free_space",)
+                    and self._wal_held_since is None
+                )
+            )
+
     def _engage_wal_hold(self, wal_bytes: int, now: float) -> None:
         if (
             not self.wal_hold_bytes
@@ -5559,6 +5572,7 @@ class MarketIndexer:
             self._disk_free_paused = disk_paused
             self._storage_assessment_pending = False
             self._bulk_paused = paused
+            self._storage_pause_reasons = tuple(reasons)
 
         details = []
         if wal_held:
@@ -6968,7 +6982,7 @@ class MarketIndexer:
                     if (
                         2 <= time.gmtime().tm_hour < 5
                         and time.monotonic() >= prune_due
-                        and self._bulk_work_allowed()
+                        and self._bucket_prune_allowed()
                         and not self._stop.is_set()
                     ):
                         try:
