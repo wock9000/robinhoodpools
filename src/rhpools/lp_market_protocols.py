@@ -270,6 +270,10 @@ class ProtocolDecodeError(ValueError):
     """A recognized protocol record is malformed or correlation is ambiguous."""
 
 
+class PinnedCallFailed(ProtocolDecodeError):
+    """The provider failed a pinned eth_call instead of returning its data."""
+
+
 def manager_descriptor(address: Any) -> Mapping[str, str] | None:
     """Return immutable provenance only for an allowlisted position manager."""
     normalized = _address(address, "manager", strict=False)
@@ -2271,12 +2275,12 @@ def _rpc_result(result: Any, correlation: Mapping[str, Any]) -> str | None:
                 and _solidity_error_reason(result["error"]) == "Invalid token ID"
             ):
                 return None
-            raise ProtocolDecodeError(f"pinned eth_call failed: {result['error']}")
+            raise PinnedCallFailed(f"pinned eth_call failed: {result['error']}")
         result = result.get("result")
     if result == "0x" and correlation.get("allow_empty"):
         return None
     if not isinstance(result, str):
-        raise ProtocolDecodeError("pinned eth_call returned no hex result")
+        raise PinnedCallFailed("pinned eth_call returned no hex result")
     return result
 
 

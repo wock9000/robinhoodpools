@@ -79,6 +79,10 @@ REQUIRED_EVENT_COLUMNS = (
 LP_ENRICHMENT_KINDS = frozenset({
     "add", "remove", "collect", "checkpoint", "donate", "fee", "transfer",
 })
+# A dead-lettered enrichment job keeps its row, so readers still treat the
+# transaction as unenriched, but is never due again. The prefix records why.
+ENRICHMENT_TERMINAL_PREFIX = "enrichment_terminal:"
+ENRICHMENT_TERMINAL_NEXT_ATTEMPT = 1e18
 _ENRICHMENT_RECOVERY_LOW_WATER = 2048
 POOL_COLUMNS = (
     "id", "protocol", "address", "token0", "token1", "symbol0", "symbol1",
@@ -3794,15 +3798,26 @@ class MarketStore:
 
 
     def mark_enrichment_error(self, tx_hash: str, error: str, *, delay: float) -> None:
+        self._record_enrichment_failure(
+            tx_hash, str(error), time.time() + max(0.0, delay),
+        )
+
+    def mark_enrichment_terminal(self, tx_hash: str, error: str) -> None:
+        """Dead-letter a job whose failure will not change on retry."""
+        self._record_enrichment_failure(
+            tx_hash, ENRICHMENT_TERMINAL_PREFIX + str(error),
+            ENRICHMENT_TERMINAL_NEXT_ATTEMPT,
+        )
+
+    def _record_enrichment_failure(
+        self, tx_hash: str, error: str, next_attempt: float,
+    ) -> None:
         with self.transaction() as connection:
             connection.execute(
                 "UPDATE pending_enrichment SET attempts=attempts+1,"
                 "next_attempt=?,last_error=?,updated_at=?,"
                 "generation=generation+1 WHERE tx_hash=?",
-                (
-                    time.time() + max(0.0, delay), str(error)[:1000],
-                    time.time(), tx_hash.lower(),
-                ),
+                (next_attempt, error[:1000], time.time(), tx_hash.lower()),
             )
 
     def queue_v3_balances(

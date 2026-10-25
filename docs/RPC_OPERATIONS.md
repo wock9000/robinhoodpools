@@ -270,6 +270,20 @@ need transaction-body requests. Headers and pinned-state calls are deduplicated
 within each wave. The shared provider item-rate and HTTP-concurrency limits
 still apply.
 
+Receipt jobs have a bounded retry budget. A decode failure over canonical
+evidence (`ProtocolDecodeError`, including a receipt that decodes to no events)
+is dead-lettered on its third attempt; provider-reported pinned `eth_call`
+failures and failed batch commits are transient. Transient failures back off
+as `2**attempts` seconds, at least 300 s for trace-capability deferrals and at
+most six hours, and are dead-lettered on the 24th attempt (about 2.6 days of
+failing). A dead-lettered job keeps its row, so the transaction still reads as
+unenriched, with `last_error` prefixed `enrichment_terminal:` and
+`next_attempt=1e18`; schedulers never select it again. Pool-identity replay that
+finishes for such a transaction re-arms it for one more attempt. Inspect the
+set with `SELECT * FROM pending_enrichment INDEXED BY
+pending_enrichment_ready_idx WHERE next_attempt>=1e18`; re-arm a job by setting
+`next_attempt=0, last_error=NULL, attempts=0`.
+
 Metadata, identity replay, and bounded source repairs run separately from receipt
 scheduling. Follow `pending_accounting` as well as enrichment and repricing queues;
 a small block gap does not prove those queues are complete.
