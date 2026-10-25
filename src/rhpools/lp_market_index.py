@@ -548,6 +548,7 @@ class MarketIndexer:
         self._bulk_paused = False
         self._wal_backlog_paused = False
         self._disk_free_paused = False
+        self._storage_pause_reasons: tuple[str, ...] = ()
         self._storage_assessment_pending = False
         self._wal_previous_backlog_bytes: int | None = None
         self._wal_previous_log_frames: int | None = None
@@ -5376,6 +5377,18 @@ class MarketIndexer:
         with self._status_lock:
             return not self._bulk_paused
 
+    def _bucket_prune_allowed(self) -> bool:
+        # Pruning moves bucket pages to the freelist, which the reserve counts
+        # as headroom, so a pause caused only by low free space must not stop it.
+        with self._status_lock:
+            return not self._storage_assessment_pending and (
+                not self._bulk_paused
+                or (
+                    self._storage_pause_reasons == ("free_space",)
+                    and self._wal_held_since is None
+                )
+            )
+
     def _engage_wal_hold(self, wal_bytes: int, now: float) -> None:
         if (
             not self.wal_hold_bytes
@@ -5574,6 +5587,7 @@ class MarketIndexer:
             self._disk_free_paused = disk_paused
             self._storage_assessment_pending = False
             self._bulk_paused = paused
+            self._storage_pause_reasons = tuple(reasons)
 
         details = []
         if wal_held:
@@ -6946,6 +6960,8 @@ class MarketIndexer:
 
     def _maintenance_run(self) -> None:
         backoff = self.maintenance_interval_s
+        prune_due = 0.0
+        empty_prune_batches = 0
         try:
             while not self._stop.is_set():
                 try:
@@ -6996,6 +7012,26 @@ class MarketIndexer:
                     backoff = min(30.0, backoff * 2.0)
                 else:
                     backoff = self.maintenance_interval_s
+                    if (
+                        2 <= time.gmtime().tm_hour < 5
+                        and time.monotonic() >= prune_due
+                        and self._bucket_prune_allowed()
+                        and not self._stop.is_set()
+                    ):
+                        try:
+                            removed = self.store.prune_bucket_batch(
+                                int(time.time()) - 35 * 86400
+                            )
+                        except Exception:
+                            logger.exception("bucket pruning failed")
+                            prune_due = time.monotonic() + 300
+                        else:
+                            empty_prune_batches = (
+                                empty_prune_batches + 1 if not removed else 0
+                            )
+                            if empty_prune_batches >= 2:
+                                prune_due = time.monotonic() + 300
+                                empty_prune_batches = 0
                     self._stop.wait(self.maintenance_interval_s)
         finally:
             self.store.cancel_checkpoint_drain()

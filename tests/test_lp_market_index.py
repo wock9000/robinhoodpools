@@ -1355,6 +1355,39 @@ def test_storage_reserve_counts_database_pages_freed_for_reuse(tmp_path, monkeyp
         store.close()
 
 
+def test_bucket_pruning_runs_through_free_space_pause_only(tmp_path, monkeypatch):
+    store = MarketStore(tmp_path / "market.sqlite")
+    scanner = MarketIndexer(
+        store,
+        Market(),
+        "http://unused.invalid",
+        rpc=StaticRpc(),
+        history_disk_reserve_bytes=1 << 40,
+        storage_resume_bytes=1 << 40,
+    )
+    monkeypatch.setattr(
+        "rhpools.lp_market_index.shutil.disk_usage",
+        lambda _path: SimpleNamespace(free=1),
+    )
+    try:
+        scanner._storage_maintenance_once()
+        assert scanner.runtime_status()["storage_pause_reasons"] == ["free_space"]
+        assert not scanner._bulk_work_allowed()
+        assert scanner._bucket_prune_allowed()
+
+        scanner._wal_held_since = time.monotonic()
+        assert not scanner._bucket_prune_allowed()
+        scanner._wal_held_since = None
+
+        with scanner._status_lock:
+            scanner._storage_pause_reasons = ("wal_backlog", "free_space")
+        assert not scanner._bucket_prune_allowed()
+    finally:
+        scanner.close()
+        store.close()
+
+
+
 def test_history_cap_rejects_trimmed_start_that_is_not_canonical(monkeypatch):
     store = MarketStore(":memory:")
     scanner = indexer(store, StaticRpc(300))
