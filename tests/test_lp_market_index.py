@@ -14,19 +14,30 @@ from rhpools.lp_market_index import (
     TICK_SPACING_SELECTOR,
     TOKEN0_SELECTOR,
     TOKEN1_SELECTOR,
+    ENRICHMENT_CAPABILITY_RECHECK_S,
+    ENRICHMENT_DECODE_TERMINAL_ATTEMPTS,
+    ENRICHMENT_MAX_ATTEMPTS,
+    ENRICHMENT_RETRY_MAX_DELAY_S,
     REPROJECT_MAX_STORE_SECONDS,
     TOKEN_METADATA_INVALID_PREFIX,
     TOKEN_METADATA_INVALID_RECHECK_S,
     MarketIndexer,
     RpcError,
 )
-from rhpools.lp_market_store import CanonicalConflict, MarketStore
+from rhpools.lp_market_store import (
+    ENRICHMENT_TERMINAL_NEXT_ATTEMPT,
+    ENRICHMENT_TERMINAL_PREFIX,
+    CanonicalConflict,
+    MarketStore,
+)
 from rhpools.lp_market_protocols import (
     V2_FACTORIES,
     V2_SYNC_TOPIC,
     POOL_MANAGER,
     TRANSFER_TOPIC,
     V4_MODIFY_LIQUIDITY_TOPIC,
+    PinnedCallFailed,
+    ProtocolDecodeError,
 )
 from rhpools.tx_chain import PoolKey
 
@@ -264,6 +275,197 @@ def test_enrichment_rpc_failure_retries_without_dropping_job():
         assert before < row["next_attempt"] <= before + 301
         assert "receipt provider unavailable" in row["last_error"].lower()
         assert "enrichment" in scanner.runtime_status()["errors"]
+    finally:
+        scanner.close()
+        store.close()
+
+
+def _pending_add(store: MarketStore, tx_hash: str, block: dict[str, str]) -> None:
+    store.ingest([block], [{
+        "block_number": int(block["number"], 16),
+        "block_hash": block["hash"],
+        "tx_hash": tx_hash,
+        "tx_index": 0,
+        "log_index": 0,
+        "timestamp": int(block["timestamp"], 16),
+        "pool_id": None,
+        "protocol": "v3",
+        "kind": "add",
+        "owner": "0x" + "11" * 20,
+        "data": {},
+    }])
+
+
+def _enrich_until_published(scanner: MarketIndexer) -> None:
+    deadline = time.monotonic() + 5
+    while not scanner._enrich_once():
+        assert time.monotonic() < deadline
+
+
+def _enrichment_job(store: MarketStore):
+    return store.read().execute(
+        "SELECT attempts,next_attempt,last_error FROM pending_enrichment",
+    ).fetchone()
+
+
+def test_repeated_decode_failure_is_dead_lettered_not_retried_forever():
+    tx_hash = "0x" + "cd" * 32
+    block = header(10)
+
+    class EmptyReceiptRpc(StaticRpc):
+        def call(self, method, params):
+            if method == "eth_getTransactionReceipt":
+                return {
+                    "transactionHash": tx_hash,
+                    "blockNumber": block["number"],
+                    "blockHash": block["hash"],
+                    "from": "0x" + "11" * 20,
+                    "effectiveGasPrice": "0x1",
+                    "gasUsed": "0x1",
+                    "status": "0x1",
+                    "logs": [],
+                }
+            return super().call(method, params)
+
+    store = MarketStore(":memory:")
+    scanner = indexer(store, EmptyReceiptRpc())
+    _pending_add(store, tx_hash, block)
+    try:
+        for attempt in range(1, ENRICHMENT_DECODE_TERMINAL_ATTEMPTS):
+            _enrich_until_published(scanner)
+            row = _enrichment_job(store)
+            assert row["attempts"] == attempt
+            assert row["last_error"] == (
+                f"enrichment decoder returned no events for {tx_hash}"
+            )
+            assert row["next_attempt"] < time.time() + 60
+            with store.transaction() as connection:
+                connection.execute("UPDATE pending_enrichment SET next_attempt=0")
+
+        _enrich_until_published(scanner)
+        row = _enrichment_job(store)
+        assert row["attempts"] == ENRICHMENT_DECODE_TERMINAL_ATTEMPTS
+        assert row["last_error"] == (
+            ENRICHMENT_TERMINAL_PREFIX
+            + f"enrichment decoder returned no events for {tx_hash}"
+        )
+        assert row["next_attempt"] == ENRICHMENT_TERMINAL_NEXT_ATTEMPT
+        assert store.pending_enrichments(16, now=time.time() + 10 * 365 * 86400) == []
+        assert scanner._enrich_once() is False
+    finally:
+        scanner.close()
+        store.close()
+
+
+def test_transient_enrichment_failure_backs_off_then_dead_letters_at_cap():
+    class FailingReceiptRpc(StaticRpc):
+        def call(self, method, params):
+            if method == "eth_getTransactionReceipt":
+                raise RpcError("receipt provider unavailable")
+            return super().call(method, params)
+
+    store = MarketStore(":memory:")
+    scanner = indexer(store, FailingReceiptRpc())
+    _pending_add(store, "0x" + "ab" * 32, header(10))
+    with store.transaction() as connection:
+        connection.execute(
+            "UPDATE pending_enrichment SET attempts=?",
+            (ENRICHMENT_MAX_ATTEMPTS - 2,),
+        )
+    try:
+        before = time.time()
+        _enrich_until_published(scanner)
+        row = _enrichment_job(store)
+        assert row["attempts"] == ENRICHMENT_MAX_ATTEMPTS - 1
+        assert row["last_error"] == "receipt provider unavailable"
+        assert (
+            before + ENRICHMENT_RETRY_MAX_DELAY_S
+            <= row["next_attempt"]
+            <= time.time() + ENRICHMENT_RETRY_MAX_DELAY_S
+        )
+        with store.transaction() as connection:
+            connection.execute("UPDATE pending_enrichment SET next_attempt=0")
+
+        _enrich_until_published(scanner)
+        row = _enrichment_job(store)
+        assert row["attempts"] == ENRICHMENT_MAX_ATTEMPTS
+        assert row["last_error"] == (
+            ENRICHMENT_TERMINAL_PREFIX + "receipt provider unavailable"
+        )
+        assert row["next_attempt"] == ENRICHMENT_TERMINAL_NEXT_ATTEMPT
+    finally:
+        scanner.close()
+        store.close()
+
+
+def test_enrichment_retry_delay_classifies_failures():
+    store = MarketStore(":memory:")
+    scanner = indexer(store)
+
+    def delay(attempts, error, *, shared=False):
+        return scanner._enrichment_retry_delay(
+            {"attempts": attempts}, error, shared=shared,
+        )
+
+    decode = ProtocolDecodeError("V3 core position result has 0 words, expected 5")
+    try:
+        assert delay(0, decode) == 2.0
+        assert delay(ENRICHMENT_DECODE_TERMINAL_ATTEMPTS - 1, decode) is None
+        # Provider-reported call failures and failed batch commits are not
+        # evidence about the transaction, so they use the transient budget.
+        failed_call = PinnedCallFailed("pinned eth_call failed: rate limited")
+        assert delay(ENRICHMENT_DECODE_TERMINAL_ATTEMPTS - 1, failed_call) == 8.0
+        assert delay(
+            ENRICHMENT_DECODE_TERMINAL_ATTEMPTS - 1, decode, shared=True,
+        ) == 8.0
+        transient = RpcError("receipt provider unavailable")
+        assert delay(9, transient) == 1024.0
+        assert delay(ENRICHMENT_MAX_ATTEMPTS - 2, transient) == (
+            ENRICHMENT_RETRY_MAX_DELAY_S
+        )
+        assert delay(ENRICHMENT_MAX_ATTEMPTS - 1, transient) is None
+        # Rows that already retried >1000 times under the uncapped policy
+        # dead-letter on their next failure instead of overflowing 2**n.
+        assert delay(1095, transient) is None
+        capability = RpcError("trace RPC deferred during provider cooldown")
+        assert delay(0, capability) == ENRICHMENT_CAPABILITY_RECHECK_S
+        assert delay(12, capability) == 2.0 ** 13
+    finally:
+        scanner.close()
+        store.close()
+
+
+def test_identity_replay_rearms_dead_lettered_enrichment():
+    tx_hash = "0x" + "ef" * 32
+    store = MarketStore(":memory:")
+    scanner = indexer(store)
+    _pending_add(store, tx_hash, header(10))
+    terminal = ENRICHMENT_TERMINAL_PREFIX + "enrichment decoder returned no events"
+    payload = {
+        "addresses": ["0x" + "22" * 20],
+        "logs": [],
+        "prior_error": terminal,
+        "prior_next_attempt": ENRICHMENT_TERMINAL_NEXT_ATTEMPT,
+        "identity_attempts": 0,
+    }
+    marker = scanner._encode_pool_identity_marker(payload)
+    with store.transaction() as connection:
+        connection.execute(
+            "UPDATE pending_enrichment SET attempts=3,next_attempt=0,last_error=?",
+            (marker,),
+        )
+    try:
+        row = dict(store.read().execute("SELECT * FROM pending_enrichment").fetchone())
+        scanner._finish_pool_identity_replay(
+            row, marker, scanner._pool_identity_marker(marker),
+            set(payload["addresses"]),
+        )
+        restored = _enrichment_job(store)
+        assert restored["last_error"] is None
+        assert restored["next_attempt"] == 0
+        assert [
+            job["tx_hash"] for job in store.pending_enrichments(16)
+        ] == [tx_hash]
     finally:
         scanner.close()
         store.close()
@@ -1151,6 +1353,39 @@ def test_storage_reserve_counts_database_pages_freed_for_reuse(tmp_path, monkeyp
     finally:
         scanner.close()
         store.close()
+
+
+def test_bucket_pruning_runs_through_free_space_pause_only(tmp_path, monkeypatch):
+    store = MarketStore(tmp_path / "market.sqlite")
+    scanner = MarketIndexer(
+        store,
+        Market(),
+        "http://unused.invalid",
+        rpc=StaticRpc(),
+        history_disk_reserve_bytes=1 << 40,
+        storage_resume_bytes=1 << 40,
+    )
+    monkeypatch.setattr(
+        "rhpools.lp_market_index.shutil.disk_usage",
+        lambda _path: SimpleNamespace(free=1),
+    )
+    try:
+        scanner._storage_maintenance_once()
+        assert scanner.runtime_status()["storage_pause_reasons"] == ["free_space"]
+        assert not scanner._bulk_work_allowed()
+        assert scanner._bucket_prune_allowed()
+
+        scanner._wal_held_since = time.monotonic()
+        assert not scanner._bucket_prune_allowed()
+        scanner._wal_held_since = None
+
+        with scanner._status_lock:
+            scanner._storage_pause_reasons = ("wal_backlog", "free_space")
+        assert not scanner._bucket_prune_allowed()
+    finally:
+        scanner.close()
+        store.close()
+
 
 
 def test_history_cap_rejects_trimmed_start_that_is_not_canonical(monkeypatch):

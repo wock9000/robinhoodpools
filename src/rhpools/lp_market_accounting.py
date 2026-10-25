@@ -16,6 +16,7 @@ from contextlib import contextmanager
 from functools import lru_cache
 from itertools import groupby, islice
 import json
+import logging
 import math
 import multiprocessing
 from multiprocessing.synchronize import Event
@@ -27,8 +28,13 @@ from typing import Any, Iterable, NamedTuple, Sequence
 
 from .lp_math import principal_raw
 from .lp_market_protocols import core_position_key
-from .lp_market_store import _insert_rows
-from .lp_owner_rollup import DEFAULT_RESERVE_BYTES, RollupReplica, install_journal, prune_journal
+from .lp_market_store import _insert_rows, state_json_digest
+from .lp_owner_rollup import (
+    DEFAULT_RESERVE_BYTES, RollupReplica, install_journal, prune_journal, release_journal,
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 _ZERO_ADDRESS = "0x" + "0" * 40
@@ -387,7 +393,7 @@ CREATE TABLE IF NOT EXISTS lp_accounting_claims (
     price1_usd REAL,
     claim0 TEXT NOT NULL,
     claim1 TEXT NOT NULL,
-    position_state_json TEXT NOT NULL DEFAULT ''
+    position_state_digest TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS lp_accounting_claims_block
     ON lp_accounting_claims(block_number);
@@ -874,6 +880,9 @@ class _PreparationReader:
         )
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA query_only=ON")
+        self._connection.create_function(
+            "state_json_digest", 1, state_json_digest, deterministic=True,
+        )
         # Position replays sort 50k-115k events; the default 2 MiB cache
         # spilled every one of them and re-read pages without the mmap.
         self._connection.execute("PRAGMA cache_size=-262144")
@@ -921,17 +930,22 @@ class _PreparationReader:
 
 _preparation_book: AccountBook | None = None
 _rollup_replica: RollupReplica | None = None
+_worker_temp_directory: Path | None = None
 
 
-def _initialize_preparation_worker(path: str, stop: Event, reserve_bytes: int) -> None:
-    global _preparation_book
+def _initialize_preparation_worker(
+    path: str, stop: Event, reserve_bytes: int, temp_directory: str,
+) -> None:
+    global _preparation_book, _worker_temp_directory
     reader = _PreparationReader(path, stop)
-    directory = str(reader.path.parent)
-    reader.read().execute("PRAGMA temp_store_directory='" + directory.replace("'", "''") + "'")
+    reader.read().execute(
+        "PRAGMA temp_store_directory='" + temp_directory.replace("'", "''") + "'"
+    )
     selected = reader.read().execute("PRAGMA temp_store_directory").fetchone()
-    if selected is None or selected[0] != directory:
+    if selected is None or selected[0] != temp_directory:
         reader.read().close()
         raise RuntimeError("SQLite could not honor the worker temporary-file directory")
+    _worker_temp_directory = Path(temp_directory)
     _preparation_book = AccountBook(
         reader, deferred=True, storage_reserve_bytes=reserve_bytes,
     )
@@ -950,9 +964,11 @@ def _owner_activity_in_worker(generation: int) -> dict[str, Any]:
     if _preparation_book is None:
         raise RuntimeError("accounting preparation worker is not initialized")
     if _rollup_replica is None:
-        reader = _preparation_book.store
+        # The replica is a SQLite temporary database, so it lives in the
+        # worker's temp_store_directory; its reserve guards that filesystem.
         _rollup_replica = RollupReplica(
-            reader.path.parent, reader._stop,
+            _worker_temp_directory or _preparation_book.store.path.parent,
+            _preparation_book.store._stop,
             reserve_bytes=_preparation_book._storage_reserve_bytes,
         )
     try:
@@ -1143,12 +1159,27 @@ class AccountBook:
         self, store: Any, *, deferred: bool = False,
         preparation_workers: int = 0,
         storage_reserve_bytes: int = DEFAULT_RESERVE_BYTES,
+        rollup_replica_dir: str | Path | None = None,
+        rollup_replica_reserve_bytes: int | None = None,
     ):
         self.store = store
         self.deferred = bool(deferred)
         self._installed = False
         self._preparation_workers = preparation_workers
         self._storage_reserve_bytes = storage_reserve_bytes
+        if rollup_replica_dir is not None and not Path(rollup_replica_dir).is_dir():
+            raise ValueError(f"rollup replica directory {rollup_replica_dir} is not a directory")
+        self._rollup_replica_dir = (
+            None if rollup_replica_dir is None else str(Path(rollup_replica_dir).resolve())
+        )
+        # Free space the replica leaves on its directory's filesystem.
+        self._rollup_reserve_bytes = (
+            storage_reserve_bytes
+            if rollup_replica_reserve_bytes is None
+            else int(rollup_replica_reserve_bytes)
+        )
+        if self._rollup_reserve_bytes < 0:
+            raise ValueError("rollup_replica_reserve_bytes must be nonnegative")
         self._preparation_pool: ProcessPoolExecutor | None = None
         self._worker_stop: Event | None = None
         self._closing = False
@@ -1179,6 +1210,10 @@ class AccountBook:
         self._rollup_future: Future[dict[str, Any]] | None = None
         self._rollup_started = -math.inf
         self._rollup_generation = -1
+        # Whether the rollup worker may still hold a replica that has not
+        # replayed the journal past ``owner_rollup_ack``. Without one, no
+        # reader needs any journalled change: a new replica starts at the head.
+        self._rollup_replica_live = False
         self._rollup_partials: dict[
             tuple[str, str, str, int], list[Any]
         ] | None = None
@@ -1190,7 +1225,10 @@ class AccountBook:
         if self._worker_stop is not None:
             self._worker_stop.set()
 
-    def _create_preparation_pool(self, workers: int) -> ProcessPoolExecutor:
+    def _create_preparation_pool(
+        self, workers: int, temp_directory: str | None = None,
+        reserve_bytes: int | None = None,
+    ) -> ProcessPoolExecutor:
         context = multiprocessing.get_context("spawn")
         if self._worker_stop is None:
             self._worker_stop = context.Event()
@@ -1199,7 +1237,11 @@ class AccountBook:
         return ProcessPoolExecutor(
             max_workers=workers, mp_context=context,
             initializer=_initialize_preparation_worker,
-            initargs=(str(self.store.path), self._worker_stop, self._storage_reserve_bytes),
+            initargs=(
+                str(self.store.path), self._worker_stop,
+                self._storage_reserve_bytes if reserve_bytes is None else reserve_bytes,
+                temp_directory or str(self.store.path.resolve().parent),
+            ),
         )
 
     def close(self) -> None:
@@ -1415,10 +1457,10 @@ class AccountBook:
                     "PRAGMA table_info(lp_accounting_claims)"
                 )
             }
-            if "position_state_json" not in claim_columns:
+            if "position_state_digest" not in claim_columns:
                 self.store.connection.execute(
                     "ALTER TABLE lp_accounting_claims ADD COLUMN "
-                    "position_state_json TEXT NOT NULL DEFAULT ''"
+                    "position_state_digest TEXT NOT NULL DEFAULT ''"
                 )
             with self.store.transaction() as conn:
                 install_journal(conn)
@@ -2580,7 +2622,7 @@ class AccountBook:
                 "position_last_tx_index", "position_last_log_index",
                 "liquidity", "sqrt_price_x96", "tick",
                 "price0_usd", "price1_usd", "claim0", "claim1",
-                "position_state_json",
+                "position_state_digest",
             )
             for position_key, candidate in candidates.items():
                 position = positions.get(position_key)
@@ -2612,6 +2654,7 @@ class AccountBook:
                     or _raw_int(block.get("timestamp")) != int(candidate[4])
                 ):
                     continue
+                stored = candidate[:15] + (state_json_digest(candidate[18]),)
                 existing = existing_claims.get(position_key)
                 if existing is not None:
                     if (
@@ -2622,9 +2665,9 @@ class AccountBook:
                         continue
                     if tuple(
                         existing.get(column) for column in claim_columns
-                    ) == candidate[:15] + candidate[18:]:
+                    ) == stored:
                         continue
-                accepted.append(candidate[:15] + candidate[18:])
+                accepted.append(stored)
                 pool_id = position.get("pool_id")
                 if pool_id:
                     affected_pools.add(str(pool_id).lower())
@@ -4321,7 +4364,7 @@ class AccountBook:
             "AND c.position_last_tx_index=p.last_tx_index "
             "AND c.position_last_log_index=p.last_log_index "
             "AND c.liquidity=p.liquidity "
-            "AND c.position_state_json=p.state_json "
+            "AND c.position_state_digest=state_json_digest(p.state_json) "
             "LEFT JOIN pools m ON m.id=p.pool_id WHERE " + " AND ".join(clauses), args))
         values: dict[str, dict[str, Any]] = {}
         for row in rows:
@@ -5747,14 +5790,19 @@ class AccountBook:
             try:
                 snapshot = future.result()
             except BrokenProcessPool:
+                self._rollup_replica_live = False
                 if self._rollup_pool is not None:
                     self._rollup_pool.shutdown(wait=False, cancel_futures=True)
                     self._rollup_pool = None
                 return False
             except Exception as exc:
-                if not _snapshot_deadline_error(exc):
+                # The worker keeps its replica only across deadline errors.
+                self._rollup_replica_live = _snapshot_deadline_error(exc)
+                if not self._rollup_replica_live:
+                    logger.warning("owner-activity rollup build failed: %s", exc)
                     raise
                 return False
+            self._rollup_replica_live = True
             return self._publish_owner_activity(snapshot)
         now = time.monotonic()
         if (
@@ -5763,8 +5811,15 @@ class AccountBook:
         ):
             return False
         self._rollup_started = now
+        if not self._rollup_replica_live:
+            # Ack before submitting, so the replica the worker is about to
+            # build starts at or past it and prune can drain the backlog.
+            with self.store.transaction() as conn:
+                release_journal(conn)
         if self._rollup_pool is None:
-            self._rollup_pool = self._create_preparation_pool(1)
+            self._rollup_pool = self._create_preparation_pool(
+                1, self._rollup_replica_dir, self._rollup_reserve_bytes,
+            )
         self._rollup_future = self._rollup_pool.submit(
             _owner_activity_in_worker, self.owners_revision,
         )

@@ -81,6 +81,22 @@ def prune_journal(connection: sqlite3.Connection, limit: int = 4096) -> int:
     ).rowcount
 
 
+def release_journal(connection: sqlite3.Connection) -> None:
+    """Acknowledge every journalled change; only call while no replica exists.
+
+    A replica starts from the journal head, so changes logged before then
+    are never read. Without this, the ack only moves when a build publishes,
+    and a build that cannot finish keeps the whole journal forever.
+    """
+    connection.execute(
+        "INSERT INTO lp_accounting_meta(key,value) VALUES('owner_rollup_ack',?) "
+        "ON CONFLICT(key) DO UPDATE SET "
+        "value=MAX(CAST(value AS INTEGER),CAST(excluded.value AS INTEGER))",
+        (_sequence(connection),),
+    )
+
+
+
 def _sequence(connection: sqlite3.Connection) -> int:
     row = connection.execute(
         "SELECT seq FROM sqlite_sequence WHERE name='lp_owner_rollup_journal'"

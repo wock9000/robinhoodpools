@@ -620,6 +620,145 @@ def test_zero_burn_checkpoint_is_not_lp_activity(tmp_path):
         app.close()
 
 
+def test_bucket_pruning_skips_busy_writer(tmp_path):
+    app = service(tmp_path / "market.sqlite")
+    entered = threading.Event()
+    release = threading.Event()
+
+    def hold_writer():
+        with app.store.transaction():
+            entered.set()
+            assert release.wait(10)
+
+    worker = threading.Thread(target=hold_writer)
+    try:
+        app.store.upsert_pools(pools())
+        block = header(100, int(time.time()) - 40 * 86400)
+        app.store.ingest([block], [swap(block, V3, "v3")])
+        worker.start()
+        assert entered.wait(10)
+        assert app.store.prune_bucket_batch(int(time.time()) - 35 * 86400) == 0
+    finally:
+        release.set()
+        worker.join(timeout=2)
+        app.close()
+
+
+def test_bucket_prune_preserves_all_and_rolling_windows(tmp_path):
+    app = service(tmp_path / "market.sqlite")
+    try:
+        app.store.upsert_pools(pools())
+        now = int(time.time())
+        headers = [
+            header(100 + index, now - days * 86400)
+            for index, days in enumerate((36, 34, 29))
+        ]
+        app.store.ingest(headers, [
+            swap(block, V3, "v3") for block in headers
+        ])
+        before = {
+            window: app.overview({"window": window})["volume_usd"]
+            for window in ("all", "30d")
+        }
+        cutoff = now - 35 * 86400
+        assert app.store.prune_bucket_batch(cutoff, limit=1) == 1
+        app.close()
+        app = service(tmp_path / "market.sqlite")
+        for _ in range(12):
+            app.store.prune_bucket_batch(cutoff, limit=1)
+        assert app.store.read().execute(
+            "SELECT COUNT(*) FROM lp_pool_buckets "
+            "WHERE resolution IN (60,3600) AND bucket<?", (cutoff,),
+        ).fetchone()[0] == 0
+        app.close()
+        app = service(tmp_path / "market.sqlite")
+        assert {
+            window: app.overview({"window": window})["volume_usd"]
+            for window in ("all", "30d")
+        } == before
+        assert before["all"] == pytest.approx(303)
+        assert before["30d"] == pytest.approx(101)
+    finally:
+        app.close()
+
+
+def test_pruned_bucket_rollups_survive_historical_reprojection(tmp_path):
+    path = tmp_path / "market.sqlite"
+    app = service(path)
+    try:
+        app.store.upsert_pools(pools())
+        now = int(time.time())
+        first = header(100, now - 40 * 86400)
+        second = header(99, now - 40 * 86400 - 61)
+        app.store.ingest([first], [swap(first, V3, "v3")])
+        assert app.overview({"window": "all"})["volume_usd"] == pytest.approx(101)
+        cutoff = now - 35 * 86400
+        for _ in range(8):
+            app.store.prune_bucket_batch(cutoff, limit=1)
+        assert app.store.read().execute(
+            "SELECT COUNT(*) FROM lp_pool_buckets WHERE resolution IN (60,3600)"
+        ).fetchone()[0] == 0
+        app.close()
+        app = service(path)
+        assert app.overview({"window": "all"})["volume_usd"] == pytest.approx(101)
+        app.store.ingest([second], [swap(second, V3, "v3")], lane="backfill")
+        app.store.reproject([row["id"] for row in app.store.pending_reprojections()])
+        assert app.store.read().execute(
+            "SELECT volume_usd FROM lp_pool_buckets WHERE resolution=86400"
+        ).fetchone()[0] == pytest.approx(202)
+        app.close()
+        app = service(path)
+        assert app.overview({"window": "all"})["volume_usd"] == pytest.approx(202)
+        assert app.overview({"window": "30d"})["volume_usd"] is None
+        app.store.rollback(99, header=second)
+        assert app.store.read().execute(
+            "SELECT volume_usd FROM lp_pool_buckets WHERE resolution=86400"
+        ).fetchone()[0] == pytest.approx(101)
+        app.close()
+        app = service(path)
+        assert app.overview({"window": "all"})["volume_usd"] == pytest.approx(101)
+    finally:
+        app.close()
+
+
+def test_pruned_day_recomputes_once_per_backfill_batch(tmp_path, monkeypatch):
+    from rhpools.lp_market_service import PriceProjection
+
+    app = service(tmp_path / "market.sqlite")
+    try:
+        app.store.upsert_pools(pools())
+        now = int(time.time())
+        day = (now - 40 * 86400) // 86400 * 86400
+        latest = header(100, day + 5 * 3600 + 30)
+        app.store.ingest([latest], [swap(latest, V3, "v3")])
+        cutoff = now - 35 * 86400
+        for _ in range(8):
+            app.store.prune_bucket_batch(cutoff)
+        restore = PriceProjection._restore_old_rollups
+        calls = []
+
+        def counted(*args, **kwargs):
+            calls.append(kwargs.get("resolutions", (3600, 86400)))
+            return restore(*args, **kwargs)
+
+        monkeypatch.setattr(PriceProjection, "_restore_old_rollups", staticmethod(counted))
+        backfill = [header(97 + hour, day + hour * 3600 + 30) for hour in range(3)]
+        app.store.ingest(backfill, [swap(block, V3, "v3") for block in backfill], lane="backfill")
+        app.store.reproject([row["id"] for row in app.store.pending_reprojections()])
+        assert sum(86400 in resolutions for resolutions in calls) == 1
+        rows = dict(app.store.read().execute(
+            "SELECT resolution||':'||bucket,volume_usd FROM lp_pool_buckets "
+            "WHERE resolution IN (3600,86400)",
+        ).fetchall())
+        assert rows == {
+            f"86400:{day}": pytest.approx(404),
+            **{f"3600:{day + hour * 3600}": pytest.approx(101) for hour in range(3)},
+        }
+    finally:
+        app.close()
+
+
+
 def test_backfilled_price_repairs_existing_flows_after_restart(tmp_path):
     path = tmp_path / "market.sqlite"
     app = service(path)

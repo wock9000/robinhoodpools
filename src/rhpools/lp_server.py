@@ -269,6 +269,11 @@ class Runtime:
                 self.market, args.rpc_url, args.database,
                 history_days=args.history_days,
                 history_disk_reserve_bytes=int(args.disk_reserve_gib * 1024**3),
+                rollup_replica_dir=args.rollup_replica_dir,
+                rollup_replica_reserve_bytes=(
+                    None if args.rollup_replica_reserve_gib is None
+                    else int(args.rollup_replica_reserve_gib * 1024**3)
+                ),
             )
             self._resources.callback(self.lp.close)
             startup.phase("services")
@@ -1198,6 +1203,15 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--database", default=os.environ.get("RHP_DATABASE"))
     ap.add_argument("--history-days", type=int, default=int(os.environ.get("LP_HISTORY_DAYS", "30")))
     ap.add_argument("--disk-reserve-gib", type=float, default=float(os.environ.get("LP_DISK_RESERVE_GIB", "4")))
+    # The owner-activity replica is a full temporary copy of the accounting
+    # inputs; this puts it (and its reserve check) on another filesystem.
+    ap.add_argument("--rollup-replica-dir", default=os.environ.get("LP_ROLLUP_REPLICA_DIR") or None)
+    # Free space the replica must leave on its directory's filesystem;
+    # defaults to --disk-reserve-gib, which still gates the writer.
+    ap.add_argument(
+        "--rollup-replica-reserve-gib", type=float,
+        default=os.environ.get("LP_ROLLUP_REPLICA_RESERVE_GIB") or None,
+    )
     ap.add_argument("--public-origin", action="append", default=[])
     ap.add_argument("--enable-transaction-prepare", action="store_true")
     ap.add_argument("--api-slots", type=int, default=int(os.environ.get("RHP_API_SLOTS", DEFAULT_API_SLOTS)))
@@ -1205,6 +1219,10 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--gate-db", default=os.environ.get("RHP_GATE_DB"))
     ap.add_argument("--gate-rpc-url", default=os.environ.get("RHP_GATE_RPC_URL", "http://127.0.0.1:8547"))
     ap.add_argument("--tx-fee-recipient", default=os.environ.get("RHP_TX_FEE_RECIPIENT") or None)
+    ap.add_argument(
+        "--drop-legacy-indexes", action="store_true",
+        help="drop indexes no query reads from a stopped store, then exit",
+    )
     return ap
 
 
@@ -1216,6 +1234,16 @@ def main() -> None:
     data_dir.mkdir(parents=True, exist_ok=True)
     args.data_dir = data_dir
     args.database = Path(args.database).expanduser() if args.database else data_dir / "lp_market.sqlite"
+    if args.drop_legacy_indexes:
+        from .lp_market_store import drop_legacy_indexes
+        dropped = drop_legacy_indexes(
+            args.database, lambda name: print(f"dropping {name}", flush=True),
+        )
+        for name, seconds in dropped:
+            print(f"dropped {name} in {seconds:.1f}s", flush=True)
+        if not dropped:
+            print("no legacy indexes present", flush=True)
+        return
     args.gate_db = Path(args.gate_db).expanduser() if args.gate_db else data_dir / "gate.sqlite"
     startup = Startup(_load_assets())
     Handler.startup = startup

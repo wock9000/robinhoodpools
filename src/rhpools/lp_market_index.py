@@ -42,6 +42,7 @@ from .lp_market_protocols import (
     V4_SWAP_TOPIC,
     MODIFY_LIQUIDITY_SELECTOR,
     SWAP_SELECTOR,
+    PinnedCallFailed,
     ProtocolDecodeError,
     _walk_trace,
     decode_gas_record,
@@ -53,7 +54,8 @@ from .lp_market_protocols import (
     repair_v4_owners,
 )
 from .lp_market_store import (
-    LP_ENRICHMENT_KINDS, CanonicalConflict, MarketStore,
+    ENRICHMENT_TERMINAL_PREFIX, LP_ENRICHMENT_KINDS, CanonicalConflict,
+    MarketStore,
 )
 
 logger = logging.getLogger(__name__)
@@ -89,6 +91,14 @@ RECENT_CATCHUP_YIELD_CHUNKS = 4
 RECENT_CATCHUP_YIELD_SECONDS = 2.0
 ENRICH_BATCH = 8
 ENRICHMENT_CAPABILITY_RECHECK_S = 300.0
+# Receipts, traces and block-pinned state are canonical and immutable, so a
+# decode failure that repeats is a property of the transaction or the decoder.
+# A few repeats absorb identity races; then the job is dead-lettered.
+ENRICHMENT_DECODE_TERMINAL_ATTEMPTS = 3
+# Provider and store failures back off exponentially to this ceiling and are
+# dead-lettered after about 2.6 days of failing (24 attempts).
+ENRICHMENT_MAX_ATTEMPTS = 24
+ENRICHMENT_RETRY_MAX_DELAY_S = 6 * 3600.0
 ENRICH_TRACE_BATCH = 8
 ENRICH_WORKERS = 8
 ENRICH_TRACE_WORKERS = 4
@@ -538,6 +548,7 @@ class MarketIndexer:
         self._bulk_paused = False
         self._wal_backlog_paused = False
         self._disk_free_paused = False
+        self._storage_pause_reasons: tuple[str, ...] = ()
         self._storage_assessment_pending = False
         self._wal_previous_backlog_bytes: int | None = None
         self._wal_previous_log_frames: int | None = None
@@ -4229,12 +4240,17 @@ class MarketIndexer:
                 (_lower(row["tx_hash"]), *sorted(LP_ENRICHMENT_KINDS)),
             ).fetchone()
             if needs_enrichment is not None:
+                prior_error = payload.get("prior_error")
+                prior_next_attempt = float(payload.get("prior_next_attempt", 0.0))
+                if str(prior_error or "").startswith(ENRICHMENT_TERMINAL_PREFIX):
+                    # Replayed identities change the decoder's inputs, so a
+                    # dead-lettered job earns one more attempt.
+                    prior_error, prior_next_attempt = None, 0.0
                 connection.execute(
                     "UPDATE pending_enrichment SET next_attempt=?,last_error=?,"
                     "updated_at=?,generation=generation+1 WHERE tx_hash=? AND last_error=?",
                     (
-                        float(payload.get("prior_next_attempt", 0.0)),
-                        payload.get("prior_error"), time.time(),
+                        prior_next_attempt, prior_error, time.time(),
                         _lower(row["tx_hash"]), marker,
                     ),
                 )
@@ -5361,6 +5377,18 @@ class MarketIndexer:
         with self._status_lock:
             return not self._bulk_paused
 
+    def _bucket_prune_allowed(self) -> bool:
+        # Pruning moves bucket pages to the freelist, which the reserve counts
+        # as headroom, so a pause caused only by low free space must not stop it.
+        with self._status_lock:
+            return not self._storage_assessment_pending and (
+                not self._bulk_paused
+                or (
+                    self._storage_pause_reasons == ("free_space",)
+                    and self._wal_held_since is None
+                )
+            )
+
     def _engage_wal_hold(self, wal_bytes: int, now: float) -> None:
         if (
             not self.wal_hold_bytes
@@ -5559,6 +5587,7 @@ class MarketIndexer:
             self._disk_free_paused = disk_paused
             self._storage_assessment_pending = False
             self._bulk_paused = paused
+            self._storage_pause_reasons = tuple(reasons)
 
         details = []
         if wal_held:
@@ -6232,7 +6261,7 @@ class MarketIndexer:
                     resolve_unknown=False,
                 )
                 if not events:
-                    raise ValueError(
+                    raise ProtocolDecodeError(
                         f"enrichment decoder returned no events for {tx_hash}"
                     )
                 requests_ = list(position_state_requests(events))
@@ -6320,13 +6349,45 @@ class MarketIndexer:
             and self._pool_identity_marker(row["last_error"]) is None
         }
 
+    def _enrichment_retry_delay(
+        self, row: Mapping[str, Any], error: BaseException, *, shared: bool,
+    ) -> float | None:
+        """Return the backoff before the next attempt, or None to dead-letter.
+
+        ``shared`` marks a failed batch commit: it says nothing about this
+        transaction's own evidence, so it is never classified as decoding.
+        """
+        attempts = int(row.get("attempts", 0)) + 1
+        deterministic = (
+            not shared
+            and isinstance(error, ProtocolDecodeError)
+            and not isinstance(error, PinnedCallFailed)
+        )
+        limit = (
+            ENRICHMENT_DECODE_TERMINAL_ATTEMPTS
+            if deterministic
+            else ENRICHMENT_MAX_ATTEMPTS
+        )
+        if attempts >= limit:
+            return None
+        delay = min(ENRICHMENT_RETRY_MAX_DELAY_S, 2.0 ** min(attempts, 20))
+        if self._trace_capability_error(error):
+            delay = max(ENRICHMENT_CAPABILITY_RECHECK_S, delay)
+        return delay
+
     def _mark_enrichment_failure(
-        self, row: Mapping[str, Any], error: Exception, *, delay: float,
+        self, row: Mapping[str, Any], error: Exception, *, shared: bool = False,
     ) -> bool:
+        delay = self._enrichment_retry_delay(row, error, shared=shared)
         with self.store.transaction() as conn:
             if not self._current_enrichment_jobs(conn, [row]):
                 return False
-            self.store.mark_enrichment_error(str(row["tx_hash"]), str(error), delay=delay)
+            if delay is None:
+                self.store.mark_enrichment_terminal(str(row["tx_hash"]), str(error))
+            else:
+                self.store.mark_enrichment_error(
+                    str(row["tx_hash"]), str(error), delay=delay,
+                )
         return True
 
     def _pending_v4_trace_hashes(
@@ -6516,16 +6577,7 @@ class MarketIndexer:
         if failures:
             with self.store.transaction():
                 for row, exc in failures:
-                    attempts = int(row.get("attempts", 0)) + 1
-                    if self._mark_enrichment_failure(
-                        row,
-                        exc,
-                        delay=(
-                            ENRICHMENT_CAPABILITY_RECHECK_S
-                            if self._trace_capability_error(exc)
-                            else min(300.0, 2.0 ** min(attempts, 8))
-                        ),
-                    ):
+                    if self._mark_enrichment_failure(row, exc):
                         batch_error = exc
             if batch_error is not None:
                 self._set_runtime("enrichment", error=batch_error)
@@ -6570,12 +6622,7 @@ class MarketIndexer:
             except Exception as exc:
                 with self.store.transaction():
                     for row in successful_rows:
-                        attempts = int(row.get("attempts", 0)) + 1
-                        self._mark_enrichment_failure(
-                            row,
-                            exc,
-                            delay=min(300.0, 2.0 ** min(attempts, 8)),
-                        )
+                        self._mark_enrichment_failure(row, exc, shared=True)
                 self._set_runtime("enrichment", error=exc)
             else:
                 store_seconds = max(time.monotonic() - acquired, 1e-9)
@@ -6913,6 +6960,8 @@ class MarketIndexer:
 
     def _maintenance_run(self) -> None:
         backoff = self.maintenance_interval_s
+        prune_due = 0.0
+        empty_prune_batches = 0
         try:
             while not self._stop.is_set():
                 try:
@@ -6963,6 +7012,26 @@ class MarketIndexer:
                     backoff = min(30.0, backoff * 2.0)
                 else:
                     backoff = self.maintenance_interval_s
+                    if (
+                        2 <= time.gmtime().tm_hour < 5
+                        and time.monotonic() >= prune_due
+                        and self._bucket_prune_allowed()
+                        and not self._stop.is_set()
+                    ):
+                        try:
+                            removed = self.store.prune_bucket_batch(
+                                int(time.time()) - 35 * 86400
+                            )
+                        except Exception:
+                            logger.exception("bucket pruning failed")
+                            prune_due = time.monotonic() + 300
+                        else:
+                            empty_prune_batches = (
+                                empty_prune_batches + 1 if not removed else 0
+                            )
+                            if empty_prune_batches >= 2:
+                                prune_due = time.monotonic() + 300
+                                empty_prune_batches = 0
                     self._stop.wait(self.maintenance_interval_s)
         finally:
             self.store.cancel_checkpoint_drain()

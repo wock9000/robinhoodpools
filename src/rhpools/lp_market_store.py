@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import contextlib
+import fcntl
+import hashlib
 import json
 import logging
 import math
+import os
 import re
 import sqlite3
 import threading
@@ -79,6 +82,10 @@ REQUIRED_EVENT_COLUMNS = (
 LP_ENRICHMENT_KINDS = frozenset({
     "add", "remove", "collect", "checkpoint", "donate", "fee", "transfer",
 })
+# A dead-lettered enrichment job keeps its row, so readers still treat the
+# transaction as unenriched, but is never due again. The prefix records why.
+ENRICHMENT_TERMINAL_PREFIX = "enrichment_terminal:"
+ENRICHMENT_TERMINAL_NEXT_ATTEMPT = 1e18
 _ENRICHMENT_RECOVERY_LOW_WATER = 2048
 POOL_COLUMNS = (
     "id", "protocol", "address", "token0", "token1", "symbol0", "symbol1",
@@ -121,6 +128,16 @@ _WRITER_MAX_FOREGROUND_SECONDS = 1.0
 # SQLite rebuilds the wal-index by reading the entire WAL before the first
 # statement of a fresh process. Warn when that read dominates startup.
 _STARTUP_WAL_WARNING_BYTES = 1024 ** 3
+# Indexes no query names since schema 19. DROP INDEX visits every page of the
+# index: a cold 2.2 GB index took 80 s on this host, so the drop is an explicit
+# offline step (``rhpools --drop-legacy-indexes``) rather than a startup migration.
+LEGACY_INDEXES = (
+    "events_owner_time_idx",
+    "events_custody_time_idx",
+    "lp_accounting_effects_position_tx",
+    "lp_accounting_episodes_owner_count_window",
+)
+_LEGACY_INDEXES_UNREAD_SINCE = 19
 
 
 class MarketStoreError(RuntimeError):
@@ -217,6 +234,62 @@ def _insert_rows(
             )
         connection.execute(statement, tuple(chain.from_iterable(batch)))
 
+
+def state_json_digest(state_json: str | None) -> str | None:
+    """Staleness key a claim stores in place of its position's ``state_json``.
+
+    Claims only test equality against ``lp_accounting_positions.state_json``;
+    a 128-bit digest keeps that test exact without a second copy of the JSON.
+    """
+    if state_json is None:
+        return None
+    return hashlib.blake2b(state_json.encode(), digest_size=16).hexdigest()
+
+
+def drop_legacy_indexes(
+    path: str | Path, progress: Callable[[str], None] | None = None,
+) -> list[tuple[str, float]]:
+    """Drop ``LEGACY_INDEXES`` from a store no indexer has open.
+
+    Returns ``(name, seconds)`` for each index that existed. Each drop commits
+    on its own, so an interrupted run keeps its progress and can be repeated.
+    """
+    database = Path(path).resolve()
+    if not database.is_file():
+        raise FileNotFoundError(database)
+    lock_fd = os.open(f"{database}.indexer.lock", os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise MarketStoreError(
+                f"an indexer has {database} open; stop the service first"
+            ) from exc
+        connection = sqlite3.connect(database, isolation_level=None, timeout=60.0)
+        try:
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if version < _LEGACY_INDEXES_UNREAD_SINCE:
+                raise MarketStoreError(
+                    f"schema {version} may still read a legacy index; "
+                    f"open the store with this release first (schema "
+                    f"{_LEGACY_INDEXES_UNREAD_SINCE})"
+                )
+            dropped: list[tuple[str, float]] = []
+            for name in LEGACY_INDEXES:
+                if connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?", (name,),
+                ).fetchone() is None:
+                    continue
+                if progress is not None:
+                    progress(name)
+                started = time.monotonic()
+                connection.execute(f"DROP INDEX IF EXISTS {name}")
+                dropped.append((name, time.monotonic() - started))
+            return dropped
+        finally:
+            connection.close()
+    finally:
+        os.close(lock_fd)
 
 
 def _header_number(header: Mapping[str, Any]) -> int:
@@ -315,6 +388,9 @@ class MarketStore:
             uri=self._uri,
         )
         connection.row_factory = sqlite3.Row
+        connection.create_function(
+            "state_json_digest", 1, state_json_digest, deterministic=True,
+        )
         connection.execute(f"PRAGMA busy_timeout={0 if checkpoint else 5000}")
         connection.execute("PRAGMA foreign_keys=ON")
         # The writer benefits from a large projection working set. Reader pages
@@ -443,10 +519,6 @@ class MarketStore:
         CREATE INDEX IF NOT EXISTS events_position_order_idx
             ON events(position_key, block_number, tx_index, log_index)
             WHERE position_key IS NOT NULL;
-        CREATE INDEX IF NOT EXISTS events_owner_time_idx
-            ON events(owner, timestamp DESC, id DESC) WHERE owner IS NOT NULL;
-        CREATE INDEX IF NOT EXISTS events_custody_time_idx
-            ON events(custody, timestamp DESC, id DESC) WHERE custody IS NOT NULL;
         CREATE INDEX IF NOT EXISTS events_owner_order_idx
             ON events(owner,block_number DESC,tx_index DESC,log_index DESC)
             WHERE owner IS NOT NULL;
@@ -591,8 +663,6 @@ class MarketStore:
                     CREATE INDEX events_position_order_idx
                         ON events(position_key,block_number,tx_index,log_index)
                         WHERE position_key IS NOT NULL;
-                    CREATE INDEX events_owner_time_idx
-                        ON events(owner,timestamp DESC,id DESC) WHERE owner IS NOT NULL;
                     PRAGMA user_version=2;
                 """)
             if int(self.connection.execute("PRAGMA user_version").fetchone()[0]) < 3:
@@ -798,6 +868,25 @@ class MarketStore:
                 self.connection.execute("DROP INDEX IF EXISTS pools_token0_idx")
                 self.connection.execute("DROP INDEX IF EXISTS pools_token1_idx")
                 self.connection.execute("PRAGMA user_version=18")
+            if int(self.connection.execute("PRAGMA user_version").fetchone()[0]) < 19:
+                with self.transaction() as connection:
+                    claim_columns = {
+                        str(row["name"])
+                        for row in connection.execute(
+                            "PRAGMA table_info(lp_accounting_claims)"
+                        )
+                    }
+                    if "position_state_json" in claim_columns:
+                        connection.execute(
+                            "ALTER TABLE lp_accounting_claims RENAME COLUMN "
+                            "position_state_json TO position_state_digest"
+                        )
+                        connection.execute(
+                            "UPDATE lp_accounting_claims "
+                            "SET position_state_digest=state_json_digest(position_state_digest) "
+                            "WHERE position_state_digest<>''"
+                        )
+                    connection.execute("PRAGMA user_version=19")
             self.connection.execute(
                 "CREATE INDEX IF NOT EXISTS pending_reprojection_order_idx "
                 "ON pending_reprojection(block_number,tx_index,log_index,event_id)"
@@ -1334,6 +1423,47 @@ class MarketStore:
                 del self._local.writer_priority
             else:
                 self._local.writer_priority = previous
+
+    def prune_bucket_batch(self, cutoff: int, limit: int = 512) -> int:
+        if limit < 1 or limit > 512:
+            raise ValueError("bucket prune batch must contain 1 to 512 rows")
+        with self.transaction(priority="background", blocking=False) as connection:
+            if connection is None:
+                return 0
+            if not self._bucket_rollup_ready:
+                self._bucket_rollup_ready = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lp_pool_buckets'"
+                ).fetchone() is not None
+                if not self._bucket_rollup_ready:
+                    return 0
+            cursor = self._metadata(connection, "bucket_prune_cursor", [60, -1, ""])
+            resolution, bucket, pool_id = cursor
+            rows = connection.execute(
+                "SELECT bucket,pool_id FROM lp_pool_buckets "
+                "WHERE resolution=? AND bucket<? AND (bucket,pool_id)>(?,?) "
+                "ORDER BY bucket,pool_id LIMIT ?",
+                (resolution, cutoff, bucket, pool_id, limit),
+            ).fetchall()
+            if not rows:
+                self._set_metadata(
+                    connection, "bucket_prune_cursor",
+                    [3600, -1, ""] if resolution == 60 else [60, -1, ""],
+                )
+                return 0
+            connection.executemany(
+                "DELETE FROM lp_pool_buckets WHERE resolution=? AND bucket=? AND pool_id=?",
+                ((resolution, row["bucket"], row["pool_id"]) for row in rows),
+            )
+            self._set_metadata(
+                connection, "bucket_prune_cursor",
+                [resolution, rows[-1]["bucket"], rows[-1]["pool_id"]],
+            )
+            self._set_metadata(
+                connection, "bucket_prune_before", max(
+                    cutoff, int(self._metadata(connection, "bucket_prune_before", 0))
+                ),
+            )
+            return len(rows)
 
     @contextlib.contextmanager
     def transaction(
@@ -3794,15 +3924,26 @@ class MarketStore:
 
 
     def mark_enrichment_error(self, tx_hash: str, error: str, *, delay: float) -> None:
+        self._record_enrichment_failure(
+            tx_hash, str(error), time.time() + max(0.0, delay),
+        )
+
+    def mark_enrichment_terminal(self, tx_hash: str, error: str) -> None:
+        """Dead-letter a job whose failure will not change on retry."""
+        self._record_enrichment_failure(
+            tx_hash, ENRICHMENT_TERMINAL_PREFIX + str(error),
+            ENRICHMENT_TERMINAL_NEXT_ATTEMPT,
+        )
+
+    def _record_enrichment_failure(
+        self, tx_hash: str, error: str, next_attempt: float,
+    ) -> None:
         with self.transaction() as connection:
             connection.execute(
                 "UPDATE pending_enrichment SET attempts=attempts+1,"
                 "next_attempt=?,last_error=?,updated_at=?,"
                 "generation=generation+1 WHERE tx_hash=?",
-                (
-                    time.time() + max(0.0, delay), str(error)[:1000],
-                    time.time(), tx_hash.lower(),
-                ),
+                (next_attempt, error[:1000], time.time(), tx_hash.lower()),
             )
 
     def queue_v3_balances(
@@ -4032,8 +4173,8 @@ class MarketStore:
         # the identity index, not a scan of all historical canonical events.
         for kind, column, index in (
             ("transaction", "tx_hash", "events_tx_log_idx"),
-            ("owner", "owner", "events_owner_time_idx"),
-            ("custody", "custody", "events_custody_time_idx"),
+            ("owner", "owner", "events_owner_order_idx"),
+            ("custody", "custody", "events_custody_order_idx"),
             ("position", "position_key", "events_position_order_idx"),
         ):
             orphaned = connection.execute(
