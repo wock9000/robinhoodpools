@@ -67,6 +67,10 @@ curl -fsS http://127.0.0.1:8196/ >/dev/null
 curl -fsS http://127.0.0.1:8196/api/lp/status
 ```
 
+### Dropping legacy indexes
+
+Stores created by earlier releases can still carry indexes no query reads (`events_owner_time_idx`, `events_custody_time_idx`, `lp_accounting_effects_position_tx`, `lp_accounting_episodes_owner_count_window`). SQLite reads every page of an index to drop it, which can take minutes on a large cold store, so startup never does it. After this release has opened the store once, stop the service and run `uv run rhpools --drop-legacy-indexes` with the same `--data-dir`/`--database`. The command refuses while an indexer holds the store, commits each drop separately, and can be rerun after an interruption. Freed pages go to SQLite's freelist for reuse; the file does not shrink.
+
 ## Safety model
 
 The default service observes and simulates; it never signs or broadcasts a transaction. Transaction preparation is disabled unless `--enable-transaction-prepare` is supplied. Enabling it permits generation of unsigned direct-pool remove and collect transaction data for independent inspection and external signing; it does not enable server signing or broadcasting. Add-liquidity execution through MiniRouter2 `0x5295e633dfb504298d4a1896ba0738acb6c89e6a` is retired because that deployment is unsafe, and the service rejects both new add requests and preparation from old add or approval quotes. Revoke any remaining token allowances to that router independently. Never give this process, its browser UI, configuration, or repository a seed phrase or private key.

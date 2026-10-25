@@ -1219,6 +1219,10 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--gate-db", default=os.environ.get("RHP_GATE_DB"))
     ap.add_argument("--gate-rpc-url", default=os.environ.get("RHP_GATE_RPC_URL", "http://127.0.0.1:8547"))
     ap.add_argument("--tx-fee-recipient", default=os.environ.get("RHP_TX_FEE_RECIPIENT") or None)
+    ap.add_argument(
+        "--drop-legacy-indexes", action="store_true",
+        help="drop indexes no query reads from a stopped store, then exit",
+    )
     return ap
 
 
@@ -1230,6 +1234,16 @@ def main() -> None:
     data_dir.mkdir(parents=True, exist_ok=True)
     args.data_dir = data_dir
     args.database = Path(args.database).expanduser() if args.database else data_dir / "lp_market.sqlite"
+    if args.drop_legacy_indexes:
+        from .lp_market_store import drop_legacy_indexes
+        dropped = drop_legacy_indexes(
+            args.database, lambda name: print(f"dropping {name}", flush=True),
+        )
+        for name, seconds in dropped:
+            print(f"dropped {name} in {seconds:.1f}s", flush=True)
+        if not dropped:
+            print("no legacy indexes present", flush=True)
+        return
     args.gate_db = Path(args.gate_db).expanduser() if args.gate_db else data_dir / "gate.sqlite"
     startup = Startup(_load_assets())
     Handler.startup = startup
