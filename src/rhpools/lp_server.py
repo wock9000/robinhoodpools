@@ -269,6 +269,7 @@ class Runtime:
                 self.market, args.rpc_url, args.database,
                 history_days=args.history_days,
                 history_disk_reserve_bytes=int(args.disk_reserve_gib * 1024**3),
+                rollup_replica_dir=args.rollup_replica_dir,
             )
             self._resources.callback(self.lp.close)
             startup.phase("services")
@@ -1198,6 +1199,9 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--database", default=os.environ.get("RHP_DATABASE"))
     ap.add_argument("--history-days", type=int, default=int(os.environ.get("LP_HISTORY_DAYS", "30")))
     ap.add_argument("--disk-reserve-gib", type=float, default=float(os.environ.get("LP_DISK_RESERVE_GIB", "4")))
+    # The owner-activity replica is a full temporary copy of the accounting
+    # inputs; this puts it (and its reserve check) on another filesystem.
+    ap.add_argument("--rollup-replica-dir", default=os.environ.get("LP_ROLLUP_REPLICA_DIR") or None)
     ap.add_argument("--public-origin", action="append", default=[])
     ap.add_argument("--enable-transaction-prepare", action="store_true")
     ap.add_argument("--api-slots", type=int, default=int(os.environ.get("RHP_API_SLOTS", DEFAULT_API_SLOTS)))

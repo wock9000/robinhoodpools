@@ -927,17 +927,22 @@ class _PreparationReader:
 
 _preparation_book: AccountBook | None = None
 _rollup_replica: RollupReplica | None = None
+_worker_temp_directory: Path | None = None
 
 
-def _initialize_preparation_worker(path: str, stop: Event, reserve_bytes: int) -> None:
-    global _preparation_book
+def _initialize_preparation_worker(
+    path: str, stop: Event, reserve_bytes: int, temp_directory: str,
+) -> None:
+    global _preparation_book, _worker_temp_directory
     reader = _PreparationReader(path, stop)
-    directory = str(reader.path.parent)
-    reader.read().execute("PRAGMA temp_store_directory='" + directory.replace("'", "''") + "'")
+    reader.read().execute(
+        "PRAGMA temp_store_directory='" + temp_directory.replace("'", "''") + "'"
+    )
     selected = reader.read().execute("PRAGMA temp_store_directory").fetchone()
-    if selected is None or selected[0] != directory:
+    if selected is None or selected[0] != temp_directory:
         reader.read().close()
         raise RuntimeError("SQLite could not honor the worker temporary-file directory")
+    _worker_temp_directory = Path(temp_directory)
     _preparation_book = AccountBook(
         reader, deferred=True, storage_reserve_bytes=reserve_bytes,
     )
@@ -956,9 +961,11 @@ def _owner_activity_in_worker(generation: int) -> dict[str, Any]:
     if _preparation_book is None:
         raise RuntimeError("accounting preparation worker is not initialized")
     if _rollup_replica is None:
-        reader = _preparation_book.store
+        # The replica is a SQLite temporary database, so it lives in the
+        # worker's temp_store_directory; its reserve guards that filesystem.
         _rollup_replica = RollupReplica(
-            reader.path.parent, reader._stop,
+            _worker_temp_directory or _preparation_book.store.path.parent,
+            _preparation_book.store._stop,
             reserve_bytes=_preparation_book._storage_reserve_bytes,
         )
     try:
@@ -1149,12 +1156,18 @@ class AccountBook:
         self, store: Any, *, deferred: bool = False,
         preparation_workers: int = 0,
         storage_reserve_bytes: int = DEFAULT_RESERVE_BYTES,
+        rollup_replica_dir: str | Path | None = None,
     ):
         self.store = store
         self.deferred = bool(deferred)
         self._installed = False
         self._preparation_workers = preparation_workers
         self._storage_reserve_bytes = storage_reserve_bytes
+        if rollup_replica_dir is not None and not Path(rollup_replica_dir).is_dir():
+            raise ValueError(f"rollup replica directory {rollup_replica_dir} is not a directory")
+        self._rollup_replica_dir = (
+            None if rollup_replica_dir is None else str(Path(rollup_replica_dir).resolve())
+        )
         self._preparation_pool: ProcessPoolExecutor | None = None
         self._worker_stop: Event | None = None
         self._closing = False
@@ -1200,7 +1213,9 @@ class AccountBook:
         if self._worker_stop is not None:
             self._worker_stop.set()
 
-    def _create_preparation_pool(self, workers: int) -> ProcessPoolExecutor:
+    def _create_preparation_pool(
+        self, workers: int, temp_directory: str | None = None,
+    ) -> ProcessPoolExecutor:
         context = multiprocessing.get_context("spawn")
         if self._worker_stop is None:
             self._worker_stop = context.Event()
@@ -1209,7 +1224,10 @@ class AccountBook:
         return ProcessPoolExecutor(
             max_workers=workers, mp_context=context,
             initializer=_initialize_preparation_worker,
-            initargs=(str(self.store.path), self._worker_stop, self._storage_reserve_bytes),
+            initargs=(
+                str(self.store.path), self._worker_stop, self._storage_reserve_bytes,
+                temp_directory or str(self.store.path.resolve().parent),
+            ),
         )
 
     def close(self) -> None:
@@ -5784,7 +5802,7 @@ class AccountBook:
             with self.store.transaction() as conn:
                 release_journal(conn)
         if self._rollup_pool is None:
-            self._rollup_pool = self._create_preparation_pool(1)
+            self._rollup_pool = self._create_preparation_pool(1, self._rollup_replica_dir)
         self._rollup_future = self._rollup_pool.submit(
             _owner_activity_in_worker, self.owners_revision,
         )

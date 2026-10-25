@@ -262,7 +262,7 @@ def rollup_worker(ledger, monkeypatch):
     monkeypatch.setattr(accounting, "_preparation_book", book)
     monkeypatch.setattr(accounting, "_rollup_replica", None)
     monkeypatch.setattr(accounting, "_OWNER_ACTIVITY_INTERVAL_SECONDS", 0.0)
-    monkeypatch.setattr(book, "_create_preparation_pool", lambda _workers: _DeferredPool())
+    monkeypatch.setattr(book, "_create_preparation_pool", lambda *_args: _DeferredPool())
     book._storage_reserve_bytes = 1
     try:
         yield store, book
@@ -362,3 +362,80 @@ def test_a_replica_kept_across_a_deadline_still_finds_its_journal(rollup_worker,
     assert _build(store, book)
     rows, ack, head = _journal(store)
     assert (rows, ack) == (0, head)
+
+
+def test_only_the_rollup_pool_moves_to_the_configured_replica_directory(ledger, tmp_path, monkeypatch):
+    import rhpools.lp_market_accounting as accounting
+
+    store, _book = ledger
+    replica_dir = tmp_path / "replica"
+    replica_dir.mkdir()
+    pools = []
+
+    class _Recorder:
+        def __init__(self, **kwargs):
+            pools.append(kwargs["initargs"])
+
+        def submit(self, *_args):
+            return None
+
+    monkeypatch.setattr(accounting, "ProcessPoolExecutor", _Recorder)
+    database_dir = str(store.path.resolve().parent)
+    for configured, expected in ((None, database_dir), (replica_dir, str(replica_dir.resolve()))):
+        pools.clear()
+        book = AccountBook(
+            store, deferred=True, preparation_workers=3, rollup_replica_dir=configured,
+        )
+        book._advance_rollup()
+        book._create_preparation_pool(3)
+        assert [args[3] for args in pools] == [expected, database_dir]
+    with pytest.raises(ValueError):
+        AccountBook(store, rollup_replica_dir=tmp_path / "missing")
+
+
+def test_rollup_worker_builds_and_measures_space_in_the_replica_directory(ledger, tmp_path, monkeypatch):
+    import os
+    import shutil
+    import threading
+
+    import rhpools.lp_market_accounting as accounting
+
+    store, _book = ledger
+    replica_dir = (tmp_path / "replica").resolve()
+    replica_dir.mkdir()
+    monkeypatch.setattr(accounting, "_preparation_book", None)
+    monkeypatch.setattr(accounting, "_rollup_replica", None)
+    monkeypatch.setattr(accounting, "_worker_temp_directory", None)
+    measured = []
+    disk_usage = shutil.disk_usage
+
+    def recording_disk_usage(path):
+        measured.append(os.fspath(path))
+        return disk_usage(path)
+
+    monkeypatch.setattr("rhpools.lp_owner_rollup.shutil.disk_usage", recording_disk_usage)
+    accounting._initialize_preparation_worker(
+        str(store.path), threading.Event(), 1, str(replica_dir),
+    )
+    reader = accounting._preparation_book.store.read()
+    try:
+        snapshot = accounting._owner_activity_in_worker(0)
+        assert snapshot["rows"] and snapshot["journal_through"] > 0
+        assert measured and set(measured) == {str(replica_dir)}
+        replica = accounting._rollup_replica.connection
+        replica.execute("PRAGMA cache_size=2")
+        replica.execute("CREATE TABLE pad(blob)")
+        replica.executemany(
+            "INSERT INTO pad VALUES(randomblob(4096))", ((),) * 256,
+        )
+        if os.path.isdir("/proc/self/fd"):
+            opened = {
+                os.readlink(f"/proc/self/fd/{fd}") for fd in os.listdir("/proc/self/fd")
+                if os.path.islink(f"/proc/self/fd/{fd}")
+            }
+            assert any(target.startswith(str(replica_dir) + os.sep) for target in opened)
+    finally:
+        if accounting._rollup_replica is not None:
+            accounting._rollup_replica.close()
+        reader.execute("PRAGMA temp_store_directory=''")
+        reader.close()

@@ -1214,7 +1214,8 @@ class LPMarketService:
     """Cached, bounded HTTP read surface over one durable event index."""
 
     def __init__(self, market, rpc_url, path: str | Path, *, history_days=30,
-                 history_disk_reserve_bytes=4 * 1024**3, start=True, deferred_start=True):
+                 history_disk_reserve_bytes=4 * 1024**3, start=True, deferred_start=True,
+                 rollup_replica_dir: str | Path | None = None):
         from .lp_market_store import MarketStore
         from .lp_market_index import MarketIndexer
         from .lp_market_accounting import AccountBook
@@ -1225,6 +1226,7 @@ class LPMarketService:
         self.book = AccountBook(
             self.store, deferred=start, preparation_workers=3 if start else 0,
             storage_reserve_bytes=history_disk_reserve_bytes,
+            rollup_replica_dir=rollup_replica_dir,
         )
         self.book.install()
         self._current_activity_lock = threading.RLock()
