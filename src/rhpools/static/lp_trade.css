@@ -1,0 +1,29 @@
+.trade-dialog { width: min(560px, calc(100vw - 12px)); }
+.trade-form { display: grid; grid-template-columns: 9ch minmax(0, 1fr); gap: 4px 8px; align-items: baseline; }
+.trade-form > label { color: var(--rhp-dim); }
+.trade-form .gate-row { margin: 0; }
+.trade-dialog input.trade-amount { flex: 1 1 14ch; min-width: 10ch; text-align: right; }
+.trade-dialog input.trade-token { flex: 1 1 24ch; }
+.trade-dialog button.seg { font-weight: 400; color: var(--rhp-dim); border-color: var(--rhp-dimmer); }
+.trade-dialog button.seg[aria-pressed="true"] { color: var(--rhp-black); background: var(--rhp-white); border-color: var(--rhp-white); font-weight: 700; }
+.trade-dialog button.link { padding: 0; border: 0; color: var(--rhp-cyan); font-weight: 400; }
+.trade-dialog button.link:hover, .trade-dialog button.link:focus-visible { background: transparent; color: var(--rhp-cyan); text-decoration: underline; }
+.trade-results { display: grid; margin: 0; padding: 0; list-style: none; }
+.trade-results button { width: 100%; padding: 1px 4px; border: 0; text-align: left; font-weight: 400; color: var(--rhp-text); }
+.trade-results .note { color: var(--rhp-dim); }
+.trade-quote .gate-table td.numeric { text-align: right; }
+.trade-quote .gate-table td.dim, .trade-quote .gate-table th { color: var(--rhp-dim); }
+.trade-route { overflow-wrap: anywhere; white-space: normal; }
+.trade-cta { width: 100%; padding: 3px 4px; }
+.trade-status { min-height: 1.45em; }
+.trade-status a { color: var(--rhp-cyan); }
+.trade-refusal { color: var(--rhp-yellow); }
+.impact-warn { color: var(--rhp-yellow); }
+.impact-bad { color: var(--rhp-red); }
+.trade-tag { margin-left: 4px; }
+@media (max-width: 460px) {
+  .trade-form { grid-template-columns: 1fr; gap: 1px 0; }
+  .trade-form > label { margin-top: 4px; }
+  .trade-quote .gate-table td { white-space: normal; overflow-wrap: anywhere; }
+}
+.trade-results button.seg { width: 100%; text-align: left; margin: 1px 0; }

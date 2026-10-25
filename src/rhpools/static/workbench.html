@@ -1,6 +1,9 @@
 <!doctype html>
 <html lang="en">
 <head>
+  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="icon" type="image/png" sizes="512x512" href="/static/rhp_icon_512.png">
+  <link rel="apple-touch-icon" href="/static/rhp_icon_180.png">
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
@@ -95,6 +98,11 @@
         <details id="pool-coverage" class="coverage-details pool-coverage is-hidden">
           <summary>STATUS DETAILS</summary><div id="pool-error" class="inline-notice" role="alert"></div>
         </details>
+
+        <section id="your-positions" class="your-positions is-hidden" aria-labelledby="your-positions-title">
+          <h2 id="your-positions-title">YOUR POSITIONS</h2>
+          <div id="your-positions-list"></div>
+        </section>
 
         <section class="primary-grid">
           <article class="chart-card" aria-labelledby="liquidity-title">
