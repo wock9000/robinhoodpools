@@ -1,4 +1,5 @@
 import json
+import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -229,6 +230,64 @@ def test_rpc_demand_counts_batch_items_and_expires_window(monkeypatch):
     gate.record(2)
     assert gate.traffic()["rpc_calls"] == 7
     assert gate.traffic()["rpc_calls_per_second"] == round(2 / 60, 3)
+
+
+def test_head_lanes_skip_a_background_pacing_backlog():
+    gate = lp_rpc._SourceGate()
+    # A background batch of 76 calls at 0.1 s/call was just granted.
+    gate.next_at = time.monotonic() + 7.6
+    started = time.monotonic()
+    gate.acquire(0.1, 2, priority=True)
+    assert time.monotonic() - started < 0.5
+    # Its cost is still charged to the shared clock that background lanes wait on.
+    assert gate.next_at - time.monotonic() > 7.6
+    gate.release()
+
+
+def test_background_leaves_a_slot_for_head_ingest_and_yields_to_it():
+    gate = lp_rpc._SourceGate(concurrency=4)
+    for _ in range(3):
+        gate.acquire(0.0, 1)
+    blocked = threading.Thread(target=gate.acquire, args=(0.0, 1), daemon=True)
+    blocked.start()
+    blocked.join(0.3)
+    assert blocked.is_alive()  # the fourth slot is reserved
+    gate.acquire(0.0, 1, priority=True)
+    assert gate.in_flight == 4
+    gate.release()  # the head request finishes; its slot stays reserved
+    blocked.join(0.3)
+    assert blocked.is_alive()
+    gate.release()  # a background request finishes
+    blocked.join(2)
+    assert not blocked.is_alive() and gate.in_flight == 3
+
+
+def test_head_lane_borrowing_from_the_provider_clock_is_bounded(monkeypatch):
+    monkeypatch.setattr(lp_rpc, "_PRIORITY_DEBT_SECONDS", 0.2)
+    gate = lp_rpc._SourceGate()
+    gate.next_at = time.monotonic() + 0.6
+    started = time.monotonic()
+    gate.acquire(0.1, 1, priority=True)
+    assert 0.3 <= time.monotonic() - started < 1.0
+    gate.release()
+
+
+def test_local_node_is_never_paced_for_either_class(monkeypatch):
+    gate = lp_rpc._gate("http://127.0.0.1:59999")
+    assert gate.concurrency == lp_rpc.LOCAL_SOURCE_CONCURRENCY
+    started = time.monotonic()
+    for _ in range(lp_rpc.LOCAL_SOURCE_CONCURRENCY - 1):
+        gate.acquire(lp_rpc._minimum_interval("http://127.0.0.1:59999"), 100)
+    gate.acquire(0.0, 100, priority=True)
+    assert time.monotonic() - started < 0.2
+    for _ in range(lp_rpc.LOCAL_SOURCE_CONCURRENCY):
+        gate.release()
+
+
+def test_only_head_and_live_lanes_get_priority(provider):
+    assert provider("live")._priority and provider("head")._priority
+    for lane in ("history", "enrichment", "receipt", "workbench", "balance"):
+        assert not provider(lane)._priority
 
 
 def test_rpc_transport_traceback_does_not_expose_url_credentials(monkeypatch):
