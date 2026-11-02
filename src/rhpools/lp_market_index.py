@@ -159,8 +159,8 @@ DEFAULT_STORAGE_RECOVERY_BYTES = 1024 ** 3
 # Raw price/reserve samples older than this are pruned (0 disables). The API's
 # longest rolling window is 30 days; 35 matches the minute/hour bucket rule.
 DEFAULT_SAMPLE_RETENTION_DAYS = 35
-# Each maintenance tick spends at most this long on sample-prune batches, one
-# non-blocking background writer turn per batch, and rests after a sweep.
+# The sample-prune thread runs batches (one waited background writer turn
+# each) for this long, rests three times as long, and rests after a sweep.
 SAMPLE_PRUNE_TICK_BUDGET_S = 0.25
 SAMPLE_PRUNE_REST_S = 3600.0
 MAX_POOL_CACHE_ENTRIES = 16_384
@@ -2814,6 +2814,12 @@ class MarketIndexer:
                     ),
                     threading.Thread(
                         target=self._run_with_writer_priority,
+                        args=("background", self._sample_prune_run),
+                        name="lp-market-sample-prune",
+                        daemon=True,
+                    ),
+                    threading.Thread(
+                        target=self._run_with_writer_priority,
                         args=("live", self._live_run),
                         name="lp-market-live",
                         daemon=True,
@@ -5402,16 +5408,22 @@ class MarketIndexer:
             )
 
     def _sample_prune_tick(self) -> bool:
-        """Spend one tick's budget on sample-prune batches; True once a sweep ends."""
+        """Spend one budget of waited background turns on sample pruning.
+
+        Returns True once a sweep has finished.
+        """
         cutoff = int(time.time()) - self.sample_retention_days * 86_400
         deadline = time.monotonic() + SAMPLE_PRUNE_TICK_BUDGET_S
         removed = 0
         complete = False
         while not self._stop.is_set():
-            batch = self.store.prune_sample_batch(cutoff)
+            # Waiting (at background priority) is what lets the pruner in
+            # while catch-up keeps the writer busy; it never takes the
+            # maintenance thread's place, so checkpoints are not delayed.
+            batch = self.store.prune_sample_batch(cutoff, blocking=True)
             removed += batch.removed
             complete = batch.complete
-            if complete or batch.busy or time.monotonic() >= deadline:
+            if complete or time.monotonic() >= deadline:
                 break
         if removed or complete:
             with self._status_lock:
@@ -5423,6 +5435,26 @@ class MarketIndexer:
                 **({"sample_prune_swept_at": time.time()} if complete else {}),
             )
         return complete
+
+    def _sample_prune_run(self) -> None:
+        while self.sample_retention_days and not self._stop.is_set():
+            if not self._retention_prune_allowed():
+                self._stop.wait(5.0)
+                continue
+            started = time.monotonic()
+            try:
+                complete = self._sample_prune_tick()
+            except Exception:
+                logger.exception("sample pruning failed")
+                self._stop.wait(300.0)
+                continue
+            # Rest three times as long as the batches took (writer waits
+            # included), keeping the pruner under a quarter of wall time.
+            self._stop.wait(
+                SAMPLE_PRUNE_REST_S if complete
+                else max(0.05, 3 * (time.monotonic() - started))
+            )
+
 
     def _engage_wal_hold(self, wal_bytes: int, now: float) -> None:
         if (
@@ -6997,7 +7029,6 @@ class MarketIndexer:
         backoff = self.maintenance_interval_s
         prune_due = 0.0
         empty_prune_batches = 0
-        sample_prune_due = 0.0
         try:
             while not self._stop.is_set():
                 try:
@@ -7068,18 +7099,6 @@ class MarketIndexer:
                             if empty_prune_batches >= 2:
                                 prune_due = time.monotonic() + 300
                                 empty_prune_batches = 0
-                    if (
-                        self.sample_retention_days
-                        and time.monotonic() >= sample_prune_due
-                        and self._retention_prune_allowed()
-                        and not self._stop.is_set()
-                    ):
-                        try:
-                            if self._sample_prune_tick():
-                                sample_prune_due = time.monotonic() + SAMPLE_PRUNE_REST_S
-                        except Exception:
-                            logger.exception("sample pruning failed")
-                            sample_prune_due = time.monotonic() + 300
                     self._stop.wait(self.maintenance_interval_s)
         finally:
             self.store.cancel_checkpoint_drain()

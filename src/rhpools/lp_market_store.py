@@ -1477,6 +1477,7 @@ class MarketStore:
 
     def prune_sample_batch(
         self, cutoff: int, *, limit: int = 512, pool_limit: int = 256,
+        blocking: bool = False,
     ) -> SamplePruneBatch:
         """Delete one bounded batch of raw price/reserve samples before ``cutoff``.
 
@@ -1487,14 +1488,14 @@ class MarketStore:
         below that block (the at-or-before answer for every later position);
         everything from the block on stays. ``sample_prune_block`` is raised
         before the first delete so lookups below it read the source events.
-        Takes the background writer turn without waiting; a busy writer gets
-        ``busy=True``. ``complete`` means the sweep finished.
+        Takes the background writer turn, without waiting unless ``blocking``;
+        a busy writer gets ``busy=True``. ``complete`` means the sweep finished.
         """
         if limit < 1 or limit > 512:
             raise ValueError("sample prune batch must delete 1 to 512 rows")
         if pool_limit < 1:
             raise ValueError("sample prune batch must visit at least one pool")
-        with self.transaction(priority="background", blocking=False) as connection:
+        with self.transaction(priority="background", blocking=blocking) as connection:
             if connection is None:
                 return SamplePruneBatch(0, False, busy=True)
             if connection.execute(

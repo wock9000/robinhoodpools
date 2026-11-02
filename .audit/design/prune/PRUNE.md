@@ -94,7 +94,7 @@ Every other large table stays in full: `events`, `blocks`, `transactions` (canon
 
 ### Mechanism
 
-`MarketStore.prune_sample_batch` takes the background writer turn without waiting, visits at most 256 pools and deletes at most 512 rows per transaction. It walks `(pool_id,block_number,tx_index,log_index)` with a cursor in `metadata` (`sample_prune_cursor`) and raises `sample_prune_block` before the first delete of a sweep. The maintenance thread spends up to 0.25 s of each 1 s tick on batches, at any hour, under the same storage gate as bucket pruning, and rests for an hour after a full sweep. `--sample-retention-days` / `LP_SAMPLE_RETENTION_DAYS` sets the window; `0` turns pruning off. No schema change.
+`MarketStore.prune_sample_batch` visits at most 256 pools and deletes at most 512 rows per transaction, walking `(pool_id,block_number,tx_index,log_index)` with a cursor in `metadata` (`sample_prune_cursor`) and raising `sample_prune_block` before the first delete of a sweep. A dedicated `lp-market-sample-prune` thread runs batches for 0.25 s, each waiting for a background-priority writer turn (the scheduler admits background writers between foreground bursts), then rests three times as long, so it stays under a quarter of wall time; it rests an hour after a full sweep. A first deploy ran the batches non-blocking from the maintenance tick, and under live catch-up they never got the writer: no batch ran in five minutes. The thread uses the same storage gate as bucket pruning (`_retention_prune_allowed`). `--sample-retention-days` / `LP_SAMPLE_RETENTION_DAYS` sets the window; `0` turns pruning off. No schema change.
 
 ### Proof
 

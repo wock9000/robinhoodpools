@@ -40,7 +40,7 @@ Run `uv run rhpools --help` for the installed command's complete option list. `-
 
 The equivalent environment settings are `RHP_HTTP_HOST`, `RHP_HTTP_PORT`, `RHP_RPC_URL`, `RHP_DATA_DIR`, `RHP_DATABASE`, `LP_HISTORY_DAYS`, and `LP_DISK_RESERVE_GIB`. Additional origins and preparation of supported direct-pool transactions require explicit CLI flags; there is no environment switch that silently enables preparation.
 
-`--sample-retention-days` / `LP_SAMPLE_RETENTION_DAYS` (default 35, `0` disables) bounds the raw per-event price and V2 reserve samples. The maintenance thread prunes older samples in small background batches, keeping each pool's first sample and its newest one before the cutoff; lookups older than the cutoff read the canonical events the samples came from, so API answers and accounting are unchanged. Deleted rows go to SQLite's freelist and are reused before the file grows. See `.audit/design/prune/PRUNE.md`.
+`--sample-retention-days` / `LP_SAMPLE_RETENTION_DAYS` (default 35, `0` disables) bounds the raw per-event price and V2 reserve samples. A background thread prunes older samples in small batches, keeping each pool's first sample and its newest one before the cutoff; lookups older than the cutoff read the canonical events the samples came from, so API answers and accounting are unchanged. Deleted rows go to SQLite's freelist and are reused before the file grows. See `.audit/design/prune/PRUNE.md`.
 
 ### Holder gate
 
