@@ -147,10 +147,18 @@ bumps `revision` so cached aggregates refresh. `pending_rollup_restore` in
 value before the change, never a double count. Deep rollbacks into pruned
 history still recompute synchronously.
 
-Before rolling the service back to a build without this lane (799889a or
-older), wait until `pending_rollup_restore` reads 0. Older builds never drain
-the queue, so any day still queued keeps its pre-change total. The extra table
-and triggers are otherwise inert for them.
+Before rolling the service back to a build without this lane (#37 at 7207f6f,
+or older), wait until `pending_rollup_restore` reads 0. Older builds never
+drain the queue, so any day still queued keeps its pre-change total. The extra
+table and triggers are otherwise inert for them.
+
+Deploy the merged build over the live `~/robinhoodpools` (not a git checkout)
+only after confirming it runs #37: `diff -rq -x __pycache__` of a 7207f6f
+worktree's `src/` and `deploy/` against the live tree must print nothing. After
+the restart, check that both new workers are required and running:
+`curl -s 127.0.0.1:8196/api/lp/status | jq '{lag_blocks,pending_rollup_restore,enrich:.latency.enrichment,req_ok:([.workers.required[]]|(index("lp-market-rollups")!=null and index("lp-market-sample-prune")!=null)),missing:.workers.missing}'`
+should show `req_ok: true` and `missing: []`, with `lag_blocks` falling and
+`pending_rollup_restore` rising and then draining.
 
 Header, event, and search writes use parameterized multi-row inserts bounded by
 SQLite's variable limit. This avoids handing the Python interpreter to competing
