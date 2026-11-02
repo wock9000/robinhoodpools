@@ -139,6 +139,32 @@ def _json_bytes(payload, key=None):
     return build() if key is None else _memoized_body(("json", *key), build)
 
 
+# The terminal's header badge and index panel read only these fields. The full
+# status document (~55 KB of provider and failure detail) stays on
+# /api/lp/status, so a connected terminal never polls it.
+_STREAM_STATUS_FIELDS = (
+    "as_of", "state", "errors", "chain_id", "head", "head_timestamp", "indexed_head",
+    "lag_blocks", "lag_s", "revision", "epoch", "backfill", "pending_enrichment",
+    "pending_reprojection", "pending_balances", "pending_rollup_restore",
+)
+_STREAM_SCAN_FIELDS = (
+    "observed_at", "blocks", "seconds", "fetch_seconds", "decode_seconds",
+    "store_lock_wait_seconds", "store_seconds", "postprocess_seconds", "publish_seconds",
+)
+STREAM_STATUS_INTERVAL_S = 2.0
+
+
+def _stream_status(status):
+    out = {field: status.get(field) for field in _STREAM_STATUS_FIELDS}
+    for lane in ("live_scan", "history_scan"):
+        scan = status.get(lane)
+        out[lane] = (
+            {field: scan[field] for field in _STREAM_SCAN_FIELDS if field in scan}
+            if isinstance(scan, dict) else None
+        )
+    return out
+
+
 def _publication_key(path, query, payload):
     status = payload.get("status") or {}
     revision = payload.get("revision", status.get("revision"))
@@ -547,7 +573,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(304 if same else 200)
         self.send_header("Content-Type", content_type)
         self.send_header("ETag", etag)
-        self.send_header("Cache-Control", "public,max-age=60" if path.startswith("/static/") else "no-store")
+        # no-transform keeps Cloudflare from injecting its analytics beacon,
+        # which the self-only script-src below would block on every page load.
+        self.send_header(
+            "Cache-Control",
+            "public,max-age=60" if path.startswith("/static/") else "no-store,no-transform",
+        )
         self.send_header("Vary", "Accept-Encoding")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "SAMEORIGIN" if path == "/pool" else "DENY")
@@ -702,6 +733,7 @@ class Handler(BaseHTTPRequestHandler):
         last_write = time.monotonic()
         next_durable = float("inf") if current_only or terminal else 0.0
         next_owner = 0.0 if owners_enabled else float("inf")
+        next_status = 0.0 if terminal else float("inf")
         owner_revision = None
         seen_rows = {}
         while not self.runtime.stopping.is_set():
@@ -741,6 +773,14 @@ class Handler(BaseHTTPRequestHandler):
                     body = _json_bytes(owners, ("lp-owners", view_key, *owner_revision))
                     sink.event(f"{after}:{feed_epoch or feed['feed_epoch']}:{block_after}", "owners", body)
                     last_write = time.monotonic()
+            if now >= next_status:
+                try:
+                    status = _stream_status(lp.status())
+                finally:
+                    lp.store.close_reader()
+                next_status = now + STREAM_STATUS_INTERVAL_S
+                sink.event(f"{after}:{feed_epoch or feed['feed_epoch']}:{block_after}", "status", _json_bytes(status))
+                last_write = time.monotonic()
             block_after = max(block_after, int(feed["sequence"]))
             feed_epoch = feed["feed_epoch"]
             feed = {**feed, "events": []}
@@ -756,7 +796,7 @@ class Handler(BaseHTTPRequestHandler):
             if now - last_write >= 10:
                 sink.heartbeat()
                 last_write = now
-            lp.wait_stream(block_after, min(0.5, max(0.01, min(next_durable, next_owner) - now)))
+            lp.wait_stream(block_after, min(0.5, max(0.01, min(next_durable, next_owner, next_status) - now)))
             try:
                 feed = lp.stream_updates(query, block_after, feed_epoch)
             finally:

@@ -412,6 +412,7 @@ class MarketIndexer:
         current_observer: Any | None = None,
         accounting_projector: Callable[[], bool] | None = None,
         accounting_recovery: Callable[[], bool] | None = None,
+        rollup_restorer: Callable[[], int] | None = None,
     ) -> None:
         if history_days < 0:
             raise ValueError("history_days must be nonnegative")
@@ -438,6 +439,7 @@ class MarketIndexer:
         self.current_observer = current_observer
         self._accounting_projector = accounting_projector
         self._accounting_recovery = accounting_recovery
+        self._rollup_restorer = rollup_restorer
         self.rpc_url = rpc_url
         self.history_days = int(history_days)
         self.v3_balances = bool(v3_balances)
@@ -2857,6 +2859,13 @@ class MarketIndexer:
                         target=self._run_with_writer_priority,
                         args=("background", self._accounting_recovery_run),
                         name="lp-market-identity-recovery",
+                        daemon=True,
+                    ))
+                if self._rollup_restorer is not None:
+                    self._threads.append(threading.Thread(
+                        target=self._run_with_writer_priority,
+                        args=("background", self._rollup_run),
+                        name="lp-market-rollups",
                         daemon=True,
                     ))
                 if self._head_wss_urls:
@@ -7298,6 +7307,32 @@ class MarketIndexer:
                 if recovered:
                     self._set_runtime("identity_recovery")
                 self._stop.wait(0.01 if worked else 0.1)
+
+    def _rollup_run(self) -> None:
+        backoff = 0.5
+        while not self._stop.is_set():
+            if not self._bulk_work_allowed():
+                self._stop.wait(0.5)
+                continue
+            try:
+                started = time.monotonic()
+                restored = self._rollup_restorer()
+                if restored:
+                    self._set_runtime(
+                        "rollups", latency=time.monotonic() - started,
+                        rollup_restore_batch=restored,
+                    )
+            except Exception as exc:
+                self._set_runtime("rollups", error=exc)
+                self._stop.wait(backoff)
+                backoff = min(30.0, backoff * 2.0)
+            else:
+                backoff = 0.5
+                with self._status_lock:
+                    recovered = "rollups" in self._errors
+                if recovered:
+                    self._set_runtime("rollups")
+                self._stop.wait(0.05 if restored else 1.0)
 
     def _projection_run(self) -> None:
         backoff = 0.5

@@ -386,7 +386,11 @@ with `Retry-After` and `gate.retry_after_ms`.
 ### Keyed streaming: `GET /api/v1/stream`
 
 The same frames as the terminal's `/api/lp/stream` (`block`, `activity`,
-`owners`, durable frames) with the same query parameters, behind a credential.
+`owners`, `status`, durable frames) with the same query parameters, behind a
+credential. With `view=terminal` the stream sends a compact `status` frame
+(heads, `lag_s`, `lag_blocks`, state, errors, queue counts and the last scan
+timings) on connect and every two seconds; `/api/lp/status` keeps the full
+document.
 Without `Upgrade: websocket` it is `text/event-stream`; with it, the frames
 arrive as JSON text messages `{"event":…,"id":…,"data":…}` and the server
 never reads client data frames (send only pong or close).

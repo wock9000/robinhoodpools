@@ -109,10 +109,14 @@ Skipped head notifications are not fork evidence and must not clear wallet
 snapshots. Same-height replacements and confirmed parent mismatches still
 withdraw orphaned activity and invalidate wallets.
 
-The browser refreshes durable index status on its one-second heartbeat,
-independently of the slower overview refresh. Requests do not overlap and
-are aborted while the page is hidden. The moving chain head is no longer
-compared against an index cursor held back by a twelve-second overview timer.
+The terminal reads index status from its event stream. With `view=terminal`
+the stream sends a compact `status` frame on connect and every two seconds, so
+an open tab makes no status requests. Overview and pool tables refetch when a
+status frame carries a new revision, at most every ten seconds; a stalled index
+therefore costs no aggregate requests. If the stream is down, the tab polls
+status and aggregates every ten seconds until it reconnects. The header badge
+reads `LAGGING <n>s` instead of `STREAM LIVE` once `lag_s` exceeds 30 seconds,
+because an open stream only proves that chain heads are arriving.
 
 The running service commits raw events, cursors, balance jobs, and coalesced
 accounting jobs atomically. A separate accounting worker replays each affected
@@ -123,6 +127,21 @@ transactions across their changed rows, releasing the writer after roughly
 after publishing the coherent snapshot; a changed canonical epoch rejects it.
 Existing financial rows remain readable while the queue drains, but cannot be
 represented as current accounting.
+
+Hour and day totals for pruned minutes (older than the 35-day bucket
+retention) are no longer recomputed inside the transaction that changed their
+events. On 2026-11-02 that recompute summed a whole day of a busy pool from the
+events table while holding the only writer. Enrichment batches held it for 197
+to 365 seconds, and the live lane fell 3,000 blocks behind. Writers now queue
+the affected `(resolution, bucket, pool_id)` keys in `lp_bucket_restore`. The
+`lp-market-rollups` lane sums each queued pool-hour in its own reader snapshot
+and takes the writer only to store the totals. A key is restored once writers
+have left it alone for 60 seconds. Any later event change or bucket-row write
+bumps the key's generation, so a total computed from an older snapshot is
+discarded and retried. `pending_rollup_restore` in `/api/lp/status` counts
+queued keys; until a key is restored its total is the value before the
+change, never a double count. Deep rollbacks into pruned history still
+recompute synchronously.
 
 Header, event, and search writes use parameterized multi-row inserts bounded by
 SQLite's variable limit. This avoids handing the Python interpreter to competing

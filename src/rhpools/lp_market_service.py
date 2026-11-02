@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from .lp_chain import NATIVE, UNISWAP_V3_FACTORY, USDG, WETH, WETH_USDG_POOL
-from .lp_market_store import _insert_rows
+from .lp_market_store import MarketStoreError, _insert_rows
 from .workbench_market import _price_from_sqrt
 
 WINDOWS = {"1h": 3600, "24h": 86400, "7d": 604800, "30d": 2592000, "all": None}
@@ -89,6 +89,16 @@ _STARTUP_WARM_BUDGET_SECONDS = 900.0
 _STORED_POOL_RESTORE_SECONDS = 5.0
 _BUCKET_INCREMENTAL_POOL_LIMIT = 8_192
 _BUCKET_INDEXED_POOL_LIMIT = 1_024
+# Hour and day totals of pruned minutes are recomputed from canonical events by
+# a background lane rather than inside the writer transaction that changed
+# them: one busy pool-day is a long indexed scan of a cold events table, and the
+# writer is shared with live ingestion. A queued key waits until writers have
+# left it alone for the settle interval, so a day being backfilled or enriched
+# is recomputed once rather than once per batch.
+ROLLUP_RESTORE_BATCH = 64
+ROLLUP_RESTORE_SETTLE_SECONDS = 60.0
+# One reader snapshot covers one hour of one pool, never a whole day.
+_ROLLUP_RESTORE_SNAPSHOT_SECONDS = 120.0
 _WARM_WINDOWS = ("24h", "1h", "7d", "30d", "all")
 # Warm the terminal's default 24h view first, then the alternate windows.
 _WARM_KEYS: tuple[tuple[str, dict[str, Any]], ...] = (
@@ -341,11 +351,27 @@ class PriceProjection:
         CREATE INDEX IF NOT EXISTS lp_events_time ON events(timestamp,block_number,tx_index,log_index);
         CREATE INDEX IF NOT EXISTS lp_pools_pair ON pools(token0,token1);
         CREATE INDEX IF NOT EXISTS lp_events_pool_order ON events(pool_id,block_number,tx_index,log_index);
+        CREATE TABLE IF NOT EXISTS lp_bucket_restore (
+            resolution INTEGER NOT NULL,bucket INTEGER NOT NULL,pool_id TEXT NOT NULL,
+            generation INTEGER NOT NULL,dirty_at REAL NOT NULL,
+            PRIMARY KEY(resolution,bucket,pool_id)
+        ) WITHOUT ROWID;
+        CREATE INDEX IF NOT EXISTS lp_bucket_restore_due ON lp_bucket_restore(dirty_at);
         """
         with store.transaction() as conn:
             for statement in schema.split(";"):
                 if statement.strip():
                     conn.execute(statement)
+            # Any write to an hour or day row invalidates a restore computed
+            # from an older snapshot of that key (see restore_pending_rollups).
+            for operation, row in (("INSERT", "NEW"), ("UPDATE", "NEW"), ("DELETE", "OLD")):
+                conn.execute(
+                    f"CREATE TRIGGER IF NOT EXISTS lp_bucket_restore_{operation.lower()} "
+                    f"AFTER {operation} ON lp_pool_buckets WHEN {row}.resolution<>60 BEGIN "
+                    "UPDATE lp_bucket_restore SET generation=generation+1 "
+                    f"WHERE resolution={row}.resolution AND bucket={row}.bucket "
+                    f"AND pool_id={row}.pool_id; END"
+                )
             if int(store._metadata(conn, "price_projection_version", 0)) < PRICE_PROJECTION_VERSION:
                 zero_depth = (
                     "p.protocol IN ('v3','v4') AND (p.token0=? OR p.token1=?) AND "
@@ -795,9 +821,9 @@ class PriceProjection:
         return state
 
     @staticmethod
-    def _restore_old_rollups(conn, pool_id, minute, ancestor=None, resolutions=(3600, 86400)):
+    def _restore_old_rollups(conn, pool_id, minute, ancestor=None):
         columns = ",".join("?" for _ in range(len(BUCKET_FIELDS) + 4))
-        for resolution in resolutions:
+        for resolution in (3600, 86400):
             bucket = minute // resolution * resolution
             row = conn.execute(
                 f"SELECT {_BUCKET_EVENT_SUMS} FROM events e INDEXED BY events_pool_time_idx "
@@ -878,8 +904,7 @@ class PriceProjection:
         if pruned:
             PriceProjection._restore_old_rollups(conn, pool_id, minute, ancestor)
 
-    @staticmethod
-    def _buckets(conn, keys):
+    def _buckets(self, conn, keys):
         ordered = sorted(keys)
         if not ordered:
             return
@@ -905,10 +930,15 @@ class PriceProjection:
                 args,
             ).fetchall():
                 aggregates[(row["pool_id"], row["bucket"])] = row
+        prune_row = conn.execute(
+            "SELECT value FROM metadata WHERE key='bucket_prune_before'"
+        ).fetchone()
+        prune_before = json.loads(prune_row[0]) if prune_row else 0
         minute_rows = []
         missing = []
         rollup_deltas = {}
         rollup_max = {}
+        restores = set()
         for pool_id, minute in ordered:
             row = aggregates.get((pool_id, minute))
             values = [row[name] or 0 for name in BUCKET_FIELDS] if row else [
@@ -919,6 +949,14 @@ class PriceProjection:
                 minute_rows.append((60, minute, pool_id, *values, max_block))
             else:
                 missing.append((minute, pool_id))
+            if minute < prune_before:
+                # A pruned minute has no materialized row to diff against, so
+                # its hour and day are recomputed from events in the background.
+                restores.update(
+                    (resolution, minute // resolution * resolution, pool_id)
+                    for resolution in (3600, 86400)
+                )
+                continue
             old = old_rows.get((pool_id, minute))
             delta = [
                 value - (old[name] if old else 0)
@@ -955,21 +993,138 @@ class PriceProjection:
             "AND events<=0",
             ((resolution, bucket, pool_id) for resolution, pool_id, bucket in rollup_deltas),
         )
-        prune_row = conn.execute(
-            "SELECT value FROM metadata WHERE key='bucket_prune_before'"
-        ).fetchone()
-        prune_before = json.loads(prune_row[0]) if prune_row else 0
-        if prune_before:
-            # Recompute each pruned hour and day once per batch, not per minute.
-            for resolution in (3600, 86400):
-                affected = {
-                    (pool_id, minute // resolution * resolution)
-                    for pool_id, minute in ordered if minute < prune_before
-                }
-                for pool_id, bucket in sorted(affected):
-                    PriceProjection._restore_old_rollups(
-                        conn, pool_id, bucket, resolutions=(resolution,),
+        if restores:
+            self._queue_rollup_restores(conn, sorted(restores))
+
+    def _queue_rollup_restores(self, conn, keys):
+        """Mark pruned hour/day totals for restore_pending_rollups()."""
+        now = time.time()
+        inserted = conn.executemany(
+            "INSERT OR IGNORE INTO lp_bucket_restore"
+            "(resolution,bucket,pool_id,generation,dirty_at) VALUES(?,?,?,0,?)",
+            ((resolution, bucket, pool_id, now) for resolution, bucket, pool_id in keys),
+        ).rowcount
+        # A restore computed from a snapshot before this change must not land.
+        conn.executemany(
+            "UPDATE lp_bucket_restore SET generation=generation+1,dirty_at=? "
+            "WHERE resolution=? AND bucket=? AND pool_id=?",
+            ((now, *key) for key in keys),
+        )
+        if inserted:
+            self.store._bump(conn, "pending_rollup_restore", inserted)
+
+    def restore_pending_rollups(
+        self, limit=ROLLUP_RESTORE_BATCH, settle_seconds=ROLLUP_RESTORE_SETTLE_SECONDS,
+    ):
+        """Recompute queued pruned hour/day totals from canonical events.
+
+        Events are summed one pool-hour per reader snapshot, outside the writer
+        turn; the writer is taken only to store finished totals. Every later
+        event change in a queued key, and every write to its bucket row, bumps
+        the key's generation, so a total read from an older snapshot is
+        discarded and the key is retried. Returns the number of keys stored.
+        """
+        store = self.store
+        with store.reader_snapshot() as reader:
+            due = reader.execute(
+                "SELECT resolution,bucket,pool_id FROM lp_bucket_restore "
+                "INDEXED BY lp_bucket_restore_due WHERE dirty_at<=? "
+                "ORDER BY dirty_at LIMIT ?",
+                (time.time() - settle_seconds, limit),
+            ).fetchall()
+        groups = {}
+        for row in due:
+            day = row["bucket"] // 86400 * 86400
+            groups.setdefault((row["pool_id"], day), set()).add(
+                (row["resolution"], row["bucket"]),
+            )
+        results = []
+        retry = []
+        for (pool_id, day), wanted in groups.items():
+            hours = (
+                range(day, day + 86400, 3600) if (86400, day) in wanted
+                else sorted(bucket for resolution, bucket in wanted if resolution == 3600)
+            )
+            generations = {}
+            totals = {key: [0] * (len(BUCKET_FIELDS) + 1) for key in wanted}
+            stale = set()
+            try:
+                for hour in hours:
+                    with store.reader_snapshot(_ROLLUP_RESTORE_SNAPSHOT_SECONDS) as reader:
+                        current = {
+                            (row["resolution"], row["bucket"]): row["generation"]
+                            for row in reader.execute(
+                                "SELECT resolution,bucket,generation FROM lp_bucket_restore "
+                                "WHERE (resolution=3600 AND bucket=? AND pool_id=?) "
+                                "OR (resolution=86400 AND bucket=? AND pool_id=?)",
+                                (hour, pool_id, day, pool_id),
+                            ).fetchall()
+                        }
+                        sums = reader.execute(
+                            f"SELECT {_BUCKET_EVENT_SUMS} FROM events e "
+                            "INDEXED BY events_pool_time_idx "
+                            "WHERE e.pool_id=? AND e.timestamp>=? AND e.timestamp<?",
+                            (pool_id, hour, hour + 3600),
+                        ).fetchone()
+                    for key in ((3600, hour), (86400, day)):
+                        if key not in wanted:
+                            continue
+                        generation = current.get(key)
+                        if generation is None or generations.setdefault(key, generation) != generation:
+                            stale.add(key)
+                            continue
+                        total = totals[key]
+                        for index, name in enumerate(BUCKET_FIELDS):
+                            total[index] += sums[name] or 0
+                        total[-1] = max(total[-1], sums["max_block"] or 0)
+            except MarketStoreError:
+                # The snapshot hit its lease or a WAL drain; requeue the keys
+                # behind newer work instead of retrying them first forever.
+                retry.extend((resolution, bucket, pool_id) for resolution, bucket in wanted)
+                continue
+            results.extend(
+                (resolution, bucket, pool_id, generations[resolution, bucket], total)
+                for (resolution, bucket), total in totals.items()
+                if (resolution, bucket) not in stale
+            )
+        if not results and not retry:
+            return 0
+        stored = 0
+        placeholders = ",".join("?" for _ in range(len(BUCKET_FIELDS) + 4))
+        with store.transaction(priority="background") as conn:
+            for resolution, bucket, pool_id, generation, total in results:
+                current = conn.execute(
+                    "SELECT generation FROM lp_bucket_restore "
+                    "WHERE resolution=? AND bucket=? AND pool_id=?",
+                    (resolution, bucket, pool_id),
+                ).fetchone()
+                if current is None or current[0] != generation:
+                    continue
+                if total[0]:
+                    conn.execute(
+                        f"INSERT OR REPLACE INTO lp_pool_buckets VALUES({placeholders})",
+                        (resolution, bucket, pool_id, *total),
                     )
+                else:
+                    conn.execute(
+                        "DELETE FROM lp_pool_buckets "
+                        "WHERE resolution=? AND bucket=? AND pool_id=?",
+                        (resolution, bucket, pool_id),
+                    )
+                conn.execute(
+                    "DELETE FROM lp_bucket_restore "
+                    "WHERE resolution=? AND bucket=? AND pool_id=?",
+                    (resolution, bucket, pool_id),
+                )
+                stored += 1
+            if stored:
+                store._bump(conn, "pending_rollup_restore", -stored)
+            conn.executemany(
+                "UPDATE lp_bucket_restore SET dirty_at=? "
+                "WHERE resolution=? AND bucket=? AND pool_id=?",
+                ((time.time(), *key) for key in retry),
+            )
+        return stored
 
     def _queue_successors(self, conn, sources, revision):
         """Repair old consumers, never rows just priced in this delivery."""
@@ -1313,6 +1468,7 @@ class LPMarketService:
             accounting_recovery=(
                 self.book.recover_pending_identities if start else None
             ),
+            rollup_restorer=self.prices.restore_pending_rollups if start else None,
         )
         self.claims = PositionClaims(
             self.store, self.book, self.prices, self.indexer._worker_rpc,

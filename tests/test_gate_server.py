@@ -257,7 +257,8 @@ def test_keyed_sse_stream_requires_a_key_and_closes_after_grace(tmp_path):
         gate.rpc.balances[HOLDER.lower()] = 1
         gate.clock.now += 31
         gate.clock.now += 61
-        frames = read_frames(response, 2)
+        # Terminal-view streams interleave index status frames every few seconds.
+        frames = [frame for frame in read_frames(response, 4) if frame is None or frame["event"] != "status"]
         assert frames[0]["event"] == "gate" and frames[0]["data"]["gate"]["state"] == "below"
         assert frames[1] is None
         connection.close()

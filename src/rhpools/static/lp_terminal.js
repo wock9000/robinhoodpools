@@ -5,7 +5,13 @@
   const MAX_TAPE_ROWS = 150;
   const TABLE_LIMIT = 100;
   const OWNER_STREAM_LIMIT = 200;
-  const AGGREGATE_REFRESH_MS = 1_000;
+  // A connected stream pushes index status; overview and pool tables refresh
+  // when its revision advances, at most this often.
+  const AGGREGATE_MIN_INTERVAL_MS = 10_000;
+  // Without the stream, status and aggregates fall back to this poll.
+  const FALLBACK_POLL_MS = 10_000;
+  // A connected stream reads LAGGING once the durable index trails the chain by this much.
+  const INDEX_LAG_WARN_S = 30;
   const REFRESH_MS = 12_000;
   const HISTORY_REFRESH_MS = 15_000;
   const REQUEST_TIMEOUT_MS = 15_000;
@@ -138,6 +144,10 @@
     streamGeneration: 0,
     streamRetryTimer: null,
     streamRetryMs: 1_000,
+    streamLabel: "",
+    streamClass: "",
+    aggregatesRevision: null,
+    aggregatesRequestedAt: 0,
     aggregateController: null,
     aggregateGeneration: 0,
     statusController: null,
@@ -1593,8 +1603,28 @@
   }
 
   function setStreamState(label, className = "") {
+    state.streamLabel = label;
+    state.streamClass = className;
+    renderStreamState();
+  }
+
+  function renderStreamState() {
+    let label = state.streamLabel;
+    let className = state.streamClass;
+    let title = "";
+    const lag = finite(state.status && state.status.lag_s);
+    // An open stream only proves the chain head is arriving; say so when the
+    // durable index behind the tables is materially older.
+    if (label === "STREAM LIVE" && lag != null && lag > INDEX_LAG_WARN_S) {
+      const gap = currentIndexGap();
+      label = `LAGGING ${formats.integer.format(Math.round(lag))}s`;
+      className = "is-stale";
+      title = `Stream connected; the durable index is ${formats.integer.format(Math.round(lag))} s`
+        + `${gap != null ? ` (${formats.integer.format(gap)} blocks)` : ""} behind the chain head`;
+    }
     elements.streamState.textContent = label;
     elements.streamState.className = `strip-state${className ? ` ${className}` : ""}`;
+    elements.streamState.title = title;
   }
 
   function advanceRevision(value) {
@@ -1626,6 +1656,19 @@
     }
     healthSuccess("status");
     renderStatus();
+    renderStreamState();
+  }
+
+  function streamOpen() {
+    return Boolean(state.stream && state.stream.readyState === EventSource.OPEN);
+  }
+
+  function applyStreamStatus(status) {
+    applyStatus(status);
+    if (!status || status.revision == null || String(status.revision) === String(state.aggregatesRevision)) return;
+    const wait = state.aggregatesRequestedAt + AGGREGATE_MIN_INTERVAL_MS - Date.now();
+    if (wait <= 0) refreshAggregates("stream");
+    else if (!state.refreshTimer) scheduleAggregateRefresh(wait);
   }
 
   function updateHeldTapeCount() {
@@ -2027,24 +2070,29 @@
     }
   }
 
-  function scheduleAggregateRefresh(delay = AGGREGATE_REFRESH_MS) {
+  function scheduleAggregateRefresh(delay = null) {
     clearTimeout(state.refreshTimer);
     state.refreshTimer = null;
     if (state.hidden) return;
+    const fallback = delay == null;
+    // An open stream drives refreshes from its status events instead.
+    if (fallback && streamOpen()) return;
     state.refreshTimer = setTimeout(() => {
       state.refreshTimer = null;
-      refreshAggregates("timer");
-    }, delay);
+      if (fallback && !streamOpen()) refreshStatus();
+      refreshAggregates(fallback ? "timer" : "stream");
+    }, fallback ? FALLBACK_POLL_MS : delay);
   }
 
   async function refreshAggregates(reason) {
     if (state.hidden) return;
     scheduleAggregateRefresh();
+    const periodic = reason === "timer" || reason === "stream";
+    if (periodic && state.aggregateController) return;
+    state.aggregatesRequestedAt = Date.now();
+    state.aggregatesRevision = state.status && state.status.revision;
     if (poolPanelActive()) refreshPools();
-    if (state.aggregateController) {
-      if (reason === "timer") return;
-      state.aggregateController.abort();
-    }
+    if (state.aggregateController) state.aggregateController.abort();
     const generation = ++state.aggregateGeneration;
     const controller = new AbortController();
     state.aggregateController = controller;
@@ -2057,7 +2105,7 @@
     }
     try {
       await Promise.all(requests);
-      if (reason === "timer" && !elements.modal.hidden && state.ownerFollow && state.ownerAddress && !state.ownerController) {
+      if (periodic && !elements.modal.hidden && state.ownerFollow && state.ownerAddress && !state.ownerController) {
         loadOwner(state.ownerAddress);
       }
     } finally {
@@ -2179,21 +2227,28 @@
       const payload = parseEvent(event, "owners");
       if (payload) applyOwnersEnvelope(payload);
     };
+    const receiveStatus = (event) => {
+      const payload = parseEvent(event, "status");
+      if (payload) applyStreamStatus(payload);
+    };
     source.addEventListener("activity", receiveActivity);
     source.addEventListener("block", receiveBlock);
     source.addEventListener("owners", receiveOwners);
+    source.addEventListener("status", receiveStatus);
     source.onopen = () => {
       if (generation !== state.streamGeneration || source !== state.stream) return;
       clearTimeout(state.streamRetryTimer);
       state.streamRetryTimer = null;
       state.streamRetryMs = 1_000;
       setStreamState("STREAM LIVE");
+      scheduleAggregateRefresh();
     };
     source.onerror = () => {
       if (generation !== state.streamGeneration || source !== state.stream) return;
       setStreamState("RECONNECTING", "is-stale");
       healthFailure("tape", new Error("live stream disconnected"));
       if (ownersEnabled) healthFailure("owners", new Error("wallet stream disconnected"));
+      if (!state.refreshTimer) scheduleAggregateRefresh();
       if (source.readyState !== EventSource.CLOSED) return;
       closeStream();
       const delay = state.streamRetryMs;
@@ -3445,10 +3500,7 @@
   renderAllTables();
   updateClock();
   refreshStatus();
-  setInterval(() => {
-    updateClock();
-    refreshStatus();
-  }, 1_000);
+  setInterval(updateClock, 1_000);
   reloadTape("initial");
   const initialOwner = String(initialUrl.searchParams.get("owner") || "").toLowerCase();
   if (ADDRESS_RE.test(initialOwner)) openOwner(initialOwner, null, "replace");

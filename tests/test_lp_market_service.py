@@ -1,4 +1,5 @@
 """Consumer-visible safeguards for quotes, canonical replay and backfill order."""
+import contextlib
 import json
 import sqlite3
 import threading
@@ -703,9 +704,11 @@ def test_pruned_bucket_rollups_survive_historical_reprojection(tmp_path):
         assert app.overview({"window": "all"})["volume_usd"] == pytest.approx(101)
         app.store.ingest([second], [swap(second, V3, "v3")], lane="backfill")
         app.store.reproject([row["id"] for row in app.store.pending_reprojections()])
-        assert app.store.read().execute(
-            "SELECT volume_usd FROM lp_pool_buckets WHERE resolution=86400"
-        ).fetchone()[0] == pytest.approx(202)
+        day_volume = "SELECT volume_usd FROM lp_pool_buckets WHERE resolution=86400"
+        # The pruned day is not recomputed under the writer, nor counted twice.
+        assert app.store.read().execute(day_volume).fetchone()[0] == pytest.approx(101)
+        assert app.prices.restore_pending_rollups(settle_seconds=0) == 2
+        assert app.store.read().execute(day_volume).fetchone()[0] == pytest.approx(202)
         app.close()
         app = service(path)
         assert app.overview({"window": "all"})["volume_usd"] == pytest.approx(202)
@@ -721,7 +724,7 @@ def test_pruned_bucket_rollups_survive_historical_reprojection(tmp_path):
         app.close()
 
 
-def test_pruned_day_recomputes_once_per_backfill_batch(tmp_path, monkeypatch):
+def test_pruned_rollups_restore_outside_writer_once_per_key(tmp_path, monkeypatch):
     from rhpools.lp_market_service import PriceProjection
 
     app = service(tmp_path / "market.sqlite")
@@ -738,14 +741,26 @@ def test_pruned_day_recomputes_once_per_backfill_batch(tmp_path, monkeypatch):
         calls = []
 
         def counted(*args, **kwargs):
-            calls.append(kwargs.get("resolutions", (3600, 86400)))
+            calls.append(args)
             return restore(*args, **kwargs)
 
         monkeypatch.setattr(PriceProjection, "_restore_old_rollups", staticmethod(counted))
         backfill = [header(97 + hour, day + hour * 3600 + 30) for hour in range(3)]
         app.store.ingest(backfill, [swap(block, V3, "v3") for block in backfill], lane="backfill")
         app.store.reproject([row["id"] for row in app.store.pending_reprojections()])
-        assert sum(86400 in resolutions for resolutions in calls) == 1
+        assert calls == []
+        queued = {
+            (row["resolution"], row["bucket"])
+            for row in app.store.read().execute(
+                "SELECT resolution,bucket FROM lp_bucket_restore",
+            ).fetchall()
+        }
+        assert queued == {(86400, day), *((3600, day + hour * 3600) for hour in range(3))}
+        assert app.store.status()["pending_rollup_restore"] == 4
+        # Keys still being touched wait for the settle interval.
+        assert app.prices.restore_pending_rollups() == 0
+        assert app.prices.restore_pending_rollups(settle_seconds=0) == 4
+        assert calls == []
         rows = dict(app.store.read().execute(
             "SELECT resolution||':'||bucket,volume_usd FROM lp_pool_buckets "
             "WHERE resolution IN (3600,86400)",
@@ -754,6 +769,53 @@ def test_pruned_day_recomputes_once_per_backfill_batch(tmp_path, monkeypatch):
             f"86400:{day}": pytest.approx(404),
             **{f"3600:{day + hour * 3600}": pytest.approx(101) for hour in range(3)},
         }
+        assert app.store.read().execute(
+            "SELECT COUNT(*) FROM lp_bucket_restore",
+        ).fetchone()[0] == 0
+        assert app.store.status()["pending_rollup_restore"] == 0
+    finally:
+        app.close()
+
+
+def test_pruned_rollup_restore_discards_totals_from_an_older_snapshot(tmp_path):
+    app = service(tmp_path / "market.sqlite")
+    try:
+        app.store.upsert_pools(pools())
+        now = int(time.time())
+        day = (now - 40 * 86400) // 86400 * 86400
+        latest = header(100, day + 5 * 3600 + 30)
+        app.store.ingest([latest], [swap(latest, V3, "v3")])
+        for _ in range(8):
+            app.store.prune_bucket_batch(now - 35 * 86400)
+        first = header(97, day + 30)
+        app.store.ingest([first], [swap(first, V3, "v3")], lane="backfill")
+        app.store.reproject([row["id"] for row in app.store.pending_reprojections()])
+        late = header(98, day + 90)
+        snapshot = app.store.reader_snapshot
+        written = []
+
+        @contextlib.contextmanager
+        def write_after_first_hour(*args, **kwargs):
+            with snapshot(*args, **kwargs) as reader:
+                yield reader
+            if args and not written:
+                # A writer commits into the same pool-day between the restore's
+                # read snapshot and its write transaction.
+                written.append(late)
+                app.store.ingest([late], [swap(late, V3, "v3")], lane="backfill")
+
+        app.store.reader_snapshot = write_after_first_hour
+        try:
+            assert app.prices.restore_pending_rollups(settle_seconds=0) == 0
+        finally:
+            del app.store.reader_snapshot
+        assert written
+        app.store.reproject([row["id"] for row in app.store.pending_reprojections()])
+        assert app.prices.restore_pending_rollups(settle_seconds=0) == 2
+        assert dict(app.store.read().execute(
+            "SELECT resolution,volume_usd FROM lp_pool_buckets "
+            "WHERE resolution IN (3600,86400) AND bucket<=?", (day,),
+        ).fetchall()) == {3600: pytest.approx(202), 86400: pytest.approx(303)}
     finally:
         app.close()
 
