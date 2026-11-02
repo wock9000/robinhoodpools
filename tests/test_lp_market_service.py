@@ -707,7 +707,7 @@ def test_pruned_bucket_rollups_survive_historical_reprojection(tmp_path):
         day_volume = "SELECT volume_usd FROM lp_pool_buckets WHERE resolution=86400"
         # The pruned day is not recomputed under the writer, nor counted twice.
         assert app.store.read().execute(day_volume).fetchone()[0] == pytest.approx(101)
-        assert app.prices.restore_pending_rollups(settle_seconds=0) == 2
+        assert app.prices.restore_pending_rollups(settle_seconds=0) == 1
         assert app.store.read().execute(day_volume).fetchone()[0] == pytest.approx(202)
         app.close()
         app = service(path)
@@ -755,20 +755,18 @@ def test_pruned_rollups_restore_outside_writer_once_per_key(tmp_path, monkeypatc
                 "SELECT resolution,bucket FROM lp_bucket_restore",
             ).fetchall()
         }
-        assert queued == {(86400, day), *((3600, day + hour * 3600) for hour in range(3))}
-        assert app.store.status()["pending_rollup_restore"] == 4
+        # Wholly pruned hours have no reader; only the day total is restored.
+        assert queued == {(86400, day)}
+        assert app.store.status()["pending_rollup_restore"] == 1
         # Keys still being touched wait for the settle interval.
         assert app.prices.restore_pending_rollups() == 0
-        assert app.prices.restore_pending_rollups(settle_seconds=0) == 4
+        revision = app.store.status()["revision"]
+        assert app.prices.restore_pending_rollups(settle_seconds=0) == 1
+        assert app.store.status()["revision"] > revision
         assert calls == []
-        rows = dict(app.store.read().execute(
-            "SELECT resolution||':'||bucket,volume_usd FROM lp_pool_buckets "
-            "WHERE resolution IN (3600,86400)",
-        ).fetchall())
-        assert rows == {
-            f"86400:{day}": pytest.approx(404),
-            **{f"3600:{day + hour * 3600}": pytest.approx(101) for hour in range(3)},
-        }
+        assert app.store.read().execute(
+            "SELECT volume_usd FROM lp_pool_buckets WHERE resolution=86400 AND bucket=?", (day,),
+        ).fetchone()[0] == pytest.approx(404)
         assert app.store.read().execute(
             "SELECT COUNT(*) FROM lp_bucket_restore",
         ).fetchone()[0] == 0
@@ -811,11 +809,84 @@ def test_pruned_rollup_restore_discards_totals_from_an_older_snapshot(tmp_path):
             del app.store.reader_snapshot
         assert written
         app.store.reproject([row["id"] for row in app.store.pending_reprojections()])
-        assert app.prices.restore_pending_rollups(settle_seconds=0) == 2
-        assert dict(app.store.read().execute(
-            "SELECT resolution,volume_usd FROM lp_pool_buckets "
-            "WHERE resolution IN (3600,86400) AND bucket<=?", (day,),
-        ).fetchall()) == {3600: pytest.approx(202), 86400: pytest.approx(303)}
+        assert app.prices.restore_pending_rollups(settle_seconds=0) == 1
+        assert app.store.read().execute(
+            "SELECT volume_usd FROM lp_pool_buckets WHERE resolution=86400 AND bucket=?", (day,),
+        ).fetchone()[0] == pytest.approx(303)
+    finally:
+        app.close()
+
+
+def _queue_pruned_days(app, days):
+    """Prune all buckets, then backfill one swap into each pruned day."""
+    now = int(time.time())
+    latest = header(200, now - 40 * 86400)
+    app.store.ingest([latest], [swap(latest, V3, "v3")])
+    for _ in range(8):
+        app.store.prune_bucket_batch(now - 35 * 86400)
+    blocks = [header(100 + index, day + 30) for index, day in enumerate(days)]
+    app.store.ingest(blocks, [swap(block, V3, "v3") for block in blocks], lane="backfill")
+    app.store.reproject([row["id"] for row in app.store.pending_reprojections()])
+
+
+def test_interrupted_restore_requeues_its_day_and_stores_the_others(tmp_path):
+    app = service(tmp_path / "market.sqlite")
+    try:
+        app.store.upsert_pools(pools())
+        now = int(time.time())
+        days = [(now - offset * 86400) // 86400 * 86400 for offset in (45, 44)]
+        _queue_pruned_days(app, days)
+        snapshot = app.store.reader_snapshot
+        interrupted = []
+
+        @contextlib.contextmanager
+        def interrupt_first_hour(*args, **kwargs):
+            with snapshot(*args, **kwargs) as reader:
+                if args and not interrupted:
+                    # What SQLite raises when the progress handler aborts a
+                    # statement for a lease expiry or WAL drain.
+                    interrupted.append(True)
+                    raise sqlite3.OperationalError("interrupted")
+                yield reader
+
+        app.store.reader_snapshot = interrupt_first_hour
+        try:
+            assert app.prices.restore_pending_rollups(settle_seconds=0) == 1
+        finally:
+            del app.store.reader_snapshot
+        assert interrupted
+        assert app.store.status()["pending_rollup_restore"] == 1
+        assert app.prices.restore_pending_rollups(settle_seconds=0) == 1
+        assert app.store.status()["pending_rollup_restore"] == 0
+        assert [
+            row[0] for row in app.store.read().execute(
+                "SELECT volume_usd FROM lp_pool_buckets WHERE resolution=86400 "
+                "AND bucket IN (?,?) ORDER BY bucket", days,
+            ).fetchall()
+        ] == [pytest.approx(101), pytest.approx(101)]
+    finally:
+        app.close()
+
+
+def test_continuously_touched_restore_key_is_restored_once_overdue(tmp_path):
+    app = service(tmp_path / "market.sqlite")
+    try:
+        app.store.upsert_pools(pools())
+        day = (int(time.time()) - 45 * 86400) // 86400 * 86400
+        _queue_pruned_days(app, [day])
+        first_dirty = "SELECT first_dirty_at FROM lp_bucket_restore WHERE resolution=86400"
+        queued_at = app.store.read().execute(first_dirty).fetchone()[0]
+        # Another writer touches the day again before it settles.
+        again = header(150, day + 90)
+        app.store.ingest([again], [swap(again, V3, "v3")], lane="backfill")
+        app.store.reproject([row["id"] for row in app.store.pending_reprojections()])
+        assert app.store.read().execute(first_dirty).fetchone()[0] == queued_at
+        assert app.prices.restore_pending_rollups() == 0
+        # Past the maximum deferral the key is due despite the fresh touch.
+        assert app.prices.restore_pending_rollups(max_defer_seconds=0) == 1
+        assert app.store.read().execute(
+            "SELECT volume_usd FROM lp_pool_buckets WHERE resolution=86400 AND bucket=?", (day,),
+        ).fetchone()[0] == pytest.approx(202)
     finally:
         app.close()
 

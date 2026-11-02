@@ -2251,7 +2251,8 @@
       if (!state.refreshTimer) scheduleAggregateRefresh();
       if (source.readyState !== EventSource.CLOSED) return;
       closeStream();
-      const delay = state.streamRetryMs;
+      // Jitter spreads reconnects after a server restart instead of syncing every tab.
+      const delay = Math.round(state.streamRetryMs * (0.5 + Math.random()));
       state.streamRetryMs = Math.min(15_000, Math.round(state.streamRetryMs * 1.8));
       state.streamRetryTimer = setTimeout(() => {
         if (!state.hidden) reloadTape("reconnect");

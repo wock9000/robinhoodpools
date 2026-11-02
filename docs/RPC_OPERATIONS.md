@@ -128,20 +128,29 @@ after publishing the coherent snapshot; a changed canonical epoch rejects it.
 Existing financial rows remain readable while the queue drains, but cannot be
 represented as current accounting.
 
-Hour and day totals for pruned minutes (older than the 35-day bucket
-retention) are no longer recomputed inside the transaction that changed their
-events. On 2026-11-02 that recompute summed a whole day of a busy pool from the
-events table while holding the only writer. Enrichment batches held it for 197
-to 365 seconds, and the live lane fell 3,000 blocks behind. Writers now queue
-the affected `(resolution, bucket, pool_id)` keys in `lp_bucket_restore`. The
-`lp-market-rollups` lane sums each queued pool-hour in its own reader snapshot
-and takes the writer only to store the totals. A key is restored once writers
-have left it alone for 60 seconds. Any later event change or bucket-row write
-bumps the key's generation, so a total computed from an older snapshot is
-discarded and retried. `pending_rollup_restore` in `/api/lp/status` counts
-queued keys; until a key is restored its total is the value before the
-change, never a double count. Deep rollbacks into pruned history still
-recompute synchronously.
+Day totals for pruned minutes (older than the 35-day bucket retention) are no
+longer recomputed inside the transaction that changed their events. On
+2026-11-02 that recompute summed a whole day of a busy pool from the events
+table while holding the only writer. Enrichment batches held it for 197 to 365
+seconds, and the live lane fell 3,000 blocks behind. Writers now queue the
+affected `(resolution, bucket, pool_id)` keys in `lp_bucket_restore`: the day,
+plus the hour only when it straddles the prune cutoff. Wholly pruned hours have
+no reader and are not restored. The `lp-market-rollups` lane sums each queued
+pool-hour in its own reader snapshot and commits one pool-day at a time, so the
+writer is held only to store totals. A key is restored once writers have left
+it alone for 60 seconds, or 15 minutes after it was first queued if they never
+do. Any later event change or bucket-row write bumps the key's generation, so a
+total computed from an older snapshot is discarded and retried. A snapshot cut
+short by its lease or a WAL drain requeues only that pool-day. Each stored batch
+bumps `revision` so cached aggregates refresh. `pending_rollup_restore` in
+`/api/lp/status` counts queued keys; until a key is restored its total is the
+value before the change, never a double count. Deep rollbacks into pruned
+history still recompute synchronously.
+
+Before rolling the service back to a build without this lane (799889a or
+older), wait until `pending_rollup_restore` reads 0. Older builds never drain
+the queue, so any day still queued keeps its pre-change total. The extra table
+and triggers are otherwise inert for them.
 
 Header, event, and search writes use parameterized multi-row inserts bounded by
 SQLite's variable limit. This avoids handing the Python interpreter to competing
