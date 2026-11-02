@@ -418,7 +418,7 @@ def test_maintenance_tick_sweeps_and_reports_progress(twins):
             app.store.read().execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             for table in SAMPLE_PRUNE_TABLES
         )
-        while not app.indexer._sample_prune_tick():
+        while not app.indexer._sample_prune_tick()[0]:
             pass
         after = sum(
             app.store.read().execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
@@ -429,4 +429,48 @@ def test_maintenance_tick_sweeps_and_reports_progress(twins):
         assert status["sample_prune_retention_days"] == RETENTION_DAYS
         assert status["sample_prune_swept_at"] > 0
     finally:
+        app.close()
+
+
+def test_prune_rest_counts_writer_time_not_writer_waits(twins):
+    import threading
+
+    from rhpools.lp_market_index import SAMPLE_PRUNE_MIN_REST_S, SAMPLE_PRUNE_REST_S
+
+    now, _control, pruned, _next_block = twins
+    app = service(pruned)
+    entered, release = threading.Event(), threading.Event()
+
+    def hold_writer():
+        with app.store.transaction():
+            entered.set()
+            release.wait(10)
+            time.sleep(0.5)
+
+    worker = threading.Thread(target=hold_writer)
+    try:
+        worker.start()
+        assert entered.wait(10)
+        release.set()
+        started = time.monotonic()
+        batch = app.store.prune_sample_batch(now - RETENTION_DAYS * DAY, blocking=True)
+        waited_and_worked = time.monotonic() - started
+        assert not batch.busy and batch.removed > 0
+        assert waited_and_worked >= 0.5 > batch.seconds > 0
+
+        indexer = app.indexer
+        assert indexer._sample_prune_rest(True, 0.2) == SAMPLE_PRUNE_REST_S
+        # Unknown or catching up: three times the writer-held time, floored.
+        assert indexer._sample_prune_rest(False, 0.2) == pytest.approx(0.6)
+        with indexer._status_lock:
+            indexer._runtime_status["recent_catchup_priority"] = True
+        assert indexer._sample_prune_rest(False, 0.2) == pytest.approx(0.6)
+        assert indexer._sample_prune_rest(False, 0.0) == SAMPLE_PRUNE_MIN_REST_S
+        # Caught up: the sweep runs freely.
+        with indexer._status_lock:
+            indexer._runtime_status["recent_catchup_priority"] = False
+        assert indexer._sample_prune_rest(False, 0.2) == SAMPLE_PRUNE_MIN_REST_S
+    finally:
+        release.set()
+        worker.join(timeout=5)
         app.close()

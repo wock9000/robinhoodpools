@@ -160,8 +160,9 @@ DEFAULT_STORAGE_RECOVERY_BYTES = 1024 ** 3
 # longest rolling window is 30 days; 35 matches the minute/hour bucket rule.
 DEFAULT_SAMPLE_RETENTION_DAYS = 35
 # The sample-prune thread runs batches (one waited background writer turn
-# each) for this long, rests three times as long, and rests after a sweep.
+# each) for this long per tick; see _sample_prune_rest for the pause.
 SAMPLE_PRUNE_TICK_BUDGET_S = 0.25
+SAMPLE_PRUNE_MIN_REST_S = 0.05
 SAMPLE_PRUNE_REST_S = 3600.0
 MAX_POOL_CACHE_ENTRIES = 16_384
 MAX_POOL_MISSES = 8_192
@@ -5407,14 +5408,16 @@ class MarketIndexer:
                 )
             )
 
-    def _sample_prune_tick(self) -> bool:
+    def _sample_prune_tick(self) -> tuple[bool, float]:
         """Spend one budget of waited background turns on sample pruning.
 
-        Returns True once a sweep has finished.
+        Returns whether a sweep finished and the seconds the batches held
+        the writer (writer waits excluded).
         """
         cutoff = int(time.time()) - self.sample_retention_days * 86_400
         deadline = time.monotonic() + SAMPLE_PRUNE_TICK_BUDGET_S
         removed = 0
+        held = 0.0
         complete = False
         while not self._stop.is_set():
             # Waiting (at background priority) is what lets the pruner in
@@ -5422,6 +5425,7 @@ class MarketIndexer:
             # maintenance thread's place, so checkpoints are not delayed.
             batch = self.store.prune_sample_batch(cutoff, blocking=True)
             removed += batch.removed
+            held += batch.seconds
             complete = batch.complete
             if complete or time.monotonic() >= deadline:
                 break
@@ -5434,26 +5438,36 @@ class MarketIndexer:
                 sample_prune_retention_days=self.sample_retention_days,
                 **({"sample_prune_swept_at": time.time()} if complete else {}),
             )
-        return complete
+        return complete, held
+
+    def _sample_prune_rest(self, complete: bool, held: float) -> float:
+        """Seconds to rest after a prune tick.
+
+        An hour after a sweep. While the live lane is catching up, three times
+        the writer-held time, so pruning takes at most a quarter of the
+        writer; time spent waiting for the turn is not work and is not
+        counted. Once caught up the sweep runs freely.
+        """
+        if complete:
+            return SAMPLE_PRUNE_REST_S
+        with self._status_lock:
+            caught_up = self._runtime_status.get("recent_catchup_priority") is False
+        if caught_up:
+            return SAMPLE_PRUNE_MIN_REST_S
+        return max(SAMPLE_PRUNE_MIN_REST_S, 3 * held)
 
     def _sample_prune_run(self) -> None:
         while self.sample_retention_days and not self._stop.is_set():
             if not self._retention_prune_allowed():
                 self._stop.wait(5.0)
                 continue
-            started = time.monotonic()
             try:
-                complete = self._sample_prune_tick()
+                complete, held = self._sample_prune_tick()
             except Exception:
                 logger.exception("sample pruning failed")
                 self._stop.wait(300.0)
                 continue
-            # Rest three times as long as the batches took (writer waits
-            # included), keeping the pruner under a quarter of wall time.
-            self._stop.wait(
-                SAMPLE_PRUNE_REST_S if complete
-                else max(0.05, 3 * (time.monotonic() - started))
-            )
+            self._stop.wait(self._sample_prune_rest(complete, held))
 
 
     def _engage_wal_hold(self, wal_bytes: int, now: float) -> None:
