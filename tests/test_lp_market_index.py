@@ -1373,15 +1373,15 @@ def test_bucket_pruning_runs_through_free_space_pause_only(tmp_path, monkeypatch
         scanner._storage_maintenance_once()
         assert scanner.runtime_status()["storage_pause_reasons"] == ["free_space"]
         assert not scanner._bulk_work_allowed()
-        assert scanner._bucket_prune_allowed()
+        assert scanner._retention_prune_allowed()
 
         scanner._wal_held_since = time.monotonic()
-        assert not scanner._bucket_prune_allowed()
+        assert not scanner._retention_prune_allowed()
         scanner._wal_held_since = None
 
         with scanner._status_lock:
             scanner._storage_pause_reasons = ("wal_backlog", "free_space")
-        assert not scanner._bucket_prune_allowed()
+        assert not scanner._retention_prune_allowed()
     finally:
         scanner.close()
         store.close()

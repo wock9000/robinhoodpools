@@ -40,6 +40,8 @@ Run `uv run rhpools --help` for the installed command's complete option list. `-
 
 The equivalent environment settings are `RHP_HTTP_HOST`, `RHP_HTTP_PORT`, `RHP_RPC_URL`, `RHP_DATA_DIR`, `RHP_DATABASE`, `LP_HISTORY_DAYS`, and `LP_DISK_RESERVE_GIB`. Additional origins and preparation of supported direct-pool transactions require explicit CLI flags; there is no environment switch that silently enables preparation.
 
+`--sample-retention-days` / `LP_SAMPLE_RETENTION_DAYS` (default 35, `0` disables) bounds the raw per-event price and V2 reserve samples. The maintenance thread prunes older samples in small background batches, keeping each pool's first sample and its newest one before the cutoff; lookups older than the cutoff read the canonical events the samples came from, so API answers and accounting are unchanged. Deleted rows go to SQLite's freelist and are reused before the file grows. See `.audit/design/prune/PRUNE.md`.
+
 ### Holder gate
 
 Token-gated features (wallet sign-in, API keys, the keyed `/api/v1/stream`) are configured by three settings: `--gate-owner` / `RHP_GATE_OWNER` pins the EOA whose EIP-712 signature is the only way to change the policy; `--gate-rpc-url` / `RHP_GATE_RPC_URL` (default `http://127.0.0.1:8547`) is the JSON-RPC endpoint the balance oracle reads `balanceOf` from; `--gate-db` / `RHP_GATE_DB` (default `<data-dir>/gate.sqlite`) holds credentials, grace anchors, policy versions and the audit log. With the owner unset or no policy applied, every gated feature refuses and the anonymous site is unchanged. The systemd unit ships these lines commented out.
