@@ -31,6 +31,13 @@ LOCAL_SOURCE_CONCURRENCY = 16
 # plus margin); background lanes then wait the borrowed time out.
 PRIORITY_LANES = frozenset({"head", "live"})
 _PRIORITY_DEBT_SECONDS = 15.0
+# A background request yields to head ingest for at most this long, then takes
+# turns with it on the same pacing (no extra provider load). A live round of tip
+# plus two boundary headers took 0.34 s on the public endpoint under background
+# saturation, so 3 s lets several head steps go first, while a workbench request
+# (6 s HTTP timeout, which does not cover this wait) is delayed here by at most
+# 3 s plus one pacing turn even when head demand saturates the endpoint.
+_BACKGROUND_MAX_YIELD_SECONDS = 3.0
 CAPABILITIES = ("head", "state", "history_state", "logs", "receipts", "trace", "archive")
 HASH_LOOKUP_METHODS = frozenset({
     "eth_getTransactionByHash",
@@ -86,17 +93,23 @@ class _SourceGate:
         priority callers, and yield while any priority caller waits. Priority
         callers are paced among themselves and may run up to
         _PRIORITY_DEBT_SECONDS ahead of the shared clock; their cost is still
-        charged to it, so the provider's long-run rate is unchanged.
+        charged to it, so the provider's long-run rate is unchanged. A
+        background caller that has yielded for _BACKGROUND_MAX_YIELD_SECONDS
+        competes on the priority pacing instead, so its wait stays bounded.
         """
         spend = interval * cost
+        started = time.monotonic()
         with self.ready:
             if priority:
                 self.priority_waiting += 1
             try:
                 while True:
                     now = time.monotonic()
-                    if priority:
-                        free = self.in_flight < self.concurrency
+                    aged = not priority and now - started >= _BACKGROUND_MAX_YIELD_SECONDS
+                    if priority or aged:
+                        free = self.in_flight < (
+                            self.concurrency if priority else max(1, self.concurrency - 1)
+                        )
                         delay = max(
                             self.priority_next_at - now,
                             self.next_at - now - _PRIORITY_DEBT_SECONDS,
@@ -109,11 +122,15 @@ class _SourceGate:
                         delay = self.next_at - now
                     if free and delay <= 0:
                         self.in_flight += 1
-                        if priority:
+                        if priority or aged:
                             self.priority_next_at = now + spend
                         self.next_at = max(self.next_at, now) + spend
                         return
-                    self.ready.wait(delay if free else None)
+                    timeout = delay if free else None
+                    if not priority and not aged:
+                        until_aged = started + _BACKGROUND_MAX_YIELD_SECONDS - now
+                        timeout = until_aged if timeout is None else min(timeout, until_aged)
+                    self.ready.wait(timeout)
             finally:
                 if priority:
                     self.priority_waiting -= 1
@@ -978,7 +995,7 @@ class RoutedRpc:
                 for index, expected in enumerate((query.get("topics") or ())[1:], 1):
                     if isinstance(expected, str):
                         params[f"topic{index}"] = expected
-                gate.acquire(0.20, 1)
+                gate.acquire(0.20, 1, priority=self._priority)
                 response: requests.Response | None = None
                 session: requests.Session | None = None
                 try:

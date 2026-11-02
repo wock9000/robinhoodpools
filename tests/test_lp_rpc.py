@@ -262,6 +262,37 @@ def test_background_leaves_a_slot_for_head_ingest_and_yields_to_it():
     assert not blocked.is_alive() and gate.in_flight == 3
 
 
+def test_background_wait_stays_bounded_while_head_demand_saturates(monkeypatch):
+    monkeypatch.setattr(lp_rpc, "_PRIORITY_DEBT_SECONDS", 0.5)
+    monkeypatch.setattr(lp_rpc, "_BACKGROUND_MAX_YIELD_SECONDS", 0.5)
+    gate = lp_rpc._SourceGate(concurrency=4)
+    stop = threading.Event()
+
+    def head_lane():
+        # Always at least one priority caller waiting: the endpoint is saturated.
+        while not stop.is_set():
+            gate.acquire(0.05, 1, priority=True)
+            gate.release()
+
+    heads = [threading.Thread(target=head_lane, daemon=True) for _ in range(3)]
+    for thread in heads:
+        thread.start()
+    time.sleep(0.3)
+    waits = []
+    try:
+        for _ in range(3):
+            started = time.monotonic()
+            gate.acquire(0.05, 1)
+            waits.append(time.monotonic() - started)
+            gate.release()
+    finally:
+        stop.set()
+        for thread in heads:
+            thread.join(2)
+    # Yield (0.5 s) plus a few pacing turns, not "until head demand stops".
+    assert max(waits) < 1.5, waits
+
+
 def test_head_lane_borrowing_from_the_provider_clock_is_bounded(monkeypatch):
     monkeypatch.setattr(lp_rpc, "_PRIORITY_DEBT_SECONDS", 0.2)
     gate = lp_rpc._SourceGate()
