@@ -148,8 +148,6 @@ class SamplePruneBatch(NamedTuple):
     removed: int
     complete: bool
     busy: bool = False
-    # Seconds holding the writer turn (work plus commit), excluding the wait.
-    seconds: float = 0.0
 
 
 class MarketStoreError(RuntimeError):
@@ -1500,80 +1498,68 @@ class MarketStore:
         with self.transaction(priority="background", blocking=blocking) as connection:
             if connection is None:
                 return SamplePruneBatch(0, False, busy=True)
-            # Time from the writer turn through commit, never the wait for it.
-            started = time.monotonic()
-            removed, complete = self._prune_sample_rows(
-                connection, cutoff, limit, pool_limit,
-            )
-        return SamplePruneBatch(
-            removed, complete, seconds=time.monotonic() - started,
-        )
-
-    def _prune_sample_rows(
-        self, connection: sqlite3.Connection, cutoff: int, limit: int, pool_limit: int,
-    ) -> tuple[int, bool]:
-        if connection.execute(
-            "SELECT COUNT(*) FROM sqlite_master WHERE name IN (?,?,?)",
-            (*SAMPLE_PRUNE_TABLES, "lp_events_time"),
-        ).fetchone()[0] < 3:
-            return 0, True
-        cursor = self._metadata(connection, "sample_prune_cursor", None)
-        if cursor is None:
-            boundary = connection.execute(
-                "SELECT block_number FROM events INDEXED BY lp_events_time "
-                "WHERE timestamp>=? ORDER BY timestamp,block_number LIMIT 1",
-                (cutoff,),
-            ).fetchone()
-            if boundary is None:
-                return 0, True
-            cursor = {"table": 0, "pool": "", "block": int(boundary[0])}
-            self._set_metadata(connection, "sample_prune_block", max(
-                cursor["block"],
-                int(self._metadata(connection, "sample_prune_block", 0)),
-            ))
-        table = SAMPLE_PRUNE_TABLES[int(cursor["table"])]
-        removed = 0
-        for _ in range(pool_limit):
-            row = connection.execute(
-                f"SELECT pool_id FROM {table} WHERE pool_id>? ORDER BY pool_id LIMIT 1",
-                (cursor["pool"],),
-            ).fetchone()
-            if row is None:
-                if int(cursor["table"]) + 1 == len(SAMPLE_PRUNE_TABLES):
-                    self._set_metadata(connection, "sample_prune_cursor", None)
-                    return removed, True
-                cursor = {**cursor, "table": int(cursor["table"]) + 1, "pool": ""}
-                break
-            pool_id = row[0]
-            first = connection.execute(
-                f"SELECT block_number,tx_index,log_index FROM {table} WHERE pool_id=? "
-                "ORDER BY block_number,tx_index,log_index LIMIT 1",
-                (pool_id,),
-            ).fetchone()
-            newest = connection.execute(
-                f"SELECT block_number,tx_index,log_index FROM {table} "
-                "WHERE pool_id=? AND block_number<? "
-                "ORDER BY block_number DESC,tx_index DESC,log_index DESC LIMIT 1",
-                (pool_id, int(cursor["block"])),
-            ).fetchone()
-            if newest is not None and tuple(newest) > tuple(first):
-                doomed = [(row[0],) for row in connection.execute(
-                    f"SELECT event_id FROM {table} WHERE pool_id=? "
-                    "AND (block_number,tx_index,log_index)>(?,?,?) "
-                    "AND (block_number,tx_index,log_index)<(?,?,?) "
-                    "ORDER BY block_number,tx_index,log_index LIMIT ?",
-                    (pool_id, *first, *newest, limit - removed),
-                )]
-                connection.executemany(
-                    f"DELETE FROM {table} WHERE event_id=?", doomed,
-                )
-                removed += len(doomed)
-                if removed >= limit:
-                    # The pool may hold more; the next batch resumes it.
+            if connection.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name IN (?,?,?)",
+                (*SAMPLE_PRUNE_TABLES, "lp_events_time"),
+            ).fetchone()[0] < 3:
+                return SamplePruneBatch(0, True)
+            cursor = self._metadata(connection, "sample_prune_cursor", None)
+            if cursor is None:
+                boundary = connection.execute(
+                    "SELECT block_number FROM events INDEXED BY lp_events_time "
+                    "WHERE timestamp>=? ORDER BY timestamp,block_number LIMIT 1",
+                    (cutoff,),
+                ).fetchone()
+                if boundary is None:
+                    return SamplePruneBatch(0, True)
+                cursor = {"table": 0, "pool": "", "block": int(boundary[0])}
+                self._set_metadata(connection, "sample_prune_block", max(
+                    cursor["block"],
+                    int(self._metadata(connection, "sample_prune_block", 0)),
+                ))
+            table = SAMPLE_PRUNE_TABLES[int(cursor["table"])]
+            removed = 0
+            for _ in range(pool_limit):
+                row = connection.execute(
+                    f"SELECT pool_id FROM {table} WHERE pool_id>? ORDER BY pool_id LIMIT 1",
+                    (cursor["pool"],),
+                ).fetchone()
+                if row is None:
+                    if int(cursor["table"]) + 1 == len(SAMPLE_PRUNE_TABLES):
+                        self._set_metadata(connection, "sample_prune_cursor", None)
+                        return SamplePruneBatch(removed, True)
+                    cursor = {**cursor, "table": int(cursor["table"]) + 1, "pool": ""}
                     break
-            cursor = {**cursor, "pool": pool_id}
-        self._set_metadata(connection, "sample_prune_cursor", cursor)
-        return removed, False
+                pool_id = row[0]
+                first = connection.execute(
+                    f"SELECT block_number,tx_index,log_index FROM {table} WHERE pool_id=? "
+                    "ORDER BY block_number,tx_index,log_index LIMIT 1",
+                    (pool_id,),
+                ).fetchone()
+                newest = connection.execute(
+                    f"SELECT block_number,tx_index,log_index FROM {table} "
+                    "WHERE pool_id=? AND block_number<? "
+                    "ORDER BY block_number DESC,tx_index DESC,log_index DESC LIMIT 1",
+                    (pool_id, int(cursor["block"])),
+                ).fetchone()
+                if newest is not None and tuple(newest) > tuple(first):
+                    doomed = [(row[0],) for row in connection.execute(
+                        f"SELECT event_id FROM {table} WHERE pool_id=? "
+                        "AND (block_number,tx_index,log_index)>(?,?,?) "
+                        "AND (block_number,tx_index,log_index)<(?,?,?) "
+                        "ORDER BY block_number,tx_index,log_index LIMIT ?",
+                        (pool_id, *first, *newest, limit - removed),
+                    )]
+                    connection.executemany(
+                        f"DELETE FROM {table} WHERE event_id=?", doomed,
+                    )
+                    removed += len(doomed)
+                    if removed >= limit:
+                        # The pool may hold more; the next batch resumes it.
+                        break
+                cursor = {**cursor, "pool": pool_id}
+            self._set_metadata(connection, "sample_prune_cursor", cursor)
+            return SamplePruneBatch(removed, False)
 
     @contextlib.contextmanager
     def transaction(
