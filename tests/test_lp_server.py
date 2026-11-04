@@ -76,6 +76,57 @@ def test_terminal_receives_heads_activity_and_scoped_wallets(tmp_path, monkeypat
         app.close()
 
 
+def test_terminal_stream_pushes_compact_index_status(tmp_path):
+    app = service(tmp_path / "market.sqlite")
+    try:
+        app.store.upsert_pools(pools())
+        block = header(100, int(time.time()) - 600)
+        app.store.ingest([block], [])
+        with serving(app) as connection:
+            connection.request("GET", "/api/lp/stream?view=terminal&current_only=1&owners=0")
+            response = connection.getresponse()
+            assert response.status == 200
+            event_name, status = "message", None
+            while status is None:
+                raw = response.readline()
+                if not raw:
+                    raise AssertionError("Stream ended before an index status")
+                line = raw.decode().strip()
+                if line.startswith("event: "):
+                    event_name = line[7:]
+                elif line.startswith("data: ") and event_name == "status":
+                    status = json.loads(line[6:])
+                elif not line:
+                    event_name = "message"
+            response.close()
+        full = app.status()
+        # The badge needs lag and heads; provider and failure detail stay on /status.
+        assert "providers" in full and "providers" not in status
+        assert len(json.dumps(status)) < 4096
+        for field in ("indexed_head", "revision", "epoch", "chain_id", "pending_enrichment"):
+            assert status[field] == full[field]
+        assert {"head", "lag_s", "lag_blocks", "state", "errors", "as_of", "live_scan"} <= set(status)
+    finally:
+        app.close()
+
+
+def test_pages_opt_out_of_edge_script_injection(tmp_path):
+    app = service(tmp_path / "market.sqlite")
+    try:
+        with serving(app) as connection:
+            connection.request("GET", "/")
+            response = connection.getresponse()
+            response.read()
+            assert response.status == 200
+            # Cloudflare skips beacon injection for no-transform responses; the
+            # policy below would block that third-party script anyway.
+            assert response.getheader("Cache-Control") == "no-store,no-transform"
+            assert "script-src 'self';" in response.getheader("Content-Security-Policy")
+    finally:
+        app.close()
+
+
+
 def test_private_routes_stay_closed_and_upstream_errors_are_redacted(tmp_path):
     app = service(tmp_path / "market.sqlite")
     secret = "test-only-provider-credential"

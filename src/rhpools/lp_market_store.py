@@ -4568,6 +4568,7 @@ class MarketStore:
             "pending_pool_unpublish": int(metadata.get("pending_pool_unpublish", 0)),
             "pending_reprojection": int(metadata.get("pending_reprojection", 0)),
             "pending_accounting": int(metadata.get("pending_accounting", 0)),
+            "pending_rollup_restore": int(metadata.get("pending_rollup_restore", 0)),
             "history_from": history_from,
             "history_to": history_to,
             "history_target": history.get("target_timestamp") if isinstance(history, dict) else None,

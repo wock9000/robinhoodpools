@@ -3991,7 +3991,7 @@
 ],
 [
 "Cache-Control",
-"no-store"
+"no-store,no-transform"
 ],
 [
 "Vary",
@@ -4044,7 +4044,7 @@
 ],
 [
 "Cache-Control",
-"no-store"
+"no-store,no-transform"
 ],
 [
 "Vary",
@@ -4144,7 +4144,7 @@
 ],
 [
 "Cache-Control",
-"no-store"
+"no-store,no-transform"
 ],
 [
 "Vary",
@@ -4197,7 +4197,7 @@
 ],
 [
 "Cache-Control",
-"no-store"
+"no-store,no-transform"
 ],
 [
 "Vary",
@@ -4297,7 +4297,7 @@
 ],
 [
 "Cache-Control",
-"no-store"
+"no-store,no-transform"
 ],
 [
 "Vary",
@@ -4350,7 +4350,7 @@
 ],
 [
 "Cache-Control",
-"no-store"
+"no-store,no-transform"
 ],
 [
 "Vary",
@@ -4450,7 +4450,7 @@
 ],
 [
 "Cache-Control",
-"no-store"
+"no-store,no-transform"
 ],
 [
 "Vary",
@@ -4503,7 +4503,7 @@
 ],
 [
 "Cache-Control",
-"no-store"
+"no-store,no-transform"
 ],
 [
 "Vary",
@@ -4603,7 +4603,7 @@
 ],
 [
 "Cache-Control",
-"no-store"
+"no-store,no-transform"
 ],
 [
 "Vary",
@@ -4656,7 +4656,7 @@
 ],
 [
 "Cache-Control",
-"no-store"
+"no-store,no-transform"
 ],
 [
 "Vary",
@@ -4756,7 +4756,7 @@
 ],
 [
 "Cache-Control",
-"no-store"
+"no-store,no-transform"
 ],
 [
 "Vary",
@@ -4809,7 +4809,7 @@
 ],
 [
 "Cache-Control",
-"no-store"
+"no-store,no-transform"
 ],
 [
 "Vary",
@@ -4909,7 +4909,7 @@
 ],
 [
 "Cache-Control",
-"no-store"
+"no-store,no-transform"
 ],
 [
 "Vary",
@@ -4962,7 +4962,7 @@
 ],
 [
 "Cache-Control",
-"no-store"
+"no-store,no-transform"
 ],
 [
 "Vary",
@@ -5062,7 +5062,7 @@
 ],
 [
 "Cache-Control",
-"no-store"
+"no-store,no-transform"
 ],
 [
 "Vary",
@@ -5119,7 +5119,7 @@
 ],
 [
 "Cache-Control",
-"no-store"
+"no-store,no-transform"
 ],
 [
 "Vary",
