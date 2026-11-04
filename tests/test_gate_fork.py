@@ -19,6 +19,18 @@ pytestmark = pytest.mark.skipif(not ANVIL.exists() or not upstream_available(), 
 THRESHOLD = 1000 * 10**18
 
 
+def read_events(response, count):
+    """Read `count` frames, skipping the index `status` frames a terminal-view stream interleaves."""
+    frames = []
+    while len(frames) < count:
+        frame = read_frames(response, 1)[0]
+        if frame is None or frame["event"] != "status":
+            frames.append(frame)
+        if frame is None:
+            break
+    return frames
+
+
 @pytest.fixture(scope="module")
 def fork():
     with Fork() as instance:
@@ -106,14 +118,14 @@ def test_holder_lifecycle_on_the_fork(tmp_path, fork):
         connection.request("GET", "/api/v1/stream?channel=both&view=terminal&current_only=1&owners=0", headers=bearer)
         response = connection.getresponse()
         assert response.status == 200
-        assert [frame["event"] for frame in read_frames(response, 2)] == ["block", "activity"]
+        assert [frame["event"] for frame in read_events(response, 2)] == ["block", "activity"]
 
         fork.set_balance(holder_address, THRESHOLD - 1)
         clock.now += 31
         status, _, me = call(address, "GET", "/api/gate/me", headers=bearer)
         assert me["state"] == "below" and me["features"] == ["flags"]
         assert me["holding"]["balance_raw"] == str(THRESHOLD - 1)
-        frames = read_frames(response, 2)
+        frames = read_events(response, 2)
         assert frames[0]["event"] == "gate" and frames[0]["data"]["gate"]["state"] == "below"
         assert frames[1] is None
         connection.close()
