@@ -156,6 +156,14 @@ DEFAULT_WAL_RESET_BYTES = 1024 ** 3
 # every restart into hours of recovery that a watchdog then interrupts.
 DEFAULT_WAL_HOLD_BYTES = 4 * 1024 ** 3
 DEFAULT_STORAGE_RECOVERY_BYTES = 1024 ** 3
+# Raw price/reserve samples older than this are pruned (0 disables). The API's
+# longest rolling window is 30 days; 35 matches the minute/hour bucket rule.
+DEFAULT_SAMPLE_RETENTION_DAYS = 35
+# The sample-prune thread runs batches (one waited background writer turn
+# each) for this long per tick; see _sample_prune_rest for the pause.
+SAMPLE_PRUNE_TICK_BUDGET_S = 0.25
+SAMPLE_PRUNE_MIN_REST_S = 0.05
+SAMPLE_PRUNE_REST_S = 3600.0
 MAX_POOL_CACHE_ENTRIES = 16_384
 MAX_POOL_MISSES = 8_192
 HEAD_FEED_MAX_EVENTS = 8192
@@ -409,6 +417,7 @@ class MarketIndexer:
         wal_reset_bytes: int = DEFAULT_WAL_RESET_BYTES,
         wal_hold_bytes: int = DEFAULT_WAL_HOLD_BYTES,
         maintenance_interval_s: float = WAL_CHECKPOINT_INTERVAL_S,
+        sample_retention_days: int = DEFAULT_SAMPLE_RETENTION_DAYS,
         current_observer: Any | None = None,
         accounting_projector: Callable[[], bool] | None = None,
         accounting_recovery: Callable[[], bool] | None = None,
@@ -433,6 +442,8 @@ class MarketIndexer:
             raise ValueError("wal_hold_bytes must not be below wal_reset_bytes")
         if maintenance_interval_s <= 0:
             raise ValueError("maintenance_interval_s must be positive")
+        if sample_retention_days < 0:
+            raise ValueError("sample_retention_days must be nonnegative")
         self.store = store
         self.market = market
         self.current_observer = current_observer
@@ -458,6 +469,7 @@ class MarketIndexer:
         self.wal_reset_bytes = int(wal_reset_bytes)
         self.wal_hold_bytes = int(wal_hold_bytes)
         self.maintenance_interval_s = float(maintenance_interval_s)
+        self.sample_retention_days = int(sample_retention_days)
         self._rpc_factory = rpc if callable(rpc) and not hasattr(rpc, "call") else None
         self._owns_clients = rpc is None or (callable(rpc) and not hasattr(rpc, "call"))
         if rpc is None:
@@ -2799,6 +2811,12 @@ class MarketIndexer:
                     threading.Thread(
                         target=self._maintenance_run,
                         name="lp-market-maintenance",
+                        daemon=True,
+                    ),
+                    threading.Thread(
+                        target=self._run_with_writer_priority,
+                        args=("background", self._sample_prune_run),
+                        name="lp-market-sample-prune",
                         daemon=True,
                     ),
                     threading.Thread(
@@ -5377,9 +5395,10 @@ class MarketIndexer:
         with self._status_lock:
             return not self._bulk_paused
 
-    def _bucket_prune_allowed(self) -> bool:
-        # Pruning moves bucket pages to the freelist, which the reserve counts
-        # as headroom, so a pause caused only by low free space must not stop it.
+    def _retention_prune_allowed(self) -> bool:
+        # Pruning moves bucket and sample pages to the freelist, which the
+        # reserve counts as headroom, so a pause caused only by low free space
+        # must not stop it.
         with self._status_lock:
             return not self._storage_assessment_pending and (
                 not self._bulk_paused
@@ -5388,6 +5407,68 @@ class MarketIndexer:
                     and self._wal_held_since is None
                 )
             )
+
+    def _sample_prune_tick(self) -> tuple[bool, float]:
+        """Spend one budget of waited background turns on sample pruning.
+
+        Returns whether a sweep finished and the seconds the batches held
+        the writer (writer waits excluded).
+        """
+        cutoff = int(time.time()) - self.sample_retention_days * 86_400
+        deadline = time.monotonic() + SAMPLE_PRUNE_TICK_BUDGET_S
+        removed = 0
+        held = 0.0
+        complete = False
+        while not self._stop.is_set():
+            # Waiting (at background priority) is what lets the pruner in
+            # while catch-up keeps the writer busy; it never takes the
+            # maintenance thread's place, so checkpoints are not delayed.
+            batch = self.store.prune_sample_batch(cutoff, blocking=True)
+            removed += batch.removed
+            held += batch.seconds
+            complete = batch.complete
+            if complete or time.monotonic() >= deadline:
+                break
+        if removed or complete:
+            with self._status_lock:
+                total = int(self._runtime_status.get("sample_prune_removed") or 0)
+            self._set_runtime(
+                "sample_prune",
+                sample_prune_removed=total + removed,
+                sample_prune_retention_days=self.sample_retention_days,
+                **({"sample_prune_swept_at": time.time()} if complete else {}),
+            )
+        return complete, held
+
+    def _sample_prune_rest(self, complete: bool, held: float) -> float:
+        """Seconds to rest after a prune tick.
+
+        An hour after a sweep. While the live lane is catching up, three times
+        the writer-held time, so pruning takes at most a quarter of the
+        writer; time spent waiting for the turn is not work and is not
+        counted. Once caught up the sweep runs freely.
+        """
+        if complete:
+            return SAMPLE_PRUNE_REST_S
+        with self._status_lock:
+            caught_up = self._runtime_status.get("recent_catchup_priority") is False
+        if caught_up:
+            return SAMPLE_PRUNE_MIN_REST_S
+        return max(SAMPLE_PRUNE_MIN_REST_S, 3 * held)
+
+    def _sample_prune_run(self) -> None:
+        while self.sample_retention_days and not self._stop.is_set():
+            if not self._retention_prune_allowed():
+                self._stop.wait(5.0)
+                continue
+            try:
+                complete, held = self._sample_prune_tick()
+            except Exception:
+                logger.exception("sample pruning failed")
+                self._stop.wait(300.0)
+                continue
+            self._stop.wait(self._sample_prune_rest(complete, held))
+
 
     def _engage_wal_hold(self, wal_bytes: int, now: float) -> None:
         if (
@@ -7015,7 +7096,7 @@ class MarketIndexer:
                     if (
                         2 <= time.gmtime().tm_hour < 5
                         and time.monotonic() >= prune_due
-                        and self._bucket_prune_allowed()
+                        and self._retention_prune_allowed()
                         and not self._stop.is_set()
                     ):
                         try:

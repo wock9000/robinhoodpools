@@ -189,6 +189,25 @@ def _basket(raw0, raw1, pool, price0, price1):
     return value0 + value1 if value0 is not None and value1 is not None else None
 
 
+def _v2_sample_ratio(pool, extra):
+    """Token1-per-token0 ratio a V2 reserve sample records for its reserves."""
+    reserve0 = _units(extra["reserve0"], pool["decimals0"])
+    reserve1 = _units(extra["reserve1"], pool["decimals1"])
+    return _number(reserve1 / reserve0) if reserve0 and reserve1 is not None else None
+
+
+def _sqrt_sample_ratio(pool, kind, sqrt):
+    """Token1-per-token0 ratio a price sample records for a sqrtPriceX96."""
+    # An initialize price nobody has traded against is geometry, not
+    # a mark: launchpad templates created 100+ pools at 60k USDG per
+    # token and their single-sided seeds valued at 5.5T USD each.
+    # State keeps the sqrt; the sample and state price stay None
+    # until the first swap.
+    if kind == "create":
+        return None
+    return _price_from_sqrt(int(sqrt), pool["decimals0"], pool["decimals1"])
+
+
 def _static_pool_fee(pool):
     try:
         fee = int(pool.get("fee_ppm")) if pool.get("fee_ppm") is not None else None
@@ -433,6 +452,92 @@ class PriceProjection:
         return None if token == WETH and pool["id"] != WETH_USDG_POOL else token
 
     @staticmethod
+    def _sample_prune_block(conn):
+        row = conn.execute(
+            "SELECT value FROM metadata WHERE key='sample_prune_block'"
+        ).fetchone()
+        return int(json.loads(row[0])) if row is not None else 0
+
+    @staticmethod
+    def _sample_event(conn, pool, order, *, after):
+        """Nearest canonical event a sample of this pool was projected from.
+
+        Returns ``(row, reserves)``; ``reserves`` is the V2 reserve mapping, or
+        ``None`` for a sqrtPriceX96 sample. ``(None, None)`` when there is none.
+        """
+        v2 = pool["protocol"] == "v2"
+        direction = "" if after else " DESC"
+        rows = conn.execute(
+            "SELECT block_number,tx_index,log_index,timestamp,kind,sqrt_price_x96"
+            + (",data" if v2 else "")
+            + " FROM events INDEXED BY lp_events_pool_order WHERE pool_id=? AND "
+            f"(block_number,tx_index,log_index){'>' if after else '<='}(?,?,?)"
+            + ("" if v2 else " AND sqrt_price_x96 IS NOT NULL")
+            + f" ORDER BY block_number{direction},tx_index{direction},log_index{direction}",
+            (pool["id"], *order),
+        )
+        try:
+            for row in rows:
+                if not v2:
+                    return row, None
+                extra = _data(row["data"])
+                if extra.get("reserve0") is not None and extra.get("reserve1") is not None:
+                    return row, extra
+        finally:
+            rows.close()
+        return None, None
+
+    def sample_at_or_before(self, conn, pool, order):
+        """Return the price (or V2 reserve) sample a pool had at ``order``.
+
+        Retention keeps every sample from ``sample_prune_block`` on plus each
+        pool's first sample and its newest one below that block, so the table
+        answers any lookup at or above it exactly. Older lookups rebuild the
+        sample from the canonical event it was projected from.
+        """
+        if order[0] >= self._sample_prune_block(conn):
+            if pool["protocol"] == "v2":
+                return conn.execute(
+                    "SELECT reserve0,reserve1,price,timestamp FROM lp_v2_reserve_samples "
+                    "WHERE pool_id=? AND (block_number,tx_index,log_index)<=(?,?,?) "
+                    "ORDER BY block_number DESC,tx_index DESC,log_index DESC LIMIT 1",
+                    (pool["id"], *order),
+                ).fetchone()
+            return conn.execute(
+                "SELECT sqrt_price_x96,price,timestamp FROM lp_price_samples "
+                "WHERE pool_id=? AND (block_number,tx_index,log_index)<=(?,?,?) "
+                "ORDER BY block_number DESC,tx_index DESC,log_index DESC LIMIT 1",
+                (pool["id"], *order),
+            ).fetchone()
+        row, extra = self._sample_event(conn, pool, order, after=False)
+        if row is None:
+            return None
+        if extra is not None:
+            return {
+                "reserve0": extra["reserve0"], "reserve1": extra["reserve1"],
+                "price": _v2_sample_ratio(pool, extra), "timestamp": row["timestamp"],
+            }
+        return {
+            "sqrt_price_x96": row["sqrt_price_x96"],
+            "price": _sqrt_sample_ratio(pool, row["kind"], row["sqrt_price_x96"]),
+            "timestamp": row["timestamp"],
+        }
+
+    def _sample_after(self, conn, pool, order):
+        """Order of the first price (or V2 reserve) sample after ``order``."""
+        if order[0] >= self._sample_prune_block(conn):
+            table = "lp_v2_reserve_samples" if pool["protocol"] == "v2" else "lp_price_samples"
+            row = conn.execute(
+                f"SELECT block_number,tx_index,log_index FROM {table} WHERE pool_id=? AND "
+                "(block_number,tx_index,log_index)>(?,?,?) "
+                "ORDER BY block_number,tx_index,log_index LIMIT 1",
+                (pool["id"], *order),
+            ).fetchone()
+            return tuple(row) if row is not None else None
+        row, _extra = self._sample_event(conn, pool, order, after=True)
+        return _order(row) if row is not None else None
+
+    @staticmethod
     def _active_liquidity(conn, pool, event, pool_state=_MISSING):
         if pool["protocol"] not in {"v3", "v4"}:
             return None
@@ -510,9 +615,7 @@ class PriceProjection:
         valuation_ratio = None
         if pool["protocol"] == "v2":
             if extra.get("reserve0") is not None and extra.get("reserve1") is not None:
-                reserve0 = _units(extra["reserve0"], pool["decimals0"])
-                reserve1 = _units(extra["reserve1"], pool["decimals1"])
-                ratio = _number(reserve1 / reserve0) if reserve0 and reserve1 is not None else None
+                ratio = _v2_sample_ratio(pool, extra)
                 if int(extra["reserve0"]) > 0 and int(extra["reserve1"]) > 0:
                     valuation_ratio = ratio
                 if persist:
@@ -535,11 +638,7 @@ class PriceProjection:
                     and _order(pool_state) <= _order(event)
                     and pool_state.get("price") is not None
                 ) else None
-                sample = cached or conn.execute(
-                    "SELECT reserve0,reserve1,price FROM lp_v2_reserve_samples WHERE pool_id=? AND "
-                    "(block_number,tx_index,log_index)<=(?,?,?) ORDER BY block_number DESC,"
-                    "tx_index DESC,log_index DESC LIMIT 1", (pool["id"], *_order(event)),
-                ).fetchone()
+                sample = cached or self.sample_at_or_before(conn, pool, _order(event))
                 if sample is not None:
                     ratio = sample["price"]
                     if cached is not None or (
@@ -547,13 +646,7 @@ class PriceProjection:
                     ):
                         valuation_ratio = ratio
         elif sqrt is not None:
-            # An initialize price nobody has traded against is geometry, not
-            # a mark: launchpad templates created 100+ pools at 60k USDG per
-            # token and their single-sided seeds valued at 5.5T USD each.
-            # State keeps the sqrt; the sample and state price stay None
-            # until the first swap.
-            if event["kind"] != "create":
-                ratio = _price_from_sqrt(int(sqrt), pool["decimals0"], pool["decimals1"])
+            ratio = _sqrt_sample_ratio(pool, event["kind"], sqrt)
         else:
             cached = pool_state if (
                 pool_state is not _MISSING
@@ -561,11 +654,7 @@ class PriceProjection:
                 and _order(pool_state) <= _order(event)
                 and pool_state.get("sqrt_price_x96") is not None
             ) else None
-            sample = cached or conn.execute(
-                "SELECT sqrt_price_x96,price,timestamp FROM lp_price_samples WHERE pool_id=? AND "
-                "(block_number,tx_index,log_index)<=(?,?,?) ORDER BY block_number DESC,"
-                "tx_index DESC,log_index DESC LIMIT 1", (pool["id"], *_order(event)),
-            ).fetchone()
+            sample = cached or self.sample_at_or_before(conn, pool, _order(event))
             sample_is_current = sample is not None and (
                 persist or 0 <= int(event["timestamp"]) - int(sample["timestamp"]) <= 300
             )
@@ -975,15 +1064,10 @@ class PriceProjection:
         """Repair old consumers, never rows just priced in this delivery."""
         token_bounds = {}
         for pool, changes in sources.values():
-            table = "lp_v2_reserve_samples" if pool["protocol"] == "v2" else "lp_price_samples"
             for change in changes:
                 low = _order(change)
-                following = conn.execute(
-                    f"SELECT block_number,tx_index,log_index FROM {table} WHERE pool_id=? AND "
-                    "(block_number,tx_index,log_index)>(?,?,?) ORDER BY block_number,tx_index,log_index LIMIT 1",
-                    (pool["id"], *low),
-                ).fetchone()
-                upper = tuple(following) if following else (2**63 - 1, 0, 0)
+                following = self._sample_after(conn, pool, low)
+                upper = following or (2**63 - 1, 0, 0)
                 queued = conn.execute(
                     "INSERT OR IGNORE INTO pending_reprojection"
                     "(event_id,block_number,tx_index,log_index) "
@@ -1277,9 +1361,10 @@ class LPMarketService:
     def __init__(self, market, rpc_url, path: str | Path, *, history_days=30,
                  history_disk_reserve_bytes=4 * 1024**3, start=True, deferred_start=True,
                  rollup_replica_dir: str | Path | None = None,
-                 rollup_replica_reserve_bytes: int | None = None):
+                 rollup_replica_reserve_bytes: int | None = None,
+                 sample_retention_days: int | None = None):
         from .lp_market_store import MarketStore
-        from .lp_market_index import MarketIndexer
+        from .lp_market_index import DEFAULT_SAMPLE_RETENTION_DAYS, MarketIndexer
         from .lp_market_accounting import AccountBook
         from .lp_market_claims import PositionClaims
         self.market = market
@@ -1308,6 +1393,10 @@ class LPMarketService:
         self.indexer = MarketIndexer(
             self.store, market, rpc_url, history_days=history_days,
             history_disk_reserve_bytes=history_disk_reserve_bytes, v3_balances=True,
+            sample_retention_days=(
+                DEFAULT_SAMPLE_RETENTION_DAYS if sample_retention_days is None
+                else sample_retention_days
+            ),
             current_observer=self,
             accounting_projector=self.book.project_pending if start else None,
             accounting_recovery=(
@@ -2882,11 +2971,9 @@ class LPMarketService:
                         "ORDER BY b.block_number DESC LIMIT 1", (row["id"],),
                     ).fetchone()
                     if balance is not None:
-                        sample = conn.execute(
-                            "SELECT price FROM lp_price_samples WHERE pool_id=? AND block_number<=? "
-                            "ORDER BY block_number DESC,tx_index DESC,log_index DESC LIMIT 1",
-                            (row["id"], balance["block_number"]),
-                        ).fetchone()
+                        sample = self.prices.sample_at_or_before(
+                            conn, row, (balance["block_number"], 2**63 - 1, 2**63 - 1),
+                        )
                         mark = {"block_number": balance["block_number"], "tx_index": 2**63 - 1,
                                 "log_index": 2**63 - 1, "timestamp": balance["timestamp"]}
                         price0, price1, _ = self.prices._quote(conn, row, mark, sample["price"] if sample else None)
@@ -2901,11 +2988,9 @@ class LPMarketService:
                         "ORDER BY block_number,tx_index,log_index LIMIT 1", (row["id"],),
                     ).fetchone()
                 else:
-                    baseline = conn.execute(
-                        f"SELECT price,timestamp FROM {sample_table} WHERE pool_id=? AND block_number<=? "
-                        "ORDER BY block_number DESC,tx_index DESC,log_index DESC LIMIT 1",
-                        (row["id"], baseline_block),
-                    ).fetchone()
+                    baseline = self.prices.sample_at_or_before(
+                        conn, row, (baseline_block, 2**63 - 1, 2**63 - 1),
+                    )
                     if baseline is None:
                         baseline = conn.execute(
                             f"SELECT price,timestamp FROM {sample_table} WHERE pool_id=? AND block_number>=? "

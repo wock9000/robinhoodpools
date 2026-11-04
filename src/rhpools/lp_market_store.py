@@ -15,7 +15,7 @@ import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from itertools import chain, islice
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from .lp_market_protocols import core_position_key
 
@@ -138,6 +138,18 @@ LEGACY_INDEXES = (
     "lp_accounting_episodes_owner_count_window",
 )
 _LEGACY_INDEXES_UNREAD_SINCE = 19
+# Raw per-event price and V2 reserve samples written by PriceProjection. Old
+# ones are pruned down to each pool's first and newest-before-cutoff sample;
+# lookups below ``sample_prune_block`` read the source events instead.
+SAMPLE_PRUNE_TABLES = ("lp_price_samples", "lp_v2_reserve_samples")
+
+
+class SamplePruneBatch(NamedTuple):
+    removed: int
+    complete: bool
+    busy: bool = False
+    # Seconds holding the writer turn (work plus commit), excluding the wait.
+    seconds: float = 0.0
 
 
 class MarketStoreError(RuntimeError):
@@ -1464,6 +1476,104 @@ class MarketStore:
                 ),
             )
             return len(rows)
+
+    def prune_sample_batch(
+        self, cutoff: int, *, limit: int = 512, pool_limit: int = 256,
+        blocking: bool = False,
+    ) -> SamplePruneBatch:
+        """Delete one bounded batch of raw price/reserve samples before ``cutoff``.
+
+        A sweep starts at the first block with an event at or after ``cutoff``
+        and walks each sample table pool by pool through its
+        ``(pool_id,block_number,tx_index,log_index)`` index. Per pool it keeps
+        the first sample (the all-time price baseline) and the newest sample
+        below that block (the at-or-before answer for every later position);
+        everything from the block on stays. ``sample_prune_block`` is raised
+        before the first delete so lookups below it read the source events.
+        Takes the background writer turn, without waiting unless ``blocking``;
+        a busy writer gets ``busy=True``. ``complete`` means the sweep finished.
+        """
+        if limit < 1 or limit > 512:
+            raise ValueError("sample prune batch must delete 1 to 512 rows")
+        if pool_limit < 1:
+            raise ValueError("sample prune batch must visit at least one pool")
+        with self.transaction(priority="background", blocking=blocking) as connection:
+            if connection is None:
+                return SamplePruneBatch(0, False, busy=True)
+            # Time from the writer turn through commit, never the wait for it.
+            started = time.monotonic()
+            removed, complete = self._prune_sample_rows(
+                connection, cutoff, limit, pool_limit,
+            )
+        return SamplePruneBatch(
+            removed, complete, seconds=time.monotonic() - started,
+        )
+
+    def _prune_sample_rows(
+        self, connection: sqlite3.Connection, cutoff: int, limit: int, pool_limit: int,
+    ) -> tuple[int, bool]:
+        if connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name IN (?,?,?)",
+            (*SAMPLE_PRUNE_TABLES, "lp_events_time"),
+        ).fetchone()[0] < 3:
+            return 0, True
+        cursor = self._metadata(connection, "sample_prune_cursor", None)
+        if cursor is None:
+            boundary = connection.execute(
+                "SELECT block_number FROM events INDEXED BY lp_events_time "
+                "WHERE timestamp>=? ORDER BY timestamp,block_number LIMIT 1",
+                (cutoff,),
+            ).fetchone()
+            if boundary is None:
+                return 0, True
+            cursor = {"table": 0, "pool": "", "block": int(boundary[0])}
+            self._set_metadata(connection, "sample_prune_block", max(
+                cursor["block"],
+                int(self._metadata(connection, "sample_prune_block", 0)),
+            ))
+        table = SAMPLE_PRUNE_TABLES[int(cursor["table"])]
+        removed = 0
+        for _ in range(pool_limit):
+            row = connection.execute(
+                f"SELECT pool_id FROM {table} WHERE pool_id>? ORDER BY pool_id LIMIT 1",
+                (cursor["pool"],),
+            ).fetchone()
+            if row is None:
+                if int(cursor["table"]) + 1 == len(SAMPLE_PRUNE_TABLES):
+                    self._set_metadata(connection, "sample_prune_cursor", None)
+                    return removed, True
+                cursor = {**cursor, "table": int(cursor["table"]) + 1, "pool": ""}
+                break
+            pool_id = row[0]
+            first = connection.execute(
+                f"SELECT block_number,tx_index,log_index FROM {table} WHERE pool_id=? "
+                "ORDER BY block_number,tx_index,log_index LIMIT 1",
+                (pool_id,),
+            ).fetchone()
+            newest = connection.execute(
+                f"SELECT block_number,tx_index,log_index FROM {table} "
+                "WHERE pool_id=? AND block_number<? "
+                "ORDER BY block_number DESC,tx_index DESC,log_index DESC LIMIT 1",
+                (pool_id, int(cursor["block"])),
+            ).fetchone()
+            if newest is not None and tuple(newest) > tuple(first):
+                doomed = [(row[0],) for row in connection.execute(
+                    f"SELECT event_id FROM {table} WHERE pool_id=? "
+                    "AND (block_number,tx_index,log_index)>(?,?,?) "
+                    "AND (block_number,tx_index,log_index)<(?,?,?) "
+                    "ORDER BY block_number,tx_index,log_index LIMIT ?",
+                    (pool_id, *first, *newest, limit - removed),
+                )]
+                connection.executemany(
+                    f"DELETE FROM {table} WHERE event_id=?", doomed,
+                )
+                removed += len(doomed)
+                if removed >= limit:
+                    # The pool may hold more; the next batch resumes it.
+                    break
+            cursor = {**cursor, "pool": pool_id}
+        self._set_metadata(connection, "sample_prune_cursor", cursor)
+        return removed, False
 
     @contextlib.contextmanager
     def transaction(
