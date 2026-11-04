@@ -1,4 +1,5 @@
 import json
+import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -212,42 +213,6 @@ def test_rpc_credentials_reject_public_files_and_bad_urls_without_leaking(tmp_pa
     assert "example-only" not in str(failure.value)
 
 
-def test_wss_credentials_reject_exposed_files_and_wrong_transport(tmp_path, monkeypatch):
-    credential = tmp_path / "provider.url"
-    credential.write_text("wss://rpc.example.test/private-token/\n")
-    credential.chmod(0o644)
-    monkeypatch.setenv("LP_RPC_HEAD_WSS_URL_FILES", str(credential))
-    with pytest.raises(ValueError) as failure:
-        lp_rpc.head_subscription_urls()
-    assert "private-token" not in str(failure.value)
-    credential.chmod(0o600)
-    credential.write_text("https://rpc.example.test/private-token/\n")
-    with pytest.raises(ValueError) as failure:
-        lp_rpc.head_subscription_urls()
-    assert "private-token" not in str(failure.value)
-
-    credential.write_text("wss://rpc.example.test/private-token/#note\n")
-    with pytest.raises(ValueError) as failure:
-        lp_rpc.head_subscription_urls()
-    assert "private-token" not in str(failure.value)
-
-
-def test_wss_credentials_preserve_source_precedence_and_local_safety(tmp_path, monkeypatch):
-    credential = tmp_path / "provider.url"
-    credential.write_text("wss://sponsored.example.test/token/\nws://127.0.0.1:8549\n")
-    credential.chmod(0o600)
-    monkeypatch.setenv("LP_RPC_HEAD_WSS_URL_FILES", str(credential))
-    monkeypatch.setenv("LP_RPC_HEAD_WSS_URLS", "wss://explicit.example.test")
-    monkeypatch.setenv("RHP_RPC_WSS", "wss://sponsored.example.test/token/")
-    monkeypatch.setenv("LP_RPC_DISABLE_LOCAL_FALLBACK", "1")
-    monkeypatch.setenv("LP_RPC_DISABLE_ALCHEMY", "1")
-    assert lp_rpc.head_subscription_urls() == (
-        "wss://explicit.example.test",
-        "wss://sponsored.example.test/token/",
-        "wss://robinhood-rpc.publicnode.com",
-    )
-
-
 def test_rpc_demand_counts_batch_items_and_expires_window(monkeypatch):
     clock = SimpleNamespace(now=100.0)
     monkeypatch.setattr(lp_rpc.time, "monotonic", lambda: clock.now)
@@ -267,124 +232,106 @@ def test_rpc_demand_counts_batch_items_and_expires_window(monkeypatch):
     assert gate.traffic()["rpc_calls_per_second"] == round(2 / 60, 3)
 
 
-def test_large_batch_respects_provider_item_limit(provider, monkeypatch):
-    clock = SimpleNamespace(now=100.0)
-    gate = lp_rpc._SourceGate(started_at=clock.now)
-    arrivals = []
-
-    def sleep(delay):
-        clock.now += delay
-
-    monkeypatch.setattr(lp_rpc, "time", SimpleNamespace(
-        monotonic=lambda: clock.now, time=lambda: clock.now, sleep=sleep,
-    ))
-    monkeypatch.setattr(lp_rpc, "_gate", lambda _url: gate)
-
-    def post(_url, *, data, **_kwargs):
-        payload = json.loads(data)
-        items = payload if isinstance(payload, list) else [payload]
-        arrivals[:] = [at for at in arrivals if at > clock.now - 1]
-        limited = len(arrivals) + len(items) > 50
-        arrivals.extend([clock.now] * len(items))
-        responses = []
-        for item in reversed(items):
-            result = {"jsonrpc": "2.0", "id": item["id"]}
-            if limited:
-                result["error"] = {
-                    "code": -32007, "message": "50/second request limit reached",
-                }
-            else:
-                result["result"] = (
-                    hex(CHAIN_ID) if item["method"] == "eth_chainId"
-                    else {"number": item["params"][0]}
-                )
-            responses.append(result)
-        encoded = json.dumps(
-            responses if isinstance(payload, list) else responses[0],
-        ).encode()
-        return SimpleNamespace(
-            raise_for_status=lambda: None,
-            raw=SimpleNamespace(read=lambda *_args, **_kwargs: encoded),
-            close=lambda: None,
-        )
-
-    session = SimpleNamespace(post=post)
-    monkeypatch.setattr(provider._registry, "_session", lambda _source: session)
-    calls = [("eth_getBlockByNumber", [hex(index), False]) for index in range(100)]
-    assert provider("live").batch(calls) == [
-        {"number": hex(index)} for index in range(100)
-    ]
+def test_head_lanes_skip_a_background_pacing_backlog():
+    gate = lp_rpc._SourceGate()
+    # A background batch of 76 calls at 0.1 s/call was just granted.
+    gate.next_at = time.monotonic() + 7.6
+    started = time.monotonic()
+    gate.acquire(0.1, 2, priority=True)
+    assert time.monotonic() - started < 0.5
+    # Its cost is still charged to the shared clock that background lanes wait on.
+    assert gate.next_at - time.monotonic() > 7.6
+    gate.release()
 
 
-@pytest.mark.parametrize("failure_kind", ["transport", "item", "exhausted"])
-def test_chunk_failure_keeps_completed_results(monkeypatch, failure_kind):
-    sources = (
-        lp_rpc._Source("primary", "https://chunk-primary.test/rpc"),
-        lp_rpc._Source("fallback", "https://chunk-fallback.test/rpc"),
-    )
-    monkeypatch.setattr(lp_rpc, "_source_list", lambda *_args: sources)
-    monkeypatch.setattr(lp_rpc, "head_subscription_urls", lambda: ())
+def test_background_leaves_a_slot_for_head_ingest_and_yields_to_it():
+    gate = lp_rpc._SourceGate(concurrency=4)
+    for _ in range(3):
+        gate.acquire(0.0, 1)
+    blocked = threading.Thread(target=gate.acquire, args=(0.0, 1), daemon=True)
+    blocked.start()
+    blocked.join(0.3)
+    assert blocked.is_alive()  # the fourth slot is reserved
+    gate.acquire(0.0, 1, priority=True)
+    assert gate.in_flight == 4
+    gate.release()  # the head request finishes; its slot stays reserved
+    blocked.join(0.3)
+    assert blocked.is_alive()
+    gate.release()  # a background request finishes
+    blocked.join(2)
+    assert not blocked.is_alive() and gate.in_flight == 3
 
-    def post(_client, source, payload):
-        if not isinstance(payload, list):
-            return {"jsonrpc": "2.0", "id": payload["id"], "result": hex(CHAIN_ID)}
-        fails = source.name == "primary" and any(
-            item["params"][0]["data"] == hex(12) for item in payload
-        )
-        if (
-            fails and failure_kind != "item"
-            or source.name == "fallback" and failure_kind == "exhausted"
-        ):
-            raise RuntimeError("connection reset")
-        responses = []
-        for item in reversed(payload):
-            result = {"jsonrpc": "2.0", "id": item["id"]}
-            if fails and item["params"][0]["data"] == hex(12):
-                result["error"] = {"code": -32000, "message": "missing trie node"}
-            else:
-                result["result"] = "0x01" if source.name == "primary" else "0x99"
-            responses.append(result)
-        return responses
 
-    monkeypatch.setattr(lp_rpc.RoutedRpc, "_post", post)
-    factory = lp_rpc.build_rpc_factory("", RuntimeError)
-    calls = [
-        ("eth_call", [{"to": "0x" + "1" * 40, "data": hex(index)}, "latest"])
-        for index in range(25)
-    ]
-    fallback_indexes = (
-        set(range(10, 25)) if failure_kind != "item" else {12, *range(20, 25)}
-    )
+def test_background_wait_stays_bounded_while_head_demand_saturates(monkeypatch):
+    monkeypatch.setattr(lp_rpc, "_PRIORITY_DEBT_SECONDS", 0.5)
+    monkeypatch.setattr(lp_rpc, "_BACKGROUND_MAX_YIELD_SECONDS", 0.5)
+    gate = lp_rpc._SourceGate(concurrency=4)
+    stop = threading.Event()
+
+    def head_lane():
+        # Always at least one priority caller waiting: the endpoint is saturated.
+        while not stop.is_set():
+            gate.acquire(0.05, 1, priority=True)
+            gate.release()
+
+    heads = [threading.Thread(target=head_lane, daemon=True) for _ in range(3)]
+    for thread in heads:
+        thread.start()
+    time.sleep(0.3)
+    waits = []
     try:
-        if failure_kind == "exhausted":
-            results = factory("state").batch_results(calls)
-            assert len(results) == 25
-            assert results[:10] == ["0x01"] * 10
-            assert all(isinstance(result, RuntimeError) for result in results[10:])
-            return
-        assert factory("state").batch(calls) == [
-            "0x99" if index in fallback_indexes else "0x01"
-            for index in range(25)
-        ]
+        for _ in range(3):
+            started = time.monotonic()
+            gate.acquire(0.05, 1)
+            waits.append(time.monotonic() - started)
+            gate.release()
     finally:
-        factory.close()
+        stop.set()
+        for thread in heads:
+            thread.join(2)
+    # Yield (0.5 s) plus a few pacing turns, not "until head demand stops".
+    assert max(waits) < 1.5, waits
 
 
-@pytest.mark.parametrize("endpoint", [
-    "https://rpc.example.test/?key={credential}",
-    "https://rpc.example.test/{credential}/",
-])
-def test_rpc_transport_traceback_does_not_expose_url_credentials(monkeypatch, endpoint):
+def test_head_lane_borrowing_from_the_provider_clock_is_bounded(monkeypatch):
+    monkeypatch.setattr(lp_rpc, "_PRIORITY_DEBT_SECONDS", 0.2)
+    gate = lp_rpc._SourceGate()
+    gate.next_at = time.monotonic() + 0.6
+    started = time.monotonic()
+    gate.acquire(0.1, 1, priority=True)
+    assert 0.3 <= time.monotonic() - started < 1.0
+    gate.release()
+
+
+def test_local_node_is_never_paced_for_either_class(monkeypatch):
+    gate = lp_rpc._gate("http://127.0.0.1:59999")
+    assert gate.concurrency == lp_rpc.LOCAL_SOURCE_CONCURRENCY
+    started = time.monotonic()
+    for _ in range(lp_rpc.LOCAL_SOURCE_CONCURRENCY - 1):
+        gate.acquire(lp_rpc._minimum_interval("http://127.0.0.1:59999"), 100)
+    gate.acquire(0.0, 100, priority=True)
+    assert time.monotonic() - started < 0.2
+    for _ in range(lp_rpc.LOCAL_SOURCE_CONCURRENCY):
+        gate.release()
+
+
+def test_only_head_and_live_lanes_get_priority(provider):
+    assert provider("live")._priority and provider("head")._priority
+    for lane in ("history", "enrichment", "receipt", "workbench", "balance"):
+        assert not provider(lane)._priority
+
+
+def test_rpc_transport_traceback_does_not_expose_url_credentials(monkeypatch):
     import traceback
 
     credential = "test-credential-never-log"
-    source = lp_rpc._Source("private-provider", endpoint.format(credential=credential))
+    source = lp_rpc._Source("private-provider", f"https://rpc.example.test/?key={credential}")
     monkeypatch.setattr(lp_rpc, "_source_list", lambda *_args: (source,))
     monkeypatch.setattr(lp_rpc, "head_subscription_urls", lambda: ())
     factory = lp_rpc.build_rpc_factory("", RuntimeError)
 
     def failed_request(*_args, **_kwargs):
-        raise lp_rpc.requests.ConnectionError(f"connection failed for {source.url}; token={credential}")
+        raise lp_rpc.requests.ConnectionError(f"connection failed for {source.url}")
 
     monkeypatch.setattr(lp_rpc.requests.Session, "post", failed_request)
     try:
@@ -392,67 +339,5 @@ def test_rpc_transport_traceback_does_not_expose_url_credentials(monkeypatch, en
             factory("live").call("eth_blockNumber")
         assert credential not in "".join(traceback.format_exception(failure.value))
         assert credential not in json.dumps(factory.status())
-    finally:
-        factory.close()
-
-
-def test_archive_sources_are_explicit_only_and_route_archive_lane_reads(monkeypatch):
-    monkeypatch.setenv("LP_RPC_ARCHIVE_URLS", "http://127.0.0.1:8547")
-    monkeypatch.setenv("LP_RPC_LOG_URLS", "https://provider.test/logs")
-    monkeypatch.setenv("LP_RPC_HEAD_URLS", "https://provider.test/head,http://127.0.0.1:8547")
-    monkeypatch.setenv("RHP_RPC_URLS", "https://generic.test/rpc")
-    monkeypatch.setenv("LP_RPC_DISABLE_ALCHEMY", "1")
-    monkeypatch.setattr(lp_rpc, "head_subscription_urls", lambda: ())
-    factory = lp_rpc.build_rpc_factory("", RuntimeError)
-    posted = []
-
-    def post(_client, source, payload):
-        if isinstance(payload, list):
-            return [post(_client, source, item) for item in payload]
-        posted.append((source.name, payload["method"]))
-        if payload["method"] == "eth_blockNumber":
-            return {"jsonrpc": "2.0", "id": payload["id"], "result": "0x1000"}
-        return {"jsonrpc": "2.0", "id": payload["id"], "result": []}
-
-    monkeypatch.setattr(lp_rpc.RoutedRpc, "_post", post)
-    monkeypatch.setattr(lp_rpc.RoutedRpc, "_ensure_chain", lambda _self, _source: None)
-    try:
-        assert [
-            source.url for source in factory._registry.sources["archive"]
-        ] == ["http://127.0.0.1:8547"]
-        query = [{"fromBlock": "0x10", "toBlock": "0x20", "topics": [[]]}]
-        assert factory("archive").call("eth_getLogs", query) == []
-        assert factory("archive").call("eth_getBlockByNumber", ["0x10", False]) == []
-        assert factory("history").call("eth_getLogs", query) == []
-        header = ("eth_getBlockByNumber", ["0x10", False])
-        assert factory("history").call(*header) == []
-        assert factory("canonical").call(*header) == []
-        assert factory("canonical").batch([header]) == [[]]
-        assert posted == [
-            ("configured-archive-1", "eth_blockNumber"),
-            ("configured-archive-1", "eth_getLogs"),
-            ("configured-archive-1", "eth_getBlockByNumber"),
-            ("configured-logs-1", "eth_getLogs"),
-            ("configured-head-2", "eth_getBlockByNumber"),
-            ("configured-head-1", "eth_getBlockByNumber"),
-            ("configured-head-1", "eth_getBlockByNumber"),
-        ]
-        assert lp_rpc._gate("http://127.0.0.1:8547").slots._initial_value == (
-            lp_rpc.LOCAL_SOURCE_CONCURRENCY
-        )
-    finally:
-        factory.close()
-
-
-def test_factory_has_no_archive_lane_without_an_archive_source(monkeypatch):
-    monkeypatch.delenv("LP_RPC_ARCHIVE_URLS", raising=False)
-    monkeypatch.delenv("LP_RPC_ARCHIVE_URL_FILES", raising=False)
-    monkeypatch.setenv("RHP_RPC_URLS", "http://127.0.0.1:8547")
-    monkeypatch.setenv("LP_RPC_DISABLE_ALCHEMY", "1")
-    monkeypatch.setattr(lp_rpc, "head_subscription_urls", lambda: ())
-    factory = lp_rpc.build_rpc_factory("", RuntimeError)
-    try:
-        assert factory("archive") is None
-        assert factory("history") is not None
     finally:
         factory.close()

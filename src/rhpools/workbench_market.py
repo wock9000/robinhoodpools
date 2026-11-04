@@ -12,6 +12,7 @@ snapshot.  No key material is read and this module has no transaction path.
 from __future__ import annotations
 
 from collections import OrderedDict, deque
+from collections.abc import MutableMapping
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from decimal import Decimal, localcontext
@@ -496,6 +497,40 @@ class _Pool:
     source: str = "census"
 
 
+class _PoolCatalog(MutableMapping[str, _Pool]):
+    def __init__(self, pools: Mapping[str, _Pool] | Iterable[tuple[str, _Pool]] = ()) -> None:
+        self._pools: dict[str, _Pool] = {}
+        self._tokens: dict[str, set[str]] = {}
+        self.update(pools)
+
+    def __getitem__(self, key: str) -> _Pool:
+        return self._pools[key]
+
+    def __setitem__(self, key: str, pool: _Pool) -> None:
+        if key in self._pools:
+            del self[key]
+        self._pools[key] = pool
+        for token in {pool.token0, pool.token1}:
+            self._tokens.setdefault(token, set()).add(key)
+
+    def __delitem__(self, key: str) -> None:
+        pool = self._pools.pop(key)
+        for token in {pool.token0, pool.token1}:
+            identities = self._tokens[token]
+            identities.remove(key)
+            if not identities:
+                del self._tokens[token]
+
+    def __iter__(self):
+        return iter(self._pools)
+
+    def __len__(self) -> int:
+        return len(self._pools)
+
+    def containing(self, token: str) -> list[_Pool]:
+        return [self._pools[key] for key in self._tokens.get(token, ())]
+
+
 @dataclass(slots=True)
 class _Token:
     symbol: str | None = None
@@ -653,7 +688,7 @@ class MarketService:
         self._census_reloaded_at = time.time()
         self._census_reload_error: str | None = None
         self._census_generation = 1
-        self._discovered: dict[str, _Pool] = {}
+        self._discovered = _PoolCatalog()
         self._invalid_index_pools: set[str] = set()
         self._index_publication_revision = 0
         self._discovery_last_poll = 0.0
@@ -1157,7 +1192,7 @@ class MarketService:
                 self._discovery_cursor = cursor
                 self._discovery_cursor_hash = cursor_hash
                 self._discovery_error = "persisted live tail awaiting canonical verification"
-            self._discovered = pools
+            self._discovered = _PoolCatalog(pools)
             self._backfill_lanes = lanes
             self._checkpoint_loaded_at = time.time()
         except FileNotFoundError:
@@ -1345,11 +1380,11 @@ class MarketService:
             raise RpcError("reorg discovery anchor is unavailable")
         message = f"factory tail reorg at block {self._discovery_cursor}: {reason}; replaying"
         with self._lock:
-            self._discovered = {
+            self._discovered = _PoolCatalog({
                 pool_id: pool
                 for pool_id, pool in self._discovered.items()
                 if pool.source != "factory-live"
-            }
+            })
             self._discovery_cursor = anchor_number
             self._discovery_cursor_hash = str(anchor["hash"]).lower()
             if self._discovery_started_block == anchor_number:
@@ -1501,11 +1536,11 @@ class MarketService:
                 for lane in self._backfill_lanes.values()
             )
             if needs_reset:
-                self._discovered = {
+                self._discovered = _PoolCatalog({
                     pool_id: pool
                     for pool_id, pool in self._discovered.items()
                     if not pool.source.startswith("backfill-")
-                }
+                })
                 self._backfill_lanes.clear()
                 self._backfill_error = "backfill anchor changed after a reorg; restarting verified scans"
             if not self._backfill_lanes:

@@ -291,7 +291,7 @@ class PositionClaims:
                 "FROM lp_accounting_positions p "
                 "INDEXED BY lp_accounting_positions_owner_active_key "
                 "LEFT JOIN lp_accounting_claims c ON c.position_key=p.position_key "
-                "AND c.position_state_json=p.state_json "
+                "AND c.position_state_digest=state_json_digest(p.state_json) "
                 "WHERE p.owner=? AND p.active_episode_id IS NOT NULL AND p.position_key>? "
                 "ORDER BY p.position_key LIMIT 4", (owner, state["positions"]),
             ).fetchall()]

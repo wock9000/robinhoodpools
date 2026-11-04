@@ -218,3 +218,39 @@ def test_invalid_owner_and_position_boundary_are_explicit():
     assert result["allocation"]["returned_position_scope"] is True
     assert result["configurations"]["returned_position_scope"] is True
     assert any("base 200-position page boundary" in item for item in result["limitations"])
+
+
+def test_stale_projection_positions_never_contribute_current_principal():
+    live = _position("live", principal=10.0, claim=1.0)
+    burned = _position("burned", principal=200.0, claim=5.0)
+    # The canonical book flags a queued replay whose events postdate the row
+    # and withholds its inventory; the row still carries an open episode.
+    burned.update({
+        "status": "stale", "liquidity": None, "principal_usd": None,
+        "claim_principal_usd": None, "principal0": None, "principal1": None,
+        "pending_principal0": None, "pending_principal1": None,
+        "valuation_basis": "unprojected_events_pending",
+        "projection": {"state": "stale", "published_block": 990, "queued_block": 999},
+        "coverage": {
+            "history": "full", "identity": "verified", "qualified": False,
+            "reasons": ["projection_stale"],
+        },
+    })
+    service = _LPService(
+        _detail([live, burned]), {POOL_V3: _pool(POOL_V3, "v3", 3_000)},
+    )
+
+    result = LPResearchService(service).owner({"owner": OWNER, "window": "all"})
+
+    assert result["allocation"]["known_principal_usdg"] == pytest.approx(11.0)
+    assert result["allocation"]["current_beneficial_positions"] == 1
+    assert [row["position_key"] for row in result["allocation"]["positions"]] == ["live"]
+    assert result["coverage"]["stale_projection_positions"] == 1
+    stale = next(
+        row for row in result["configurations"]["positions"]
+        if row["position_key"] == "burned"
+    )
+    assert stale["current"] is False
+    assert stale["status"] == "stale"
+    assert stale["projection"]["queued_block"] == 999
+    assert any("newer than their published accounting projection" in item for item in result["limitations"])

@@ -1,6 +1,9 @@
 <!doctype html>
 <html lang="en">
 <head>
+  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="icon" type="image/png" sizes="512x512" href="/static/rhp_icon_512.png">
+  <link rel="apple-touch-icon" href="/static/rhp_icon_180.png">
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
@@ -9,21 +12,23 @@
   <script src="/static/lp_panes_boot.js"></script>
   <title>Robinhood Pools / Chain 4663</title>
   <link rel="stylesheet" href="/static/lp_terminal.css">
+  <link rel="stylesheet" href="/static/lp_gate.css">
+  <link rel="stylesheet" href="/static/lp_trade.css">
 </head>
 <body>
   <header class="terminal-header">
     <div class="status-strip">
-      <strong class="product-name">ROBINHOOD POOLS</strong>
+      <strong class="product-name"><img src="/static/rhp_logo.png" alt="RH.Pools" width="119" height="14"></strong>
       <span class="chain-id">4663</span>
       <span id="strip-context" class="status-context">LP WALLETS</span>
       <span class="block-readout">
         <span class="strip-label">BLOCK</span>
         <a id="live-block-link" rel="noopener noreferrer" target="_blank">#—</a>
         <span id="live-block-age">—</span>
-        <span id="live-block-gap" class="block-gap" hidden>GAP</span>
       </span>
       <span id="stream-state" class="strip-state" role="status">CONNECTING</span>
-      <span id="strip-freshness" title="Age of the last index status response. Live head, durable index head, and the actual catch-up gap are shown below.">STATUS —</span>
+      <span id="strip-freshness" title="Age of the last index status response. Select INDEX STATUS for full diagnostics.">STATUS —</span>
+      <button id="gate-chip" class="gate-chip" type="button" aria-haspopup="dialog" aria-controls="gate-dialog" hidden><span class="strip-label">WALLET</span><span class="gate-chip-text">none</span></button>
       <time id="terminal-clock" datetime="">--:--:-- UTC</time>
       <nav id="key-strip" class="key-strip" aria-label="Window, tape, and pane controls">
         <label class="mobile-only sr-only" for="mobile-window">Accounting window</label>
@@ -49,6 +54,7 @@
       <a href="#tape-section">FEED</a>
       <a href="#owners-section">WALLETS</a>
       <a href="#pools-section">POOLS</a>
+      <a href="#trade" id="trade-nav">TRADE</a>
       <a href="/guide">GUIDE</a>
       <a href="/research">RESEARCH</a>
       <a href="/flow">FLOW</a>
@@ -57,6 +63,7 @@
         <summary><span id="mobile-more-window">24h</span>&nbsp; MORE</summary>
         <nav aria-label="Research and help">
           <div id="mobile-controls-slot"></div>
+          <a href="#trade">Trade</a>
           <a href="/guide">Beginner guide</a>
           <a href="/research">LP research</a>
           <a href="/flow">Fomo flow</a>
@@ -68,7 +75,7 @@
 
   <main id="terminal-main">
     <section class="readout" aria-label="LP market status">
-      <button id="status-readout" type="button" class="readout-line" aria-label="Open index status details" aria-live="polite" aria-haspopup="dialog" aria-controls="index-status-shell" title="Open index status details">index connecting</button>
+      <button id="status-readout" type="button" class="readout-line" aria-label="Open index status details" aria-live="polite" aria-haspopup="dialog" aria-controls="index-status-shell" title="Open index status details">INDEX STATUS</button>
       <div id="overview-readout" class="readout-line dim">24h · metrics —</div>
       <div id="endpoint-health" class="sr-only" role="status" aria-live="polite"></div>
     </section>
@@ -110,8 +117,8 @@
           <p id="owner-curve-note" class="curve-note">—</p>
         </section>
         <section aria-labelledby="owner-positions-title">
-          <h3 id="owner-positions-title" class="modal-section-title">OPEN POSITIONS · DEPTH</h3>
-          <div class="table-wrap modal-table-wrap" tabindex="0" aria-label="Owner open positions, horizontally scrollable">
+          <h3 id="owner-positions-title" class="modal-section-title">POSITIONS · DEPTH</h3>
+          <div class="table-wrap modal-table-wrap" tabindex="0" aria-label="Owner positions, horizontally scrollable">
             <table class="terminal-table"><thead><tr><th>pair</th><th>proto</th><th>position / range</th><th class="numeric">liquidity</th><th class="numeric">principal</th><th class="numeric">uncollected fees</th><th class="numeric">equity</th><th>valuation</th><th>status</th><th>depth</th></tr></thead><tbody id="owner-positions-body"></tbody></table>
           </div>
         </section>
@@ -121,12 +128,18 @@
             <table class="terminal-table"><thead><tr><th>closed</th><th>pair</th><th>proto</th><th class="numeric">paid in</th><th class="numeric">got out</th><th class="numeric">fees</th><th class="numeric">gross P/L</th><th class="numeric">gas</th><th class="numeric">net P/L</th><th class="numeric">return</th><th class="numeric">held</th><th>depth</th></tr></thead><tbody id="owner-closed-body"></tbody></table>
           </div>
         </section>
+        <section id="owner-trades" aria-labelledby="owner-trades-title" hidden>
+          <h3 id="owner-trades-title" class="modal-section-title">TRADES</h3>
+          <div class="table-wrap modal-table-wrap" tabindex="0" aria-label="Wallet trades, horizontally scrollable">
+            <table class="terminal-table"><thead><tr><th>age</th><th>sold</th><th>bought</th><th>via</th><th>tx</th></tr></thead><tbody id="owner-trades-body"></tbody></table>
+          </div>
+        </section>
       </div>
     </section>
 
     <section id="tape-section" aria-labelledby="tape-title">
       <header class="section-head">
-        <div><h1 id="tape-title">FEED</h1></div>
+        <h1 id="tape-title">FEED</h1>
         <button id="mobile-filter-toggle" class="mobile-only" type="button" aria-expanded="false" aria-controls="tape-tools">Filter</button>
         <div id="tape-tools" class="tools">
           <label class="filter-field" for="market-filter"><span aria-hidden="true">/</span><span class="sr-only">Filter pair, pool, owner, custody, token, or transaction</span><input id="market-filter" type="search" autocomplete="off" spellcheck="false" placeholder="filter pair / pool / LP"></label>
@@ -159,13 +172,7 @@
 
     <section id="owners-section" aria-labelledby="owners-title">
       <header class="section-head">
-        <div class="owners-heading">
-          <h1 id="owners-title">LP WALLETS</h1>
-          <span class="wallet-description">Who is providing liquidity, and where? Select a wallet for positions and accounting.</span>
-          <div class="owner-qualification" role="status" aria-live="polite">
-            <span id="owners-accounting-readout">Loading wallet activity…</span>
-          </div>
-        </div>
+        <h1 id="owners-title">LP WALLETS</h1>
         <div class="tools">
           <label for="owner-scope" class="sr-only">Wallet identity scope</label>
           <select id="owner-scope">
@@ -222,7 +229,7 @@
         <button id="mobile-pool-order" type="button" aria-label="Reverse pool sort order">↓</button>
       </div>
       <div id="pool-panel" role="tabpanel" aria-labelledby="tab-pools">
-        <div class="table-wrap pool-wrap" tabindex="0" aria-label="Pools table, horizontally scrollable">
+        <div class="table-wrap pool-wrap" id="pools-wrap" tabindex="0" aria-label="Pools table, horizontally scrollable">
           <table class="terminal-table" id="pools-table" role="table">
             <thead><tr><th>pair</th><th>proto</th><th class="numeric"><button type="button" data-pool-sort="fee">fee</button></th><th class="numeric"><button type="button" data-pool-sort="tvl">TVL</button></th><th class="numeric desktop-column"><button type="button" data-pool-sort="active_tvl">active TVL</button></th><th class="numeric desktop-column"><button type="button" data-pool-sort="observed_active_tvl">observed active</button></th><th class="numeric"><button type="button" data-pool-sort="volume">volume</button></th><th class="numeric"><button type="button" data-pool-sort="fees">fees</button></th><th class="numeric"><button type="button" data-pool-sort="flow">net flow</button></th><th class="numeric desktop-column"><button type="button" data-pool-sort="swaps">swaps</button></th><th class="numeric desktop-column"><button type="button" data-pool-sort="adds">adds</button></th><th class="numeric desktop-column"><button type="button" data-pool-sort="removes">removes</button></th><th class="numeric"><button type="button" data-pool-sort="lps">LPs</button></th><th class="numeric desktop-column"><button type="button" data-pool-sort="price">price t1/t0</button></th><th class="numeric desktop-column"><button type="button" data-pool-sort="change">change</button></th></tr></thead>
             <tbody id="pools-body"></tbody>
@@ -255,14 +262,38 @@
         <h2 id="pool-inspector-title">POOL INSPECTOR</h2>
         <span id="pool-inspector-context">—</span>
         <a id="pool-inspector-new-tab" href="/pool" target="_blank" rel="noopener noreferrer">NEW TAB</a>
+        <button id="pool-inspector-trade" type="button">TRADE</button>
+        <button id="pool-inspector-lp" type="button">LIQUIDITY</button>
         <button id="pool-inspector-close" type="button" aria-label="Close pool inspector">CLOSE</button>
       </header>
       <iframe id="pool-inspector-frame" class="pool-inspector-frame" title="Live pool inspector" src="about:blank"></iframe>
     </div>
   </section>
 
-  <footer class="terminal-footer"><span id="footer-state">index —</span><a class="sponsor-link" href="https://www.quicknode.com/" target="_blank" rel="noopener noreferrer">Powered by Quicknode</a><span>READ ONLY · <a class="source-link" href="https://github.com/wock9000/robinhoodpools#license" target="_blank" rel="noopener noreferrer" title="Copyright 2026 RobinhoodPools contributors · AGPL-3.0-only · no warranty · corresponding source">SOURCE</a></span></footer>
+  <footer class="terminal-footer"><span id="footer-state">INDEX STATUS</span><span class="sponsor-credit">Powered by <a class="sponsor-link" href="https://goldsky.com/" target="_blank" rel="noopener noreferrer">Goldsky</a> and <a class="sponsor-link" href="https://www.quicknode.com/" target="_blank" rel="noopener noreferrer">Quicknode</a></span><span class="footer-meta"><a class="source-link" href="https://github.com/wock9000/robinhoodpools" target="_blank" rel="noopener noreferrer" title="RobinhoodPools on GitHub · Copyright 2026 RobinhoodPools contributors · AGPL-3.0-only · no warranty">GITHUB</a></span></footer>
   <div id="copy-status" class="sr-only" role="status" aria-live="polite"></div>
+  <dialog id="gate-dialog" class="gate-dialog" aria-labelledby="gate-dialog-title">
+    <header class="pool-inspector-head">
+      <h2 id="gate-dialog-title">WALLET</h2>
+      <span id="gate-dialog-address"></span>
+      <button id="gate-dialog-close" type="button" aria-label="Close wallet dialog">CLOSE</button>
+    </header>
+    <div class="gate-body">
+      <section id="gate-status" class="gate-section"></section>
+      <section id="gate-keys" class="gate-section" hidden></section>
+      <section id="gate-policy" class="gate-section" hidden></section>
+    </div>
+  </dialog>
+  <dialog id="trade-dialog" class="gate-dialog trade-dialog" aria-labelledby="trade-dialog-title">
+    <header class="pool-inspector-head">
+      <h2 id="trade-dialog-title">TRADE</h2>
+      <span id="trade-dialog-wallet"></span>
+      <button id="trade-dialog-close" type="button" aria-label="Close trade ticket">CLOSE</button>
+    </header>
+    <form id="trade-body" class="gate-body" novalidate></form>
+  </dialog>
   <script src="/static/lp_terminal.js" defer></script>
+  <script src="/static/lp_gate.js" defer></script>
+  <script src="/static/lp_trade.js" defer></script>
 </body>
 </html>

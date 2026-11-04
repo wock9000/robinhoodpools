@@ -73,8 +73,6 @@ a:hover { text-decoration: underline; }
 .slash { color: #777; }
 .identity-line strong { color: var(--black); }
 .identity-line time { margin-left: auto; color: #444; }
-.read-only { display: inline-flex; align-items: center; gap: 5px; color: #177317; font-weight: 800; }
-.read-only i { width: 5px; height: 5px; background: currentColor; }
 .terminal-header nav { min-height: 25px; gap: 20px; overflow-x: auto; }
 .terminal-header nav a { color: var(--dim); font-size: 10px; font-weight: 800; }
 .terminal-header nav a:hover { color: var(--cyan); }
@@ -269,7 +267,6 @@ footer span { overflow: hidden; text-overflow: ellipsis; }
   .identity-line .slash,
   .identity-line strong,
   .identity-line time { display: none; }
-  .read-only { margin-left: auto; }
   .terminal-header nav { min-height: 39px; gap: 17px; }
   .terminal-header nav a { min-height: 34px; display: inline-flex; align-items: center; }
   .hero { min-height: 0; grid-template-columns: 1fr; gap: 6px; padding: 6px 8px; }

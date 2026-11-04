@@ -1,0 +1,74 @@
+.gate-chip {
+  flex: none;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--rhp-black);
+  font: inherit;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.gate-chip:hover, .gate-chip:focus-visible { text-decoration: underline; }
+.gate-chip .strip-label { font-weight: 700; }
+.gate-chip.is-dim { color: var(--rhp-dim); }
+.gate-chip.is-holder { color: #276827; }
+.gate-chip.is-grace { color: #7b3600; }
+.gate-chip.is-below { color: #a00000; }
+
+.gate-dialog {
+  width: min(600px, calc(100vw - 12px));
+  max-height: calc(100vh - 24px);
+  padding: 0;
+  border: 1px solid var(--rhp-white);
+  border-radius: 0;
+  background: var(--rhp-black);
+  color: var(--rhp-text);
+  font: 12px/1.45 var(--rhp-mono);
+}
+.gate-dialog::backdrop { background: rgba(0, 0, 0, 0.7); }
+.gate-dialog .pool-inspector-head button { margin-left: auto; }
+.gate-body { display: grid; gap: 10px; padding: 8px 7px 10px; }
+.gate-section h3 { margin: 0 0 3px; font: 800 12px/1.35 var(--rhp-mono); color: var(--rhp-white); }
+.gate-section p { margin: 0 0 2px; }
+.gate-section .note { color: var(--rhp-dim); }
+.gate-section .bad { color: var(--rhp-red); }
+.gate-section .good { color: var(--rhp-green); }
+.gate-section .warn { color: var(--rhp-yellow); }
+.gate-table { width: 100%; border-collapse: collapse; }
+.gate-table th, .gate-table td { padding: 1px 6px 1px 0; text-align: left; vertical-align: top; white-space: nowrap; }
+.gate-table th { color: var(--rhp-dim); font-weight: 400; }
+.gate-table td.grow { white-space: normal; overflow-wrap: anywhere; }
+.gate-row { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; margin-top: 4px; }
+.gate-row label { color: var(--rhp-dim); }
+.gate-dialog input, .gate-dialog button {
+  padding: 0 4px;
+  border: 1px solid var(--rhp-dimmer);
+  border-radius: 0;
+  background: var(--rhp-black);
+  color: var(--rhp-text);
+  font: inherit;
+}
+.gate-dialog input { min-width: 12ch; }
+.gate-dialog input.wide { flex: 1 1 30ch; }
+.gate-dialog button { border-color: var(--rhp-white); color: var(--rhp-white); font-weight: 700; cursor: pointer; }
+.gate-dialog button:hover, .gate-dialog button:focus-visible { background: var(--rhp-white); color: var(--rhp-black); }
+.gate-dialog button:disabled { border-color: var(--rhp-dimmer); color: var(--rhp-dim); cursor: default; background: transparent; }
+.gate-dialog button.danger { border-color: var(--rhp-red); color: var(--rhp-red); }
+.gate-dialog button.danger:hover { background: var(--rhp-red); color: var(--rhp-black); }
+.gate-secret { display: block; margin: 4px 0; padding: 3px 5px; border: 1px solid var(--rhp-yellow); color: var(--rhp-yellow); overflow-wrap: anywhere; user-select: all; }
+.gate-form { display: grid; grid-template-columns: 12ch minmax(0, 1fr); gap: 3px 8px; align-items: baseline; }
+.gate-form label { color: var(--rhp-dim); }
+.gate-error {
+  max-width: 100%;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  line-clamp: 2;
+}
+.gate-chip { max-width: 60ch; overflow: hidden; text-overflow: ellipsis; }
+.gate-preview { font-size: 10px; overflow-wrap: anywhere; }
