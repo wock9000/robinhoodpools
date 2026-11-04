@@ -25,6 +25,19 @@ MAX_BATCH_CALLS = 100
 MAX_SOURCE_CONCURRENCY = 4
 # A local node has no provider quota; the archive lane fans log pages out to it.
 LOCAL_SOURCE_CONCURRENCY = 16
+# Head ingestion must keep chain rate when every lane fails over to one paced
+# provider. These lanes skip ahead of background waiters and may borrow up to
+# this much of the provider's pacing clock (one full 100-call batch at 10 calls/s
+# plus margin); background lanes then wait the borrowed time out.
+PRIORITY_LANES = frozenset({"head", "live"})
+_PRIORITY_DEBT_SECONDS = 15.0
+# A background request yields to head ingest for at most this long, then takes
+# turns with it on the same pacing (no extra provider load). A live round of tip
+# plus two boundary headers took 0.34 s on the public endpoint under background
+# saturation, so 3 s lets several head steps go first, while a workbench request
+# (6 s HTTP timeout, which does not cover this wait) is delayed here by at most
+# 3 s plus one pacing turn even when head demand saturates the endpoint.
+_BACKGROUND_MAX_YIELD_SECONDS = 3.0
 CAPABILITIES = ("head", "state", "history_state", "logs", "receipts", "trace", "archive")
 HASH_LOOKUP_METHODS = frozenset({
     "eth_getTransactionByHash",
@@ -60,30 +73,73 @@ class _SourceState:
     methods: set[str] = field(default_factory=set)
 @dataclass(slots=True)
 class _SourceGate:
-    lock: threading.Lock = field(default_factory=threading.Lock)
+    ready: threading.Condition = field(default_factory=threading.Condition)
     traffic_lock: threading.Lock = field(default_factory=threading.Lock)
+    concurrency: int = MAX_SOURCE_CONCURRENCY
+    in_flight: int = 0
     next_at: float = 0.0
-    slots: threading.BoundedSemaphore = field(
-        default_factory=lambda: threading.BoundedSemaphore(MAX_SOURCE_CONCURRENCY),
-    )
+    priority_next_at: float = 0.0
+    priority_waiting: int = 0
     started_at: float = field(default_factory=time.monotonic)
     http_requests: int = 0
     rpc_calls: int = 0
     seconds: list[int] = field(default_factory=lambda: [-1] * 60)
     http_window: list[int] = field(default_factory=lambda: [0] * 60)
     calls_window: list[int] = field(default_factory=lambda: [0] * 60)
-    def acquire(self, interval: float, cost: int) -> None:
-        """Acquire response capacity only when this request may start."""
-        while True:
-            self.slots.acquire()
-            with self.lock:
-                now = time.monotonic()
-                delay = self.next_at - now
-                if delay <= 0:
-                    self.next_at = now + interval * cost
-                    return
-            self.slots.release()
-            time.sleep(delay)
+    def acquire(self, interval: float, cost: int, *, priority: bool = False) -> None:
+        """Acquire a concurrency slot and pacing budget when this request may start.
+
+        Background callers wait for the shared pacing clock, leave one slot to
+        priority callers, and yield while any priority caller waits. Priority
+        callers are paced among themselves and may run up to
+        _PRIORITY_DEBT_SECONDS ahead of the shared clock; their cost is still
+        charged to it, so the provider's long-run rate is unchanged. A
+        background caller that has yielded for _BACKGROUND_MAX_YIELD_SECONDS
+        competes on the priority pacing instead, so its wait stays bounded.
+        """
+        spend = interval * cost
+        started = time.monotonic()
+        with self.ready:
+            if priority:
+                self.priority_waiting += 1
+            try:
+                while True:
+                    now = time.monotonic()
+                    aged = not priority and now - started >= _BACKGROUND_MAX_YIELD_SECONDS
+                    if priority or aged:
+                        free = self.in_flight < (
+                            self.concurrency if priority else max(1, self.concurrency - 1)
+                        )
+                        delay = max(
+                            self.priority_next_at - now,
+                            self.next_at - now - _PRIORITY_DEBT_SECONDS,
+                        )
+                    else:
+                        free = (
+                            self.in_flight < max(1, self.concurrency - 1)
+                            and not self.priority_waiting
+                        )
+                        delay = self.next_at - now
+                    if free and delay <= 0:
+                        self.in_flight += 1
+                        if priority or aged:
+                            self.priority_next_at = now + spend
+                        self.next_at = max(self.next_at, now) + spend
+                        return
+                    timeout = delay if free else None
+                    if not priority and not aged:
+                        until_aged = started + _BACKGROUND_MAX_YIELD_SECONDS - now
+                        timeout = until_aged if timeout is None else min(timeout, until_aged)
+                    self.ready.wait(timeout)
+            finally:
+                if priority:
+                    self.priority_waiting -= 1
+                    self.ready.notify_all()
+
+    def release(self) -> None:
+        with self.ready:
+            self.in_flight -= 1
+            self.ready.notify_all()
 
 
     def record(self, calls: int) -> None:
@@ -112,6 +168,9 @@ class _SourceGate:
                 "rpc_calls": self.rpc_calls,
                 "http_rps": round(sum(self.http_window[i] for i in active) / window, 3),
                 "rpc_calls_per_second": round(sum(self.calls_window[i] for i in active) / window, 3),
+                # Seconds of already-granted pacing a new background request waits behind.
+                "backlog_seconds": round(max(0.0, self.next_at - now), 3),
+                "in_flight": self.in_flight,
             }
 
 
@@ -128,7 +187,7 @@ def _gate(url: str) -> _SourceGate:
         gate = _GATES.get(url)
         if gate is None:
             gate = _SourceGate(
-                slots=threading.BoundedSemaphore(_source_concurrency(url)),
+                concurrency=_source_concurrency(url),
             )
             _GATES[url] = gate
         return gate
@@ -746,6 +805,7 @@ class RoutedRpc:
         # The canonical lane frames a local archive source, so its headers
         # must come from a provider that is not that same local node.
         self._allow_local = lane != "canonical"
+        self._priority = lane in PRIORITY_LANES
 
     def _error(self, message: str, *, code: int | None = None) -> Exception:
         try:
@@ -786,7 +846,7 @@ class RoutedRpc:
         body = json.dumps(payload, separators=(",", ":"))
         calls = len(payload) if isinstance(payload, list) else 1
         gate = _gate(source.url)
-        gate.acquire(_minimum_interval(source.url), calls)
+        gate.acquire(_minimum_interval(source.url), calls, priority=self._priority)
         response: requests.Response | None = None
         session: requests.Session | None = None
         try:
@@ -811,7 +871,7 @@ class RoutedRpc:
         finally:
             if session is not None:
                 self._registry._release_session()
-            gate.slots.release()
+            gate.release()
         if len(raw) > MAX_RPC_RESPONSE_BYTES:
             raise self._error(
                 f"{source.name} response exceeds {MAX_RPC_RESPONSE_BYTES} bytes"
@@ -935,7 +995,7 @@ class RoutedRpc:
                 for index, expected in enumerate((query.get("topics") or ())[1:], 1):
                     if isinstance(expected, str):
                         params[f"topic{index}"] = expected
-                gate.acquire(0.20, 1)
+                gate.acquire(0.20, 1, priority=self._priority)
                 response: requests.Response | None = None
                 session: requests.Session | None = None
                 try:
@@ -956,7 +1016,7 @@ class RoutedRpc:
                         response.close()
                     if session is not None:
                         self._registry._release_session()
-                    gate.slots.release()
+                    gate.release()
                 if len(raw) > MAX_RPC_RESPONSE_BYTES:
                     raise self._error("blockscout explorer response is oversized")
                 payload = json.loads(raw)
