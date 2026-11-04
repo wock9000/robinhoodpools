@@ -192,7 +192,10 @@ def fork():
 
 @pytest.fixture(scope="module")
 def pools_db(tmp_path_factory):
-    path = tmp_path_factory.mktemp("market") / "pools.sqlite"
+    return _write_pools_db(tmp_path_factory.mktemp("market") / "pools.sqlite", POOL_ROWS)
+
+
+def _write_pools_db(path, rows):
     connection = sqlite3.connect(path)
     connection.executescript(
         "CREATE TABLE pools(id TEXT PRIMARY KEY, protocol TEXT NOT NULL, address TEXT NOT NULL, token0 TEXT NOT NULL, token1 TEXT NOT NULL,"
@@ -201,7 +204,7 @@ def pools_db(tmp_path_factory):
         "CREATE TABLE lp_v2_reserve_samples(pool_id TEXT, block_number INTEGER, tx_index INTEGER, log_index INTEGER, reserve0 TEXT, reserve1 TEXT);"
         "CREATE INDEX lp_v2_samples_order ON lp_v2_reserve_samples(pool_id,block_number,tx_index,log_index);"
     )
-    connection.executemany(f"INSERT INTO pools({POOL_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?)", POOL_ROWS)
+    connection.executemany(f"INSERT INTO pools({POOL_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?)", rows)
     connection.commit()
     connection.close()
     return path
@@ -273,6 +276,42 @@ def trade(core: TxCore, fork: Fork, intent: SwapIntent, *, policy: TxPolicy | No
     if intent.side is Side.BUY and fee.currency == intent.currency_in:
         assert fee.amount == intent.amount_in * quote.to_json()["fee_bps"] // 10_000
     return quote, fill
+
+
+def v2_weth_reserve(fork: Fork, pair: str) -> int:
+    token0 = "0x" + fork.call(pair, tc.selector("token0()"))[-20:].hex()
+    reserves = fork.call(pair, tc.selector("getReserves()"))
+    return int.from_bytes(reserves[0:32], "big") if token0 == WETH else int.from_bytes(reserves[32:64], "big")
+
+
+@pytest.fixture(scope="module")
+def v2_market(fork, tmp_path_factory):
+    """A V2-only route book over the deepest catalogued V2 pair whose token still sells back.
+
+    The pairs are real and drift: on 2026-11-03 the ASTRO pair held 5.1e15 wei WETH, so a fixed
+    1e16 buy was refused at 65% impact, and ASTRO no longer transferred into its pair (unsellable).
+    Trades are 1% of the chosen pair's WETH, far inside TxPolicy.max_impact_bps. The book holds
+    only that pair plus the USDG pools, so every token hop is the V2 pair.
+    """
+    usdg_rows = [row for row in POOL_ROWS if USDG in (row[3], row[4]) and {row[3], row[4]} <= {WETH, NATIVE, USDG}]
+    v2_rows = [row for row in POOL_ROWS if row[1] == "v2"]
+    refusals = []
+    for row in sorted(v2_rows, key=lambda row: v2_weth_reserve(fork, row[2]), reverse=True):
+        pair, token = row[2], row[4] if row[3] == WETH else row[3]
+        eth = v2_weth_reserve(fork, pair) // 100
+        if eth < 10**12:
+            refusals.append(f"{pair}: {eth * 100} wei WETH is too thin")
+            continue
+        path = _write_pools_db(tmp_path_factory.mktemp("v2-market") / "pools.sqlite", [row, *usdg_rows])
+        core = TxCore(fork.rpc, RouteBook(_reader_for(path), fork.rpc), TxPolicy(fee_bps=75, fee_recipient=FEE_TO))
+        assert core.enabled, core.mismatches
+        try:
+            core.quote(swap(fork.user, Side.BUY, token, NATIVE, eth))
+        except TxRefusal as refusal:
+            refusals.append(f"{pair}: {refusal}")
+            continue
+        return core, token, eth
+    pytest.skip("no catalogued V2 pair is tradable on the fork: " + "; ".join(refusals))
 
 
 def test_holder_tiers_pay_exact_fee_and_receive_quoted_output(core, fork, tmp_path):
@@ -469,14 +508,17 @@ def test_buying_a_token_that_cannot_be_sold_back_is_refused(core, fork):
     assert "sell_unverified" not in quote.warnings
 
 
-def test_v2_token_buy_and_sell(core, fork):
-    quote, _ = trade(core, fork, swap(fork.user, Side.BUY, ASTRO, NATIVE, 10**16))
+def test_v2_token_buy_and_sell(v2_market, fork):
+    core, token, eth = v2_market
+    quote, _ = trade(core, fork, swap(fork.user, Side.BUY, token, NATIVE, eth))
     assert [h.pool.venue.value for h in quote.route.hops] == ["v2"]
-    quote, _ = trade(core, fork, swap(fork.user, Side.BUY, ASTRO, USDG, 10 * 10**6))
+    usdg_before = fork.balance(USDG, fork.user)
+    fork.get_usdg(eth)
+    quote, _ = trade(core, fork, swap(fork.user, Side.BUY, token, USDG, fork.balance(USDG, fork.user) - usdg_before))
     assert [h.pool.venue.value for h in quote.route.hops][-1] == "v2"
-    held = fork.balance(ASTRO, fork.user)
-    trade(core, fork, swap(fork.user, Side.SELL, ASTRO, NATIVE, held // 2))
-    trade(core, fork, swap(fork.user, Side.SELL, ASTRO, USDG, held // 4))
+    held = fork.balance(token, fork.user)
+    trade(core, fork, swap(fork.user, Side.SELL, token, NATIVE, held // 2))
+    trade(core, fork, swap(fork.user, Side.SELL, token, USDG, held // 4))
 
 
 @pytest.mark.parametrize(
@@ -485,7 +527,6 @@ def test_v2_token_buy_and_sell(core, fork):
         (Side.BUY, ITH, NATIVE, 10**16),
         (Side.SELL, ITH, NATIVE, 10**18),
         (Side.SELL, PIPEDOG, USDG, 10**12),
-        (Side.SELL, ASTRO, NATIVE, 10**6),
         (Side.BUY, PIPEDOG, NATIVE, 10**15),
     ],
 )
@@ -494,7 +535,18 @@ def test_min_out_plus_one_reverts(core, fork, side, token, quote_currency, amoun
         if fork.balance(token, fork.user) == 0:
             trade(core, fork, swap(fork.user, Side.BUY, token, NATIVE, 10**16))
         amount = fork.balance(token, fork.user) // 10
-    quote = core.quote(swap(fork.user, side, token, quote_currency, amount, slippage_bps=0))
+    assert_min_out_plus_one_reverts(core, fork, swap(fork.user, side, token, quote_currency, amount, slippage_bps=0))
+
+
+def test_v2_min_out_plus_one_reverts(v2_market, fork):
+    core, token, eth = v2_market
+    if fork.balance(token, fork.user) == 0:
+        trade(core, fork, swap(fork.user, Side.BUY, token, NATIVE, eth))
+    assert_min_out_plus_one_reverts(core, fork, swap(fork.user, Side.SELL, token, NATIVE, fork.balance(token, fork.user) // 10, slippage_bps=0))
+
+
+def assert_min_out_plus_one_reverts(core: TxCore, fork: Fork, intent: SwapIntent) -> None:
+    quote = core.quote(intent)
     sig = fork.sign(quote.step("permit").typed_data) if quote.plan.permit else None
     exact = core.swaps.finalize(quote.plan, quote.amounts.net_out, Signatures(permit=sig))
     assert core.sim.run(fork.user, (), Call(exact.to, exact.calldata(), exact.value), "latest").ok
