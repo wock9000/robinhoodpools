@@ -4,6 +4,7 @@ Every test builds the same 41-day history (V3 anchor, V4, V2 and a cross pool
 with LP positions opened and closed across the 35-day cutoff), copies the
 database, prunes one copy and compares the copies.
 """
+import json
 import sqlite3
 import time
 from unittest import mock
@@ -166,6 +167,18 @@ def prune_all(app, cutoff):
     batches = 0
     while True:
         batch = app.store.prune_sample_batch(cutoff, limit=7, pool_limit=2)
+        assert not batch.busy
+        batches += 1
+        if batch.complete:
+            return batches
+
+
+def prune_history_all(app, floor_block, floor_timestamp):
+    batches = 0
+    while True:
+        batch = app.store.prune_history_batch(
+            floor_block, floor_timestamp, limit=7,
+        )
         assert not batch.busy
         batches += 1
         if batch.complete:
@@ -473,4 +486,43 @@ def test_prune_rest_counts_writer_time_not_writer_waits(twins):
     finally:
         release.set()
         worker.join(timeout=5)
+        app.close()
+
+
+def test_history_pruning_keeps_retained_answers_and_closed_summaries(twins):
+    now, control, pruned, _next_block = twins
+    reference = service(control)
+    app = service(pruned)
+    cutoff = now - 7 * DAY
+    try:
+        floor = app.store.read().execute(
+            "SELECT block_number,timestamp FROM events INDEXED BY lp_events_time "
+            "WHERE timestamp>=? ORDER BY timestamp,block_number LIMIT 1",
+            (cutoff,),
+        ).fetchone()
+        assert floor is not None
+        before = {
+            window: normalize(api_snapshot(reference, now)[f"tape:{window}"])
+            for window in ("1h", "24h", "7d")
+        }
+        summaries = {
+            table: table_rows(reference, table)
+            for table in ("lp_accounting_positions", "lp_accounting_episodes")
+        }
+        assert prune_history_all(app, floor["block_number"], floor["timestamp"]) > 1
+        for window in before:
+            assert normalize(api_snapshot(app, now)[f"tape:{window}"]) == before[window]
+        for table, expected in summaries.items():
+            assert table_rows(app, table) == expected
+        metadata = app.store.read().execute(
+            "SELECT value FROM metadata WHERE key='history_floor_block'"
+        ).fetchone()
+        assert json.loads(metadata[0]) == floor["block_number"]
+        # A completed sweep is idempotent and cannot queue an older history
+        # interval for a subsequent restart.
+        assert app.store.prune_history_batch(
+            floor["block_number"], floor["timestamp"],
+        ).complete
+    finally:
+        reference.close()
         app.close()

@@ -32,13 +32,18 @@ uv run rhpools \
   --rpc-url https://rpc.mainnet.chain.robinhood.com \
   --data-dir ~/.local/share/rhpools \
   --database ~/.local/share/rhpools/lp_market.sqlite \
-  --history-days 30 \
+  --history-days 7 \
+  --retention-days 7 \
   --disk-reserve-gib 4
 ```
 
 Run `uv run rhpools --help` for the installed command's complete option list. `--public-origin` may be repeated to authorize an additional browser origin for protected POST requests. Keep the listener on loopback unless you have separately designed authentication, TLS, proxy limits, and host-level access control.
 
-The equivalent environment settings are `RHP_HTTP_HOST`, `RHP_HTTP_PORT`, `RHP_RPC_URL`, `RHP_DATA_DIR`, `RHP_DATABASE`, `LP_HISTORY_DAYS`, and `LP_DISK_RESERVE_GIB`. Additional origins and preparation of supported direct-pool transactions require explicit CLI flags; there is no environment switch that silently enables preparation.
+The equivalent environment settings are `RHP_HTTP_HOST`, `RHP_HTTP_PORT`, `RHP_RPC_URL`, `RHP_DATA_DIR`, `RHP_DATABASE`, `LP_HISTORY_DAYS`, `LP_RETENTION_DAYS`, and `LP_DISK_RESERVE_GIB`. Additional origins and preparation of supported direct-pool transactions require explicit CLI flags; there is no environment switch that silently enables preparation.
+
+`--retention-days` / `LP_RETENTION_DAYS` (default 7, `0` disables) bounds canonical tape rows. A background writer deletes closed-position effects, transactions, blocks, event search entries, derived samples, and old price marks with the source events. It preserves daily buckets, catalog data, summaries, current pool state, and all source events for active positions. Windows beyond the retained tape horizon report partial canonical coverage while their bucket and accounting summaries remain available.
+
+SQLite uses 128 MiB for its writer cache, 16 MiB for each request reader, 64 MiB for accounting preparation workers, and a 1 GiB mmap cap. Set `LP_SQLITE_WRITER_CACHE_MIB`, `LP_SQLITE_READER_CACHE_MIB`, `LP_SQLITE_PREPARE_CACHE_MIB`, or `LP_SQLITE_MMAP_MIB` only after measuring a concrete query regression.
 
 `--sample-retention-days` / `LP_SAMPLE_RETENTION_DAYS` (default 35, `0` disables) bounds the raw per-event price and V2 reserve samples. A background thread prunes older samples in small batches, keeping each pool's first sample and its newest one before the cutoff; lookups older than the cutoff read the canonical events the samples came from, so API answers and accounting are unchanged. Deleted rows go to SQLite's freelist and are reused before the file grows. See `.audit/design/prune/PRUNE.md`.
 

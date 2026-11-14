@@ -156,6 +156,13 @@ DEFAULT_WAL_RESET_BYTES = 1024 ** 3
 # every restart into hours of recovery that a watchdog then interrupts.
 DEFAULT_WAL_HOLD_BYTES = 4 * 1024 ** 3
 DEFAULT_STORAGE_RECOVERY_BYTES = 1024 ** 3
+# Canonical rows feed the public tape. Seven days covers the public short
+# horizon; longer overview windows use retained daily buckets and accounting
+# summaries. Zero disables canonical-history pruning.
+DEFAULT_HISTORY_RETENTION_DAYS = 7
+HISTORY_PRUNE_TICK_BUDGET_S = 0.25
+HISTORY_PRUNE_MIN_REST_S = 0.05
+HISTORY_PRUNE_REST_S = 3600.0
 # Raw price/reserve samples older than this are pruned (0 disables). The API's
 # longest rolling window is 30 days; 35 matches the minute/hour bucket rule.
 DEFAULT_SAMPLE_RETENTION_DAYS = 35
@@ -417,6 +424,7 @@ class MarketIndexer:
         wal_reset_bytes: int = DEFAULT_WAL_RESET_BYTES,
         wal_hold_bytes: int = DEFAULT_WAL_HOLD_BYTES,
         maintenance_interval_s: float = WAL_CHECKPOINT_INTERVAL_S,
+        retention_days: int = DEFAULT_HISTORY_RETENTION_DAYS,
         sample_retention_days: int = DEFAULT_SAMPLE_RETENTION_DAYS,
         current_observer: Any | None = None,
         accounting_projector: Callable[[], bool] | None = None,
@@ -443,6 +451,8 @@ class MarketIndexer:
             raise ValueError("wal_hold_bytes must not be below wal_reset_bytes")
         if maintenance_interval_s <= 0:
             raise ValueError("maintenance_interval_s must be positive")
+        if retention_days < 0:
+            raise ValueError("retention_days must be nonnegative")
         if sample_retention_days < 0:
             raise ValueError("sample_retention_days must be nonnegative")
         self.store = store
@@ -471,6 +481,7 @@ class MarketIndexer:
         self.wal_reset_bytes = int(wal_reset_bytes)
         self.wal_hold_bytes = int(wal_hold_bytes)
         self.maintenance_interval_s = float(maintenance_interval_s)
+        self.retention_days = int(retention_days)
         self.sample_retention_days = int(sample_retention_days)
         self._rpc_factory = rpc if callable(rpc) and not hasattr(rpc, "call") else None
         self._owns_clients = rpc is None or (callable(rpc) and not hasattr(rpc, "call"))
@@ -2819,6 +2830,12 @@ class MarketIndexer:
                         target=self._run_with_writer_priority,
                         args=("background", self._sample_prune_run),
                         name="lp-market-sample-prune",
+                        daemon=True,
+                    ),
+                    threading.Thread(
+                        target=self._run_with_writer_priority,
+                        args=("background", self._history_prune_run),
+                        name="lp-market-history-prune",
                         daemon=True,
                     ),
                     threading.Thread(
@@ -5416,6 +5433,65 @@ class MarketIndexer:
                     and self._wal_held_since is None
                 )
             )
+    def _history_prune_tick(self) -> tuple[bool, float]:
+        """Spend one bounded writer budget pruning canonical history."""
+        cutoff = int(time.time()) - self.retention_days * 86_400
+        row = self.store.read().execute(
+            "SELECT block_number,timestamp FROM events INDEXED BY lp_events_time "
+            "WHERE timestamp>=? ORDER BY timestamp,block_number,tx_index,log_index LIMIT 1",
+            (cutoff,),
+        ).fetchone()
+        if row is None:
+            return True, 0.0
+        floor_block, floor_timestamp = int(row["block_number"]), int(row["timestamp"])
+        deadline = time.monotonic() + HISTORY_PRUNE_TICK_BUDGET_S
+        removed = 0
+        held = 0.0
+        complete = False
+        while not self._stop.is_set():
+            batch = self.store.prune_history_batch(
+                floor_block, floor_timestamp, blocking=True,
+            )
+            removed += batch.removed
+            held += batch.seconds
+            complete = batch.complete
+            if complete or time.monotonic() >= deadline:
+                break
+        if removed or complete:
+            with self._status_lock:
+                total = int(self._runtime_status.get("history_prune_removed") or 0)
+            self._set_runtime(
+                "history_prune",
+                history_prune_removed=total + removed,
+                history_prune_retention_days=self.retention_days,
+                history_prune_floor_block=floor_block,
+                history_prune_floor_timestamp=floor_timestamp,
+                **({"history_prune_swept_at": time.time()} if complete else {}),
+            )
+        return complete, held
+
+    def _history_prune_rest(self, complete: bool, held: float) -> float:
+        if complete:
+            return HISTORY_PRUNE_REST_S
+        with self._status_lock:
+            caught_up = self._runtime_status.get("recent_catchup_priority") is False
+        if caught_up:
+            return HISTORY_PRUNE_MIN_REST_S
+        return max(HISTORY_PRUNE_MIN_REST_S, 3 * held)
+
+    def _history_prune_run(self) -> None:
+        while self.retention_days and not self._stop.is_set():
+            if not self._retention_prune_allowed():
+                self._stop.wait(5.0)
+                continue
+            try:
+                complete, held = self._history_prune_tick()
+            except Exception:
+                logger.exception("history pruning failed")
+                self._stop.wait(300.0)
+                continue
+            self._stop.wait(self._history_prune_rest(complete, held))
+
 
     def _sample_prune_tick(self) -> tuple[bool, float]:
         """Spend one budget of waited background turns on sample pruning.

@@ -1555,7 +1555,7 @@ class LPMarketService:
                  history_disk_reserve_bytes=4 * 1024**3, start=True, deferred_start=True,
                  rollup_replica_dir: str | Path | None = None,
                  rollup_replica_reserve_bytes: int | None = None,
-                 sample_retention_days: int | None = None):
+                 retention_days: int = 7, sample_retention_days: int | None = None):
         from .lp_market_store import MarketStore
         from .lp_market_index import DEFAULT_SAMPLE_RETENTION_DAYS, MarketIndexer
         from .lp_market_accounting import AccountBook
@@ -1586,6 +1586,7 @@ class LPMarketService:
         self.indexer = MarketIndexer(
             self.store, market, rpc_url, history_days=history_days,
             history_disk_reserve_bytes=history_disk_reserve_bytes, v3_balances=True,
+            retention_days=retention_days,
             sample_retention_days=(
                 DEFAULT_SAMPLE_RETENTION_DAYS if sample_retention_days is None
                 else sample_retention_days
