@@ -163,6 +163,7 @@ DEFAULT_HISTORY_RETENTION_DAYS = 7
 HISTORY_PRUNE_TICK_BUDGET_S = 0.25
 HISTORY_PRUNE_MIN_REST_S = 0.05
 HISTORY_PRUNE_REST_S = 3600.0
+HISTORY_PRUNE_BACKFILL_WAIT_S = 300.0
 # Raw price/reserve samples older than this are pruned (0 disables). The API's
 # longest rolling window is 30 days; 35 matches the minute/hour bucket rule.
 DEFAULT_SAMPLE_RETENTION_DAYS = 35
@@ -5433,8 +5434,17 @@ class MarketIndexer:
                     and self._wal_held_since is None
                 )
             )
-    def _history_prune_tick(self) -> tuple[bool, float]:
-        """Spend one bounded writer budget pruning canonical history."""
+    def _history_prune_tick(self) -> tuple[bool, float] | None:
+        """Spend one bounded writer budget pruning canonical history.
+
+        Returns None while the history backfill is still running: until it
+        reaches its target, the oldest stored event is not the retention
+        floor, and advancing the floor (or the history cursor) would discard
+        the backfill as it lands.
+        """
+        history = self.store.cursor("history")
+        if not isinstance(history, dict) or not history.get("complete"):
+            return None
         cutoff = int(time.time()) - self.retention_days * 86_400
         row = self.store.read().execute(
             "SELECT block_number,timestamp FROM events INDEXED BY lp_events_time "
@@ -5485,12 +5495,15 @@ class MarketIndexer:
                 self._stop.wait(5.0)
                 continue
             try:
-                complete, held = self._history_prune_tick()
+                result = self._history_prune_tick()
             except Exception:
                 logger.exception("history pruning failed")
                 self._stop.wait(300.0)
                 continue
-            self._stop.wait(self._history_prune_rest(complete, held))
+            if result is None:
+                self._stop.wait(HISTORY_PRUNE_BACKFILL_WAIT_S)
+                continue
+            self._stop.wait(self._history_prune_rest(*result))
 
 
     def _sample_prune_tick(self) -> tuple[bool, float]:

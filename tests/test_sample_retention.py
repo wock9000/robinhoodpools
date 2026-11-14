@@ -526,3 +526,48 @@ def test_history_pruning_keeps_retained_answers_and_closed_summaries(twins):
     finally:
         reference.close()
         app.close()
+
+
+def test_history_prune_waits_until_backfill_reaches_its_target(twins):
+    # A fresh database holds only recent rows while the history lane is still
+    # walking back toward its target, so the oldest stored event is not the
+    # retention floor. Pruning then must neither delete the backfill nor mark
+    # the history cursor complete.
+    now, _control, pruned, next_block = twins
+    app = service(pruned)
+    count = "SELECT COUNT(*) FROM events"
+    try:
+        app.indexer.retention_days = 7
+        backfilling = {
+            "next_to": FIRST_BLOCK + 40, "low_block": FIRST_BLOCK + 41,
+            "target_block": FIRST_BLOCK, "target_timestamp": now - 40 * DAY,
+            "target_pending": False, "origin_head": next_block,
+            "complete": False, "has_coverage": True,
+        }
+        app.store.ingest(
+            [header(next_block, now)], [], lane="history",
+            cursor={**backfilling, "block_hash": header(next_block, now)["hash"]},
+        )
+        before = app.store.read().execute(count).fetchone()[0]
+
+        assert app.indexer._history_prune_tick() is None
+        assert app.store.read().execute(count).fetchone()[0] == before
+        cursor = app.store.cursor("history")
+        assert cursor["complete"] is False
+        assert cursor["target_block"] == FIRST_BLOCK
+        assert app.store.read().execute(
+            "SELECT 1 FROM metadata WHERE key='history_floor_block'"
+        ).fetchone() is None
+
+        app.store.ingest(
+            [header(next_block + 1, now + 60)], [], lane="history",
+            cursor={
+                **backfilling, "complete": True,
+                "block_hash": header(next_block + 1, now + 60)["hash"],
+            },
+        )
+        while not app.indexer._history_prune_tick()[0]:
+            pass
+        assert app.store.read().execute(count).fetchone()[0] < before
+    finally:
+        app.close()
