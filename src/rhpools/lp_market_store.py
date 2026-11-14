@@ -144,6 +144,19 @@ _LEGACY_INDEXES_UNREAD_SINCE = 19
 SAMPLE_PRUNE_TABLES = ("lp_price_samples", "lp_v2_reserve_samples")
 
 
+def _sqlite_mib(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+    return max(1, value)
+
+
+_SQLITE_WRITER_CACHE_MIB = _sqlite_mib("LP_SQLITE_WRITER_CACHE_MIB", 128)
+_SQLITE_READER_CACHE_MIB = _sqlite_mib("LP_SQLITE_READER_CACHE_MIB", 16)
+_SQLITE_MMAP_MIB = _sqlite_mib("LP_SQLITE_MMAP_MIB", 1024)
+
+
 class SamplePruneBatch(NamedTuple):
     removed: int
     complete: bool
@@ -151,6 +164,13 @@ class SamplePruneBatch(NamedTuple):
     # Seconds holding the writer turn (work plus commit), excluding the wait.
     seconds: float = 0.0
 
+
+class RollingPruneBatch(NamedTuple):
+    removed: int
+    complete: bool
+    busy: bool = False
+    # Seconds holding the writer turn (work plus commit), excluding the wait.
+    seconds: float = 0.0
 
 class MarketStoreError(RuntimeError):
     """Base class for durable market-store failures."""
@@ -405,14 +425,13 @@ class MarketStore:
         )
         connection.execute(f"PRAGMA busy_timeout={0 if checkpoint else 5000}")
         connection.execute("PRAGMA foreign_keys=ON")
-        # The writer benefits from a large projection working set. Reader pages
-        # come through the shared mmap, but the private cache is also the
-        # sorter's memory budget: at 1 MiB every window aggregate and owner
-        # projection spilled sort runs to /var/tmp (75 GB of cancelled writes
-        # in 40 minutes, measured). Readers are per-thread and closed after
-        # each request, at most api_slots of them.
-        connection.execute(f"PRAGMA cache_size=-{1048576 if writer else 131072}")
-        connection.execute("PRAGMA mmap_size=34359738368")
+        # Bound every connection. The old 1 GiB writer cache, 128 MiB reader
+        # cache and 32 GiB mmap made a modest HTTP burst look like a 45 GiB RSS
+        # process on a large database. Operators may raise these three knobs
+        # when a measured query needs it.
+        cache_mib = _SQLITE_WRITER_CACHE_MIB if writer else _SQLITE_READER_CACHE_MIB
+        connection.execute(f"PRAGMA cache_size=-{cache_mib * 1024}")
+        connection.execute(f"PRAGMA mmap_size={_SQLITE_MMAP_MIB * 1024**2}")
         if writer:
             connection.execute("PRAGMA journal_mode=WAL")
             # NORMAL fsyncs the WAL at checkpoint rather than every commit. A
@@ -1574,6 +1593,192 @@ class MarketStore:
             cursor = {**cursor, "pool": pool_id}
         self._set_metadata(connection, "sample_prune_cursor", cursor)
         return removed, False
+
+    def prune_history_batch(
+        self, floor_block: int, floor_timestamp: int, *, limit: int = 512,
+        blocking: bool = False,
+    ) -> RollingPruneBatch:
+        """Delete one bounded batch of history no retained reader can use.
+
+        Events of an active position stay canonical: accounting can replay their
+        position without inventing its opening state. Closed positions keep only
+        their materialized summaries. The cursor is monotonic so a restart does
+        not rescan the old side of a multi-terabyte event index.
+        """
+        if limit < 1 or limit > 512:
+            raise ValueError("history prune batch must delete 1 to 512 events")
+        with self.transaction(priority="background", blocking=blocking) as connection:
+            if connection is None:
+                return RollingPruneBatch(0, False, busy=True)
+            started = time.monotonic()
+            removed, complete = self._prune_history_rows(
+                connection, int(floor_block), int(floor_timestamp), limit,
+            )
+        return RollingPruneBatch(
+            removed, complete, seconds=time.monotonic() - started,
+        )
+
+    def _prune_history_rows(
+        self, connection: sqlite3.Connection, floor_block: int,
+        floor_timestamp: int, limit: int,
+    ) -> tuple[int, bool]:
+        if floor_block <= 0:
+            return 0, True
+        account_tables = connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
+            "AND name IN ('lp_accounting_event_keys','lp_accounting_positions',"
+            "'lp_accounting_effects','lp_accounting_episodes','lp_accounting_tx_costs')",
+        ).fetchone()[0] == 5
+        cursor = self._metadata(connection, "history_prune_cursor", {})
+        if not isinstance(cursor, dict):
+            cursor = {}
+        prior_floor = int(cursor.get("floor_block") or 0)
+        if floor_block < prior_floor:
+            floor_block = prior_floor
+        after = (
+            int(cursor.get("block_number") or -1),
+            int(cursor.get("event_id") or 0),
+        )
+        active = (
+            "EXISTS(SELECT 1 FROM lp_accounting_event_keys k "
+            "JOIN lp_accounting_positions p ON p.position_key=k.position_key "
+            "WHERE k.event_id=events.id AND p.active_episode_id IS NOT NULL)"
+            if account_tables else "0"
+        )
+        rows = connection.execute(
+            "SELECT id,block_number,tx_hash FROM events INDEXED BY events_block_idx "
+            "WHERE block_number<? AND (block_number,id)>(?,?) AND NOT " + active
+            + " ORDER BY block_number,id LIMIT ?",
+            (floor_block, *after, limit),
+        ).fetchall()
+        if not rows:
+            # History coverage is a promise to refill an interval. Once its
+            # canonical rows are gone, retaining that promise would make a
+            # restart fetch them again.
+            connection.execute(
+                "DELETE FROM coverage_intervals WHERE lane='history' AND end_block<?",
+                (floor_block,),
+            )
+            history = self._metadata(connection, "cursor:history", {})
+            if isinstance(history, dict):
+                updated = dict(history)
+                updated["target_block"] = max(
+                    floor_block, int(updated.get("target_block") or 0),
+                )
+                updated["low_block"] = max(
+                    floor_block, int(updated.get("low_block") or 0),
+                )
+                updated["complete"] = True
+                self._set_metadata(connection, "cursor:history", updated)
+            self._set_metadata(connection, "history_floor_block", floor_block)
+            self._set_metadata(connection, "history_floor_timestamp", floor_timestamp)
+            self._set_metadata(connection, "history_prune_cursor", {
+                "floor_block": floor_block, "block_number": after[0],
+                "event_id": after[1],
+            })
+            return 0, True
+
+        ids = tuple(int(row["id"]) for row in rows)
+        tx_hashes = tuple(str(row["tx_hash"]) for row in rows)
+        marks = ",".join("?" for _ in ids)
+        if account_tables:
+            # Materialized closed episodes remain queryable. The raw effect,
+            # event key and gas row do not. An open episode never reaches this
+            # batch because its source event is protected by the query above.
+            closed_effects = (
+                "event_id IN (" + marks + ") AND (episode_id IS NULL OR EXISTS("
+                "SELECT 1 FROM lp_accounting_episodes ep WHERE ep.id="
+                "lp_accounting_effects.episode_id AND ep.closed_at<?))"
+            )
+            connection.execute(
+                "DELETE FROM lp_accounting_tx_costs WHERE tx_hash IN ("
+                + ",".join("?" for _ in tx_hashes) + ") AND NOT EXISTS("
+                "SELECT 1 FROM lp_accounting_effects x JOIN "
+                "lp_accounting_episodes ep ON ep.id=x.episode_id "
+                "WHERE x.tx_hash=lp_accounting_tx_costs.tx_hash "
+                "AND ep.closed_at IS NULL)",
+                tx_hashes,
+            )
+            connection.execute(
+                "DELETE FROM lp_accounting_effects WHERE " + closed_effects,
+                (*ids, floor_timestamp),
+            )
+            connection.execute(
+                "DELETE FROM lp_accounting_event_keys WHERE event_id IN (" + marks + ")",
+                ids,
+            )
+
+        for table in (*SAMPLE_PRUNE_TABLES, "lp_price_marks"):
+            if connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table,),
+            ).fetchone() is None:
+                continue
+            if table == "lp_price_marks":
+                connection.execute(
+                    "DELETE FROM lp_price_marks WHERE event_id IN (" + marks + ") "
+                    "AND EXISTS(SELECT 1 FROM lp_price_marks newer WHERE "
+                    "newer.token=lp_price_marks.token AND newer.block_number<? "
+                    "AND (newer.block_number,newer.tx_index,newer.log_index)>"
+                    "(lp_price_marks.block_number,lp_price_marks.tx_index,"
+                    "lp_price_marks.log_index))",
+                    (*ids, floor_block),
+                )
+            else:
+                connection.execute(
+                    f"DELETE FROM {table} WHERE event_id IN ({marks})", ids,
+                )
+        removed_pending = connection.execute(
+            "DELETE FROM pending_reprojection WHERE event_id IN (" + marks + ")", ids,
+        ).rowcount
+        if removed_pending:
+            self._bump(connection, "pending_reprojection", -removed_pending)
+        connection.execute("DELETE FROM events WHERE id IN (" + marks + ")", ids)
+        self._bump(connection, "indexed_events", -len(ids))
+        # Transaction search entries are the only search entities owned by raw
+        # event history. Owners, positions, pools and token catalog entries are
+        # durable summary/catalog data and deliberately remain.
+        for tx_hash in tx_hashes:
+            if connection.execute(
+                "SELECT 1 FROM events WHERE tx_hash=? LIMIT 1", (tx_hash,),
+            ).fetchone() is None:
+                connection.execute(
+                    "DELETE FROM lp_search_entities WHERE kind='transaction' AND id=?",
+                    (tx_hash.lower(),),
+                )
+        removed_transactions = connection.execute(
+            "DELETE FROM transactions WHERE tx_hash IN (" + ",".join("?" for _ in tx_hashes)
+            + ") AND block_number<? AND NOT EXISTS(SELECT 1 FROM events "
+            "WHERE events.tx_hash=transactions.tx_hash)",
+            (*tx_hashes, floor_block),
+        ).rowcount
+        if removed_transactions:
+            self._bump(connection, "indexed_transactions", -removed_transactions)
+        removed_enrichment = connection.execute(
+            "DELETE FROM pending_enrichment WHERE block_number<? AND NOT EXISTS("
+            "SELECT 1 FROM events WHERE events.tx_hash=pending_enrichment.tx_hash)",
+            (floor_block,),
+        ).rowcount
+        if removed_enrichment:
+            self._bump(connection, "pending_enrichment", -removed_enrichment)
+        removed_balances = connection.execute(
+            "DELETE FROM pending_balances WHERE block_number<? AND NOT EXISTS("
+            "SELECT 1 FROM events WHERE events.pool_id=pending_balances.pool_id "
+            "AND events.block_number=pending_balances.block_number)",
+            (floor_block,),
+        ).rowcount
+        if removed_balances:
+            self._bump(connection, "pending_balances", -removed_balances)
+        connection.execute(
+            "DELETE FROM blocks WHERE number<? AND NOT EXISTS("
+            "SELECT 1 FROM events WHERE events.block_number=blocks.number)",
+            (floor_block,),
+        )
+        self._set_metadata(connection, "history_prune_cursor", {
+            "floor_block": floor_block, "block_number": int(rows[-1]["block_number"]),
+            "event_id": int(rows[-1]["id"]),
+        })
+        return len(rows), False
 
     @contextlib.contextmanager
     def transaction(

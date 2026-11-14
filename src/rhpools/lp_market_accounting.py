@@ -20,6 +20,7 @@ import logging
 import math
 import multiprocessing
 from multiprocessing.synchronize import Event
+import os
 from pathlib import Path
 import sqlite3
 import threading
@@ -883,10 +884,10 @@ class _PreparationReader:
         self._connection.create_function(
             "state_json_digest", 1, state_json_digest, deterministic=True,
         )
-        # Position replays sort 50k-115k events; the default 2 MiB cache
-        # spilled every one of them and re-read pages without the mmap.
-        self._connection.execute("PRAGMA cache_size=-262144")
-        self._connection.execute("PRAGMA mmap_size=34359738368")
+        cache_mib = max(1, int(os.environ.get("LP_SQLITE_PREPARE_CACHE_MIB", "64")))
+        mmap_mib = max(1, int(os.environ.get("LP_SQLITE_MMAP_MIB", "1024")))
+        self._connection.execute(f"PRAGMA cache_size=-{cache_mib * 1024}")
+        self._connection.execute(f"PRAGMA mmap_size={mmap_mib * 1024**2}")
 
     def read(self) -> sqlite3.Connection:
         return self._connection

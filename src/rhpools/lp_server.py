@@ -300,6 +300,7 @@ class Runtime:
                     None if args.rollup_replica_reserve_gib is None
                     else int(args.rollup_replica_reserve_gib * 1024**3)
                 ),
+                retention_days=args.retention_days,
                 sample_retention_days=args.sample_retention_days,
             )
             self._resources.callback(self.lp.close)
@@ -1243,6 +1244,11 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--data-dir", default=os.environ.get("RHP_DATA_DIR", str(Path.home() / ".local/share/rhpools")))
     ap.add_argument("--database", default=os.environ.get("RHP_DATABASE"))
     ap.add_argument("--history-days", type=int, default=int(os.environ.get("LP_HISTORY_DAYS", "30")))
+    ap.add_argument(
+        "--retention-days", type=int,
+        default=int(os.environ.get("LP_RETENTION_DAYS", "7")),
+        help="retain canonical tape rows for this many days; 0 disables pruning",
+    )
     ap.add_argument("--disk-reserve-gib", type=float, default=float(os.environ.get("LP_DISK_RESERVE_GIB", "4")))
     # The owner-activity replica is a full temporary copy of the accounting
     # inputs; this puts it (and its reserve check) on another filesystem.
