@@ -200,3 +200,35 @@ def test_decode_revert_string_and_wrapped():
     failed = tc.selector("ExecutionFailed(uint256,bytes)") + encode(["uint256", "bytes"], [3, bytes.fromhex("5bf6f916")])
     assert decode_revert(failed).kind == "expired"
     assert decode_revert(failed).detail.startswith("command 3")
+
+
+@pytest.mark.parametrize("details_signature,kind", [
+    ("ERC20TransferFailed()", "unknown"),
+    ("NativeTransferFailed()", "unknown"),
+    ("SubscriptionReverted(address,bytes)", "unknown"),
+    ("ModifyLiquidityNotificationReverted(address,bytes)", "unknown"),
+    ("BurnNotificationReverted(address,bytes)", "unknown"),
+    ("HookCallFailed()", "hook_reverted"),
+    (None, "hook_reverted"),
+])
+@pytest.mark.parametrize("router_wrapped", [False, True])
+def test_decode_revert_wrapped_call_context(details_signature, kind, router_wrapped):
+    from eth_abi import encode
+
+    # Synthetic ABI payloads: subscriber details contain only the error selector,
+    # not the arguments from its declaration. No captured execution data is needed.
+    target = "0x1111111111111111111111111111111111111111"
+    details = tc.selector(details_signature) if details_signature else b""
+    wrapped = tc.selector("WrappedError(address,bytes4,bytes,bytes)") + encode(
+        ["address", "bytes4", "bytes", "bytes"],
+        [target, tc.selector("transfer(address,uint256)"), b"\x01\x02", details],
+    )
+    if router_wrapped:
+        wrapped = tc.selector("ExecutionFailed(uint256,bytes)") + encode(
+            ["uint256", "bytes"], [3, wrapped]
+        )
+    decoded = decode_revert(wrapped)
+    assert decoded.kind == kind
+    assert decoded.selector == "0x90bfb865"
+    prefix = "command 3: " if router_wrapped else ""
+    assert decoded.detail == f"{prefix}{target} a9059cbb 0102"

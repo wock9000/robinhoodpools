@@ -876,6 +876,15 @@ class RevertKind:
 _ERROR_STRING = selector("Error(string)")
 _WRAPPED_ERROR = selector("WrappedError(address,bytes4,bytes,bytes)")
 _EXECUTION_FAILED = selector("ExecutionFailed(uint256,bytes)")
+# WrappedError details that name a call other than a hook: PoolManager token/native transfers and
+# PositionManager subscriber notifications. Other details (HookCallFailed, empty) keep "hook_reverted".
+_NON_HOOK_WRAPPED_DETAILS = frozenset(selector(s) for s in (
+    "ERC20TransferFailed()",
+    "NativeTransferFailed()",
+    "SubscriptionReverted(address,bytes)",
+    "ModifyLiquidityNotificationReverted(address,bytes)",
+    "BurnNotificationReverted(address,bytes)",
+))
 _KNOWN_SELECTORS: dict[bytes, str] = {
     selector("TransactionDeadlinePassed()"): "expired",
     selector("DeadlinePassed(uint256)"): "expired",
@@ -931,10 +940,11 @@ def decode_revert(data: bytes) -> RevertKind:
         return RevertKind(inner_kind.kind, inner_kind.selector, f"command {index}: {inner_kind.detail}".strip())
     if sel == _WRAPPED_ERROR:
         try:
-            target, hook_sel, reason, _ = decode(["address", "bytes4", "bytes", "bytes"], data[4:])
+            target, hook_sel, reason, details = decode(["address", "bytes4", "bytes", "bytes"], data[4:])
         except Exception:
             return RevertKind("hook_reverted", hexsel)
-        return RevertKind("hook_reverted", hexsel, f"{target} {hook_sel.hex()} {reason.hex()}")
+        kind = "unknown" if details[:4] in _NON_HOOK_WRAPPED_DETAILS else "hook_reverted"
+        return RevertKind(kind, hexsel, f"{target} {hook_sel.hex()} {reason.hex()}")
     kind = _KNOWN_SELECTORS.get(sel)
     if kind is None:
         return RevertKind("unknown", hexsel)
